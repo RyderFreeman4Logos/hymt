@@ -68,6 +68,12 @@ Template-specific options:
 - `hymt config edit`
 - `hymt tokenizer download [--force]`
 
+Related skills cover command/documentation translation:
+
+- `hymt exec -- <command> [args...]`, `hymt exec install`, and `hymt exec precache` are documented in `skills/exec/SKILL.md`.
+- `hymt man [--original] [--refresh] <page>` is documented in `skills/man/SKILL.md`.
+- `hymt info [--original] [--refresh] <topic>` is documented in `skills/info/SKILL.md`.
+
 ## Behavior
 
 - Translation output goes to stdout; progress and status go to stderr.
