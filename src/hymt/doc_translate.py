@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from importlib import import_module
 import os
 from pathlib import Path
+import sys
 import tempfile
 from types import ModuleType
 from typing import TextIO
@@ -140,6 +141,12 @@ def build_doc_translation_targets(
     targets: list[DocTranslationTarget] = []
     for path in files:
         if path.stem.endswith(f".{target_suffix}"):
+            continue
+        if not _is_utf8_text_file(path):
+            print(
+                f"Warning: skipping {path.relative_to(resolved_source)}: not valid UTF-8",
+                file=sys.stderr,
+            )
             continue
         targets.append(
             DocTranslationTarget(
@@ -345,6 +352,12 @@ def _scan_markdown_files(root: Path, *, recursive: bool) -> tuple[Path, ...]:
         with os.scandir(directory) as entries:
             for entry in sorted(entries, key=lambda item: item.name):
                 path = Path(entry.path)
+                if entry.is_symlink() and not path.exists():
+                    print(
+                        f"Warning: skipping {path.relative_to(root)}: broken symlink",
+                        file=sys.stderr,
+                    )
+                    continue
                 if entry.is_dir(follow_symlinks=True):
                     if recursive:
                         walk(path)
@@ -402,6 +415,14 @@ def _target_lang_path_suffix(target_lang: str) -> str:
             "document target language must contain only ASCII letters, digits, or hyphens"
         )
     return TARGET_SUFFIX_ALIASES.get(suffix, suffix)
+
+
+def _is_utf8_text_file(path: Path) -> bool:
+    try:
+        path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return False
+    return True
 
 
 def _source_state(path: Path) -> _SourceState:

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import redirect_stderr
 import io
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -51,6 +53,23 @@ class TranslateDocTargetTests(unittest.TestCase):
             [target.source_path.name for target in recursive],
             ["README.md", "GUIDE.md"],
         )
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "requires symlink support")
+    def test_build_targets_skip_invalid_utf8_and_broken_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "README.md").write_text("# hello\n", encoding="utf-8")
+            (root / "BROKEN.md").write_bytes(b"\xff\xfe\xfd")
+            os.symlink(root / "missing.md", root / "MISSING.md")
+
+            warning = io.StringIO()
+            with redirect_stderr(warning):
+                targets = build_doc_translation_targets(root, "zh", recursive=False)
+
+        self.assertEqual([target.source_path.name for target in targets], ["README.md"])
+        text = warning.getvalue()
+        self.assertIn("Warning: skipping BROKEN.md: not valid UTF-8", text)
+        self.assertIn("Warning: skipping MISSING.md: broken symlink", text)
 
 
 class TranslateDocRuntimeTests(unittest.TestCase):

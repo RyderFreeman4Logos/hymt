@@ -208,6 +208,39 @@ class BatchPlanTests(unittest.TestCase):
                 warning.getvalue(),
             )
 
+    @unittest.skipUnless(hasattr(os, "symlink"), "requires symlink support")
+    def test_build_batch_plan_skips_invalid_utf8_and_broken_symlink(self) -> None:
+        with temporary_home(), tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "valid.md").write_text("fresh", encoding="utf-8")
+            (root / "invalid.md").write_bytes(b"\xff\xfe\xfd")
+            os.symlink(root / "missing.md", root / "broken.md")
+
+            warning = io.StringIO()
+            with patched_batch_dependencies(), redirect_stderr(warning):
+                plan = build_batch_plan(
+                    root,
+                    root / "out",
+                    "zh",
+                    fake_config(),
+                    TemplateType.DEFAULT,
+                    {},
+                )
+
+            self.assertEqual(
+                [file.relative_path for file in plan.files], [Path("valid.md")]
+            )
+            self.assertEqual(plan.skipped, ())
+            text = warning.getvalue()
+            self.assertIn(
+                "Warning: skipping invalid.md: not valid UTF-8",
+                text,
+            )
+            self.assertIn(
+                "Warning: skipping broken.md: broken symlink",
+                text,
+            )
+
     def test_run_batch_translation_writes_outputs_even_when_fully_cached(self) -> None:
         with temporary_home(), tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
