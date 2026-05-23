@@ -124,6 +124,7 @@ async def translate_text(
     if initial_estimate is not None:
         _print_estimate(initial_estimate)
     stream_enabled = _stream_enabled(config, stream)
+    options_hash = _template_options_hash(template_kwargs)
     segment_hashes = [_segment_cache_hash(segment) for segment in plan.segments]
     segment_tokens = [plan.count_tokens(segment) for segment in plan.segments]
     translations: list[str | None] = [None] * plan.segment_count
@@ -145,7 +146,7 @@ async def translate_text(
                 zip(segment_hashes, segment_tokens, strict=True)
             ):
                 cached = history.find_segment_cached(
-                    segment_hash, target_lang, template_name
+                    segment_hash, target_lang, template_name, options_hash
                 )
                 if cached is None:
                     missing_indexes.append(index)
@@ -181,6 +182,7 @@ async def translate_text(
                                 datetime.now(timezone.utc).isoformat(
                                     timespec="seconds"
                                 ),
+                                options_hash=options_hash,
                             )
                             completed += 1
                             completed_tokens += segment_tokens[index]
@@ -201,6 +203,7 @@ async def translate_text(
                             target_lang,
                             template_type,
                             template_kwargs,
+                            options_hash,
                             template_name,
                             progress,
                             completed,
@@ -380,6 +383,7 @@ async def _translate_missing_segments(
     target_lang: str,
     template_type: TemplateType,
     template_kwargs: dict[str, object],
+    options_hash: str,
     template_name: str,
     progress: TranslationProgress,
     completed: int,
@@ -405,6 +409,7 @@ async def _translate_missing_segments(
             template_name,
             translated_segment,
             datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            options_hash=options_hash,
         )
         async with progress_lock:
             completed += 1
@@ -484,6 +489,16 @@ def _translation_cache_hash(
 
 def _segment_cache_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _template_options_hash(template_kwargs: dict[str, object]) -> str:
+    normalized = _normalize_cache_kwargs(template_kwargs)
+    if not normalized:
+        return ""
+    encoded = json.dumps(
+        normalized, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _normalize_cache_kwargs(template_kwargs: dict[str, object]) -> dict[str, JsonValue]:

@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from hymt.history import HistoryDB, TaskRecord
 from hymt.templates import TemplateType
-from hymt.translate import _segment_cache_hash, translate_text
+from hymt.translate import _segment_cache_hash, _template_options_hash, translate_text
 
 
 class TranslationCacheTests(unittest.TestCase):
@@ -80,6 +80,72 @@ class TranslationCacheTests(unittest.TestCase):
 
         self.assertEqual(output, "fresh output")
         self.assertEqual(FakeTranslationClient.calls, 1)
+
+    def test_template_options_are_part_of_segment_cache_identity(self) -> None:
+        source = "source text"
+
+        with temporary_home():
+            HistoryDB().store_segment_cache(
+                _segment_cache_hash(source),
+                "en",
+                TemplateType.STYLE.value,
+                "cached output",
+                "2026-05-23T00:00:00+00:00",
+                options_hash=_template_options_hash({"style": "formal"}),
+            )
+            stderr = io.StringIO()
+            FakeTranslationClient.calls = 0
+
+            with (
+                patch("hymt.translate.plan_translation", return_value=FakePlan()),
+                patch("hymt.translate._translation_lock", return_value=nullcontext()),
+                patch("hymt.translate.TranslationClient", FakeTranslationClient),
+                redirect_stderr(stderr),
+            ):
+                output = asyncio.run(
+                    translate_text(
+                        source,
+                        "en",
+                        SimpleNamespace(concurrency=1, config_version=1, model=""),
+                        TemplateType.STYLE,
+                        style="casual",
+                    )
+                )
+
+        self.assertEqual(output, "fresh output")
+        self.assertEqual(FakeTranslationClient.calls, 1)
+
+    def test_matching_template_options_reuse_segment_cache(self) -> None:
+        source = "source text"
+
+        with temporary_home():
+            HistoryDB().store_segment_cache(
+                _segment_cache_hash(source),
+                "en",
+                TemplateType.STYLE.value,
+                "cached output",
+                "2026-05-23T00:00:00+00:00",
+                options_hash=_template_options_hash({"style": "formal"}),
+            )
+            stderr = io.StringIO()
+
+            with (
+                patch("hymt.translate.plan_translation", return_value=FakePlan()),
+                patch("hymt.translate.TranslationClient") as client_cls,
+                redirect_stderr(stderr),
+            ):
+                output = asyncio.run(
+                    translate_text(
+                        source,
+                        "en",
+                        SimpleNamespace(concurrency=1, config_version=1, model=""),
+                        TemplateType.STYLE,
+                        style="formal",
+                    )
+                )
+
+        self.assertEqual(output, "cached output")
+        client_cls.assert_not_called()
 
     def test_translate_text_prompts_and_files_issue_for_timing_divergence(self) -> None:
         source = "source text"

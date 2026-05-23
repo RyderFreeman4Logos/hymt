@@ -121,6 +121,110 @@ class HistoryMigrationTests(unittest.TestCase):
                 )
             )
 
+    def test_segment_cache_distinguishes_template_options(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "history.db"
+            db = HistoryDB(path)
+            content_hash = "segment-hash"
+
+            db.store_segment_cache(
+                content_hash,
+                "en",
+                "style",
+                "formal output",
+                "2026-05-23T00:00:00+00:00",
+                options_hash="formal-hash",
+            )
+            db.store_segment_cache(
+                content_hash,
+                "en",
+                "style",
+                "casual output",
+                "2026-05-23T00:00:00+00:00",
+                options_hash="casual-hash",
+            )
+
+            self.assertEqual(
+                db.find_segment_cached(
+                    content_hash,
+                    target_lang="en",
+                    template_type="style",
+                    options_hash="formal-hash",
+                ),
+                "formal output",
+            )
+            self.assertEqual(
+                db.find_segment_cached(
+                    content_hash,
+                    target_lang="en",
+                    template_type="style",
+                    options_hash="casual-hash",
+                ),
+                "casual output",
+            )
+            self.assertIsNone(
+                db.find_segment_cached(
+                    content_hash,
+                    target_lang="en",
+                    template_type="style",
+                )
+            )
+
+    def test_segment_cache_migrates_template_options_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "history.db"
+            connection = sqlite3.connect(path)
+            try:
+                connection.execute(OLD_SEGMENT_CACHE_SCHEMA)
+                connection.execute(
+                    """
+                    INSERT INTO segment_cache (
+                        content_hash,
+                        target_lang,
+                        template_type,
+                        translated_text,
+                        created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "segment-hash",
+                        "en",
+                        "style",
+                        "legacy output",
+                        "2026-05-23T00:00:00+00:00",
+                    ),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            db = HistoryDB(path)
+            db.store_segment_cache(
+                "segment-hash",
+                "en",
+                "style",
+                "formal output",
+                "2026-05-23T00:00:01+00:00",
+                options_hash="formal-hash",
+            )
+
+            self.assertEqual(
+                db.find_segment_cached(
+                    "segment-hash", target_lang="en", template_type="style"
+                ),
+                "legacy output",
+            )
+            self.assertEqual(
+                db.find_segment_cached(
+                    "segment-hash",
+                    target_lang="en",
+                    template_type="style",
+                    options_hash="formal-hash",
+                ),
+                "formal output",
+            )
+
 
 class temporary_home:
     def __enter__(self) -> str:
@@ -183,6 +287,18 @@ CREATE TABLE tasks (
     tokens_per_second REAL NOT NULL,
     input_chars INTEGER NOT NULL,
     output_chars INTEGER NOT NULL
+);
+"""
+
+
+OLD_SEGMENT_CACHE_SCHEMA = """
+CREATE TABLE segment_cache (
+    content_hash TEXT NOT NULL,
+    target_lang TEXT NOT NULL,
+    template_type TEXT NOT NULL,
+    translated_text TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (content_hash, target_lang, template_type)
 );
 """
 

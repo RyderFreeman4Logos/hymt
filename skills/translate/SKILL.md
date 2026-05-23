@@ -59,7 +59,7 @@ Template-specific options:
 - `[translation].stream = true` is the default. `--stream`/`--no-stream` override config for translation runs.
 - Streaming runs send tokens to stdout as the endpoint produces them; non-streaming runs buffer output until completion.
 - Progress is written to stderr as `[done/total] XX.XX% | elapsed 2m47s | eta 1m23s | NN.NN tok/s`.
-- Identical source segments, target language, and template type reuse cached segment translations.
+- Identical source segments, target language, template type, and template-specific options reuse cached segment translations.
 - After a completed interactive translation, if actual runtime diverges from the estimate by `[timing].divergence_threshold` (default `2.0`), `hymt` can prompt to file a GitHub timing-data issue.
 - Config lives at `~/.config/hymt/config.toml`.
 - The tokenizer is cached at `~/.cache/hymt/tokenizer/tokenizer.json`.

@@ -44,9 +44,10 @@ CREATE TABLE IF NOT EXISTS segment_cache (
     content_hash TEXT NOT NULL,
     target_lang TEXT NOT NULL,
     template_type TEXT NOT NULL,
+    options_hash TEXT NOT NULL DEFAULT '',
     translated_text TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    PRIMARY KEY (content_hash, target_lang, template_type)
+    PRIMARY KEY (content_hash, target_lang, template_type, options_hash)
 );
 """
 
@@ -136,7 +137,7 @@ def format_duration(seconds: float) -> str:
 
 class HistoryDB:
     _schema_verified_paths: set[tuple[Path, int]] = set()
-    _schema_version = 2
+    _schema_version = 3
 
     def __init__(self, path: Path | str | None = None) -> None:
         self._path = Path(path).expanduser() if path is not None else history_path()
@@ -197,7 +198,11 @@ class HistoryDB:
             connection.close()
 
     def find_segment_cached(
-        self, content_hash: str, target_lang: str, template_type: str
+        self,
+        content_hash: str,
+        target_lang: str,
+        template_type: str,
+        options_hash: str = "",
     ) -> str | None:
         connection = self._connect_if_exists()
         if connection is None:
@@ -211,9 +216,10 @@ class HistoryDB:
                 WHERE content_hash = ?
                   AND target_lang = ?
                   AND template_type = ?
+                  AND options_hash = ?
                 LIMIT 1
                 """,
-                (content_hash, target_lang, template_type),
+                (content_hash, target_lang, template_type, options_hash),
             ).fetchone()
             if row is None:
                 return None
@@ -228,6 +234,7 @@ class HistoryDB:
         template_type: str,
         translated_text: str,
         created_at: str,
+        options_hash: str = "",
     ) -> None:
         connection = self._connect(create=True)
         try:
@@ -238,16 +245,24 @@ class HistoryDB:
                     content_hash,
                     target_lang,
                     template_type,
+                    options_hash,
                     translated_text,
                     created_at
                 )
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(content_hash, target_lang, template_type)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(content_hash, target_lang, template_type, options_hash)
                 DO UPDATE SET
                     translated_text = excluded.translated_text,
                     created_at = excluded.created_at
                 """,
-                (content_hash, target_lang, template_type, translated_text, created_at),
+                (
+                    content_hash,
+                    target_lang,
+                    template_type,
+                    options_hash,
+                    translated_text,
+                    created_at,
+                ),
             )
             connection.commit()
         finally:
@@ -466,6 +481,17 @@ class HistoryDB:
             connection.execute(
                 "ALTER TABLE tasks ADD COLUMN config_version INTEGER DEFAULT 1"
             )
+        segment_columns = {
+            str(row["name"]): int(row["pk"])
+            for row in connection.execute("PRAGMA table_info(segment_cache)").fetchall()
+        }
+        if "options_hash" not in segment_columns:
+            connection.execute(
+                "ALTER TABLE segment_cache ADD COLUMN options_hash TEXT NOT NULL DEFAULT ''"
+            )
+            segment_columns["options_hash"] = 0
+        if segment_columns.get("options_hash", 0) == 0:
+            _rebuild_segment_cache_primary_key(connection)
         connection.commit()
         self._schema_verified_paths.add(cache_key)
 
@@ -488,6 +514,44 @@ def _build_estimate(
         estimated_output_tokens=estimated_output_tokens,
         versions_used=versions_used,
     )
+
+
+def _rebuild_segment_cache_primary_key(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE segment_cache_new (
+            content_hash TEXT NOT NULL,
+            target_lang TEXT NOT NULL,
+            template_type TEXT NOT NULL,
+            options_hash TEXT NOT NULL DEFAULT '',
+            translated_text TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (content_hash, target_lang, template_type, options_hash)
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT OR REPLACE INTO segment_cache_new (
+            content_hash,
+            target_lang,
+            template_type,
+            options_hash,
+            translated_text,
+            created_at
+        )
+        SELECT
+            content_hash,
+            target_lang,
+            template_type,
+            COALESCE(options_hash, ''),
+            translated_text,
+            created_at
+        FROM segment_cache
+        """
+    )
+    connection.execute("DROP TABLE segment_cache")
+    connection.execute("ALTER TABLE segment_cache_new RENAME TO segment_cache")
 
 
 def _record_from_row(row: sqlite3.Row) -> TaskRecord:
