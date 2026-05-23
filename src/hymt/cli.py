@@ -11,6 +11,7 @@ import click
 
 from hymt.batch import build_batch_plan, run_batch_translation, show_batch_preview
 from hymt.config import HotConfig, config_path, show
+from hymt.docs import show_translated_info, show_translated_man
 from hymt.exec_wrapper import run_exec_command
 from hymt.history import (
     HistoryDB,
@@ -325,6 +326,68 @@ def config_edit() -> None:
     result = subprocess.run(command, check=False)
     if result.returncode != 0:
         raise click.ClickException(f"Editor exited with status {result.returncode}")
+
+
+@main.command(
+    "man",
+    context_settings={"ignore_unknown_options": True, "allow_extra_args": True},
+)
+@click.option(
+    "--target",
+    "-t",
+    "target_lang",
+    default="zh",
+    show_default=True,
+    help="Target language code.",
+)
+@click.option("--original", is_flag=True, help="Show the untranslated system manpage.")
+@click.option("--refresh", is_flag=True, help="Force a fresh translation.")
+@click.argument("man_args", nargs=-1, type=click.UNPROCESSED)
+def man_command(
+    target_lang: str, original: bool, refresh: bool, man_args: tuple[str, ...]
+) -> None:
+    try:
+        returncode = show_translated_man(
+            man_args,
+            target_lang,
+            HotConfig(),
+            original=original,
+            refresh=refresh,
+        )
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    raise click.exceptions.Exit(returncode)
+
+
+@main.command(
+    "info",
+    context_settings={"ignore_unknown_options": True, "allow_extra_args": True},
+)
+@click.option(
+    "--target",
+    "-t",
+    "target_lang",
+    default="zh",
+    show_default=True,
+    help="Target language code.",
+)
+@click.option("--original", is_flag=True, help="Show the untranslated info page.")
+@click.option("--refresh", is_flag=True, help="Force a fresh translation.")
+@click.argument("info_args", nargs=-1, type=click.UNPROCESSED)
+def info_command(
+    target_lang: str, original: bool, refresh: bool, info_args: tuple[str, ...]
+) -> None:
+    try:
+        returncode = show_translated_info(
+            info_args,
+            target_lang,
+            HotConfig(),
+            original=original,
+            refresh=refresh,
+        )
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    raise click.exceptions.Exit(returncode)
 
 
 @main.group(
