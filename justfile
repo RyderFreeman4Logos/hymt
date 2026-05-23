@@ -78,3 +78,15 @@ install-hooks:
     @git config --unset core.hooksPath 2>/dev/null || true
     lefthook install
     @echo "Lefthook hooks installed."
+
+doc-translate-sync:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "{{_repo_root}}"
+    bash scripts/hooks/translate-readme-zh.sh
+    if [ -z "$(git status --porcelain -- README.zh-cn.md)" ]; then
+        echo "README.zh-cn.md already in sync."
+        exit 0
+    fi
+    git add README.zh-cn.md
+    echo "Staged README.zh-cn.md"

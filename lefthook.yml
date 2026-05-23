@@ -13,3 +13,8 @@ pre-push:
   commands:
     review-check:
       run: scripts/hooks/review-check.sh
+
+post-commit:
+  commands:
+    auto-translate-readme:
+      run: bash scripts/hooks/auto-translate-readme.sh
