@@ -23,6 +23,9 @@ temperature = 0.7
 top_p = 0.6
 top_k = 20
 repetition_penalty = 1.05
+
+[timing]
+divergence_threshold = 2.0
 """
 
 
@@ -83,6 +86,10 @@ class HotConfig:
     @property
     def timeout(self) -> float:
         return self._get_float("translation", "timeout", 600.0)
+
+    @property
+    def timing_divergence_threshold(self) -> float:
+        return self._get_float_above("timing", "divergence_threshold", 2.0, 1.0)
 
     @property
     def temperature(self) -> float:
@@ -161,3 +168,9 @@ class HotConfig:
         if isinstance(value, int | float):
             return float(value)
         return default
+
+    def _get_float_above(
+        self, section_name: str, key: str, default: float, minimum: float
+    ) -> float:
+        value = self._get_float(section_name, key, default)
+        return value if value > minimum else default

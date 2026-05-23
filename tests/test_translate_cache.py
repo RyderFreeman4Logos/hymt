@@ -82,6 +82,92 @@ class TranslationCacheTests(unittest.TestCase):
         self.assertNotIn("Cache hit", stderr.getvalue())
         self.assertEqual(FakeTranslationClient.calls, 1)
 
+    def test_translate_text_prompts_and_files_issue_for_timing_divergence(self) -> None:
+        source = "source text"
+
+        with temporary_home():
+            seed_estimate_history()
+            stderr = io.StringIO()
+            FakeTranslationClient.calls = 0
+            fake_stdin = InteractiveStdin("y\n")
+            completed = SimpleNamespace(
+                returncode=0,
+                stdout="https://github.com/RyderFreeman4Logos/hymt/issues/99\n",
+                stderr="",
+            )
+
+            with (
+                patch("hymt.translate.plan_translation", return_value=FakePlan()),
+                patch("hymt.translate._translation_lock", return_value=nullcontext()),
+                patch("hymt.translate.TranslationClient", FakeTranslationClient),
+                patch("hymt.translate._monotonic", side_effect=[0.0, 5.0]),
+                patch("hymt.timing_issue.sys.stdin", fake_stdin),
+                patch("hymt.timing_issue.shutil.which", side_effect=fake_which),
+                patch("hymt.timing_issue.platform.platform", return_value="TestOS"),
+                patch("hymt.timing_issue.platform.machine", return_value="x86_64"),
+                patch("hymt.timing_issue.platform.processor", return_value="test-cpu"),
+                patch(
+                    "hymt.timing_issue.subprocess.run", return_value=completed
+                ) as run,
+                redirect_stderr(stderr),
+            ):
+                output = asyncio.run(
+                    translate_text(
+                        source,
+                        "en",
+                        fake_config(),
+                        TemplateType.DEFAULT,
+                    )
+                )
+
+        self.assertEqual(output, "fresh output")
+        self.assertIn("Actual time (5s) differs significantly", stderr.getvalue())
+        self.assertIn("Filed timing issue", stderr.getvalue())
+        run.assert_called_once()
+        command = run.call_args.args[0]
+        body = command[command.index("--body") + 1]
+        self.assertEqual(
+            command[:5],
+            ["gh", "issue", "create", "--repo", "RyderFreeman4Logos/hymt"],
+        )
+        self.assertIn("Historical token/s statistics", body)
+        self.assertIn("| Input tokens | 11 |", body)
+        self.assertIn("| Segments | 1 |", body)
+        self.assertIn("- hymt version: 0.1.0", body)
+        self.assertIn("- config_version: 1", body)
+
+    def test_translate_text_skips_timing_issue_prompt_when_non_interactive(
+        self,
+    ) -> None:
+        source = "source text"
+
+        with temporary_home():
+            seed_estimate_history()
+            stderr = io.StringIO()
+            FakeTranslationClient.calls = 0
+
+            with (
+                patch("hymt.translate.plan_translation", return_value=FakePlan()),
+                patch("hymt.translate._translation_lock", return_value=nullcontext()),
+                patch("hymt.translate.TranslationClient", FakeTranslationClient),
+                patch("hymt.translate._monotonic", side_effect=[0.0, 5.0]),
+                patch("hymt.timing_issue.sys.stdin", io.StringIO("")),
+                patch("hymt.timing_issue.subprocess.run") as run,
+                redirect_stderr(stderr),
+            ):
+                output = asyncio.run(
+                    translate_text(
+                        source,
+                        "en",
+                        fake_config(),
+                        TemplateType.DEFAULT,
+                    )
+                )
+
+        self.assertEqual(output, "fresh output")
+        self.assertNotIn("File an issue with timing data?", stderr.getvalue())
+        run.assert_not_called()
+
 
 class FakePlan:
     source_tokens = 11
@@ -114,6 +200,11 @@ class FakeTranslationClient:
         on_progress: object,
     ) -> list[str]:
         return ["fresh output"]
+
+
+class InteractiveStdin(io.StringIO):
+    def isatty(self) -> bool:
+        return True
 
 
 class temporary_home:
@@ -155,6 +246,46 @@ def task_record(
         output_text=output_text,
         input_hash=input_hash,
     )
+
+
+def seed_estimate_history() -> None:
+    for index in range(3):
+        HistoryDB().insert_task(
+            TaskRecord(
+                started_at=f"2026-05-23T00:00:0{index}+00:00",
+                finished_at=f"2026-05-23T00:00:0{index + 1}+00:00",
+                duration_seconds=1.0,
+                input_tokens=11,
+                output_tokens=10,
+                segments=1,
+                concurrency=1,
+                source_lang=None,
+                target_lang="en",
+                template_type="default",
+                model=None,
+                tokens_per_second=10.0,
+                input_chars=11,
+                output_chars=10,
+                output_text=f"historical output {index}",
+                input_hash=f"history-{index}",
+                config_version=1,
+            )
+        )
+
+
+def fake_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        concurrency=1,
+        config_version=1,
+        model="test-model",
+        timing_divergence_threshold=2.0,
+    )
+
+
+def fake_which(command: str) -> str | None:
+    if command == "gh":
+        return "/usr/bin/gh"
+    return None
 
 
 if __name__ == "__main__":
