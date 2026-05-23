@@ -47,16 +47,21 @@ class TranslationGroup(click.Group):
     def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
         if not args and self.no_args_is_help and not ctx.resilient_parsing:
             raise click.NoArgsIsHelpError(ctx)
-        if self._first_command_candidate(ctx, args) is None:
+        first_command = self._first_command_candidate(ctx, args)
+        treat_rest_as_text = first_command is None and self._has_argument_separator(args)
+        if first_command is None:
             args = self._option_args_first(args)
         rest = click.Command.parse_args(self, ctx, args)
         if rest:
-            cmd_name = rest[0]
-            command = self.get_command(ctx, cmd_name)
-            if command is not None:
-                ctx._protected_args, ctx.args = rest[:1], rest[1:]
-            else:
+            if treat_rest_as_text:
                 ctx._protected_args, ctx.args = [], rest
+            else:
+                cmd_name = rest[0]
+                command = self.get_command(ctx, cmd_name)
+                if command is not None:
+                    ctx._protected_args, ctx.args = rest[:1], rest[1:]
+                else:
+                    ctx._protected_args, ctx.args = [], rest
         return ctx.args
 
     def _first_command_candidate(self, ctx: click.Context, args: list[str]) -> str | None:
@@ -104,6 +109,21 @@ class TranslationGroup(click.Group):
                 text_args.append(arg)
             index += 1
         return [*option_args, *text_args]
+
+    def _has_argument_separator(self, args: list[str]) -> bool:
+        index = 0
+        while index < len(args):
+            arg = args[index]
+            if arg == "--":
+                return True
+            if arg in VALUE_OPTIONS:
+                index += 2
+                continue
+            if arg.startswith(LONG_VALUE_PREFIXES) or _is_attached_short_value(arg):
+                index += 1
+                continue
+            index += 1
+        return False
 
 
 def _is_attached_short_value(arg: str) -> bool:

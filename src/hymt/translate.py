@@ -15,7 +15,7 @@ from typing import TypeAlias
 
 from hymt.client import TranslationClient
 from hymt.config import HotConfig
-from hymt.history import HistoryDB, TaskRecord, format_duration
+from hymt.history import DurationEstimate, HistoryDB, TaskRecord, format_duration
 from hymt.segment import Segmenter, create_segmenter
 from hymt.templates import TemplateType, build_prompt
 
@@ -186,7 +186,7 @@ async def translate_file(
     output_path.write_text(translated, encoding="utf-8")
 
 
-def _print_estimate(est: "DurationEstimate") -> None:
+def _print_estimate(est: DurationEstimate) -> None:
     stats = est.stats
     if len(est.versions_used) <= 1:
         print(

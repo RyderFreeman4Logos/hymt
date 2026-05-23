@@ -53,6 +53,22 @@ class StdoutNewlineTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertEqual(result.output, "translated\n")
 
+    def test_cli_separator_treats_subcommand_name_as_text(self) -> None:
+        with temporary_home() as home:
+            runner = CliRunner()
+            translate = AsyncMock(return_value="translated")
+            with (
+                patch("hymt.cli.HotConfig", return_value=SimpleNamespace()),
+                patch("hymt.cli._announce_tokenizer_download"),
+                patch("hymt.cli.translate_text", new=translate),
+            ):
+                result = runner.invoke(main, ["-t", "en", "--", "config"], env={"HOME": home})
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(result.output, "translated\n")
+        translate.assert_awaited_once()
+        self.assertEqual(translate.await_args.args[0], "config")
+
 
 class temporary_home:
     def __enter__(self) -> str:
