@@ -11,7 +11,24 @@ TOKENIZER_REPO = "tencent/Hy-MT2-7B"
 TOKENIZER_FILENAME = "tokenizer.json"
 TOKENIZER_CACHE_DIR = Path.home() / ".cache" / "hymt" / "tokenizer"
 TOKENIZER_PATH = TOKENIZER_CACHE_DIR / TOKENIZER_FILENAME
-SENTENCE_ENDINGS = frozenset({".", "。", "！", "？", "!", "?"})
+
+_CJK_SENTENCE_RE = re.compile(
+    r"(?<=[。！？…])"
+    r"[\"'」』）)\]]*"
+    r"(?=\s|\Z|[^\"'」』）)\]])"
+)
+
+_EN_SENTENCE_RE = re.compile(
+    r"(?<=[.!?])"
+    r"[\"')]*"
+    r"(?=\s+[A-Z一-鿿぀-ヿ]|\s*\Z)"
+)
+
+_CLAUSE_RE = re.compile(
+    r"(?<=[，,、；;：:])"
+    r"[\"'」』）)]*"
+    r"(?=\s|\Z|[^\"'」』）)])"
+)
 
 
 class Segmenter:
@@ -38,7 +55,11 @@ class Segmenter:
                 if self.count_tokens(sentence) <= max_tokens:
                     units.append(sentence)
                     continue
-                units.extend(self._split_word_or_character(sentence, max_tokens))
+                for clause in _split_clauses(sentence):
+                    if self.count_tokens(clause) <= max_tokens:
+                        units.append(clause)
+                        continue
+                    units.extend(self._split_word_or_character(clause, max_tokens))
 
         return self._pack_units(units, max_tokens)
 
@@ -115,13 +136,16 @@ def _split_paragraphs(text: str) -> list[str]:
 
 
 def _split_sentences(text: str) -> list[str]:
-    sentences: list[str] = []
-    current = ""
-    for char in text:
-        current += char
-        if char in SENTENCE_ENDINGS:
-            sentences.append(current)
-            current = ""
-    if current:
-        sentences.append(current)
-    return sentences
+    parts = _CJK_SENTENCE_RE.split(text)
+    result: list[str] = []
+    for part in parts:
+        if not part:
+            continue
+        en_parts = _EN_SENTENCE_RE.split(part)
+        result.extend(p for p in en_parts if p)
+    return result
+
+
+def _split_clauses(text: str) -> list[str]:
+    parts = _CLAUSE_RE.split(text)
+    return [p for p in parts if p]

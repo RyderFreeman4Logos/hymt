@@ -12,6 +12,7 @@ __all__ = [
     "HistoryDB",
     "PerformanceStats",
     "TaskRecord",
+    "TranslationPreview",
     "estimate_duration_seconds",
     "format_duration",
     "history_path",
@@ -34,7 +35,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     model TEXT,
     tokens_per_second REAL NOT NULL,
     input_chars INTEGER NOT NULL,
-    output_chars INTEGER NOT NULL
+    output_chars INTEGER NOT NULL,
+    output_text TEXT
 );
 """
 
@@ -55,7 +57,19 @@ class TaskRecord:
     tokens_per_second: float
     input_chars: int
     output_chars: int
+    output_text: str | None = None
     id: int | None = None
+
+
+@dataclass(frozen=True)
+class TranslationPreview:
+    position: int
+    id: int
+    finished_at: str
+    target_lang: str
+    template_type: str
+    output_chars: int
+    preview: str
 
 
 @dataclass(frozen=True)
@@ -133,9 +147,10 @@ class HistoryDB:
                     model,
                     tokens_per_second,
                     input_chars,
-                    output_chars
+                    output_chars,
+                    output_text
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.started_at,
@@ -152,6 +167,7 @@ class HistoryDB:
                     record.tokens_per_second,
                     record.input_chars,
                     record.output_chars,
+                    record.output_text,
                 ),
             )
             connection.commit()
@@ -171,6 +187,80 @@ class HistoryDB:
                 parameters = (limit,)
             rows = connection.execute(sql, parameters).fetchall()
             return [_record_from_row(row) for row in rows]
+        finally:
+            connection.close()
+
+    def fetch_recent_output(self, position: int = 1) -> str | None:
+        if position < 1:
+            raise ValueError("position must be at least 1")
+        connection = self._connect_if_exists()
+        if connection is None:
+            return None
+        try:
+            self._ensure_schema(connection)
+            row = connection.execute(
+                """
+                SELECT output_text
+                FROM tasks
+                WHERE output_text IS NOT NULL
+                ORDER BY finished_at DESC, id DESC
+                LIMIT 1 OFFSET ?
+                """,
+                (position - 1,),
+            ).fetchone()
+            if row is None:
+                return None
+            return str(row["output_text"])
+        finally:
+            connection.close()
+
+    def count_translations(self) -> int:
+        connection = self._connect_if_exists()
+        if connection is None:
+            return 0
+        try:
+            self._ensure_schema(connection)
+            row = connection.execute(
+                "SELECT COUNT(*) AS count FROM tasks WHERE output_text IS NOT NULL"
+            ).fetchone()
+            return int(row["count"]) if row is not None else 0
+        finally:
+            connection.close()
+
+    def fetch_recent_translations(self, limit: int = 10) -> list[TranslationPreview]:
+        connection = self._connect_if_exists()
+        if connection is None:
+            return []
+        try:
+            self._ensure_schema(connection)
+            rows = connection.execute(
+                """
+                SELECT
+                    id,
+                    finished_at,
+                    target_lang,
+                    template_type,
+                    output_chars,
+                    output_text
+                FROM tasks
+                WHERE output_text IS NOT NULL
+                ORDER BY finished_at DESC, id DESC
+                LIMIT ?
+                """,
+                (max(0, limit),),
+            ).fetchall()
+            return [
+                TranslationPreview(
+                    position=index,
+                    id=int(row["id"]),
+                    finished_at=str(row["finished_at"]),
+                    target_lang=str(row["target_lang"]),
+                    template_type=str(row["template_type"]),
+                    output_chars=int(row["output_chars"]),
+                    preview=_preview_text(str(row["output_text"])),
+                )
+                for index, row in enumerate(rows, start=1)
+            ]
         finally:
             connection.close()
 
@@ -250,6 +340,13 @@ class HistoryDB:
 
     def _ensure_schema(self, connection: sqlite3.Connection) -> None:
         connection.execute(SCHEMA)
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(tasks)").fetchall()
+        }
+        if "output_text" not in columns:
+            connection.execute("ALTER TABLE tasks ADD COLUMN output_text TEXT")
+        connection.commit()
 
 
 def _record_from_row(row: sqlite3.Row) -> TaskRecord:
@@ -269,7 +366,13 @@ def _record_from_row(row: sqlite3.Row) -> TaskRecord:
         tokens_per_second=float(row["tokens_per_second"]),
         input_chars=int(row["input_chars"]),
         output_chars=int(row["output_chars"]),
+        output_text=row["output_text"] if row["output_text"] is None else str(row["output_text"]),
     )
+
+
+def _preview_text(text: str, limit: int = 80) -> str:
+    preview = " ".join(text.split())
+    return preview[:limit]
 
 
 def _stats_filters(

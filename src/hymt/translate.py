@@ -126,6 +126,7 @@ async def translate_text(
             tokens_per_second=tokens_per_second,
             input_chars=len(text),
             output_chars=len(translated),
+            output_text=translated,
         ),
     )
     return translated

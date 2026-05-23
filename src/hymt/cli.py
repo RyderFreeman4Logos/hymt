@@ -10,7 +10,13 @@ import sys
 import click
 
 from hymt.config import HotConfig, config_path, show
-from hymt.history import HistoryDB, TaskRecord, estimate_duration_seconds, format_duration
+from hymt.history import (
+    HistoryDB,
+    TaskRecord,
+    TranslationPreview,
+    estimate_duration_seconds,
+    format_duration,
+)
 from hymt.segment import TOKENIZER_PATH, ensure_tokenizer
 from hymt.templates import TemplateType
 from hymt.translate import plan_translation, translate_file, translate_text
@@ -307,6 +313,26 @@ def history_command(show_all: bool, show_stats: bool, clear: bool) -> None:
     _show_history_records(records)
 
 
+@main.command("recall")
+@click.option("-n", "position", type=click.IntRange(min=1), default=1, help="Nth most recent output.")
+@click.option("--list", "show_list", is_flag=True, help="Show recent translations with previews.")
+def recall_command(position: int, show_list: bool) -> None:
+    db = HistoryDB()
+    if show_list:
+        previews = db.fetch_recent_translations(limit=10)
+        if not previews:
+            click.echo("No translation history.", err=True)
+            raise click.exceptions.Exit(1)
+        _show_translation_previews(previews)
+        return
+
+    output_text = db.fetch_recent_output(position)
+    if output_text is None:
+        _show_recall_missing(db.count_translations())
+        raise click.exceptions.Exit(1)
+    sys.stdout.write(output_text)
+
+
 def _template_kwargs(
     terms: tuple[str, ...],
     style: str | None,
@@ -366,6 +392,30 @@ def _show_history_records(records: list[TaskRecord]) -> None:
             f"{record.tokens_per_second:>7.1f} "
             f"{format_duration(record.duration_seconds):>9}"
         )
+
+
+def _show_translation_previews(previews: list[TranslationPreview]) -> None:
+    click.echo(
+        f"{'N':>3} {'ID':>4} {'Finished':<19} {'Target':<8} "
+        f"{'Type':<12} {'Chars':>7} Preview"
+    )
+    for preview in previews:
+        click.echo(
+            f"{preview.position:>3} "
+            f"{preview.id:>4} "
+            f"{_compact_timestamp(preview.finished_at):<19} "
+            f"{preview.target_lang:<8.8} "
+            f"{preview.template_type:<12.12} "
+            f"{preview.output_chars:>7} "
+            f"{preview.preview}"
+        )
+
+
+def _show_recall_missing(count: int) -> None:
+    if count == 0:
+        click.echo("No translation history.", err=True)
+        return
+    click.echo(f"Only {count} translations in history.", err=True)
 
 
 def _compact_timestamp(value: str) -> str:
