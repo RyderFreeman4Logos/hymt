@@ -11,6 +11,8 @@ import click
 
 from hymt.batch import build_batch_plan, run_batch_translation, show_batch_preview
 from hymt.config import HotConfig, config_path, show
+from hymt.docs import show_translated_info, show_translated_man
+from hymt.exec_wrapper import run_exec_command
 from hymt.history import (
     HistoryDB,
     TaskRecord,
@@ -19,9 +21,11 @@ from hymt.history import (
     format_duration,
 )
 from hymt.language import DocumentLanguagePlan, analyze_document_language
+from hymt.precache import run_precache
 from hymt.segment import TOKENIZER_PATH, ensure_tokenizer, has_tokenizer_support
 from hymt.templates import TemplateType
 from hymt.translate import plan_translation, translate_file, translate_text
+from hymt.zsh_plugin import install_zsh_plugin
 
 
 TEMPLATE_CHOICES = [template.value for template in TemplateType]
@@ -324,6 +328,147 @@ def config_edit() -> None:
     result = subprocess.run(command, check=False)
     if result.returncode != 0:
         raise click.ClickException(f"Editor exited with status {result.returncode}")
+
+
+@main.command(
+    "man",
+    context_settings={"ignore_unknown_options": True, "allow_extra_args": True},
+)
+@click.option(
+    "--target",
+    "-t",
+    "target_lang",
+    default="zh",
+    show_default=True,
+    help="Target language code.",
+)
+@click.option("--original", is_flag=True, help="Show the untranslated system manpage.")
+@click.option("--refresh", is_flag=True, help="Force a fresh translation.")
+@click.argument("man_args", nargs=-1, type=click.UNPROCESSED)
+def man_command(
+    target_lang: str, original: bool, refresh: bool, man_args: tuple[str, ...]
+) -> None:
+    try:
+        returncode = show_translated_man(
+            man_args,
+            target_lang,
+            HotConfig(),
+            original=original,
+            refresh=refresh,
+        )
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    raise click.exceptions.Exit(returncode)
+
+
+@main.command(
+    "info",
+    context_settings={"ignore_unknown_options": True, "allow_extra_args": True},
+)
+@click.option(
+    "--target",
+    "-t",
+    "target_lang",
+    default="zh",
+    show_default=True,
+    help="Target language code.",
+)
+@click.option("--original", is_flag=True, help="Show the untranslated info page.")
+@click.option("--refresh", is_flag=True, help="Force a fresh translation.")
+@click.argument("info_args", nargs=-1, type=click.UNPROCESSED)
+def info_command(
+    target_lang: str, original: bool, refresh: bool, info_args: tuple[str, ...]
+) -> None:
+    try:
+        returncode = show_translated_info(
+            info_args,
+            target_lang,
+            HotConfig(),
+            original=original,
+            refresh=refresh,
+        )
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    raise click.exceptions.Exit(returncode)
+
+
+@main.group(
+    "exec",
+    invoke_without_command=True,
+    context_settings={"ignore_unknown_options": True, "allow_extra_args": True},
+    help="Run a command and translate its output after completion.",
+)
+@click.option(
+    "--target",
+    "-t",
+    "target_lang",
+    default="zh",
+    show_default=True,
+    help="Target language code.",
+)
+@click.pass_context
+def exec_command(ctx: click.Context, target_lang: str) -> None:
+    if ctx.invoked_subcommand is not None:
+        return
+    command = list(ctx.args)
+    if command and command[0] == "--":
+        command = command[1:]
+    if not command:
+        raise click.UsageError("Use 'hymt exec -- command args...'")
+    try:
+        returncode = run_exec_command(command, target_lang, HotConfig())
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    raise click.exceptions.Exit(returncode)
+
+
+@exec_command.command("install")
+@click.option("--update", is_flag=True, help="Overwrite an existing zsh plugin.")
+def exec_install_command(update: bool) -> None:
+    try:
+        result = install_zsh_plugin(HotConfig(), update=update)
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Installed {result.plugin_path}")
+    if result.updated_zshrc:
+        click.echo(f"Added source line to {result.zshrc_path}")
+    else:
+        click.echo(f"Source line already present in {result.zshrc_path}")
+
+
+@exec_command.command("precache")
+@click.option(
+    "--target",
+    "-t",
+    "target_lang",
+    default="zh",
+    show_default=True,
+    help="Target language code.",
+)
+@click.option(
+    "--recursive",
+    is_flag=True,
+    help="Also translate discovered subcommand --help output.",
+)
+@click.option("--section", help="Only translate a specific man section.")
+def exec_precache_command(
+    target_lang: str, recursive: bool, section: str | None
+) -> None:
+    try:
+        summary = run_precache(
+            target_lang,
+            HotConfig(),
+            recursive=recursive,
+            section=section,
+            progress_stream=sys.stderr,
+        )
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(
+        "Precache complete: "
+        f"{summary.translated}/{summary.total} translated, {summary.failed} failed.",
+        err=True,
+    )
 
 
 @main.group()
