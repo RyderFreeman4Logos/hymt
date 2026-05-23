@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import datetime, timezone
 import asyncio
 import os
 import re
@@ -10,8 +9,7 @@ import subprocess
 import sys
 
 from hymt.config import HotConfig
-from hymt.templates import TemplateType
-from hymt.translate import translate_text
+from hymt.exec_cache import translate_cached_text
 
 
 def show_translated_man(
@@ -27,7 +25,9 @@ def show_translated_man(
     if original:
         return subprocess.call(["man", *args])
     text = _capture_man(args)
-    translated = _translate_document(text, target_lang, config, refresh)
+    translated = _translate_document(
+        "man", " ".join(args), text, target_lang, config, refresh
+    )
     return _page_text(translated)
 
 
@@ -44,7 +44,9 @@ def show_translated_info(
     if original:
         return subprocess.call(["info", *args])
     text = _capture_info(args)
-    translated = _translate_document(text, target_lang, config, refresh)
+    translated = _translate_document(
+        "info", " ".join(args), text, target_lang, config, refresh
+    )
     return _page_text(translated)
 
 
@@ -89,26 +91,21 @@ def _strip_overstrikes(text: str) -> str:
 
 
 def _translate_document(
-    text: str, target_lang: str, config: HotConfig, refresh: bool
+    command: str,
+    subcommand: str,
+    text: str,
+    target_lang: str,
+    config: HotConfig,
+    refresh: bool,
 ) -> str:
-    if refresh:
-        return asyncio.run(
-            translate_text(
-                text,
-                target_lang,
-                config,
-                TemplateType.DEFAULT,
-                stream=False,
-                cache_bust=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            )
-        )
     return asyncio.run(
-        translate_text(
+        translate_cached_text(
+            command,
+            subcommand,
             text,
             target_lang,
             config,
-            TemplateType.DEFAULT,
-            stream=False,
+            refresh=refresh,
         )
     )
 

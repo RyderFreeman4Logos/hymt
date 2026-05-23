@@ -13,8 +13,7 @@ import threading
 from typing import BinaryIO, TextIO
 
 from hymt.config import HotConfig
-from hymt.templates import TemplateType
-from hymt.translate import translate_text
+from hymt.exec_cache import translate_cached_text
 
 
 ANSI_CYAN = "\033[36m"
@@ -102,24 +101,37 @@ async def _translate_result(
     if config.exec_translate_stderr and result.stderr:
         stderr_text = _decode_for_translation(result.stderr)
         if stderr_text is not None:
-            translated = await _translate_output(stderr_text, target_lang, config)
+            translated = await _translate_output(
+                command, stderr_text, target_lang, config
+            )
             _write_translation("stderr", translated, sys.stderr, ANSI_YELLOW)
     if _should_translate_stdout(command, result.stdout, target_lang, config):
         stdout_text = _decode_for_translation(result.stdout)
         if stdout_text is not None:
             stream = sys.stdout if sys.stdout.isatty() else sys.stderr
-            translated = await _translate_output(stdout_text, target_lang, config)
+            translated = await _translate_output(
+                command, stdout_text, target_lang, config
+            )
             _write_translation("stdout", translated, stream, ANSI_CYAN)
 
 
-async def _translate_output(text: str, target_lang: str, config: HotConfig) -> str:
-    return await translate_text(
+async def _translate_output(
+    command: list[str], text: str, target_lang: str, config: HotConfig
+) -> str:
+    cache_command, cache_subcommand = _cache_identity(command)
+    return await translate_cached_text(
+        cache_command,
+        cache_subcommand,
         text,
         target_lang,
         config,
-        TemplateType.DEFAULT,
-        stream=False,
     )
+
+
+def _cache_identity(command: list[str]) -> tuple[str, str]:
+    executable = Path(command[0]).name
+    subcommand = command[1] if len(command) > 1 else ""
+    return executable, subcommand
 
 
 def _write_translation(

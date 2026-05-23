@@ -13,10 +13,9 @@ from typing import TextIO
 
 from hymt.config import HotConfig
 from hymt.docs import _capture_man
+from hymt.exec_cache import translate_cached_text
 from hymt.exec_wrapper import _decode_for_translation, _looks_binary
 from hymt.history import format_duration
-from hymt.templates import TemplateType
-from hymt.translate import translate_text
 
 
 MAN_APROPOS_PATTERN = re.compile(
@@ -56,13 +55,14 @@ def run_precache(
         try:
             text = _load_item_text(item)
             if text.strip():
+                cache_command, cache_subcommand = _cache_identity(item)
                 asyncio.run(
-                    translate_text(
+                    translate_cached_text(
+                        cache_command,
+                        cache_subcommand,
                         text,
                         target_lang,
                         config,
-                        TemplateType.DEFAULT,
-                        stream=False,
                     )
                 )
                 translated += 1
@@ -156,6 +156,14 @@ def _load_item_text(item: PrecacheItem) -> str:
     if item.kind == "help":
         return _capture_help(item.args)
     raise ValueError(f"Unsupported precache item kind: {item.kind}")
+
+
+def _cache_identity(item: PrecacheItem) -> tuple[str, str]:
+    if item.kind == "man":
+        return "man", " ".join(item.args)
+    if item.kind == "help":
+        return item.args[0], " ".join(item.args[1:])
+    return item.kind, " ".join(item.args)
 
 
 def _capture_help(args: tuple[str, ...]) -> str:

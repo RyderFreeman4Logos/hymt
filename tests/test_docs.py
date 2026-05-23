@@ -8,7 +8,6 @@ from click.testing import CliRunner
 from hymt.cli import main
 from hymt.config import HotConfig
 from hymt.docs import show_translated_man
-from hymt.templates import TemplateType
 
 
 class DocsCommandTests(unittest.TestCase):
@@ -17,7 +16,7 @@ class DocsCommandTests(unittest.TestCase):
 
         with (
             patch("hymt.docs._capture_man", return_value="git manual"),
-            patch("hymt.docs.translate_text", side_effect=fake_translate),
+            patch("hymt.docs.translate_cached_text", side_effect=fake_translate),
             patch(
                 "hymt.docs._page_text", side_effect=lambda text: paged.append(text) or 0
             ),
@@ -34,29 +33,31 @@ class DocsCommandTests(unittest.TestCase):
         self.assertEqual(returncode, 3)
         call.assert_called_once_with(["man", "git"])
 
-    def test_man_refresh_uses_new_cache_identity_without_changing_prompt(self) -> None:
+    def test_man_refresh_forces_cached_translation_refresh(self) -> None:
         captured_kwargs: list[dict[str, object]] = []
 
         async def capture_translate(
+            command: str,
+            subcommand: str,
             text: str,
             target_lang: str,
             config: HotConfig,
-            template_type: TemplateType,
             **kwargs: object,
         ) -> str:
-            del target_lang, config, template_type
+            del target_lang, config
+            self.assertEqual(command, "man")
+            self.assertEqual(subcommand, "git")
             captured_kwargs.append(kwargs)
             return f"ZH:{text}"
 
         with (
             patch("hymt.docs._capture_man", return_value="git manual"),
-            patch("hymt.docs.translate_text", side_effect=capture_translate),
+            patch("hymt.docs.translate_cached_text", side_effect=capture_translate),
             patch("hymt.docs._page_text", return_value=0),
         ):
             show_translated_man(("git",), "zh", HotConfig(), refresh=True)
 
-        self.assertEqual(captured_kwargs[0]["stream"], False)
-        self.assertIn("cache_bust", captured_kwargs[0])
+        self.assertTrue(captured_kwargs[0]["refresh"])
 
     def test_cli_preserves_man_apropos_arguments(self) -> None:
         runner = CliRunner()
@@ -69,14 +70,14 @@ class DocsCommandTests(unittest.TestCase):
 
 
 async def fake_translate(
+    command: str,
+    subcommand: str,
     text: str,
     target_lang: str,
     config: HotConfig,
-    template_type: TemplateType,
-    *,
-    stream: bool | None = None,
+    **kwargs: object,
 ) -> str:
-    del target_lang, config, template_type, stream
+    del command, subcommand, target_lang, config, kwargs
     return f"ZH:{text}"
 
 

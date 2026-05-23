@@ -10,7 +10,6 @@ from unittest.mock import AsyncMock, patch
 
 from hymt.config import HotConfig
 from hymt.exec_wrapper import run_exec_command
-from hymt.templates import TemplateType
 
 
 class ExecWrapperTests(unittest.TestCase):
@@ -20,7 +19,9 @@ class ExecWrapperTests(unittest.TestCase):
 
         with (
             temporary_home(),
-            patch("hymt.exec_wrapper.translate_text", side_effect=fake_translate),
+            patch(
+                "hymt.exec_wrapper.translate_cached_text", side_effect=fake_translate
+            ),
             redirect_stdout(stdout),
             redirect_stderr(stderr),
         ):
@@ -48,7 +49,9 @@ class ExecWrapperTests(unittest.TestCase):
 
         with (
             temporary_home(),
-            patch("hymt.exec_wrapper.translate_text", new_callable=AsyncMock) as tx,
+            patch(
+                "hymt.exec_wrapper.translate_cached_text", new_callable=AsyncMock
+            ) as tx,
             redirect_stdout(stdout),
             redirect_stderr(stderr),
         ):
@@ -66,7 +69,9 @@ class ExecWrapperTests(unittest.TestCase):
     def test_exec_returns_wrapped_command_status(self) -> None:
         with (
             temporary_home(),
-            patch("hymt.exec_wrapper.translate_text", side_effect=fake_translate),
+            patch(
+                "hymt.exec_wrapper.translate_cached_text", side_effect=fake_translate
+            ),
             redirect_stdout(io.StringIO()),
             redirect_stderr(io.StringIO()),
         ):
@@ -80,14 +85,13 @@ class ExecWrapperTests(unittest.TestCase):
 
 
 async def fake_translate(
+    command: str,
+    subcommand: str,
     text: str,
     target_lang: str,
     config: HotConfig,
-    template_type: TemplateType,
-    *,
-    stream: bool | None = None,
 ) -> str:
-    del target_lang, config, template_type, stream
+    del command, subcommand, target_lang, config
     return f"ZH:{text}"
 
 

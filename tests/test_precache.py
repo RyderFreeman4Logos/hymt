@@ -18,7 +18,6 @@ from hymt.precache import (
     _extract_subcommands,
     run_precache,
 )
-from hymt.templates import TemplateType
 
 
 class PrecacheTests(unittest.TestCase):
@@ -59,7 +58,7 @@ Options:
             temporary_home(),
             patch("hymt.precache._discover_items", return_value=items),
             patch("hymt.precache._load_item_text", side_effect=["manual", "help"]),
-            patch("hymt.precache.translate_text", side_effect=fake_translate),
+            patch("hymt.precache.translate_cached_text", side_effect=fake_translate),
         ):
             summary = run_precache("zh", HotConfig(), progress_stream=progress)
 
@@ -85,14 +84,13 @@ Options:
 
 
 async def fake_translate(
+    command: str,
+    subcommand: str,
     text: str,
     target_lang: str,
     config: HotConfig,
-    template_type: TemplateType,
-    *,
-    stream: bool | None = None,
 ) -> str:
-    del target_lang, config, template_type, stream
+    del command, subcommand, target_lang, config
     return f"ZH:{text}"
 
 
