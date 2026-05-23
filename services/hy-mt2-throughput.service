@@ -16,7 +16,7 @@ ExecStart=/usr/local/share/mise/installs/llama-cpp/9294-cuda/llama-server \
   --top-k 20 \
   --top-p 0.6 \
   --repeat-penalty 1.05 \
-  --host 0.0.0.0 \
+  --host 100.78.159.38 \
   --port 8401
 Restart=on-failure
 RestartSec=5
