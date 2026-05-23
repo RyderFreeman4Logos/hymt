@@ -24,10 +24,15 @@ class ZshPluginTests(unittest.TestCase):
         self.assertIn("[[ -o interactive ]]", plugin_text)
         self.assertIn("[[ -t 1 && -t 2 ]]", plugin_text)
         self.assertIn("_hymt_has_agent_env", plugin_text)
+        self.assertIn("CODEX_SESSION_ID", plugin_text)
+        self.assertIn("OPENCODE_SESSION", plugin_text)
         self.assertIn("_hymt_is_agent_child", plugin_text)
         self.assertIn("_hymt_command_blocked", plugin_text)
         self.assertIn('${1:t}" == "hymt"', plugin_text)
         self.assertIn("_hymt_inside_script", plugin_text)
+        self.assertNotIn("preexec", plugin_text)
+        self.assertIn('command hymt exec -- "$@"', plugin_text)
+        self.assertIn('"$@"', plugin_text)
         self.assertIn(result.source_line, zshrc_text)
 
     def test_install_requires_update_for_existing_plugin(self) -> None:

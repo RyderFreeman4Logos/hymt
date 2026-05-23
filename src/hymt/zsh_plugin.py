@@ -58,7 +58,12 @@ _hymt_has_agent_env() {{
   [[ -n "${{CSA_SESSION_DIR:-}}" ]] && return 0
   [[ -n "${{CSA_SESSION_ID:-}}" ]] && return 0
   [[ -n "${{CODEX_SESSION:-}}" ]] && return 0
+  [[ -n "${{CODEX_SESSION_ID:-}}" ]] && return 0
   [[ -n "${{GEMINI_CLI:-}}" ]] && return 0
+  [[ -n "${{GEMINI_SESSION_ID:-}}" ]] && return 0
+  [[ -n "${{OPENCODE_SESSION:-}}" ]] && return 0
+  [[ -n "${{AIDER_SESSION_ID:-}}" ]] && return 0
+  [[ -n "${{CURSOR_SESSION_ID:-}}" ]] && return 0
   return 1
 }}
 
