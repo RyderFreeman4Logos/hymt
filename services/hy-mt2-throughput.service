@@ -1,0 +1,27 @@
+[Unit]
+Description=Hy-MT2-7B Translation (Throughput: Q4_K_M, 8 slots, Q4 KV)
+After=network.target
+Conflicts=hy-mt2-quality.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/share/mise/installs/llama-cpp/9294-cuda/llama-server \
+  -m /ssd/mirror-rootfs/home/obj/models/hy-mt2/Hy-MT2-7B.i1-Q4_K_M.gguf \
+  -ngl 99 \
+  -fa on \
+  -ctk q4_0 -ctv q4_0 \
+  -c 65536 \
+  --parallel 8 \
+  --temp 0.7 \
+  --top-k 20 \
+  --top-p 0.6 \
+  --repeat-penalty 1.05 \
+  --host 127.0.0.1 \
+  --port 8401
+Restart=on-failure
+RestartSec=5
+Environment=CUDA_VISIBLE_DEVICES=0
+Environment=LD_LIBRARY_PATH=/usr/local/share/mise/installs/llama-cpp/9294-cuda
+
+[Install]
+WantedBy=default.target
