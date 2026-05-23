@@ -24,6 +24,7 @@ from hymt.language import DocumentLanguagePlan, analyze_document_language
 from hymt.segment import TOKENIZER_PATH, ensure_tokenizer, has_tokenizer_support
 from hymt.templates import TemplateType
 from hymt.translate import plan_translation, translate_file, translate_text
+from hymt.zsh_plugin import install_zsh_plugin
 
 
 TEMPLATE_CHOICES = [template.value for template in TemplateType]
@@ -418,6 +419,20 @@ def exec_command(ctx: click.Context, target_lang: str) -> None:
     except (OSError, ValueError, RuntimeError) as exc:
         raise click.ClickException(str(exc)) from exc
     raise click.exceptions.Exit(returncode)
+
+
+@exec_command.command("install")
+@click.option("--update", is_flag=True, help="Overwrite an existing zsh plugin.")
+def exec_install_command(update: bool) -> None:
+    try:
+        result = install_zsh_plugin(HotConfig(), update=update)
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Installed {result.plugin_path}")
+    if result.updated_zshrc:
+        click.echo(f"Added source line to {result.zshrc_path}")
+    else:
+        click.echo(f"Source line already present in {result.zshrc_path}")
 
 
 @main.group()
