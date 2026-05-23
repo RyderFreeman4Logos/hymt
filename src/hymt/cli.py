@@ -21,6 +21,7 @@ from hymt.history import (
     format_duration,
 )
 from hymt.language import DocumentLanguagePlan, analyze_document_language
+from hymt.precache import run_precache
 from hymt.segment import TOKENIZER_PATH, ensure_tokenizer, has_tokenizer_support
 from hymt.templates import TemplateType
 from hymt.translate import plan_translation, translate_file, translate_text
@@ -433,6 +434,41 @@ def exec_install_command(update: bool) -> None:
         click.echo(f"Added source line to {result.zshrc_path}")
     else:
         click.echo(f"Source line already present in {result.zshrc_path}")
+
+
+@exec_command.command("precache")
+@click.option(
+    "--target",
+    "-t",
+    "target_lang",
+    default="zh",
+    show_default=True,
+    help="Target language code.",
+)
+@click.option(
+    "--recursive",
+    is_flag=True,
+    help="Also translate discovered subcommand --help output.",
+)
+@click.option("--section", help="Only translate a specific man section.")
+def exec_precache_command(
+    target_lang: str, recursive: bool, section: str | None
+) -> None:
+    try:
+        summary = run_precache(
+            target_lang,
+            HotConfig(),
+            recursive=recursive,
+            section=section,
+            progress_stream=sys.stderr,
+        )
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(
+        "Precache complete: "
+        f"{summary.translated}/{summary.total} translated, {summary.failed} failed.",
+        err=True,
+    )
 
 
 @main.group()
