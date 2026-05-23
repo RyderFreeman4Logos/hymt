@@ -18,7 +18,14 @@ if [ -n "$(git diff -- README.zh-cn.md)" ] || [ -n "$(git diff --cached -- READM
   exit 0
 fi
 
-bash "${repo_root}/scripts/hooks/translate-readme-zh.sh"
+if [ -n "$(git diff -- README.md)" ]; then
+  readme_src=$(mktemp "${repo_root}/.git/README-committed-XXXXXX.md")
+  git show HEAD:README.md > "${readme_src}"
+  trap 'rm -f "${readme_src}"' EXIT
+  README_SOURCE="${readme_src}" bash "${repo_root}/scripts/hooks/translate-readme-zh.sh"
+else
+  bash "${repo_root}/scripts/hooks/translate-readme-zh.sh"
+fi
 if [ -z "$(git status --porcelain -- README.zh-cn.md)" ]; then
   echo "post-commit: README.zh-cn.md already in sync." >&2
   exit 0

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root="$(git rev-parse --show-toplevel)"
-readme_en="${repo_root}/README.md"
+readme_en="${README_SOURCE:-${repo_root}/README.md}"
 readme_zh="${repo_root}/README.zh-cn.md"
 real_home="${HOME:-}"
 runtime_home="${repo_root}/.git/hymt-home"
