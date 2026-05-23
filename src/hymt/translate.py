@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from collections.abc import Generator
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import hashlib
 from pathlib import Path
 import sqlite3
 import sys
@@ -85,15 +86,22 @@ async def translate_text(
     if not text:
         return ""
 
+    input_hash = hashlib.sha256(text.encode()).hexdigest()
+    template_name = template_type.value
     plan = plan_translation(text, target_lang, config, template_type, **template_kwargs)
     print(f"Source tokens: {plan.source_tokens}; segments: {plan.segment_count}", file=sys.stderr)
     history = HistoryDB()
+    cached = history.find_cached(input_hash, target_lang, template_name)
+    if cached is not None:
+        print("Cache hit — returning stored translation", file=sys.stderr)
+        return cached
+
     cv = config.config_version
     initial_estimate = history.estimate(
         plan.segment_count,
         config.concurrency,
         target_lang,
-        template_type.value,
+        template_name,
         config_version=cv,
     )
     if initial_estimate is not None:
@@ -142,12 +150,13 @@ async def translate_text(
             concurrency=config.concurrency,
             source_lang=None,
             target_lang=target_lang,
-            template_type=template_type.value,
+            template_type=template_name,
             model=config.model or None,
             tokens_per_second=tokens_per_second,
             input_chars=len(text),
             output_chars=len(translated),
             output_text=translated,
+            input_hash=input_hash,
             config_version=cv,
         ),
     )

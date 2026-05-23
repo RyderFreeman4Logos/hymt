@@ -36,7 +36,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     tokens_per_second REAL NOT NULL,
     input_chars INTEGER NOT NULL,
     output_chars INTEGER NOT NULL,
-    output_text TEXT
+    output_text TEXT,
+    input_hash TEXT
 );
 """
 
@@ -58,6 +59,7 @@ class TaskRecord:
     input_chars: int
     output_chars: int
     output_text: str | None = None
+    input_hash: str | None = None
     config_version: int = 1
     id: int | None = None
 
@@ -153,9 +155,10 @@ class HistoryDB:
                     input_chars,
                     output_chars,
                     output_text,
+                    input_hash,
                     config_version
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.started_at,
@@ -173,10 +176,36 @@ class HistoryDB:
                     record.input_chars,
                     record.output_chars,
                     record.output_text,
+                    record.input_hash,
                     record.config_version,
                 ),
             )
             connection.commit()
+        finally:
+            connection.close()
+
+    def find_cached(self, input_hash: str, target_lang: str, template_type: str) -> str | None:
+        connection = self._connect_if_exists()
+        if connection is None:
+            return None
+        try:
+            self._ensure_schema(connection)
+            row = connection.execute(
+                """
+                SELECT output_text
+                FROM tasks
+                WHERE input_hash = ?
+                  AND target_lang = ?
+                  AND template_type = ?
+                  AND output_text IS NOT NULL
+                ORDER BY finished_at DESC, id DESC
+                LIMIT 1
+                """,
+                (input_hash, target_lang, template_type),
+            ).fetchone()
+            if row is None:
+                return None
+            return str(row["output_text"])
         finally:
             connection.close()
 
@@ -382,6 +411,8 @@ class HistoryDB:
         }
         if "output_text" not in columns:
             connection.execute("ALTER TABLE tasks ADD COLUMN output_text TEXT")
+        if "input_hash" not in columns:
+            connection.execute("ALTER TABLE tasks ADD COLUMN input_hash TEXT")
         if "config_version" not in columns:
             connection.execute("ALTER TABLE tasks ADD COLUMN config_version INTEGER DEFAULT 1")
         connection.commit()
@@ -410,6 +441,7 @@ def _build_estimate(
 
 def _record_from_row(row: sqlite3.Row) -> TaskRecord:
     cv = row["config_version"] if "config_version" in row.keys() else 1
+    input_hash = row["input_hash"] if "input_hash" in row.keys() else None
     return TaskRecord(
         id=int(row["id"]),
         started_at=str(row["started_at"]),
@@ -427,6 +459,7 @@ def _record_from_row(row: sqlite3.Row) -> TaskRecord:
         input_chars=int(row["input_chars"]),
         output_chars=int(row["output_chars"]),
         output_text=row["output_text"] if row["output_text"] is None else str(row["output_text"]),
+        input_hash=input_hash if input_hash is None else str(input_hash),
         config_version=int(cv) if cv is not None else 1,
     )
 
