@@ -130,7 +130,7 @@ def build_batch_plan(
 ) -> BatchPlan:
     root = directory.expanduser().resolve(strict=True)
     source_paths = _scan_text_files(root, recursive=recursive)
-    sources = _read_sources_parallel(source_paths)
+    sources = _read_sources_parallel(source_paths, root=root)
     db = history or HistoryDB()
     template_name = template_type.value
     options_hash = _template_options_hash(template_kwargs)
@@ -345,6 +345,12 @@ def _scan_text_files(root: Path, *, recursive: bool) -> tuple[Path, ...]:
             sorted_entries = sorted(entries, key=lambda entry: entry.name)
             for entry in sorted_entries:
                 path = Path(entry.path)
+                if entry.is_symlink() and not path.exists():
+                    print(
+                        f"Warning: skipping {path.relative_to(root)}: broken symlink",
+                        file=sys.stderr,
+                    )
+                    continue
                 if entry.is_dir(follow_symlinks=True):
                     if recursive:
                         walk(path)
@@ -359,18 +365,33 @@ def _scan_text_files(root: Path, *, recursive: bool) -> tuple[Path, ...]:
     return tuple(files)
 
 
-def _read_sources_parallel(paths: tuple[Path, ...]) -> tuple[BatchSourceFile, ...]:
+def _read_sources_parallel(
+    paths: tuple[Path, ...], *, root: Path
+) -> tuple[BatchSourceFile, ...]:
     if not paths:
         return ()
     with ThreadPoolExecutor() as executor:
-        return tuple(executor.map(_read_source_file, paths))
+        sources: list[BatchSourceFile] = []
+        for path, source in zip(paths, executor.map(_read_source_file, paths)):
+            if source is None:
+                print(
+                    f"Warning: skipping {_relative_to_root(path, root)}: not valid UTF-8",
+                    file=sys.stderr,
+                )
+                continue
+            sources.append(source)
+        return tuple(sources)
 
 
-def _read_source_file(path: Path) -> BatchSourceFile:
-    raw = path.read_bytes()
+def _read_source_file(path: Path) -> BatchSourceFile | None:
+    try:
+        raw = path.read_bytes()
+        text = raw.decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
     return BatchSourceFile(
         path=path,
-        text=raw.decode("utf-8"),
+        text=text,
         file_hash=hashlib.sha256(raw).hexdigest(),
     )
 
