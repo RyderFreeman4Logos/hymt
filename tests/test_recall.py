@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import sqlite3
 import tempfile
@@ -81,6 +82,25 @@ class HistoryMigrationTests(unittest.TestCase):
 
             self.assertEqual(db.fetch_recent_output(), "migrated output")
 
+    def test_find_cached_returns_most_recent_matching_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "history.db"
+            db = HistoryDB(path)
+            input_hash = hashlib.sha256("source text".encode()).hexdigest()
+
+            db.insert_task(task_record("older output", input_hash=input_hash))
+            db.insert_task(task_record("wrong language", input_hash=input_hash, target_lang="ja"))
+            db.insert_task(task_record("wrong template", input_hash=input_hash, template_type="style"))
+            db.insert_task(task_record("newer output", input_hash=input_hash))
+
+            self.assertEqual(
+                db.find_cached(input_hash, target_lang="en", template_type="default"),
+                "newer output",
+            )
+            self.assertIsNone(
+                db.find_cached("missing", target_lang="en", template_type="default")
+            )
+
 
 class temporary_home:
     def __enter__(self) -> str:
@@ -99,7 +119,13 @@ def insert_output(output_text: str) -> None:
     db.insert_task(task_record(output_text))
 
 
-def task_record(output_text: str) -> TaskRecord:
+def task_record(
+    output_text: str,
+    *,
+    input_hash: str | None = None,
+    target_lang: str = "en",
+    template_type: str = "default",
+) -> TaskRecord:
     return TaskRecord(
         started_at="2026-05-23T00:00:00+00:00",
         finished_at=f"2026-05-23T00:00:{len(output_text):02d}+00:00",
@@ -109,13 +135,14 @@ def task_record(output_text: str) -> TaskRecord:
         segments=1,
         concurrency=1,
         source_lang=None,
-        target_lang="en",
-        template_type="default",
+        target_lang=target_lang,
+        template_type=template_type,
         model=None,
         tokens_per_second=1.0,
         input_chars=4,
         output_chars=len(output_text),
         output_text=output_text,
+        input_hash=input_hash,
     )
 
 
