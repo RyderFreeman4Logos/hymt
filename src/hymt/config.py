@@ -13,7 +13,7 @@ model = ""
 
 [translation]
 context_window = 4096
-max_output_tokens = 2048
+max_output_tokens = 4096
 concurrency = 1
 
 [inference]
@@ -68,7 +68,7 @@ class HotConfig:
 
     @property
     def max_output_tokens(self) -> int:
-        return self._get_positive_int("translation", "max_output_tokens", 2048)
+        return self._get_positive_int("translation", "max_output_tokens", 4096)
 
     @property
     def concurrency(self) -> int:

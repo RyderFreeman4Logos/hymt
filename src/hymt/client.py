@@ -83,10 +83,8 @@ class TranslationClient:
             "max_tokens": self._config.max_output_tokens,
             "temperature": self._config.temperature,
             "top_p": self._config.top_p,
-            "extra_body": {
-                "top_k": self._config.top_k,
-                "repetition_penalty": self._config.repetition_penalty,
-            },
+            "top_k": self._config.top_k,
+            "repetition_penalty": self._config.repetition_penalty,
         }
         if self._config.model:
             payload["model"] = self._config.model
