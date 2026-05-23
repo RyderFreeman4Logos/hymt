@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import os
 import sqlite3
 import tempfile
@@ -82,29 +81,44 @@ class HistoryMigrationTests(unittest.TestCase):
 
             self.assertEqual(db.fetch_recent_output(), "migrated output")
 
-    def test_find_cached_returns_most_recent_matching_output(self) -> None:
+    def test_segment_cache_returns_matching_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "history.db"
             db = HistoryDB(path)
-            input_hash = hashlib.sha256("source text".encode()).hexdigest()
+            content_hash = "segment-hash"
 
-            db.insert_task(task_record("older output", input_hash=input_hash))
-            db.insert_task(
-                task_record("wrong language", input_hash=input_hash, target_lang="ja")
+            db.store_segment_cache(
+                content_hash,
+                "en",
+                "default",
+                "cached output",
+                "2026-05-23T00:00:00+00:00",
             )
-            db.insert_task(
-                task_record(
-                    "wrong template", input_hash=input_hash, template_type="style"
-                )
+            db.store_segment_cache(
+                content_hash,
+                "ja",
+                "default",
+                "wrong language",
+                "2026-05-23T00:00:00+00:00",
             )
-            db.insert_task(task_record("newer output", input_hash=input_hash))
+            db.store_segment_cache(
+                content_hash,
+                "en",
+                "style",
+                "wrong template",
+                "2026-05-23T00:00:00+00:00",
+            )
 
             self.assertEqual(
-                db.find_cached(input_hash, target_lang="en", template_type="default"),
-                "newer output",
+                db.find_segment_cached(
+                    content_hash, target_lang="en", template_type="default"
+                ),
+                "cached output",
             )
             self.assertIsNone(
-                db.find_cached("missing", target_lang="en", template_type="default")
+                db.find_segment_cached(
+                    "missing", target_lang="en", template_type="default"
+                )
             )
 
 

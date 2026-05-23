@@ -11,16 +11,22 @@ from unittest.mock import patch
 
 from hymt.history import HistoryDB, TaskRecord
 from hymt.templates import TemplateType
-from hymt.translate import _translation_cache_hash, translate_text
+from hymt.translate import _segment_cache_hash, translate_text
 
 
 class TranslationCacheTests(unittest.TestCase):
     def test_translate_text_returns_cached_output_without_client_call(self) -> None:
         source = "source text"
-        input_hash = _translation_cache_hash(source, "en", TemplateType.DEFAULT, {})
+        segment_hash = _segment_cache_hash(source)
 
         with temporary_home():
-            HistoryDB().insert_task(task_record("cached output", input_hash=input_hash))
+            HistoryDB().store_segment_cache(
+                segment_hash,
+                "en",
+                TemplateType.DEFAULT.value,
+                "cached output",
+                "2026-05-23T00:00:00+00:00",
+            )
             stderr = io.StringIO()
 
             with (
@@ -39,25 +45,19 @@ class TranslationCacheTests(unittest.TestCase):
 
         self.assertEqual(output, "cached output")
         self.assertIn("Source tokens: 11; segments: 1", stderr.getvalue())
-        self.assertIn("Cache hit", stderr.getvalue())
+        self.assertIn("[1/1] 100.00%", stderr.getvalue())
         client_cls.assert_not_called()
 
-    def test_template_options_are_part_of_cache_identity(self) -> None:
+    def test_template_type_is_part_of_segment_cache_identity(self) -> None:
         source = "source text"
-        cached_hash = _translation_cache_hash(
-            source,
-            "en",
-            TemplateType.STYLE,
-            {"style": "casual"},
-        )
 
         with temporary_home():
-            HistoryDB().insert_task(
-                task_record(
-                    "cached output",
-                    input_hash=cached_hash,
-                    template_type=TemplateType.STYLE.value,
-                )
+            HistoryDB().store_segment_cache(
+                _segment_cache_hash(source),
+                "en",
+                TemplateType.DEFAULT.value,
+                "cached output",
+                "2026-05-23T00:00:00+00:00",
             )
             stderr = io.StringIO()
             FakeTranslationClient.calls = 0
@@ -79,7 +79,6 @@ class TranslationCacheTests(unittest.TestCase):
                 )
 
         self.assertEqual(output, "fresh output")
-        self.assertNotIn("Cache hit", stderr.getvalue())
         self.assertEqual(FakeTranslationClient.calls, 1)
 
     def test_translate_text_prompts_and_files_issue_for_timing_divergence(self) -> None:
@@ -100,7 +99,10 @@ class TranslationCacheTests(unittest.TestCase):
                 patch("hymt.translate.plan_translation", return_value=FakePlan()),
                 patch("hymt.translate._translation_lock", return_value=nullcontext()),
                 patch("hymt.translate.TranslationClient", FakeTranslationClient),
-                patch("hymt.translate._monotonic", side_effect=[0.0, 5.0]),
+                patch(
+                    "hymt.translate._monotonic",
+                    side_effect=[0.0, 0.0, 5.0, 5.0, 5.0],
+                ),
                 patch("hymt.timing_issue.sys.stdin", fake_stdin),
                 patch("hymt.timing_issue.shutil.which", side_effect=fake_which),
                 patch("hymt.timing_issue.platform.platform", return_value="TestOS"),
@@ -150,7 +152,10 @@ class TranslationCacheTests(unittest.TestCase):
                 patch("hymt.translate.plan_translation", return_value=FakePlan()),
                 patch("hymt.translate._translation_lock", return_value=nullcontext()),
                 patch("hymt.translate.TranslationClient", FakeTranslationClient),
-                patch("hymt.translate._monotonic", side_effect=[0.0, 5.0]),
+                patch(
+                    "hymt.translate._monotonic",
+                    side_effect=[0.0, 0.0, 5.0, 5.0, 5.0],
+                ),
                 patch("hymt.timing_issue.sys.stdin", io.StringIO("")),
                 patch("hymt.timing_issue.subprocess.run") as run,
                 redirect_stderr(stderr),
@@ -188,18 +193,14 @@ class FakeTranslationClient:
         self._config = config
 
     async def __aenter__(self) -> FakeTranslationClient:
-        FakeTranslationClient.calls += 1
         return self
 
     async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None:
         return None
 
-    async def translate_batch(
-        self,
-        prompts: list[str],
-        on_progress: object,
-    ) -> list[str]:
-        return ["fresh output"]
+    async def translate(self, prompt: str) -> str:
+        FakeTranslationClient.calls += 1
+        return "fresh output"
 
 
 class InteractiveStdin(io.StringIO):

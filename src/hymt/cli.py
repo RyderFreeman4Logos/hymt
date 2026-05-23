@@ -17,6 +17,7 @@ from hymt.history import (
     estimate_duration_seconds,
     format_duration,
 )
+from hymt.language import detect_target_language
 from hymt.segment import TOKENIZER_PATH, ensure_tokenizer, has_tokenizer_support
 from hymt.templates import TemplateType
 from hymt.translate import plan_translation, translate_file, translate_text
@@ -187,6 +188,17 @@ def _is_attached_short_value(arg: str) -> bool:
 @click.option(
     "--instruction", "instructions", multiple=True, help="Personalization instruction."
 )
+@click.option(
+    "--yes",
+    is_flag=True,
+    help="Skip interactive confirmation prompts.",
+)
+@click.option(
+    "--stream/--no-stream",
+    "stream",
+    default=None,
+    help="Override [translation].stream for stdout streaming.",
+)
 @click.pass_context
 def main(
     ctx: click.Context,
@@ -199,6 +211,8 @@ def main(
     background_context: str | None,
     format_type: str | None,
     instructions: tuple[str, ...],
+    yes: bool,
+    stream: bool | None,
 ) -> None:
     if ctx.invoked_subcommand is not None:
         return
@@ -212,9 +226,14 @@ def main(
             terms, style, background_context, format_type, instructions
         )
         config = HotConfig()
+        stream_enabled = _stream_enabled(config, stream)
         selected_type = TemplateType(template_type)
-        _announce_tokenizer_download()
         if input_file is not None:
+            source_text = input_file.read_text(encoding="utf-8")
+            if not _confirm_translation_if_needed(source_text, target_lang, yes):
+                click.echo("Translation cancelled.", err=True)
+                return
+            _announce_tokenizer_download()
             asyncio.run(
                 translate_file(
                     input_file,
@@ -222,16 +241,44 @@ def main(
                     target_lang,
                     config,
                     selected_type,
+                    stream=stream_enabled,
+                    source_text=source_text,
                     **kwargs,
                 )
             )
             return
         source_text = text if text is not None else sys.stdin.read()
+        if not _confirm_translation_if_needed(source_text, target_lang, yes):
+            click.echo("Translation cancelled.", err=True)
+            return
+        _announce_tokenizer_download()
+        streamed_chars = 0
+
+        def write_token(token: str) -> None:
+            nonlocal streamed_chars
+            streamed_chars += len(token)
+            sys.stdout.write(token)
+            sys.stdout.flush()
+
         translated = asyncio.run(
-            translate_text(source_text, target_lang, config, selected_type, **kwargs)
+            translate_text(
+                source_text,
+                target_lang,
+                config,
+                selected_type,
+                stream=stream_enabled,
+                on_token=write_token
+                if output_file is None and stream_enabled
+                else None,
+                **kwargs,
+            )
         )
         if output_file is None:
-            click.echo(translated, nl=True)
+            if not stream_enabled or streamed_chars == 0:
+                sys.stdout.write(translated)
+            if not translated.endswith("\n"):
+                sys.stdout.write("\n")
+            sys.stdout.flush()
             return
         output_file.parent.mkdir(parents=True, exist_ok=True)
         output_file.write_text(translated, encoding="utf-8")
@@ -453,6 +500,29 @@ def _template_kwargs(
 def _announce_tokenizer_download() -> None:
     if has_tokenizer_support() and not TOKENIZER_PATH.exists():
         click.echo("Downloading tokenizer...", err=True)
+
+
+def _confirm_translation_if_needed(
+    text: str, target_lang: str, assume_yes: bool
+) -> bool:
+    if assume_yes or not sys.stdin.isatty():
+        return True
+    detection = detect_target_language(text, target_lang)
+    if detection is None or detection.target_ratio <= 0.60:
+        return True
+    sys.stderr.write(
+        f"Input appears to already be in {target_lang}. Translate anyway? (y/n) "
+    )
+    sys.stderr.flush()
+    answer = sys.stdin.readline().strip().lower()
+    return answer in {"y", "yes"}
+
+
+def _stream_enabled(config: HotConfig, override: bool | None) -> bool:
+    if override is not None:
+        return override
+    value = getattr(config, "stream", True)
+    return value if isinstance(value, bool) else True
 
 
 def _show_history_stats(db: HistoryDB) -> None:
