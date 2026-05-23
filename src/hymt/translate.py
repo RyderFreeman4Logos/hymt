@@ -175,6 +175,8 @@ async def translate_file(
     translated = await translate_text(text, target_lang, config, template_type, **template_kwargs)
     if output_path is None:
         sys.stdout.write(translated)
+        if not translated.endswith("\n"):
+            sys.stdout.write("\n")
         return
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(translated, encoding="utf-8")

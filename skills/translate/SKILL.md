@@ -52,6 +52,7 @@ Template-specific options:
 ## Behavior
 
 - Translation output goes to stdout; progress and status go to stderr.
+- Stdout translations end with a trailing newline.
 - Identical source text, target language, and template type reuse cached history output.
 - Config lives at `~/.config/hymt/config.toml`.
 - The tokenizer is cached at `~/.cache/hymt/tokenizer/tokenizer.json`.

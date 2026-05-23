@@ -166,7 +166,7 @@ def main(
         raise click.ClickException(str(exc)) from exc
 
     if output_file is None:
-        click.echo(translated, nl=False)
+        click.echo(translated, nl=True)
         return
     output_file.parent.mkdir(parents=True, exist_ok=True)
     output_file.write_text(translated, encoding="utf-8")
