@@ -39,7 +39,9 @@ VALUE_OPTIONS = frozenset(
         "--instruction",
     }
 )
-LONG_VALUE_PREFIXES = tuple(f"{option}=" for option in VALUE_OPTIONS if option.startswith("--"))
+LONG_VALUE_PREFIXES = tuple(
+    f"{option}=" for option in VALUE_OPTIONS if option.startswith("--")
+)
 SHORT_VALUE_OPTIONS = frozenset({"-t", "-f", "-o"})
 
 
@@ -48,7 +50,9 @@ class TranslationGroup(click.Group):
         if not args and self.no_args_is_help and not ctx.resilient_parsing:
             raise click.NoArgsIsHelpError(ctx)
         first_command = self._first_command_candidate(ctx, args)
-        treat_rest_as_text = first_command is None and self._has_argument_separator(args)
+        treat_rest_as_text = first_command is None and self._has_argument_separator(
+            args
+        )
         if first_command is None:
             args = self._option_args_first(args)
         rest = click.Command.parse_args(self, ctx, args)
@@ -64,7 +68,9 @@ class TranslationGroup(click.Group):
                     ctx._protected_args, ctx.args = [], rest
         return ctx.args
 
-    def _first_command_candidate(self, ctx: click.Context, args: list[str]) -> str | None:
+    def _first_command_candidate(
+        self, ctx: click.Context, args: list[str]
+    ) -> str | None:
         index = 0
         while index < len(args):
             arg = args[index]
@@ -127,7 +133,9 @@ class TranslationGroup(click.Group):
 
 
 def _is_attached_short_value(arg: str) -> bool:
-    return any(arg.startswith(option) and arg != option for option in SHORT_VALUE_OPTIONS)
+    return any(
+        arg.startswith(option) and arg != option for option in SHORT_VALUE_OPTIONS
+    )
 
 
 @click.group(
@@ -136,9 +144,28 @@ def _is_attached_short_value(arg: str) -> bool:
     context_settings={"ignore_unknown_options": True, "allow_extra_args": True},
     help="Translate positional text, a file, or stdin.",
 )
-@click.option("--target", "-t", "target_lang", default="zh", show_default=True, help="Target language code.")
-@click.option("--file", "-f", "input_file", type=click.Path(path_type=Path), help="Input file path.")
-@click.option("--output", "-o", "output_file", type=click.Path(path_type=Path), help="Output file path.")
+@click.option(
+    "--target",
+    "-t",
+    "target_lang",
+    default="zh",
+    show_default=True,
+    help="Target language code.",
+)
+@click.option(
+    "--file",
+    "-f",
+    "input_file",
+    type=click.Path(path_type=Path),
+    help="Input file path.",
+)
+@click.option(
+    "--output",
+    "-o",
+    "output_file",
+    type=click.Path(path_type=Path),
+    help="Output file path.",
+)
 @click.option(
     "--type",
     "template_type",
@@ -149,9 +176,17 @@ def _is_attached_short_value(arg: str) -> bool:
 )
 @click.option("--terms", multiple=True, help="Terminology pair, format: source=target.")
 @click.option("--style", help="Style description for style translations.")
-@click.option("--context", "background_context", help="Background context for context-aware translations.")
-@click.option("--format", "format_type", help="Data format for structured translations.")
-@click.option("--instruction", "instructions", multiple=True, help="Personalization instruction.")
+@click.option(
+    "--context",
+    "background_context",
+    help="Background context for context-aware translations.",
+)
+@click.option(
+    "--format", "format_type", help="Data format for structured translations."
+)
+@click.option(
+    "--instruction", "instructions", multiple=True, help="Personalization instruction."
+)
 @click.pass_context
 def main(
     ctx: click.Context,
@@ -173,23 +208,35 @@ def main(
         raise click.UsageError("Use either positional text or --file, not both")
 
     try:
-        kwargs = _template_kwargs(terms, style, background_context, format_type, instructions)
+        kwargs = _template_kwargs(
+            terms, style, background_context, format_type, instructions
+        )
         config = HotConfig()
         selected_type = TemplateType(template_type)
         _announce_tokenizer_download()
         if input_file is not None:
-            asyncio.run(translate_file(input_file, output_file, target_lang, config, selected_type, **kwargs))
+            asyncio.run(
+                translate_file(
+                    input_file,
+                    output_file,
+                    target_lang,
+                    config,
+                    selected_type,
+                    **kwargs,
+                )
+            )
             return
         source_text = text if text is not None else sys.stdin.read()
-        translated = asyncio.run(translate_text(source_text, target_lang, config, selected_type, **kwargs))
+        translated = asyncio.run(
+            translate_text(source_text, target_lang, config, selected_type, **kwargs)
+        )
+        if output_file is None:
+            click.echo(translated, nl=True)
+            return
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        output_file.write_text(translated, encoding="utf-8")
     except (OSError, ValueError, RuntimeError) as exc:
         raise click.ClickException(str(exc)) from exc
-
-    if output_file is None:
-        click.echo(translated, nl=True)
-        return
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-    output_file.write_text(translated, encoding="utf-8")
 
 
 @main.group()
@@ -247,8 +294,16 @@ def tokenizer_download(force: bool) -> None:
 
 
 @main.command("estimate")
-@click.option("--file", "-f", "input_file", type=click.Path(path_type=Path), help="Input file path.")
-@click.option("--target", "-t", "target_lang", required=True, help="Target language code.")
+@click.option(
+    "--file",
+    "-f",
+    "input_file",
+    type=click.Path(path_type=Path),
+    help="Input file path.",
+)
+@click.option(
+    "--target", "-t", "target_lang", required=True, help="Target language code."
+)
 @click.option(
     "--type",
     "template_type",
@@ -259,9 +314,17 @@ def tokenizer_download(force: bool) -> None:
 )
 @click.option("--terms", multiple=True, help="Terminology pair, format: source=target.")
 @click.option("--style", help="Style description for style translations.")
-@click.option("--context", "background_context", help="Background context for context-aware translations.")
-@click.option("--format", "format_type", help="Data format for structured translations.")
-@click.option("--instruction", "instructions", multiple=True, help="Personalization instruction.")
+@click.option(
+    "--context",
+    "background_context",
+    help="Background context for context-aware translations.",
+)
+@click.option(
+    "--format", "format_type", help="Data format for structured translations."
+)
+@click.option(
+    "--instruction", "instructions", multiple=True, help="Personalization instruction."
+)
 def estimate_command(
     input_file: Path | None,
     target_lang: str,
@@ -273,8 +336,14 @@ def estimate_command(
     instructions: tuple[str, ...],
 ) -> None:
     try:
-        text = input_file.read_text(encoding="utf-8") if input_file is not None else sys.stdin.read()
-        kwargs = _template_kwargs(terms, style, background_context, format_type, instructions)
+        text = (
+            input_file.read_text(encoding="utf-8")
+            if input_file is not None
+            else sys.stdin.read()
+        )
+        kwargs = _template_kwargs(
+            terms, style, background_context, format_type, instructions
+        )
         config = HotConfig()
         selected_type = TemplateType(template_type)
         _announce_tokenizer_download()
@@ -338,8 +407,16 @@ def history_command(show_all: bool, show_stats: bool, clear: bool) -> None:
 
 
 @main.command("recall")
-@click.option("-n", "position", type=click.IntRange(min=1), default=1, help="Nth most recent output.")
-@click.option("--list", "show_list", is_flag=True, help="Show recent translations with previews.")
+@click.option(
+    "-n",
+    "position",
+    type=click.IntRange(min=1),
+    default=1,
+    help="Nth most recent output.",
+)
+@click.option(
+    "--list", "show_list", is_flag=True, help="Show recent translations with previews."
+)
 def recall_command(position: int, show_list: bool) -> None:
     db = HistoryDB()
     if show_list:

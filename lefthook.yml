@@ -1,7 +1,13 @@
+# Lefthook — git hooks manager
+# Install: lefthook install
+# Docs: https://github.com/evilmartians/lefthook
+
+no_tty: true
+
 pre-commit:
   commands:
-    noop:
-      run: "true"
+    quality-gates:
+      run: just pre-commit
 
 pre-push:
   commands:

@@ -17,9 +17,13 @@ class TranslationError(RuntimeError):
 
 
 class TranslationClient:
-    def __init__(self, config: HotConfig, http_client: httpx.AsyncClient | None = None) -> None:
+    def __init__(
+        self, config: HotConfig, http_client: httpx.AsyncClient | None = None
+    ) -> None:
         self._config = config
-        self._client = http_client or httpx.AsyncClient(timeout=httpx.Timeout(config.timeout))
+        self._client = http_client or httpx.AsyncClient(
+            timeout=httpx.Timeout(config.timeout)
+        )
         self._owns_client = http_client is None
         self._concurrency = config.concurrency
         self._semaphore = asyncio.Semaphore(self._concurrency)
@@ -116,7 +120,11 @@ class TranslationClient:
                 if not _is_retryable_response(response) or attempt == max_retries:
                     raise error
                 last_error = error
-            except (httpx.TimeoutException, httpx.TransportError, json.JSONDecodeError) as exc:
+            except (
+                httpx.TimeoutException,
+                httpx.TransportError,
+                json.JSONDecodeError,
+            ) as exc:
                 if attempt == max_retries:
                     raise TranslationError("Translation request failed") from exc
                 last_error = exc

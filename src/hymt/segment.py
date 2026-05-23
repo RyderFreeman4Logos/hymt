@@ -141,11 +141,15 @@ def create_segmenter(force_download: bool = False) -> Segmenter:
 
 def ensure_tokenizer(force_download: bool = False) -> str:
     if not has_tokenizer_support():
-        raise RuntimeError("tokenizers is not installed; using approximate token counting")
+        raise RuntimeError(
+            "tokenizers is not installed; using approximate token counting"
+        )
     try:
         from huggingface_hub import hf_hub_download
     except ImportError as exc:
-        raise RuntimeError("huggingface-hub is required to download the tokenizer") from exc
+        raise RuntimeError(
+            "huggingface-hub is required to download the tokenizer"
+        ) from exc
 
     if TOKENIZER_PATH.exists() and not force_download:
         return str(TOKENIZER_PATH)
@@ -223,8 +227,10 @@ def _sentence_boundary_end(text: str, index: int) -> int | None:
 
     boundary_end = _consume_sentence_enders(text, index)
     lookahead = _consume_trailing_closers(text, boundary_end)
-    if lookahead < len(text) and text[boundary_end - 1] == "." and _looks_like_abbreviation(
-        text, boundary_end - 1
+    if (
+        lookahead < len(text)
+        and text[boundary_end - 1] == "."
+        and _looks_like_abbreviation(text, boundary_end - 1)
     ):
         return None
     if _starts_sentence_after_boundary(text, lookahead):
@@ -283,7 +289,11 @@ def _starts_sentence_after_boundary(text: str, index: int) -> bool:
 
 
 def _is_decimal_point(text: str, index: int) -> bool:
-    return 0 < index < len(text) - 1 and text[index - 1].isdigit() and text[index + 1].isdigit()
+    return (
+        0 < index < len(text) - 1
+        and text[index - 1].isdigit()
+        and text[index + 1].isdigit()
+    )
 
 
 def _looks_like_abbreviation(text: str, index: int) -> bool:

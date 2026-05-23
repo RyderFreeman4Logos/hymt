@@ -101,7 +101,9 @@ def history_path() -> Path:
     return Path.home() / ".local" / "share" / "hymt" / "history.db"
 
 
-def estimate_duration_seconds(stats: PerformanceStats, segments: int, concurrency: int) -> float:
+def estimate_duration_seconds(
+    stats: PerformanceStats, segments: int, concurrency: int
+) -> float:
     effective_segments = max(1, segments)
     effective_concurrency = max(1, min(max(1, concurrency), effective_segments))
     estimated_output_tokens = stats.avg_output_tokens_per_segment * effective_segments
@@ -184,7 +186,9 @@ class HistoryDB:
         finally:
             connection.close()
 
-    def find_cached(self, input_hash: str, target_lang: str, template_type: str) -> str | None:
+    def find_cached(
+        self, input_hash: str, target_lang: str, template_type: str
+    ) -> str | None:
         connection = self._connect_if_exists()
         if connection is None:
             return None
@@ -310,7 +314,9 @@ class HistoryDB:
             return None
         try:
             self._ensure_schema(connection)
-            where, parameters = _stats_filters(target_lang, template_type, config_version)
+            where, parameters = _stats_filters(
+                target_lang, template_type, config_version
+            )
             rows = connection.execute(
                 f"""
                 SELECT
@@ -358,7 +364,9 @@ class HistoryDB:
             global_fallback = self.stats()
             if global_fallback is not None:
                 all_versions = self._distinct_versions()
-                return _build_estimate(global_fallback, segments, concurrency, tuple(all_versions))
+                return _build_estimate(
+                    global_fallback, segments, concurrency, tuple(all_versions)
+                )
         return None
 
     def _distinct_versions(self) -> list[int]:
@@ -414,7 +422,9 @@ class HistoryDB:
         if "input_hash" not in columns:
             connection.execute("ALTER TABLE tasks ADD COLUMN input_hash TEXT")
         if "config_version" not in columns:
-            connection.execute("ALTER TABLE tasks ADD COLUMN config_version INTEGER DEFAULT 1")
+            connection.execute(
+                "ALTER TABLE tasks ADD COLUMN config_version INTEGER DEFAULT 1"
+            )
         connection.commit()
         self._schema_verified_paths.add(cache_key)
 
@@ -451,14 +461,18 @@ def _record_from_row(row: sqlite3.Row) -> TaskRecord:
         output_tokens=int(row["output_tokens"]),
         segments=int(row["segments"]),
         concurrency=int(row["concurrency"]),
-        source_lang=row["source_lang"] if row["source_lang"] is None else str(row["source_lang"]),
+        source_lang=row["source_lang"]
+        if row["source_lang"] is None
+        else str(row["source_lang"]),
         target_lang=str(row["target_lang"]),
         template_type=str(row["template_type"]),
         model=row["model"] if row["model"] is None else str(row["model"]),
         tokens_per_second=float(row["tokens_per_second"]),
         input_chars=int(row["input_chars"]),
         output_chars=int(row["output_chars"]),
-        output_text=row["output_text"] if row["output_text"] is None else str(row["output_text"]),
+        output_text=row["output_text"]
+        if row["output_text"] is None
+        else str(row["output_text"]),
         input_hash=input_hash if input_hash is None else str(input_hash),
         config_version=int(cv) if cv is not None else 1,
     )
@@ -512,5 +526,7 @@ def _stats_from_rows(rows: list[sqlite3.Row]) -> PerformanceStats | None:
 def _percentile(sorted_values: list[float], percentile: float) -> float:
     if not sorted_values:
         return 0.0
-    index = min(len(sorted_values) - 1, max(0, ceil(percentile * len(sorted_values)) - 1))
+    index = min(
+        len(sorted_values) - 1, max(0, ceil(percentile * len(sorted_values)) - 1)
+    )
     return sorted_values[index]

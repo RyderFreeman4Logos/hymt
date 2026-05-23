@@ -66,7 +66,9 @@ def plan_translation(
     segmenter = create_segmenter()
     overhead_prompt = build_prompt("", target_lang, template_type, **template_kwargs)
     prompt_overhead_tokens = segmenter.count_tokens(overhead_prompt)
-    available_source_tokens = config.context_window - prompt_overhead_tokens - config.max_output_tokens
+    available_source_tokens = (
+        config.context_window - prompt_overhead_tokens - config.max_output_tokens
+    )
     if available_source_tokens <= 0:
         raise ValueError(
             "Config context_window is too small for the selected template and max_output_tokens"
@@ -91,9 +93,14 @@ async def translate_text(
         return ""
 
     template_name = template_type.value
-    input_hash = _translation_cache_hash(text, target_lang, template_type, template_kwargs)
+    input_hash = _translation_cache_hash(
+        text, target_lang, template_type, template_kwargs
+    )
     plan = plan_translation(text, target_lang, config, template_type, **template_kwargs)
-    print(f"Source tokens: {plan.source_tokens}; segments: {plan.segment_count}", file=sys.stderr)
+    print(
+        f"Source tokens: {plan.source_tokens}; segments: {plan.segment_count}",
+        file=sys.stderr,
+    )
     history = HistoryDB()
     cached = history.find_cached(input_hash, target_lang, template_name)
     if cached is not None:
@@ -135,13 +142,17 @@ async def translate_text(
                 )
 
         async with TranslationClient(config) as client:
-            translations = await client.translate_batch(prompts, on_progress=report_progress)
+            translations = await client.translate_batch(
+                prompts, on_progress=report_progress
+            )
 
     translated = "".join(translations)
     finished_at = datetime.now(timezone.utc)
     duration_seconds = time.monotonic() - started_monotonic
     output_tokens = plan.count_tokens(translated)
-    tokens_per_second = output_tokens / duration_seconds if duration_seconds > 0 else 0.0
+    tokens_per_second = (
+        output_tokens / duration_seconds if duration_seconds > 0 else 0.0
+    )
     _record_successful_translation(
         history,
         TaskRecord(
@@ -176,7 +187,9 @@ async def translate_file(
     **template_kwargs: object,
 ) -> None:
     text = input_path.read_text(encoding="utf-8")
-    translated = await translate_text(text, target_lang, config, template_type, **template_kwargs)
+    translated = await translate_text(
+        text, target_lang, config, template_type, **template_kwargs
+    )
     if output_path is None:
         sys.stdout.write(translated)
         if not translated.endswith("\n"):
@@ -201,8 +214,7 @@ def _print_estimate(est: DurationEstimate) -> None:
     hi = format_duration(slow_seconds)
     vers = ",".join(str(v) for v in est.versions_used)
     print(
-        f"Estimated time: ~{lo}–{hi} "
-        f"based on {stats.count} tasks (versions {vers})",
+        f"Estimated time: ~{lo}–{hi} based on {stats.count} tasks (versions {vers})",
         file=sys.stderr,
     )
 
@@ -232,12 +244,17 @@ def _translation_cache_hash(
         "template_type": template_type.value,
         "template_kwargs": _normalize_cache_kwargs(template_kwargs),
     }
-    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    encoded = json.dumps(
+        payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    )
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _normalize_cache_kwargs(template_kwargs: dict[str, object]) -> dict[str, JsonValue]:
-    return {key: _normalize_cache_value(template_kwargs[key]) for key in sorted(template_kwargs)}
+    return {
+        key: _normalize_cache_value(template_kwargs[key])
+        for key in sorted(template_kwargs)
+    }
 
 
 def _normalize_cache_value(value: object) -> JsonValue:

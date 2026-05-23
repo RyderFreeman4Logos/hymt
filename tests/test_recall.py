@@ -89,8 +89,14 @@ class HistoryMigrationTests(unittest.TestCase):
             input_hash = hashlib.sha256("source text".encode()).hexdigest()
 
             db.insert_task(task_record("older output", input_hash=input_hash))
-            db.insert_task(task_record("wrong language", input_hash=input_hash, target_lang="ja"))
-            db.insert_task(task_record("wrong template", input_hash=input_hash, template_type="style"))
+            db.insert_task(
+                task_record("wrong language", input_hash=input_hash, target_lang="ja")
+            )
+            db.insert_task(
+                task_record(
+                    "wrong template", input_hash=input_hash, template_type="style"
+                )
+            )
             db.insert_task(task_record("newer output", input_hash=input_hash))
 
             self.assertEqual(
