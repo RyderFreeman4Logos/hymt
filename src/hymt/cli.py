@@ -116,7 +116,7 @@ def _is_attached_short_value(arg: str) -> bool:
     context_settings={"ignore_unknown_options": True, "allow_extra_args": True},
     help="Translate positional text, a file, or stdin.",
 )
-@click.option("--target", "-t", "target_lang", help="Target language code.")
+@click.option("--target", "-t", "target_lang", default="zh", show_default=True, help="Target language code.")
 @click.option("--file", "-f", "input_file", type=click.Path(path_type=Path), help="Input file path.")
 @click.option("--output", "-o", "output_file", type=click.Path(path_type=Path), help="Output file path.")
 @click.option(
@@ -148,8 +148,7 @@ def main(
     if ctx.invoked_subcommand is not None:
         return
     text = " ".join(ctx.args) if ctx.args else None
-    if target_lang is None:
-        raise click.UsageError("--target / -t is required for translation")
+    assert target_lang is not None
     if input_file is not None and text is not None:
         raise click.UsageError("Use either positional text or --file, not both")
 
