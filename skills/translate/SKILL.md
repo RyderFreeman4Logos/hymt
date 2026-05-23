@@ -20,10 +20,11 @@ Use `hymt` when an agent should drive the local Hy-MT2 CLI instead of hand-writi
 ## Batch translate directories
 
 - Preview a directory without writing files: `hymt batch ./docs -t zh`
+- Include subdirectories in the preview: `hymt batch ./docs -t zh --recursive`
 - Translate and write outputs: `hymt batch ./docs -t zh --write`
 - Skip confirmation for automation: `hymt batch ./docs -t zh --write --yes`
 - Write to a separate tree while preserving source-relative paths: `hymt batch ./docs -t zh --write --output-dir translated-docs`
-- Batch mode scans recursively, follows symlinks, and selects `.txt` and `.md` files.
+- Batch mode scans the top-level directory by default; add `--recursive` to descend into subdirectories. It follows symlinks and selects `.txt` and `.md` files.
 - Output names are `{stem}.{target}.{ext}`; for the default target this writes `README.zh.md` beside `README.md`.
 - Files whose resolved output path would leave the scan root or `--output-dir` are skipped with a stderr warning.
 - Batch target names accept only ASCII letters, digits, and hyphens; dots, path separators, and other characters are rejected.
@@ -65,7 +66,7 @@ Template-specific options:
 ## Utility commands
 
 - `hymt estimate -t <lang> [--file <path>] [template options...]`
-- `hymt batch [DIRECTORY] -t <lang> [--write] [--output-dir <dir>] [--yes] [template options...]`
+- `hymt batch [DIRECTORY] -t <lang> [--recursive] [--write] [--output-dir <dir>] [--yes] [template options...]`
 - `hymt history`
 - `hymt history --all`
 - `hymt history --stats`

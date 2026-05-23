@@ -606,6 +606,7 @@ def estimate_command(
 )
 @click.option("--write", is_flag=True, help="Write translated files.")
 @click.option("--yes", is_flag=True, help="Skip batch confirmation.")
+@click.option("--recursive", is_flag=True, default=False, help="Scan subdirectories.")
 @click.option(
     "--type",
     "template_type",
@@ -639,6 +640,7 @@ def batch_command(
     output_dir: Path | None,
     write: bool,
     yes: bool,
+    recursive: bool,
     template_type: str,
     terms: tuple[str, ...],
     style: str | None,
@@ -661,6 +663,7 @@ def batch_command(
             config,
             selected_type,
             kwargs,
+            recursive=recursive,
         )
         show_batch_preview(plan, sys.stderr)
         if not write:
