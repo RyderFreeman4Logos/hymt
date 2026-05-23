@@ -128,9 +128,9 @@ def build_batch_plan(
     recursive: bool = False,
     history: HistoryDB | None = None,
 ) -> BatchPlan:
-    root = directory.expanduser().resolve(strict=True)
-    source_paths = _scan_text_files(root, recursive=recursive)
-    sources = _read_sources_parallel(source_paths, root=root)
+    resolved_root = directory.expanduser().resolve(strict=True)
+    source_paths = _scan_text_files(resolved_root, recursive=recursive)
+    sources = _read_sources_parallel(source_paths, root=resolved_root)
     db = history or HistoryDB()
     template_name = template_type.value
     options_hash = _template_options_hash(template_kwargs)
@@ -138,11 +138,11 @@ def build_batch_plan(
     files: list[BatchFilePlan] = []
     skipped: list[BatchSkippedFile] = []
     for source in sources:
-        relative_path = _relative_to_root(source.path, root)
+        relative_path = _relative_to_root(source.path, resolved_root)
         try:
             output_path = _output_path(
                 source.path,
-                root,
+                resolved_root,
                 output_dir,
                 target_lang,
             )
@@ -201,7 +201,11 @@ def build_batch_plan(
             )
         )
 
-    return BatchPlan(root=root, files=tuple(files), skipped=tuple(skipped))
+    return BatchPlan(
+        root=resolved_root,
+        files=tuple(files),
+        skipped=tuple(skipped),
+    )
 
 
 def show_batch_preview(plan: BatchPlan, stream: TextIO = sys.stderr) -> None:

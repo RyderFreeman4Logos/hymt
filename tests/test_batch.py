@@ -127,6 +127,37 @@ class BatchPlanTests(unittest.TestCase):
                         {},
                     )
 
+    def test_build_batch_plan_accepts_relative_directory_roots(self) -> None:
+        with temporary_home(), tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            current = base / "current"
+            current.mkdir()
+            drafts = base / "drafts"
+            drafts.mkdir()
+            (drafts / "input.md").write_text("fresh", encoding="utf-8")
+
+            previous_cwd = Path.cwd()
+            os.chdir(current)
+            try:
+                with patched_batch_dependencies():
+                    plan = build_batch_plan(
+                        Path("../drafts"),
+                        None,
+                        "zh",
+                        fake_config(),
+                        TemplateType.DEFAULT,
+                        {},
+                    )
+            finally:
+                os.chdir(previous_cwd)
+
+            self.assertEqual(plan.root, drafts.resolve())
+            self.assertEqual(
+                [file.relative_path for file in plan.files], [Path("input.md")]
+            )
+            self.assertEqual(plan.skipped, ())
+            self.assertEqual(plan.files[0].output_path, drafts / "input.zh.md")
+
     def test_output_path_allows_hyphenated_target_lang(self) -> None:
         with temporary_home(), tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
