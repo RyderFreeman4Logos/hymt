@@ -16,6 +16,9 @@ dependencies = [
 detect = [
     "langdetect>=1.0.9",
 ]
+watch = [
+    "watchfiles>=1.0",
+]
 
 [project.scripts]
 hymt = "hymt.cli:main"

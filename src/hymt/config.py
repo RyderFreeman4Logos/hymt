@@ -16,6 +16,7 @@ context_window = 16384
 max_output_tokens = 4096
 concurrency = 1
 stream = true
+max_retranslation_retries = 10
 config_version = 1
 timeout = 600
 
@@ -116,6 +117,10 @@ class HotConfig:
     @property
     def stream(self) -> bool:
         return self._get_bool("translation", "stream", True)
+
+    @property
+    def max_retranslation_retries(self) -> int:
+        return self._get_positive_int("translation", "max_retranslation_retries", 10)
 
     @property
     def config_version(self) -> int:

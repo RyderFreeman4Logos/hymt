@@ -21,6 +21,7 @@ class DefaultConfigTests(unittest.TestCase):
         self.assertEqual(config.context_window, 16384)
         self.assertEqual(config.max_output_tokens, 4096)
         self.assertTrue(config.stream)
+        self.assertEqual(config.max_retranslation_retries, 10)
         self.assertEqual(config.timing_divergence_threshold, 2.0)
         self.assertEqual(
             str(config.exec_shared_cache_path), "/usr/local/share/hymt/cache.db"
@@ -45,6 +46,7 @@ url = "http://127.0.0.1:8401/v1"
 
 [translation]
 stream = false
+max_retranslation_retries = 7
 
 [timing]
 divergence_threshold = 3.5
@@ -64,6 +66,7 @@ blocklist = ["hymt", "ssh"]
 
         self.assertEqual(config.timing_divergence_threshold, 3.5)
         self.assertFalse(config.stream)
+        self.assertEqual(config.max_retranslation_retries, 7)
         self.assertFalse(config.exec_translate_stderr)
         self.assertEqual(config.exec_translate_stdout, "auto")
         self.assertEqual(config.exec_skip_patterns, ("*.json",))
