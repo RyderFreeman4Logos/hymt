@@ -124,10 +124,12 @@ def build_batch_plan(
     config: HotConfig,
     template_type: TemplateType,
     template_kwargs: dict[str, object],
+    *,
+    recursive: bool = False,
     history: HistoryDB | None = None,
 ) -> BatchPlan:
     root = directory.expanduser().resolve(strict=True)
-    source_paths = _scan_text_files(root)
+    source_paths = _scan_text_files(root, recursive=recursive)
     sources = _read_sources_parallel(source_paths)
     db = history or HistoryDB()
     template_name = template_type.value
@@ -326,7 +328,7 @@ class BatchProgress:
         return average_seconds * remaining_files
 
 
-def _scan_text_files(root: Path) -> tuple[Path, ...]:
+def _scan_text_files(root: Path, *, recursive: bool) -> tuple[Path, ...]:
     if not root.is_dir():
         raise NotADirectoryError(str(root))
 
@@ -344,8 +346,10 @@ def _scan_text_files(root: Path) -> tuple[Path, ...]:
             for entry in sorted_entries:
                 path = Path(entry.path)
                 if entry.is_dir(follow_symlinks=True):
-                    walk(path)
-                elif (
+                    if recursive:
+                        walk(path)
+                    continue
+                if (
                     entry.is_file(follow_symlinks=True)
                     and path.suffix.lower() in TEXT_FILE_SUFFIXES
                 ):

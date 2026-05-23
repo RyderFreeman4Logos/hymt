@@ -25,6 +25,29 @@ from hymt.translate import _segment_cache_hash
 
 
 class BatchPlanTests(unittest.TestCase):
+    def test_build_batch_plan_scans_top_level_by_default(self) -> None:
+        with temporary_home(), tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "top.md").write_text("fresh", encoding="utf-8")
+            nested = root / "nested"
+            nested.mkdir()
+            (nested / "deep.txt").write_text("fresh", encoding="utf-8")
+
+            with patched_batch_dependencies():
+                plan = build_batch_plan(
+                    root,
+                    root / "out",
+                    "zh",
+                    fake_config(),
+                    TemplateType.DEFAULT,
+                    {},
+                )
+
+            self.assertEqual(
+                [file.relative_path for file in plan.files],
+                [Path("top.md")],
+            )
+
     def test_build_batch_plan_scans_filters_and_reports_cache_status(self) -> None:
         with temporary_home(), tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -53,6 +76,7 @@ class BatchPlanTests(unittest.TestCase):
                     fake_config(),
                     TemplateType.DEFAULT,
                     {},
+                    recursive=True,
                 )
 
             self.assertEqual(len(plan.skipped), 1)
@@ -134,6 +158,7 @@ class BatchPlanTests(unittest.TestCase):
                     fake_config(),
                     TemplateType.DEFAULT,
                     {},
+                    recursive=True,
                 )
 
             self.assertEqual(len(plan.files), 0)
@@ -167,6 +192,7 @@ class BatchPlanTests(unittest.TestCase):
                     fake_config(),
                     TemplateType.DEFAULT,
                     {},
+                    recursive=True,
                 )
 
             self.assertEqual(len(plan.files), 0)
@@ -229,6 +255,14 @@ class BatchPlanTests(unittest.TestCase):
 
 
 class BatchCliTests(unittest.TestCase):
+    def test_batch_help_shows_recursive_flag(self) -> None:
+        runner = CliRunner()
+
+        result = runner.invoke(main, ["batch", "--help"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("--recursive", result.output)
+
     def test_batch_without_write_is_dry_run(self) -> None:
         with temporary_home() as home, tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -248,6 +282,27 @@ class BatchCliTests(unittest.TestCase):
             self.assertEqual(result.exit_code, 0, result.output)
             self.assertIn("Dry run: no files written.", result.output)
             self.assertFalse((root / "input.zh.md").exists())
+
+    def test_batch_recursive_scans_subdirectories(self) -> None:
+        with temporary_home() as home, tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            nested = root / "nested"
+            nested.mkdir()
+            (nested / "input.md").write_text("English.", encoding="utf-8")
+
+            runner = CliRunner()
+            with (
+                patched_batch_dependencies(),
+                patch("hymt.cli.HotConfig", return_value=fake_config()),
+            ):
+                result = runner.invoke(
+                    main,
+                    ["batch", "-t", "zh", "--recursive", str(root)],
+                    env={"HOME": home},
+                )
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertIn("nested/input.md", result.output)
 
 
 class patched_batch_dependencies:
