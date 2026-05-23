@@ -20,8 +20,28 @@ class DefaultConfigTests(unittest.TestCase):
 
         self.assertEqual(config.context_window, 16384)
         self.assertEqual(config.max_output_tokens, 4096)
+        self.assertEqual(config.timing_divergence_threshold, 2.0)
         self.assertGreater(plan.available_source_tokens, 0)
         self.assertEqual(plan.segments, ["hello"])
+
+    def test_timing_divergence_threshold_uses_config_value(self) -> None:
+        with temporary_home() as home:
+            path = os.path.join(home, ".config", "hymt", "config.toml")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as config_file:
+                config_file.write(
+                    """
+[endpoint]
+url = "http://127.0.0.1:8401/v1"
+
+[timing]
+divergence_threshold = 3.5
+"""
+                )
+
+            config = HotConfig()
+
+        self.assertEqual(config.timing_divergence_threshold, 3.5)
 
 
 class CountingSegmenter:

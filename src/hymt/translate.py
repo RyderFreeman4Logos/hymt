@@ -18,6 +18,7 @@ from hymt.config import HotConfig
 from hymt.history import DurationEstimate, HistoryDB, TaskRecord, format_duration
 from hymt.segment import Segmenter, create_segmenter
 from hymt.templates import TemplateType, build_prompt
+from hymt.timing_issue import TimingIssueData, maybe_prompt_timing_issue
 
 LOCK_PATH = Path.home() / ".cache" / "hymt" / "translate.lock"
 JsonValue: TypeAlias = (
@@ -39,6 +40,10 @@ def _translation_lock() -> Generator[None]:
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         fd.close()
+
+
+def _monotonic() -> float:
+    return time.monotonic()
 
 
 @dataclass(frozen=True)
@@ -124,11 +129,11 @@ async def translate_text(
 
     with _translation_lock():
         started_at = datetime.now(timezone.utc)
-        started_monotonic = time.monotonic()
+        started_monotonic = _monotonic()
 
         def report_progress(done: int, total: int) -> None:
             if total > 1:
-                elapsed = time.monotonic() - started_monotonic
+                elapsed = _monotonic() - started_monotonic
                 percent = int(done / total * 100)
                 eta_seconds = elapsed / done * (total - done) if done else 0.0
                 processed_tokens = plan.source_tokens * done / total
@@ -148,7 +153,7 @@ async def translate_text(
 
     translated = "".join(translations)
     finished_at = datetime.now(timezone.utc)
-    duration_seconds = time.monotonic() - started_monotonic
+    duration_seconds = _monotonic() - started_monotonic
     output_tokens = plan.count_tokens(translated)
     tokens_per_second = (
         output_tokens / duration_seconds if duration_seconds > 0 else 0.0
@@ -174,6 +179,23 @@ async def translate_text(
             input_hash=input_hash,
             config_version=cv,
         ),
+    )
+    maybe_prompt_timing_issue(
+        history,
+        initial_estimate,
+        TimingIssueData(
+            input_tokens=plan.source_tokens,
+            output_tokens=output_tokens,
+            segments=plan.segment_count,
+            actual_seconds=duration_seconds,
+            estimated_seconds=initial_estimate.seconds if initial_estimate else 0.0,
+            config_version=cv,
+            target_lang=target_lang,
+            template_type=template_name,
+            concurrency=config.concurrency,
+            model=config.model or None,
+        ),
+        getattr(config, "timing_divergence_threshold", 2.0),
     )
     return translated
 
