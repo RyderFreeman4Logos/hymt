@@ -11,7 +11,12 @@ from unittest.mock import AsyncMock, patch
 
 from click.testing import CliRunner
 
-from hymt.batch import build_batch_plan, run_batch_translation, show_batch_preview
+from hymt.batch import (
+    _output_path,
+    build_batch_plan,
+    run_batch_translation,
+    show_batch_preview,
+)
 from hymt.cli import main
 from hymt.history import HistoryDB
 from hymt.templates import TemplateType
@@ -71,6 +76,66 @@ class BatchPlanTests(unittest.TestCase):
             self.assertIn("cache=full", text)
             self.assertIn("cache=partial", text)
             self.assertIn("Total estimated time:", text)
+
+    def test_build_batch_plan_rejects_path_unsafe_target_lang(self) -> None:
+        with temporary_home(), tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "input.md").write_text("fresh", encoding="utf-8")
+
+            with patched_batch_dependencies():
+                with self.assertRaisesRegex(ValueError, "ASCII letters"):
+                    build_batch_plan(
+                        root,
+                        root / "out",
+                        "../../etc",
+                        fake_config(),
+                        TemplateType.DEFAULT,
+                        {},
+                    )
+                with self.assertRaisesRegex(ValueError, "ASCII letters"):
+                    build_batch_plan(
+                        root,
+                        root / "out",
+                        "zh.Hant",
+                        fake_config(),
+                        TemplateType.DEFAULT,
+                        {},
+                    )
+
+    def test_output_path_allows_hyphenated_target_lang(self) -> None:
+        with temporary_home(), tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_path = root / "input.md"
+            source_path.write_text("fresh", encoding="utf-8")
+
+            self.assertEqual(
+                _output_path(source_path, root, root / "out", "zh-Hant"),
+                root / "out" / "input.zh-Hant.md",
+            )
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "requires symlink support")
+    def test_build_batch_plan_rejects_output_dir_escape(self) -> None:
+        with temporary_home(), tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            nested = root / "nested"
+            nested.mkdir()
+            (nested / "input.md").write_text("fresh", encoding="utf-8")
+            output_dir = root / "out"
+            output_dir.mkdir()
+            escape_dir = root / "escape"
+            escape_dir.mkdir()
+            os.symlink(escape_dir, output_dir / "nested")
+
+            with patched_batch_dependencies():
+                with self.assertRaisesRegex(ValueError, "escapes output directory"):
+                    build_batch_plan(
+                        root,
+                        output_dir,
+                        "zh",
+                        fake_config(),
+                        TemplateType.DEFAULT,
+                        {},
+                    )
 
     def test_run_batch_translation_writes_outputs_even_when_fully_cached(self) -> None:
         with temporary_home(), tempfile.TemporaryDirectory() as tmpdir:

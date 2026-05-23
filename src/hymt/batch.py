@@ -131,6 +131,12 @@ def build_batch_plan(
     skipped: list[BatchSkippedFile] = []
     for source in sources:
         relative_path = _relative_to_root(source.path, root)
+        output_path = _output_path(
+            source.path,
+            root,
+            output_dir,
+            target_lang,
+        )
         document_plan = analyze_document_language(source.text, target_lang)
         if _is_target_language_document(document_plan):
             skipped.append(
@@ -168,12 +174,7 @@ def build_batch_plan(
             BatchFilePlan(
                 source_path=source.path,
                 relative_path=relative_path,
-                output_path=_output_path(
-                    source.path,
-                    root,
-                    output_dir,
-                    target_lang,
-                ),
+                output_path=output_path,
                 text=source.text,
                 file_hash=source.file_hash,
                 document_plan=document_plan,
@@ -368,14 +369,29 @@ def _output_path(
     output_dir: Path | None,
     target_lang: str,
 ) -> Path:
-    target_name = f"{source_path.stem}.{target_lang}{source_path.suffix}"
+    target_suffix = _target_lang_path_suffix(target_lang)
+    target_name = f"{source_path.stem}.{target_suffix}{source_path.suffix}"
     if output_dir is None:
         return source_path.with_name(target_name)
-    return (
-        output_dir.expanduser()
-        / _relative_to_root(source_path, root).parent
-        / target_name
+    resolved_output_dir = output_dir.expanduser().resolve()
+    output_path = (
+        resolved_output_dir / _relative_to_root(source_path, root).parent / target_name
     )
+    resolved_output_path = output_path.resolve()
+    if not resolved_output_path.is_relative_to(resolved_output_dir):
+        raise ValueError(f"batch output path escapes output directory: {output_path}")
+    return resolved_output_path
+
+
+def _target_lang_path_suffix(target_lang: str) -> str:
+    suffix = target_lang.strip()
+    if not suffix or not all(
+        char.isascii() and (char.isalnum() or char == "-") for char in suffix
+    ):
+        raise ValueError(
+            "batch target language must contain only ASCII letters, digits, or hyphens"
+        )
+    return suffix
 
 
 def _relative_to_root(path: Path, root: Path) -> Path:
