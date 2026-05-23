@@ -11,6 +11,7 @@ import click
 
 from hymt.batch import build_batch_plan, run_batch_translation, show_batch_preview
 from hymt.config import HotConfig, config_path, show
+from hymt.doc_translate import run_doc_translation
 from hymt.docs import show_translated_info, show_translated_man
 from hymt.exec_wrapper import run_exec_command
 from hymt.history import (
@@ -737,6 +738,98 @@ def recall_command(position: int, show_list: bool) -> None:
         _show_recall_missing(db.count_translations())
         raise click.exceptions.Exit(1)
     sys.stdout.write(output_text)
+
+
+@main.command("translate-doc")
+@click.argument(
+    "source",
+    type=click.Path(path_type=Path, exists=True),
+)
+@click.option("--target", "-t", "target_lang", default="zh", show_default=True)
+@click.option(
+    "--output",
+    "-o",
+    "output_path",
+    type=click.Path(path_type=Path),
+    help="Explicit output path for a single source file.",
+)
+@click.option(
+    "--output-dir",
+    type=click.Path(path_type=Path, file_okay=False, dir_okay=True),
+    help="Output directory for translated Markdown files.",
+)
+@click.option(
+    "--recursive",
+    is_flag=True,
+    help="Scan subdirectories when SOURCE is a directory.",
+)
+@click.option(
+    "--watch",
+    is_flag=True,
+    help="Watch a single source file and re-translate on change.",
+)
+@click.option(
+    "--type",
+    "template_type",
+    type=click.Choice(TEMPLATE_CHOICES),
+    default=TemplateType.DEFAULT.value,
+    show_default=True,
+    help="Template type.",
+)
+@click.option("--terms", multiple=True, help="Terminology pair, format: source=target.")
+@click.option("--style", help="Style description for style translations.")
+@click.option(
+    "--context",
+    "background_context",
+    help="Background context for context-aware translations.",
+)
+@click.option(
+    "--format", "format_type", help="Data format for structured translations."
+)
+@click.option(
+    "--instruction", "instructions", multiple=True, help="Personalization instruction."
+)
+@click.option(
+    "--stream/--no-stream",
+    "stream",
+    default=None,
+    help="Override [translation].stream for document translation.",
+)
+def translate_doc_command(
+    source: Path,
+    target_lang: str,
+    output_path: Path | None,
+    output_dir: Path | None,
+    recursive: bool,
+    watch: bool,
+    template_type: str,
+    terms: tuple[str, ...],
+    style: str | None,
+    background_context: str | None,
+    format_type: str | None,
+    instructions: tuple[str, ...],
+    stream: bool | None,
+) -> None:
+    try:
+        kwargs = _template_kwargs(
+            terms, style, background_context, format_type, instructions
+        )
+        _announce_tokenizer_download()
+        run_doc_translation(
+            source,
+            target_lang,
+            HotConfig(),
+            output_path=output_path,
+            output_dir=output_dir,
+            recursive=recursive,
+            watch=watch,
+            stream=stream,
+            template_type=TemplateType(template_type),
+            template_kwargs=kwargs,
+            progress_stream=sys.stderr,
+        )
+    except (OSError, UnicodeError, ValueError, RuntimeError) as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 def _template_kwargs(
