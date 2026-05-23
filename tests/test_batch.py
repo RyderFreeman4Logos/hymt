@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import redirect_stderr
 import io
 import os
 from pathlib import Path
@@ -114,7 +115,38 @@ class BatchPlanTests(unittest.TestCase):
             )
 
     @unittest.skipUnless(hasattr(os, "symlink"), "requires symlink support")
-    def test_build_batch_plan_rejects_output_dir_escape(self) -> None:
+    def test_build_batch_plan_skips_in_place_output_escape(self) -> None:
+        with temporary_home(), tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            root = base / "root"
+            root.mkdir()
+            escape_dir = base / "escape"
+            escape_dir.mkdir()
+            (escape_dir / "input.md").write_text("fresh", encoding="utf-8")
+            os.symlink(escape_dir, root / "linked")
+
+            warning = io.StringIO()
+            with patched_batch_dependencies(), redirect_stderr(warning):
+                plan = build_batch_plan(
+                    root,
+                    None,
+                    "zh",
+                    fake_config(),
+                    TemplateType.DEFAULT,
+                    {},
+                )
+
+            self.assertEqual(len(plan.files), 0)
+            self.assertEqual(len(plan.skipped), 1)
+            self.assertEqual(plan.skipped[0].relative_path, Path("linked/input.md"))
+            self.assertEqual(plan.skipped[0].reason, "output path escapes scan root")
+            self.assertIn(
+                "Warning: skipping linked/input.md: output path escapes scan root",
+                warning.getvalue(),
+            )
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "requires symlink support")
+    def test_build_batch_plan_skips_output_dir_escape(self) -> None:
         with temporary_home(), tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             nested = root / "nested"
@@ -126,16 +158,29 @@ class BatchPlanTests(unittest.TestCase):
             escape_dir.mkdir()
             os.symlink(escape_dir, output_dir / "nested")
 
-            with patched_batch_dependencies():
-                with self.assertRaisesRegex(ValueError, "escapes output directory"):
-                    build_batch_plan(
-                        root,
-                        output_dir,
-                        "zh",
-                        fake_config(),
-                        TemplateType.DEFAULT,
-                        {},
-                    )
+            warning = io.StringIO()
+            with patched_batch_dependencies(), redirect_stderr(warning):
+                plan = build_batch_plan(
+                    root,
+                    output_dir,
+                    "zh",
+                    fake_config(),
+                    TemplateType.DEFAULT,
+                    {},
+                )
+
+            self.assertEqual(len(plan.files), 0)
+            self.assertEqual(len(plan.skipped), 1)
+            self.assertEqual(plan.skipped[0].relative_path, Path("nested/input.md"))
+            self.assertEqual(
+                plan.skipped[0].reason,
+                "output path escapes output directory",
+            )
+            self.assertIn(
+                "Warning: skipping nested/input.md: "
+                "output path escapes output directory",
+                warning.getvalue(),
+            )
 
     def test_run_batch_translation_writes_outputs_even_when_fully_cached(self) -> None:
         with temporary_home(), tempfile.TemporaryDirectory() as tmpdir:
