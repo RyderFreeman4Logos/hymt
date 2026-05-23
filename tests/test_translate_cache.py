@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import redirect_stderr
-import hashlib
+from contextlib import nullcontext, redirect_stderr
 import io
 import os
 import tempfile
@@ -12,13 +11,13 @@ from unittest.mock import patch
 
 from hymt.history import HistoryDB, TaskRecord
 from hymt.templates import TemplateType
-from hymt.translate import translate_text
+from hymt.translate import _translation_cache_hash, translate_text
 
 
 class TranslationCacheTests(unittest.TestCase):
     def test_translate_text_returns_cached_output_without_client_call(self) -> None:
         source = "source text"
-        input_hash = hashlib.sha256(source.encode()).hexdigest()
+        input_hash = _translation_cache_hash(source, "en", TemplateType.DEFAULT, {})
 
         with temporary_home():
             HistoryDB().insert_task(task_record("cached output", input_hash=input_hash))
@@ -43,6 +42,46 @@ class TranslationCacheTests(unittest.TestCase):
         self.assertIn("Cache hit", stderr.getvalue())
         client_cls.assert_not_called()
 
+    def test_template_options_are_part_of_cache_identity(self) -> None:
+        source = "source text"
+        cached_hash = _translation_cache_hash(
+            source,
+            "en",
+            TemplateType.STYLE,
+            {"style": "casual"},
+        )
+
+        with temporary_home():
+            HistoryDB().insert_task(
+                task_record(
+                    "cached output",
+                    input_hash=cached_hash,
+                    template_type=TemplateType.STYLE.value,
+                )
+            )
+            stderr = io.StringIO()
+            FakeTranslationClient.calls = 0
+
+            with (
+                patch("hymt.translate.plan_translation", return_value=FakePlan()),
+                patch("hymt.translate._translation_lock", return_value=nullcontext()),
+                patch("hymt.translate.TranslationClient", FakeTranslationClient),
+                redirect_stderr(stderr),
+            ):
+                output = asyncio.run(
+                    translate_text(
+                        source,
+                        "en",
+                        SimpleNamespace(concurrency=1, config_version=1, model=""),
+                        TemplateType.STYLE,
+                        style="formal",
+                    )
+                )
+
+        self.assertEqual(output, "fresh output")
+        self.assertNotIn("Cache hit", stderr.getvalue())
+        self.assertEqual(FakeTranslationClient.calls, 1)
+
 
 class FakePlan:
     source_tokens = 11
@@ -51,6 +90,30 @@ class FakePlan:
     @property
     def segment_count(self) -> int:
         return len(self.segments)
+
+    def count_tokens(self, text: str) -> int:
+        return len(text)
+
+
+class FakeTranslationClient:
+    calls = 0
+
+    def __init__(self, config: object) -> None:
+        self._config = config
+
+    async def __aenter__(self) -> FakeTranslationClient:
+        FakeTranslationClient.calls += 1
+        return self
+
+    async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        return None
+
+    async def translate_batch(
+        self,
+        prompts: list[str],
+        on_progress: object,
+    ) -> list[str]:
+        return ["fresh output"]
 
 
 class temporary_home:
@@ -68,7 +131,12 @@ class temporary_home:
         self._tmpdir.cleanup()
 
 
-def task_record(output_text: str, *, input_hash: str) -> TaskRecord:
+def task_record(
+    output_text: str,
+    *,
+    input_hash: str,
+    template_type: str = "default",
+) -> TaskRecord:
     return TaskRecord(
         started_at="2026-05-23T00:00:00+00:00",
         finished_at="2026-05-23T00:00:01+00:00",
@@ -79,7 +147,7 @@ def task_record(output_text: str, *, input_hash: str) -> TaskRecord:
         concurrency=1,
         source_lang=None,
         target_lang="en",
-        template_type="default",
+        template_type=template_type,
         model=None,
         tokens_per_second=1.0,
         input_chars=11,
