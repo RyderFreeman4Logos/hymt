@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 
+import hymt.segment as segment_module
 from hymt.segment import Segmenter, _split_clauses, _split_sentences
 
 
@@ -53,6 +54,22 @@ class ClauseSplitTests(unittest.TestCase):
 
 
 class SegmenterTests(unittest.TestCase):
+    def test_count_tokens_uses_byte_estimate_without_tokenizer(self) -> None:
+        segmenter = Segmenter()
+        self.assertEqual(segmenter.count_tokens(""), 0)
+        self.assertEqual(segmenter.count_tokens("abcd"), 1)
+        self.assertEqual(segmenter.count_tokens("abcde"), 2)
+        self.assertEqual(segmenter.count_tokens("你"), 1)
+
+    def test_create_segmenter_falls_back_when_tokenizers_is_unavailable(self) -> None:
+        original = segment_module._TokenizerImpl
+        segment_module._TokenizerImpl = None
+        try:
+            segmenter = segment_module.create_segmenter()
+        finally:
+            segment_module._TokenizerImpl = original
+        self.assertEqual(segmenter.count_tokens("fallback"), 2)
+
     def test_segment_uses_sentence_then_clause_fallback(self) -> None:
         segmenter = make_segmenter()
         text = "第一句。第二句，第三句；第四句"

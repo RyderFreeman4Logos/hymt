@@ -53,7 +53,8 @@ Template-specific options:
 
 - Translation output goes to stdout; progress and status go to stderr.
 - Stdout translations end with a trailing newline.
-- Identical source text, target language, and template type reuse cached history output.
+- Identical source text, target language, template type, and template-specific options reuse cached history output.
 - Config lives at `~/.config/hymt/config.toml`.
 - The tokenizer is cached at `~/.cache/hymt/tokenizer/tokenizer.json`.
-- `hymt estimate` and translation commands auto-download the tokenizer on first use.
+- `hymt estimate` and translation commands auto-download the tokenizer on first use when the `tokenizers` dependency is available.
+- On Android/Termux installs, `hymt` uses approximate token counting for segmentation because Rust tokenizer wheels are unavailable.

@@ -8,8 +8,8 @@ readme = "README.md"
 dependencies = [
     "click>=8.0",
     "httpx>=0.27",
-    "tokenizers>=0.21",
-    "huggingface-hub>=0.28,<1.14",
+    "tokenizers>=0.21; sys_platform != 'android'",
+    "huggingface-hub>=0.28,<1.14; sys_platform != 'android'",
 ]
 
 [project.scripts]

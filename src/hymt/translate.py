@@ -6,18 +6,23 @@ from collections.abc import Generator
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
+import json
 from pathlib import Path
 import sqlite3
 import sys
 import time
+from typing import TypeAlias
 
 from hymt.client import TranslationClient
 from hymt.config import HotConfig
-from hymt.history import HistoryDB, TaskRecord, format_duration
-from hymt.segment import Segmenter, ensure_tokenizer
+from hymt.history import DurationEstimate, HistoryDB, TaskRecord, format_duration
+from hymt.segment import Segmenter, create_segmenter
 from hymt.templates import TemplateType, build_prompt
 
 LOCK_PATH = Path.home() / ".cache" / "hymt" / "translate.lock"
+JsonValue: TypeAlias = (
+    None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
+)
 
 
 @contextmanager
@@ -58,11 +63,12 @@ def plan_translation(
     template_type: TemplateType = TemplateType.DEFAULT,
     **template_kwargs: object,
 ) -> TranslationPlan:
-    tokenizer_path = ensure_tokenizer()
-    segmenter = Segmenter(tokenizer_path)
+    segmenter = create_segmenter()
     overhead_prompt = build_prompt("", target_lang, template_type, **template_kwargs)
     prompt_overhead_tokens = segmenter.count_tokens(overhead_prompt)
-    available_source_tokens = config.context_window - prompt_overhead_tokens - config.max_output_tokens
+    available_source_tokens = (
+        config.context_window - prompt_overhead_tokens - config.max_output_tokens
+    )
     if available_source_tokens <= 0:
         raise ValueError(
             "Config context_window is too small for the selected template and max_output_tokens"
@@ -86,10 +92,15 @@ async def translate_text(
     if not text:
         return ""
 
-    input_hash = hashlib.sha256(text.encode()).hexdigest()
     template_name = template_type.value
+    input_hash = _translation_cache_hash(
+        text, target_lang, template_type, template_kwargs
+    )
     plan = plan_translation(text, target_lang, config, template_type, **template_kwargs)
-    print(f"Source tokens: {plan.source_tokens}; segments: {plan.segment_count}", file=sys.stderr)
+    print(
+        f"Source tokens: {plan.source_tokens}; segments: {plan.segment_count}",
+        file=sys.stderr,
+    )
     history = HistoryDB()
     cached = history.find_cached(input_hash, target_lang, template_name)
     if cached is not None:
@@ -131,13 +142,17 @@ async def translate_text(
                 )
 
         async with TranslationClient(config) as client:
-            translations = await client.translate_batch(prompts, on_progress=report_progress)
+            translations = await client.translate_batch(
+                prompts, on_progress=report_progress
+            )
 
     translated = "".join(translations)
     finished_at = datetime.now(timezone.utc)
     duration_seconds = time.monotonic() - started_monotonic
     output_tokens = plan.count_tokens(translated)
-    tokens_per_second = output_tokens / duration_seconds if duration_seconds > 0 else 0.0
+    tokens_per_second = (
+        output_tokens / duration_seconds if duration_seconds > 0 else 0.0
+    )
     _record_successful_translation(
         history,
         TaskRecord(
@@ -172,7 +187,9 @@ async def translate_file(
     **template_kwargs: object,
 ) -> None:
     text = input_path.read_text(encoding="utf-8")
-    translated = await translate_text(text, target_lang, config, template_type, **template_kwargs)
+    translated = await translate_text(
+        text, target_lang, config, template_type, **template_kwargs
+    )
     if output_path is None:
         sys.stdout.write(translated)
         if not translated.endswith("\n"):
@@ -182,7 +199,7 @@ async def translate_file(
     output_path.write_text(translated, encoding="utf-8")
 
 
-def _print_estimate(est: "DurationEstimate") -> None:
+def _print_estimate(est: DurationEstimate) -> None:
     stats = est.stats
     if len(est.versions_used) <= 1:
         print(
@@ -197,8 +214,7 @@ def _print_estimate(est: "DurationEstimate") -> None:
     hi = format_duration(slow_seconds)
     vers = ",".join(str(v) for v in est.versions_used)
     print(
-        f"Estimated time: ~{lo}–{hi} "
-        f"based on {stats.count} tasks (versions {vers})",
+        f"Estimated time: ~{lo}–{hi} based on {stats.count} tasks (versions {vers})",
         file=sys.stderr,
     )
 
@@ -214,3 +230,41 @@ def _record_successful_translation(history: HistoryDB, record: TaskRecord) -> No
         f"avg {record.tokens_per_second:.1f} tok/s | timing recorded",
         file=sys.stderr,
     )
+
+
+def _translation_cache_hash(
+    text: str,
+    target_lang: str,
+    template_type: TemplateType,
+    template_kwargs: dict[str, object],
+) -> str:
+    payload: dict[str, JsonValue] = {
+        "source_text": text,
+        "target_lang": target_lang,
+        "template_type": template_type.value,
+        "template_kwargs": _normalize_cache_kwargs(template_kwargs),
+    }
+    encoded = json.dumps(
+        payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _normalize_cache_kwargs(template_kwargs: dict[str, object]) -> dict[str, JsonValue]:
+    return {
+        key: _normalize_cache_value(template_kwargs[key])
+        for key in sorted(template_kwargs)
+    }
+
+
+def _normalize_cache_value(value: object) -> JsonValue:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (tuple, list)):
+        return [_normalize_cache_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            str(key): _normalize_cache_value(value[key])
+            for key in sorted(value, key=lambda item: str(item))
+        }
+    return str(value)

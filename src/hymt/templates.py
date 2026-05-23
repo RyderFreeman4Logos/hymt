@@ -64,7 +64,9 @@ def language_name(code: str) -> str:
         return LANGUAGE_NAMES[normalized]
     except KeyError as exc:
         supported = ", ".join(sorted(SUPPORTED_LANGUAGES))
-        raise ValueError(f"Unsupported target language '{code}'. Supported: {supported}") from exc
+        raise ValueError(
+            f"Unsupported target language '{code}'. Supported: {supported}"
+        ) from exc
 
 
 def build_prompt(
@@ -80,22 +82,43 @@ def build_prompt(
         case TemplateType.DEFAULT:
             return build_default_prompt(source_text, target_name, chinese_prompt)
         case TemplateType.TERMINOLOGY:
-            return build_terminology_prompt(source_text, target_name, chinese_prompt, kwargs.get("terms"))
+            return build_terminology_prompt(
+                source_text, target_name, chinese_prompt, kwargs.get("terms")
+            )
         case TemplateType.STYLE:
-            return build_style_prompt(source_text, target_name, chinese_prompt, kwargs.get("style") or kwargs.get("target_style"))
+            return build_style_prompt(
+                source_text,
+                target_name,
+                chinese_prompt,
+                kwargs.get("style") or kwargs.get("target_style"),
+            )
         case TemplateType.PERSONALIZATION:
-            return build_personalization_prompt(source_text, target_name, chinese_prompt, kwargs.get("instructions"))
+            return build_personalization_prompt(
+                source_text, target_name, chinese_prompt, kwargs.get("instructions")
+            )
         case TemplateType.DELIMITERS:
             return build_delimiters_prompt(source_text, target_name, chinese_prompt)
         case TemplateType.STRUCTURED:
-            return build_structured_prompt(source_text, target_name, chinese_prompt, kwargs.get("format_type") or kwargs.get("format"))
+            return build_structured_prompt(
+                source_text,
+                target_name,
+                chinese_prompt,
+                kwargs.get("format_type") or kwargs.get("format"),
+            )
         case TemplateType.CONTEXT_AWARE:
-            return build_context_prompt(source_text, target_name, chinese_prompt, kwargs.get("background_text") or kwargs.get("context"))
+            return build_context_prompt(
+                source_text,
+                target_name,
+                chinese_prompt,
+                kwargs.get("background_text") or kwargs.get("context"),
+            )
         case _:
             raise ValueError(f"Unsupported template type '{selected_type}'")
 
 
-def build_default_prompt(source_text: str, target_lang: str, chinese_prompt: bool = False) -> str:
+def build_default_prompt(
+    source_text: str, target_lang: str, chinese_prompt: bool = False
+) -> str:
     if chinese_prompt:
         return f"请将以下文本翻译成{target_lang}。注意，你应该只输出翻译结果，不要添加任何解释：\n\n{source_text}"
     return (
@@ -154,15 +177,23 @@ def build_personalization_prompt(
 ) -> str:
     normalized = _normalize_instructions(instructions)
     if chinese_prompt:
-        tasks = [f"{index}. {instruction}" for index, instruction in enumerate(normalized, start=1)]
+        tasks = [
+            f"{index}. {instruction}"
+            for index, instruction in enumerate(normalized, start=1)
+        ]
         tasks.append(f"{len(tasks) + 1}. 将[源文本]翻译成{target_lang}。")
         return f"[源文本]\n{source_text}\n\n[翻译任务]\n" + "\n".join(tasks)
-    tasks = [f"{index}. {instruction}" for index, instruction in enumerate(normalized, start=1)]
+    tasks = [
+        f"{index}. {instruction}"
+        for index, instruction in enumerate(normalized, start=1)
+    ]
     tasks.append(f"{len(tasks) + 1}. Translate the [Source Text] into {target_lang}.")
     return f"[Source Text]\n{source_text}\n\n[Translation Tasks]\n" + "\n".join(tasks)
 
 
-def build_delimiters_prompt(source_text: str, target_lang: str, chinese_prompt: bool = False) -> str:
+def build_delimiters_prompt(
+    source_text: str, target_lang: str, chinese_prompt: bool = False
+) -> str:
     if chinese_prompt:
         return (
             f"请准确地将以下文本翻译成{target_lang}。\n"
@@ -231,13 +262,17 @@ def _normalize_terms(terms: object) -> list[tuple[str, str]]:
     if isinstance(terms, Mapping):
         return [(str(source), str(target)) for source, target in terms.items()]
     if not isinstance(terms, Iterable) or isinstance(terms, str):
-        raise ValueError("terms must be an iterable of 'source=target' strings or pairs")
+        raise ValueError(
+            "terms must be an iterable of 'source=target' strings or pairs"
+        )
     normalized: list[tuple[str, str]] = []
     for term in terms:
         if isinstance(term, str):
             source, separator, target = term.partition("=")
             if not separator:
-                raise ValueError(f"Invalid terminology pair '{term}'. Expected source=target")
+                raise ValueError(
+                    f"Invalid terminology pair '{term}'. Expected source=target"
+                )
             normalized.append((source, target))
             continue
         if isinstance(term, Iterable):

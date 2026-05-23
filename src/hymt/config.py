@@ -12,7 +12,7 @@ api_key = ""
 model = ""
 
 [translation]
-context_window = 4096
+context_window = 16384
 max_output_tokens = 4096
 concurrency = 1
 config_version = 1
@@ -66,7 +66,7 @@ class HotConfig:
 
     @property
     def context_window(self) -> int:
-        return self._get_positive_int("translation", "context_window", 4096)
+        return self._get_positive_int("translation", "context_window", 16384)
 
     @property
     def max_output_tokens(self) -> int:

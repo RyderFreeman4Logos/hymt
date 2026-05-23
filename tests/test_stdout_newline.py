@@ -25,7 +25,10 @@ class StdoutNewlineTests(unittest.TestCase):
             stdout = io.StringIO()
 
             with (
-                patch("hymt.translate.translate_text", new=AsyncMock(return_value="translated")),
+                patch(
+                    "hymt.translate.translate_text",
+                    new=AsyncMock(return_value="translated"),
+                ),
                 redirect_stdout(stdout),
             ):
                 asyncio.run(
@@ -46,12 +49,53 @@ class StdoutNewlineTests(unittest.TestCase):
             with (
                 patch("hymt.cli.HotConfig", return_value=SimpleNamespace()),
                 patch("hymt.cli._announce_tokenizer_download"),
-                patch("hymt.cli.translate_text", new=AsyncMock(return_value="translated")),
+                patch(
+                    "hymt.cli.translate_text", new=AsyncMock(return_value="translated")
+                ),
             ):
                 result = runner.invoke(main, ["-t", "en", "source"], env={"HOME": home})
 
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertEqual(result.output, "translated\n")
+
+    def test_cli_separator_treats_subcommand_name_as_text(self) -> None:
+        with temporary_home() as home:
+            runner = CliRunner()
+            translate = AsyncMock(return_value="translated")
+            with (
+                patch("hymt.cli.HotConfig", return_value=SimpleNamespace()),
+                patch("hymt.cli._announce_tokenizer_download"),
+                patch("hymt.cli.translate_text", new=translate),
+            ):
+                result = runner.invoke(
+                    main, ["-t", "en", "--", "config"], env={"HOME": home}
+                )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(result.output, "translated\n")
+        translate.assert_awaited_once()
+        self.assertEqual(translate.await_args.args[0], "config")
+
+    def test_cli_output_write_error_becomes_click_error(self) -> None:
+        with temporary_home() as home, tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "existing-dir"
+            output_path.mkdir()
+            runner = CliRunner()
+            with (
+                patch("hymt.cli.HotConfig", return_value=SimpleNamespace()),
+                patch("hymt.cli._announce_tokenizer_download"),
+                patch(
+                    "hymt.cli.translate_text", new=AsyncMock(return_value="translated")
+                ),
+            ):
+                result = runner.invoke(
+                    main,
+                    ["-t", "en", "-o", str(output_path), "source"],
+                    env={"HOME": home},
+                )
+
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("Error:", result.output)
 
 
 class temporary_home:
