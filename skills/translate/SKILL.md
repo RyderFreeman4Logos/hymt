@@ -32,6 +32,16 @@ Use `hymt` when an agent should drive the local Hy-MT2 CLI instead of hand-writi
 - `--write` writes outputs even for fully cached files, so deleted output files can be regenerated from cache.
 - Batch progress and per-file translation progress are written to stderr in the standard `[done/total] XX.XX% | elapsed ... | eta ... | NN.NN tok/s` format.
 
+## Translate Markdown docs
+
+- Translate one Markdown file to Simplified Chinese: `hymt translate-doc README.md`
+- Explicit output path: `hymt translate-doc README.md -t zh -o README.zh-cn.md`
+- Translate to another language: `hymt translate-doc README.md -t ja`
+- Translate a documentation tree: `hymt translate-doc docs/ --recursive`
+- Keep a file in sync while editing: `hymt translate-doc README.md --watch`
+- `translate-doc` only accepts Markdown input, normalizes `-t zh` outputs to `.zh-cn.md`, and falls back to polling when `watchfiles` is unavailable.
+- Watch-mode retries are bounded by `[translation].max_retranslation_retries`, and changed files reuse cached segments instead of retranslating the whole document from scratch.
+
 ## Template types
 
 `--type` accepts:
@@ -63,6 +73,7 @@ Template-specific options:
 - `hymt recall`
 - `hymt recall -n <N>`
 - `hymt recall --list`
+- `hymt translate-doc <FILE|DIR> -t <lang> [--recursive] [--watch] [--output-dir <dir>] [template options...]`
 - `hymt config show`
 - `hymt config path`
 - `hymt config edit`
@@ -73,6 +84,7 @@ Related skills cover command/documentation translation:
 - `hymt exec -- <command> [args...]`, `hymt exec install`, and `hymt exec precache` are documented in `skills/exec/SKILL.md`.
 - `hymt man [--original] [--refresh] <page>` is documented in `skills/man/SKILL.md`.
 - `hymt info [--original] [--refresh] <topic>` is documented in `skills/info/SKILL.md`.
+- `hymt translate-doc ...` is documented in `skills/translate-doc/SKILL.md`.
 
 ## Behavior
 
@@ -86,8 +98,10 @@ Related skills cover command/documentation translation:
 - Streaming runs send tokens to stdout as the endpoint produces them; non-streaming runs buffer output until completion.
 - Progress is written to stderr as `[done/total] XX.XX% | elapsed 2m47s | eta 1m23s | NN.NN tok/s`.
 - Identical source segments, target language, template type, and template-specific options reuse cached segment translations.
+- `translate-doc` persists each completed segment immediately, so watch-mode retries and interrupted runs can resume from the segment cache.
 - After a completed interactive translation, if actual runtime diverges from the estimate by `[timing].divergence_threshold` (default `2.0`), `hymt` can prompt to file a GitHub timing-data issue.
 - Config lives at `~/.config/hymt/config.toml`.
+- `translate-doc --watch` also reads `[translation].max_retranslation_retries` from that config.
 - The tokenizer is cached at `~/.cache/hymt/tokenizer/tokenizer.json`.
 - `hymt estimate` and translation commands auto-download the tokenizer on first use when the `tokenizers` dependency is available.
 - On Android/Termux installs, `hymt` uses approximate token counting for segmentation because Rust tokenizer wheels are unavailable.
