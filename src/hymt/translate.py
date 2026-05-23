@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import fcntl
+from contextlib import contextmanager
+from collections.abc import Generator
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,6 +15,24 @@ from hymt.config import HotConfig
 from hymt.history import HistoryDB, TaskRecord, format_duration
 from hymt.segment import Segmenter, ensure_tokenizer
 from hymt.templates import TemplateType, build_prompt
+
+LOCK_PATH = Path.home() / ".cache" / "hymt" / "translate.lock"
+
+
+@contextmanager
+def _translation_lock() -> Generator[None]:
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fd = open(LOCK_PATH, "w")  # noqa: SIM115
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print("Waiting for translation lock...", file=sys.stderr)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        fd.close()
 
 
 @dataclass(frozen=True)
@@ -64,46 +85,46 @@ async def translate_text(
     if not text:
         return ""
 
-    started_at = datetime.now(timezone.utc)
-    started_monotonic = time.monotonic()
     plan = plan_translation(text, target_lang, config, template_type, **template_kwargs)
     print(f"Source tokens: {plan.source_tokens}; segments: {plan.segment_count}", file=sys.stderr)
     history = HistoryDB()
+    cv = config.config_version
     initial_estimate = history.estimate(
         plan.segment_count,
         config.concurrency,
         target_lang,
         template_type.value,
+        config_version=cv,
     )
     if initial_estimate is not None:
-        print(
-            "Estimated time: "
-            f"~{format_duration(initial_estimate.seconds)} "
-            f"based on {initial_estimate.stats.count} historical tasks",
-            file=sys.stderr,
-        )
+        _print_estimate(initial_estimate)
     prompts = [
         build_prompt(segment, target_lang, template_type, **template_kwargs)
         for segment in plan.segments
     ]
 
-    def report_progress(done: int, total: int) -> None:
-        if total > 1:
-            elapsed = time.monotonic() - started_monotonic
-            percent = int(done / total * 100)
-            eta_seconds = elapsed / done * (total - done) if done else 0.0
-            processed_tokens = plan.source_tokens * done / total
-            tokens_per_second = processed_tokens / elapsed if elapsed > 0 else 0.0
-            print(
-                f"[{done}/{total}] {percent}% | "
-                f"elapsed {format_duration(elapsed)} | "
-                f"eta {format_duration(eta_seconds)} | "
-                f"{tokens_per_second:.1f} tok/s",
-                file=sys.stderr,
-            )
+    with _translation_lock():
+        started_at = datetime.now(timezone.utc)
+        started_monotonic = time.monotonic()
 
-    async with TranslationClient(config) as client:
-        translations = await client.translate_batch(prompts, on_progress=report_progress)
+        def report_progress(done: int, total: int) -> None:
+            if total > 1:
+                elapsed = time.monotonic() - started_monotonic
+                percent = int(done / total * 100)
+                eta_seconds = elapsed / done * (total - done) if done else 0.0
+                processed_tokens = plan.source_tokens * done / total
+                tokens_per_second = processed_tokens / elapsed if elapsed > 0 else 0.0
+                print(
+                    f"[{done}/{total}] {percent}% | "
+                    f"elapsed {format_duration(elapsed)} | "
+                    f"eta {format_duration(eta_seconds)} | "
+                    f"{tokens_per_second:.1f} tok/s",
+                    file=sys.stderr,
+                )
+
+        async with TranslationClient(config) as client:
+            translations = await client.translate_batch(prompts, on_progress=report_progress)
+
     translated = "".join(translations)
     finished_at = datetime.now(timezone.utc)
     duration_seconds = time.monotonic() - started_monotonic
@@ -127,6 +148,7 @@ async def translate_text(
             input_chars=len(text),
             output_chars=len(translated),
             output_text=translated,
+            config_version=cv,
         ),
     )
     return translated
@@ -147,6 +169,27 @@ async def translate_file(
         return
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(translated, encoding="utf-8")
+
+
+def _print_estimate(est: "DurationEstimate") -> None:
+    stats = est.stats
+    if len(est.versions_used) <= 1:
+        print(
+            f"Estimated time: ~{format_duration(est.seconds)} "
+            f"based on {stats.count} historical tasks",
+            file=sys.stderr,
+        )
+        return
+    slow_tps = max(0.1, stats.p5_tokens_per_second)
+    slow_seconds = est.estimated_output_tokens / slow_tps / max(1, est.concurrency)
+    lo = format_duration(est.seconds)
+    hi = format_duration(slow_seconds)
+    vers = ",".join(str(v) for v in est.versions_used)
+    print(
+        f"Estimated time: ~{lo}–{hi} "
+        f"based on {stats.count} tasks (versions {vers})",
+        file=sys.stderr,
+    )
 
 
 def _record_successful_translation(history: HistoryDB, record: TaskRecord) -> None:

@@ -15,6 +15,8 @@ model = ""
 context_window = 4096
 max_output_tokens = 4096
 concurrency = 1
+config_version = 1
+timeout = 600
 
 [inference]
 temperature = 0.7
@@ -73,6 +75,14 @@ class HotConfig:
     @property
     def concurrency(self) -> int:
         return self._get_positive_int("translation", "concurrency", 1)
+
+    @property
+    def config_version(self) -> int:
+        return self._get_positive_int("translation", "config_version", 1)
+
+    @property
+    def timeout(self) -> float:
+        return self._get_float("translation", "timeout", 600.0)
 
     @property
     def temperature(self) -> float:

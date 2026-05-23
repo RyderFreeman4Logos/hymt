@@ -58,6 +58,7 @@ class TaskRecord:
     input_chars: int
     output_chars: int
     output_text: str | None = None
+    config_version: int = 1
     id: int | None = None
 
 
@@ -91,6 +92,7 @@ class DurationEstimate:
     seconds: float
     concurrency: int
     estimated_output_tokens: float
+    versions_used: tuple[int, ...] = ()
 
 
 def history_path() -> Path:
@@ -150,9 +152,10 @@ class HistoryDB:
                     tokens_per_second,
                     input_chars,
                     output_chars,
-                    output_text
+                    output_text,
+                    config_version
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.started_at,
@@ -170,6 +173,7 @@ class HistoryDB:
                     record.input_chars,
                     record.output_chars,
                     record.output_text,
+                    record.config_version,
                 ),
             )
             connection.commit()
@@ -270,13 +274,14 @@ class HistoryDB:
         self,
         target_lang: str | None = None,
         template_type: str | None = None,
+        config_version: int | None = None,
     ) -> PerformanceStats | None:
         connection = self._connect_if_exists()
         if connection is None:
             return None
         try:
             self._ensure_schema(connection)
-            where, parameters = _stats_filters(target_lang, template_type)
+            where, parameters = _stats_filters(target_lang, template_type, config_version)
             rows = connection.execute(
                 f"""
                 SELECT
@@ -284,7 +289,8 @@ class HistoryDB:
                     input_tokens,
                     output_tokens,
                     segments,
-                    tokens_per_second
+                    tokens_per_second,
+                    config_version
                 FROM tasks
                 {where}
                 ORDER BY tokens_per_second
@@ -301,20 +307,43 @@ class HistoryDB:
         concurrency: int,
         target_lang: str | None = None,
         template_type: str | None = None,
+        config_version: int | None = None,
+        min_samples: int = 3,
     ) -> DurationEstimate | None:
-        stats = self.stats(target_lang, template_type)
-        if stats is None and (target_lang is not None or template_type is not None):
-            stats = self.stats()
-        if stats is None:
-            return None
-        effective_segments = max(1, segments)
-        estimated_output_tokens = stats.avg_output_tokens_per_segment * effective_segments
-        return DurationEstimate(
-            stats=stats,
-            seconds=estimate_duration_seconds(stats, segments, concurrency),
-            concurrency=concurrency,
-            estimated_output_tokens=estimated_output_tokens,
-        )
+        stats = self.stats(target_lang, template_type, config_version)
+        versions_used: tuple[int, ...] = ()
+        if config_version is not None:
+            versions_used = (config_version,)
+        if stats is not None and stats.count >= min_samples:
+            return _build_estimate(stats, segments, concurrency, versions_used)
+        if config_version is not None:
+            broader = self.stats(target_lang, template_type)
+            if broader is not None:
+                all_versions = self._distinct_versions()
+                versions_used = tuple(all_versions)
+                return _build_estimate(broader, segments, concurrency, versions_used)
+        if target_lang is not None or template_type is not None:
+            fallback = self.stats(config_version=config_version)
+            if fallback is not None and fallback.count >= min_samples:
+                return _build_estimate(fallback, segments, concurrency, versions_used)
+            global_fallback = self.stats()
+            if global_fallback is not None:
+                all_versions = self._distinct_versions()
+                return _build_estimate(global_fallback, segments, concurrency, tuple(all_versions))
+        return None
+
+    def _distinct_versions(self) -> list[int]:
+        connection = self._connect_if_exists()
+        if connection is None:
+            return []
+        try:
+            self._ensure_schema(connection)
+            rows = connection.execute(
+                "SELECT DISTINCT config_version FROM tasks WHERE config_version IS NOT NULL ORDER BY config_version"
+            ).fetchall()
+            return [int(row["config_version"]) for row in rows]
+        finally:
+            connection.close()
 
     def clear(self) -> int:
         connection = self._connect_if_exists()
@@ -353,6 +382,8 @@ class HistoryDB:
         }
         if "output_text" not in columns:
             connection.execute("ALTER TABLE tasks ADD COLUMN output_text TEXT")
+        if "config_version" not in columns:
+            connection.execute("ALTER TABLE tasks ADD COLUMN config_version INTEGER DEFAULT 1")
         connection.commit()
         self._schema_verified_paths.add(cache_key)
 
@@ -360,7 +391,25 @@ class HistoryDB:
         return self._path.resolve(strict=False)
 
 
+def _build_estimate(
+    stats: PerformanceStats,
+    segments: int,
+    concurrency: int,
+    versions_used: tuple[int, ...],
+) -> DurationEstimate:
+    effective_segments = max(1, segments)
+    estimated_output_tokens = stats.avg_output_tokens_per_segment * effective_segments
+    return DurationEstimate(
+        stats=stats,
+        seconds=estimate_duration_seconds(stats, segments, concurrency),
+        concurrency=concurrency,
+        estimated_output_tokens=estimated_output_tokens,
+        versions_used=versions_used,
+    )
+
+
 def _record_from_row(row: sqlite3.Row) -> TaskRecord:
+    cv = row["config_version"] if "config_version" in row.keys() else 1
     return TaskRecord(
         id=int(row["id"]),
         started_at=str(row["started_at"]),
@@ -378,6 +427,7 @@ def _record_from_row(row: sqlite3.Row) -> TaskRecord:
         input_chars=int(row["input_chars"]),
         output_chars=int(row["output_chars"]),
         output_text=row["output_text"] if row["output_text"] is None else str(row["output_text"]),
+        config_version=int(cv) if cv is not None else 1,
     )
 
 
@@ -389,15 +439,19 @@ def _preview_text(text: str, limit: int = 80) -> str:
 def _stats_filters(
     target_lang: str | None,
     template_type: str | None,
-) -> tuple[str, tuple[str, ...]]:
+    config_version: int | None = None,
+) -> tuple[str, tuple[str | int, ...]]:
     filters: list[str] = ["tokens_per_second > 0", "segments > 0"]
-    parameters: list[str] = []
+    parameters: list[str | int] = []
     if target_lang is not None:
         filters.append("target_lang = ?")
         parameters.append(target_lang)
     if template_type is not None:
         filters.append("template_type = ?")
         parameters.append(template_type)
+    if config_version is not None:
+        filters.append("config_version = ?")
+        parameters.append(config_version)
     return f"WHERE {' AND '.join(filters)}", tuple(parameters)
 
 

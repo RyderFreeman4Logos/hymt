@@ -19,7 +19,7 @@ class TranslationError(RuntimeError):
 class TranslationClient:
     def __init__(self, config: HotConfig, http_client: httpx.AsyncClient | None = None) -> None:
         self._config = config
-        self._client = http_client or httpx.AsyncClient(timeout=httpx.Timeout(120.0))
+        self._client = http_client or httpx.AsyncClient(timeout=httpx.Timeout(config.timeout))
         self._owns_client = http_client is None
         self._concurrency = config.concurrency
         self._semaphore = asyncio.Semaphore(self._concurrency)
