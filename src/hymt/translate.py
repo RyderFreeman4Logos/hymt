@@ -14,7 +14,7 @@ import time
 from hymt.client import TranslationClient
 from hymt.config import HotConfig
 from hymt.history import HistoryDB, TaskRecord, format_duration
-from hymt.segment import Segmenter, ensure_tokenizer
+from hymt.segment import Segmenter, create_segmenter
 from hymt.templates import TemplateType, build_prompt
 
 LOCK_PATH = Path.home() / ".cache" / "hymt" / "translate.lock"
@@ -58,8 +58,7 @@ def plan_translation(
     template_type: TemplateType = TemplateType.DEFAULT,
     **template_kwargs: object,
 ) -> TranslationPlan:
-    tokenizer_path = ensure_tokenizer()
-    segmenter = Segmenter(tokenizer_path)
+    segmenter = create_segmenter()
     overhead_prompt = build_prompt("", target_lang, template_type, **template_kwargs)
     prompt_overhead_tokens = segmenter.count_tokens(overhead_prompt)
     available_source_tokens = config.context_window - prompt_overhead_tokens - config.max_output_tokens

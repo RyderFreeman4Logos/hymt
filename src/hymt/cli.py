@@ -17,7 +17,7 @@ from hymt.history import (
     estimate_duration_seconds,
     format_duration,
 )
-from hymt.segment import TOKENIZER_PATH, ensure_tokenizer
+from hymt.segment import TOKENIZER_PATH, ensure_tokenizer, has_tokenizer_support
 from hymt.templates import TemplateType
 from hymt.translate import plan_translation, translate_file, translate_text
 
@@ -213,6 +213,11 @@ def tokenizer() -> None:
 @tokenizer.command("download")
 @click.option("--force", is_flag=True, help="Force a fresh tokenizer download.")
 def tokenizer_download(force: bool) -> None:
+    if not has_tokenizer_support():
+        raise click.ClickException(
+            "The tokenizer dependency is not installed on this platform; "
+            "hymt will use approximate token counting."
+        )
     click.echo("Downloading tokenizer...", err=True)
     try:
         path = ensure_tokenizer(force_download=force)
@@ -349,7 +354,7 @@ def _template_kwargs(
 
 
 def _announce_tokenizer_download() -> None:
-    if not TOKENIZER_PATH.exists():
+    if has_tokenizer_support() and not TOKENIZER_PATH.exists():
         click.echo("Downloading tokenizer...", err=True)
 
 

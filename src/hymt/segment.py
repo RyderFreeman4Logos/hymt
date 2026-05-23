@@ -3,9 +3,12 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 import re
+from typing import Protocol
 
-from huggingface_hub import hf_hub_download
-from tokenizers import Tokenizer
+try:
+    from tokenizers import Tokenizer as _TokenizerImpl
+except ImportError:
+    _TokenizerImpl = None
 
 
 TOKENIZER_REPO = "tencent/Hy-MT2-7B"
@@ -39,11 +42,23 @@ _COMMON_ABBREVIATIONS = frozenset(
 )
 
 
+class _EncodedTokens(Protocol):
+    ids: list[int]
+
+
+class _TokenizerLike(Protocol):
+    def encode(self, text: str) -> _EncodedTokens: ...
+
+
 class Segmenter:
-    def __init__(self, tokenizer_path: str) -> None:
-        self._tokenizer = Tokenizer.from_file(str(tokenizer_path))
+    def __init__(self, tokenizer_path: str | None = None) -> None:
+        self._tokenizer: _TokenizerLike | None = None
+        if tokenizer_path is not None and _TokenizerImpl is not None:
+            self._tokenizer = _TokenizerImpl.from_file(str(tokenizer_path))
 
     def count_tokens(self, text: str) -> int:
+        if self._tokenizer is None:
+            return _estimate_token_count(text)
         return len(self._tokenizer.encode(text).ids)
 
     def segment(self, text: str, max_tokens: int) -> list[str]:
@@ -118,7 +133,20 @@ class Segmenter:
         return segments
 
 
+def create_segmenter(force_download: bool = False) -> Segmenter:
+    if not has_tokenizer_support():
+        return Segmenter()
+    return Segmenter(ensure_tokenizer(force_download=force_download))
+
+
 def ensure_tokenizer(force_download: bool = False) -> str:
+    if not has_tokenizer_support():
+        raise RuntimeError("tokenizers is not installed; using approximate token counting")
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError as exc:
+        raise RuntimeError("huggingface-hub is required to download the tokenizer") from exc
+
     if TOKENIZER_PATH.exists() and not force_download:
         return str(TOKENIZER_PATH)
     TOKENIZER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -129,6 +157,16 @@ def ensure_tokenizer(force_download: bool = False) -> str:
         force_download=force_download,
     )
     return str(Path(path))
+
+
+def has_tokenizer_support() -> bool:
+    return _TokenizerImpl is not None
+
+
+def _estimate_token_count(text: str) -> int:
+    if not text:
+        return 0
+    return max(1, (len(text.encode("utf-8")) + 3) // 4)
 
 
 def _split_paragraphs(text: str) -> list[str]:
