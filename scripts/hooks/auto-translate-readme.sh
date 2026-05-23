@@ -19,7 +19,6 @@ if [ -z "$(git status --porcelain -- README.zh-cn.md)" ]; then
   exit 0
 fi
 
-git add README.zh-cn.md
 mkdir -p "${repo_root}/.git/just-tmp"
 env JUST_TEMPDIR="${repo_root}/.git/just-tmp" \
-  git commit -m "docs(readme): auto-translate README.zh-cn.md"
+  git commit --only -- README.zh-cn.md -m "docs(readme): auto-translate README.zh-cn.md"
