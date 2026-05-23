@@ -15,6 +15,7 @@ model = ""
 context_window = 16384
 max_output_tokens = 4096
 concurrency = 1
+stream = true
 config_version = 1
 timeout = 600
 
@@ -78,6 +79,10 @@ class HotConfig:
     @property
     def concurrency(self) -> int:
         return self._get_positive_int("translation", "concurrency", 1)
+
+    @property
+    def stream(self) -> bool:
+        return self._get_bool("translation", "stream", True)
 
     @property
     def config_version(self) -> int:
@@ -159,6 +164,11 @@ class HotConfig:
         if isinstance(value, int) and not isinstance(value, bool) and value > 0:
             return value
         return default
+
+    def _get_bool(self, section_name: str, key: str, default: bool) -> bool:
+        with self._lock:
+            value = self._get_section(section_name).get(key, default)
+        return value if isinstance(value, bool) else default
 
     def _get_float(self, section_name: str, key: str, default: float) -> float:
         with self._lock:

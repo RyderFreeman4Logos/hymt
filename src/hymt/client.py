@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 import asyncio
 import json
 
@@ -47,6 +47,14 @@ class TranslationClient:
         response_data = await self._post_with_retry(url, payload, headers)
         return _extract_translation(response_data)
 
+    async def translate_stream(self, prompt: str) -> AsyncIterator[str]:
+        self._config.maybe_reload()
+        payload = self._build_payload(prompt, stream=True)
+        headers = self._build_headers()
+        url = self._chat_url()
+        async for token in self._stream_with_retry(url, payload, headers):
+            yield token
+
     async def translate_batch(
         self,
         prompts: list[str],
@@ -81,7 +89,7 @@ class TranslationClient:
                 self._semaphore = asyncio.Semaphore(concurrency)
             return self._semaphore
 
-    def _build_payload(self, prompt: str) -> dict[str, object]:
+    def _build_payload(self, prompt: str, *, stream: bool = False) -> dict[str, object]:
         payload: dict[str, object] = {
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": self._config.max_output_tokens,
@@ -92,6 +100,8 @@ class TranslationClient:
         }
         if self._config.model:
             payload["model"] = self._config.model
+        if stream:
+            payload["stream"] = True
         return payload
 
     def _build_headers(self) -> dict[str, str]:
@@ -131,6 +141,59 @@ class TranslationClient:
             await asyncio.sleep(min(0.5 * (2**attempt), 8.0))
         raise TranslationError("Translation request failed") from last_error
 
+    async def _stream_with_retry(
+        self,
+        url: str,
+        payload: dict[str, object],
+        headers: dict[str, str],
+        max_retries: int = 5,
+    ) -> AsyncIterator[str]:
+        last_error: Exception | None = None
+        for attempt in range(max_retries + 1):
+            yielded = False
+            try:
+                async with self._client.stream(
+                    "POST", url, json=payload, headers=headers
+                ) as response:
+                    if response.status_code >= 400:
+                        body = await response.aread()
+                        error = TranslationError(
+                            _format_response_error_text(
+                                response.status_code,
+                                body.decode("utf-8", errors="replace"),
+                            )
+                        )
+                        if (
+                            not _is_retryable_status(response.status_code, body)
+                            or attempt == max_retries
+                        ):
+                            raise error
+                        last_error = error
+                    elif _is_event_stream(response):
+                        async for token in _iter_sse_tokens(response):
+                            yielded = True
+                            yield token
+                        return
+                    else:
+                        data = _decode_json_bytes(await response.aread())
+                        token = _extract_translation(data)
+                        if token:
+                            yielded = True
+                            yield token
+                        return
+            except (
+                httpx.TimeoutException,
+                httpx.TransportError,
+                json.JSONDecodeError,
+            ) as exc:
+                if yielded or attempt == max_retries:
+                    raise TranslationError(
+                        "Streaming translation request failed"
+                    ) from exc
+                last_error = exc
+            await asyncio.sleep(min(0.5 * (2**attempt), 8.0))
+        raise TranslationError("Streaming translation request failed") from last_error
+
 
 def _decode_json_response(response: httpx.Response) -> dict[str, object]:
     data = response.json()
@@ -139,17 +202,32 @@ def _decode_json_response(response: httpx.Response) -> dict[str, object]:
     return data
 
 
+def _decode_json_bytes(body: bytes) -> dict[str, object]:
+    data = json.loads(body.decode("utf-8"))
+    if not isinstance(data, dict):
+        raise TranslationError("Translation response must be a JSON object")
+    return data
+
+
 def _is_retryable_response(response: httpx.Response) -> bool:
-    if response.status_code in RETRYABLE_STATUS_CODES:
+    return _is_retryable_status(response.status_code, response.content)
+
+
+def _is_retryable_status(status_code: int, body: bytes) -> bool:
+    if status_code in RETRYABLE_STATUS_CODES:
         return True
-    if response.status_code != 400:
+    if status_code != 400:
         return False
-    body = response.text.lower()
-    return "json" in body or "parse" in body
+    text = body.decode("utf-8", errors="replace").lower()
+    return "json" in text or "parse" in text
 
 
 def _format_response_error(response: httpx.Response) -> str:
-    return f"HTTP {response.status_code}: {response.text[:500]}"
+    return _format_response_error_text(response.status_code, response.text)
+
+
+def _format_response_error_text(status_code: int, text: str) -> str:
+    return f"HTTP {status_code}: {text[:500]}"
 
 
 def _extract_translation(data: dict[str, object]) -> str:
@@ -168,3 +246,52 @@ def _extract_translation(data: dict[str, object]) -> str:
     if isinstance(text, str):
         return text
     raise TranslationError("Translation response missing message content")
+
+
+def _is_event_stream(response: httpx.Response) -> bool:
+    content_type = response.headers.get("content-type", "").lower()
+    return "text/event-stream" in content_type
+
+
+async def _iter_sse_tokens(response: httpx.Response) -> AsyncIterator[str]:
+    data_lines: list[str] = []
+    async for raw_line in response.aiter_lines():
+        line = raw_line.strip()
+        if not line:
+            async for token in _tokens_from_sse_data(data_lines):
+                yield token
+            data_lines = []
+            continue
+        if line.startswith(":"):
+            continue
+        if line.startswith("data:"):
+            data_lines.append(line[5:].lstrip())
+    async for token in _tokens_from_sse_data(data_lines):
+        yield token
+
+
+async def _tokens_from_sse_data(data_lines: list[str]) -> AsyncIterator[str]:
+    if not data_lines:
+        return
+    data = "\n".join(data_lines)
+    if data == "[DONE]":
+        return
+    token = _extract_stream_token(_decode_json_bytes(data.encode("utf-8")))
+    if token:
+        yield token
+
+
+def _extract_stream_token(data: dict[str, object]) -> str:
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+    first = choices[0]
+    if not isinstance(first, dict):
+        return ""
+    delta = first.get("delta")
+    if isinstance(delta, dict):
+        content = delta.get("content")
+        if isinstance(content, str):
+            return content
+    text = first.get("text")
+    return text if isinstance(text, str) else ""

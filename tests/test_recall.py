@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import os
 import sqlite3
 import tempfile
@@ -82,29 +81,148 @@ class HistoryMigrationTests(unittest.TestCase):
 
             self.assertEqual(db.fetch_recent_output(), "migrated output")
 
-    def test_find_cached_returns_most_recent_matching_output(self) -> None:
+    def test_segment_cache_returns_matching_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "history.db"
             db = HistoryDB(path)
-            input_hash = hashlib.sha256("source text".encode()).hexdigest()
+            content_hash = "segment-hash"
 
-            db.insert_task(task_record("older output", input_hash=input_hash))
-            db.insert_task(
-                task_record("wrong language", input_hash=input_hash, target_lang="ja")
+            db.store_segment_cache(
+                content_hash,
+                "en",
+                "default",
+                "cached output",
+                "2026-05-23T00:00:00+00:00",
             )
-            db.insert_task(
-                task_record(
-                    "wrong template", input_hash=input_hash, template_type="style"
-                )
+            db.store_segment_cache(
+                content_hash,
+                "ja",
+                "default",
+                "wrong language",
+                "2026-05-23T00:00:00+00:00",
             )
-            db.insert_task(task_record("newer output", input_hash=input_hash))
+            db.store_segment_cache(
+                content_hash,
+                "en",
+                "style",
+                "wrong template",
+                "2026-05-23T00:00:00+00:00",
+            )
 
             self.assertEqual(
-                db.find_cached(input_hash, target_lang="en", template_type="default"),
-                "newer output",
+                db.find_segment_cached(
+                    content_hash, target_lang="en", template_type="default"
+                ),
+                "cached output",
             )
             self.assertIsNone(
-                db.find_cached("missing", target_lang="en", template_type="default")
+                db.find_segment_cached(
+                    "missing", target_lang="en", template_type="default"
+                )
+            )
+
+    def test_segment_cache_distinguishes_template_options(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "history.db"
+            db = HistoryDB(path)
+            content_hash = "segment-hash"
+
+            db.store_segment_cache(
+                content_hash,
+                "en",
+                "style",
+                "formal output",
+                "2026-05-23T00:00:00+00:00",
+                options_hash="formal-hash",
+            )
+            db.store_segment_cache(
+                content_hash,
+                "en",
+                "style",
+                "casual output",
+                "2026-05-23T00:00:00+00:00",
+                options_hash="casual-hash",
+            )
+
+            self.assertEqual(
+                db.find_segment_cached(
+                    content_hash,
+                    target_lang="en",
+                    template_type="style",
+                    options_hash="formal-hash",
+                ),
+                "formal output",
+            )
+            self.assertEqual(
+                db.find_segment_cached(
+                    content_hash,
+                    target_lang="en",
+                    template_type="style",
+                    options_hash="casual-hash",
+                ),
+                "casual output",
+            )
+            self.assertIsNone(
+                db.find_segment_cached(
+                    content_hash,
+                    target_lang="en",
+                    template_type="style",
+                )
+            )
+
+    def test_segment_cache_migrates_template_options_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "history.db"
+            connection = sqlite3.connect(path)
+            try:
+                connection.execute(OLD_SEGMENT_CACHE_SCHEMA)
+                connection.execute(
+                    """
+                    INSERT INTO segment_cache (
+                        content_hash,
+                        target_lang,
+                        template_type,
+                        translated_text,
+                        created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "segment-hash",
+                        "en",
+                        "style",
+                        "legacy output",
+                        "2026-05-23T00:00:00+00:00",
+                    ),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            db = HistoryDB(path)
+            db.store_segment_cache(
+                "segment-hash",
+                "en",
+                "style",
+                "formal output",
+                "2026-05-23T00:00:01+00:00",
+                options_hash="formal-hash",
+            )
+
+            self.assertEqual(
+                db.find_segment_cached(
+                    "segment-hash", target_lang="en", template_type="style"
+                ),
+                "legacy output",
+            )
+            self.assertEqual(
+                db.find_segment_cached(
+                    "segment-hash",
+                    target_lang="en",
+                    template_type="style",
+                    options_hash="formal-hash",
+                ),
+                "formal output",
             )
 
 
@@ -169,6 +287,18 @@ CREATE TABLE tasks (
     tokens_per_second REAL NOT NULL,
     input_chars INTEGER NOT NULL,
     output_chars INTEGER NOT NULL
+);
+"""
+
+
+OLD_SEGMENT_CACHE_SCHEMA = """
+CREATE TABLE segment_cache (
+    content_hash TEXT NOT NULL,
+    target_lang TEXT NOT NULL,
+    template_type TEXT NOT NULL,
+    translated_text TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (content_hash, target_lang, template_type)
 );
 """
 

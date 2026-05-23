@@ -12,6 +12,11 @@ dependencies = [
     "huggingface-hub>=0.28,<1.14; sys_platform != 'android'",
 ]
 
+[project.optional-dependencies]
+detect = [
+    "langdetect>=1.0.9",
+]
+
 [project.scripts]
 hymt = "hymt.cli:main"
 
