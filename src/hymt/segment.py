@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 import re
 
@@ -12,22 +13,29 @@ TOKENIZER_FILENAME = "tokenizer.json"
 TOKENIZER_CACHE_DIR = Path.home() / ".cache" / "hymt" / "tokenizer"
 TOKENIZER_PATH = TOKENIZER_CACHE_DIR / TOKENIZER_FILENAME
 
-_CJK_SENTENCE_RE = re.compile(
-    r"(?<=[。！？…])"
-    r"[\"'」』）)\]]*"
-    r"(?=\s|\Z|[^\"'」』）)\]])"
-)
-
-_EN_SENTENCE_RE = re.compile(
-    r"(?<=[.!?])"
-    r"[\"')]*"
-    r"(?=\s+[A-Z一-鿿぀-ヿ]|\s*\Z)"
-)
-
-_CLAUSE_RE = re.compile(
-    r"(?<=[，,、；;：:])"
-    r"[\"'」』）)]*"
-    r"(?=\s|\Z|[^\"'」』）)])"
+_PARAGRAPH_SPLIT_RE = re.compile(r"(\n\s*\n)")
+_WORD_SPLIT_RE = re.compile(r"(\s+)")
+_CJK_SENTENCE_ENDERS = frozenset("。！？")
+_EN_SENTENCE_ENDERS = frozenset(".!?")
+_CLAUSE_ENDERS = frozenset("，,、；;：:")
+_TRAILING_CLOSERS = frozenset("\"'”’」』）)]】》〉")
+_COMMON_ABBREVIATIONS = frozenset(
+    {
+        "dr",
+        "mr",
+        "mrs",
+        "ms",
+        "prof",
+        "sr",
+        "jr",
+        "st",
+        "vs",
+        "etc",
+        "e.g",
+        "i.e",
+        "fig",
+        "no",
+    }
 )
 
 
@@ -64,7 +72,7 @@ class Segmenter:
         return self._pack_units(units, max_tokens)
 
     def _split_word_or_character(self, text: str, max_tokens: int) -> list[str]:
-        word_units = [part for part in re.split(r"(\s+)", text) if part]
+        word_units = [part for part in _WORD_SPLIT_RE.split(text) if part]
         if len(word_units) > 1:
             chunks: list[str] = []
             for unit in word_units:
@@ -124,7 +132,7 @@ def ensure_tokenizer(force_download: bool = False) -> str:
 
 
 def _split_paragraphs(text: str) -> list[str]:
-    parts = re.split(r"(\n\s*\n)", text)
+    parts = _PARAGRAPH_SPLIT_RE.split(text)
     paragraphs: list[str] = []
     for index in range(0, len(parts), 2):
         paragraph = parts[index]
@@ -136,16 +144,132 @@ def _split_paragraphs(text: str) -> list[str]:
 
 
 def _split_sentences(text: str) -> list[str]:
-    parts = _CJK_SENTENCE_RE.split(text)
-    result: list[str] = []
-    for part in parts:
-        if not part:
-            continue
-        en_parts = _EN_SENTENCE_RE.split(part)
-        result.extend(p for p in en_parts if p)
-    return result
+    return _split_on_boundaries(text, _sentence_boundary_end)
 
 
 def _split_clauses(text: str) -> list[str]:
-    parts = _CLAUSE_RE.split(text)
-    return [p for p in parts if p]
+    return _split_on_boundaries(text, _clause_boundary_end)
+
+
+def _split_on_boundaries(
+    text: str,
+    boundary_end_at: Callable[[str, int], int | None],
+) -> list[str]:
+    parts: list[str] = []
+    start = 0
+    index = 0
+    while index < len(text):
+        boundary_end = boundary_end_at(text, index)
+        if boundary_end is None:
+            index += 1
+            continue
+        split_at = _consume_trailing_closers(text, boundary_end)
+        parts.append(text[start:split_at])
+        start = split_at
+        index = split_at
+    if start < len(text):
+        parts.append(text[start:])
+    return [part for part in parts if part]
+
+
+def _sentence_boundary_end(text: str, index: int) -> int | None:
+    char = text[index]
+    if char == "…":
+        return _consume_consecutive(text, index, "…")
+    if char in _CJK_SENTENCE_ENDERS:
+        return _consume_sentence_enders(text, index)
+    if char not in _EN_SENTENCE_ENDERS:
+        return None
+    if char == "." and _is_decimal_point(text, index):
+        return None
+
+    boundary_end = _consume_sentence_enders(text, index)
+    lookahead = _consume_trailing_closers(text, boundary_end)
+    if lookahead < len(text) and text[boundary_end - 1] == "." and _looks_like_abbreviation(
+        text, boundary_end - 1
+    ):
+        return None
+    if _starts_sentence_after_boundary(text, lookahead):
+        return boundary_end
+    return None
+
+
+def _clause_boundary_end(text: str, index: int) -> int | None:
+    if text[index] in _CLAUSE_ENDERS:
+        return index + 1
+    return None
+
+
+def _consume_sentence_enders(text: str, index: int) -> int:
+    end = index
+    while end < len(text):
+        char = text[end]
+        if char == "…":
+            end = _consume_consecutive(text, end, "…")
+            continue
+        if char in _CJK_SENTENCE_ENDERS or char in _EN_SENTENCE_ENDERS:
+            end += 1
+            continue
+        break
+    return end
+
+
+def _consume_consecutive(text: str, index: int, char: str) -> int:
+    end = index
+    while end < len(text) and text[end] == char:
+        end += 1
+    return end
+
+
+def _consume_trailing_closers(text: str, index: int) -> int:
+    end = index
+    while end < len(text) and text[end] in _TRAILING_CLOSERS:
+        end += 1
+    return end
+
+
+def _starts_sentence_after_boundary(text: str, index: int) -> bool:
+    if index >= len(text):
+        return True
+
+    lookahead = index
+    while lookahead < len(text) and text[lookahead].isspace():
+        lookahead += 1
+    if lookahead == index:
+        return False
+    if lookahead >= len(text):
+        return True
+
+    next_char = text[lookahead]
+    return next_char.isupper() or _is_cjk_character(next_char)
+
+
+def _is_decimal_point(text: str, index: int) -> bool:
+    return 0 < index < len(text) - 1 and text[index - 1].isdigit() and text[index + 1].isdigit()
+
+
+def _looks_like_abbreviation(text: str, index: int) -> bool:
+    start = index
+    while start > 0 and (text[start - 1].isalpha() or text[start - 1] == "."):
+        start -= 1
+
+    candidate = text[start:index]
+    if not candidate or not any(char.isalpha() for char in candidate):
+        return False
+
+    normalized = candidate.casefold()
+    if normalized in _COMMON_ABBREVIATIONS:
+        return True
+
+    parts = [part for part in candidate.split(".") if part]
+    return len(parts) > 1 and all(len(part) == 1 and part.isalpha() for part in parts)
+
+
+def _is_cjk_character(char: str) -> bool:
+    codepoint = ord(char)
+    return (
+        0x3400 <= codepoint <= 0x4DBF
+        or 0x4E00 <= codepoint <= 0x9FFF
+        or 0x3040 <= codepoint <= 0x30FF
+        or 0xAC00 <= codepoint <= 0xD7AF
+    )
