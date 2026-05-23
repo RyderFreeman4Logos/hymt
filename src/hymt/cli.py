@@ -9,6 +9,7 @@ import sys
 
 import click
 
+from hymt.batch import build_batch_plan, run_batch_translation, show_batch_preview
 from hymt.config import HotConfig, config_path, show
 from hymt.history import (
     HistoryDB,
@@ -442,6 +443,105 @@ def estimate_command(
             f"~{format_duration(estimate.seconds)} "
             f"(concurrency={config.concurrency})"
         )
+
+
+@main.command("batch")
+@click.argument(
+    "directory",
+    required=False,
+    default=".",
+    type=click.Path(path_type=Path, file_okay=False, dir_okay=True),
+)
+@click.option("--target", "-t", "target_lang", default="zh", show_default=True)
+@click.option(
+    "--output-dir",
+    type=click.Path(path_type=Path, file_okay=False, dir_okay=True),
+    help="Directory for translated files; preserves source-relative paths.",
+)
+@click.option("--write", is_flag=True, help="Write translated files.")
+@click.option("--yes", is_flag=True, help="Skip batch confirmation.")
+@click.option(
+    "--type",
+    "template_type",
+    type=click.Choice(TEMPLATE_CHOICES),
+    default=TemplateType.DEFAULT.value,
+    show_default=True,
+    help="Template type.",
+)
+@click.option("--terms", multiple=True, help="Terminology pair, format: source=target.")
+@click.option("--style", help="Style description for style translations.")
+@click.option(
+    "--context",
+    "background_context",
+    help="Background context for context-aware translations.",
+)
+@click.option(
+    "--format", "format_type", help="Data format for structured translations."
+)
+@click.option(
+    "--instruction", "instructions", multiple=True, help="Personalization instruction."
+)
+@click.option(
+    "--stream/--no-stream",
+    "stream",
+    default=None,
+    help="Override [translation].stream for batch translation.",
+)
+def batch_command(
+    directory: Path,
+    target_lang: str,
+    output_dir: Path | None,
+    write: bool,
+    yes: bool,
+    template_type: str,
+    terms: tuple[str, ...],
+    style: str | None,
+    background_context: str | None,
+    format_type: str | None,
+    instructions: tuple[str, ...],
+    stream: bool | None,
+) -> None:
+    try:
+        kwargs = _template_kwargs(
+            terms, style, background_context, format_type, instructions
+        )
+        config = HotConfig()
+        selected_type = TemplateType(template_type)
+        _announce_tokenizer_download()
+        plan = build_batch_plan(
+            directory,
+            output_dir,
+            target_lang,
+            config,
+            selected_type,
+            kwargs,
+        )
+        show_batch_preview(plan, sys.stderr)
+        if not write:
+            click.echo(
+                "Dry run: no files written. Re-run with --write to translate.", err=True
+            )
+            return
+        if not plan.files:
+            click.echo("No files to translate.", err=True)
+            return
+        if not yes and not click.confirm(
+            f"Translate and write {len(plan.files)} files?", default=False, err=True
+        ):
+            click.echo("Batch translation cancelled.", err=True)
+            return
+        asyncio.run(
+            run_batch_translation(
+                plan,
+                target_lang,
+                config,
+                selected_type,
+                stream=stream,
+                template_kwargs=kwargs,
+            )
+        )
+    except (OSError, UnicodeError, ValueError, RuntimeError) as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 @main.command("history")

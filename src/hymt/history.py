@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from math import ceil, isfinite
 from pathlib import Path
@@ -224,6 +225,40 @@ class HistoryDB:
             if row is None:
                 return None
             return str(row["translated_text"])
+        finally:
+            connection.close()
+
+    def find_cached_segment_hashes(
+        self,
+        content_hashes: Iterable[str],
+        target_lang: str,
+        template_type: str,
+        options_hash: str = "",
+    ) -> set[str]:
+        unique_hashes = tuple(dict.fromkeys(content_hashes))
+        if not unique_hashes:
+            return set()
+        connection = self._connect_if_exists()
+        if connection is None:
+            return set()
+        try:
+            self._ensure_schema(connection)
+            cached: set[str] = set()
+            for chunk in _chunks(unique_hashes, 900):
+                placeholders = ",".join("?" for _ in chunk)
+                rows = connection.execute(
+                    f"""
+                    SELECT content_hash
+                    FROM segment_cache
+                    WHERE content_hash IN ({placeholders})
+                      AND target_lang = ?
+                      AND template_type = ?
+                      AND options_hash = ?
+                    """,
+                    (*chunk, target_lang, template_type, options_hash),
+                ).fetchall()
+                cached.update(str(row["content_hash"]) for row in rows)
+            return cached
         finally:
             connection.close()
 
@@ -635,3 +670,7 @@ def _percentile(sorted_values: list[float], percentile: float) -> float:
         len(sorted_values) - 1, max(0, ceil(percentile * len(sorted_values)) - 1)
     )
     return sorted_values[index]
+
+
+def _chunks(values: tuple[str, ...], size: int) -> list[tuple[str, ...]]:
+    return [values[index : index + size] for index in range(0, len(values), size)]

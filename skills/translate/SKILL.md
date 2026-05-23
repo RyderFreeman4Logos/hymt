@@ -17,6 +17,19 @@ Use `hymt` when an agent should drive the local Hy-MT2 CLI instead of hand-writi
 - If the source text matches a subcommand name, disambiguate with `--`: `hymt -t zh -- "config"`
 - Mixed-language documents use smart partial translation when language detection is available: target-language paragraphs are kept, non-target paragraphs are translated, and fenced code blocks are always preserved.
 
+## Batch translate directories
+
+- Preview a directory without writing files: `hymt batch ./docs -t zh`
+- Translate and write outputs: `hymt batch ./docs -t zh --write`
+- Skip confirmation for automation: `hymt batch ./docs -t zh --write --yes`
+- Write to a separate tree while preserving source-relative paths: `hymt batch ./docs -t zh --write --output-dir translated-docs`
+- Batch mode scans recursively, follows symlinks, and selects `.txt` and `.md` files.
+- Output names are `{stem}.{target}.{ext}`; for the default target this writes `README.zh.md` beside `README.md`.
+- Files already detected as target-language documents are skipped. Mixed-language files keep target-language paragraphs and translate the remaining paragraphs.
+- The preview lists every selected file with `full`, `partial`, or `none` segment-cache status, cached segment counts, per-file ETA, and total ETA.
+- `--write` writes outputs even for fully cached files, so deleted output files can be regenerated from cache.
+- Batch progress and per-file translation progress are written to stderr in the standard `[done/total] XX.XX% | elapsed ... | eta ... | NN.NN tok/s` format.
+
 ## Template types
 
 `--type` accepts:
@@ -40,6 +53,7 @@ Template-specific options:
 ## Utility commands
 
 - `hymt estimate -t <lang> [--file <path>] [template options...]`
+- `hymt batch [DIRECTORY] -t <lang> [--write] [--output-dir <dir>] [--yes] [template options...]`
 - `hymt history`
 - `hymt history --all`
 - `hymt history --stats`
