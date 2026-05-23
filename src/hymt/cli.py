@@ -10,9 +10,10 @@ import sys
 import click
 
 from hymt.config import HotConfig, config_path, show
+from hymt.history import HistoryDB, TaskRecord, estimate_duration_seconds, format_duration
 from hymt.segment import TOKENIZER_PATH, ensure_tokenizer
 from hymt.templates import TemplateType
-from hymt.translate import translate_file, translate_text
+from hymt.translate import plan_translation, translate_file, translate_text
 
 
 TEMPLATE_CHOICES = [template.value for template in TemplateType]
@@ -215,6 +216,97 @@ def tokenizer_download(force: bool) -> None:
     click.echo(path)
 
 
+@main.command("estimate")
+@click.option("--file", "-f", "input_file", type=click.Path(path_type=Path), help="Input file path.")
+@click.option("--target", "-t", "target_lang", required=True, help="Target language code.")
+@click.option(
+    "--type",
+    "template_type",
+    type=click.Choice(TEMPLATE_CHOICES),
+    default=TemplateType.DEFAULT.value,
+    show_default=True,
+    help="Template type.",
+)
+@click.option("--terms", multiple=True, help="Terminology pair, format: source=target.")
+@click.option("--style", help="Style description for style translations.")
+@click.option("--context", "background_context", help="Background context for context-aware translations.")
+@click.option("--format", "format_type", help="Data format for structured translations.")
+@click.option("--instruction", "instructions", multiple=True, help="Personalization instruction.")
+def estimate_command(
+    input_file: Path | None,
+    target_lang: str,
+    template_type: str,
+    terms: tuple[str, ...],
+    style: str | None,
+    background_context: str | None,
+    format_type: str | None,
+    instructions: tuple[str, ...],
+) -> None:
+    try:
+        text = input_file.read_text(encoding="utf-8") if input_file is not None else sys.stdin.read()
+        kwargs = _template_kwargs(terms, style, background_context, format_type, instructions)
+        config = HotConfig()
+        selected_type = TemplateType(template_type)
+        _announce_tokenizer_download()
+        plan = plan_translation(text, target_lang, config, selected_type, **kwargs)
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    click.echo(f"Input: {len(text):,} chars (~{plan.source_tokens:,} tokens)")
+    click.echo(f"Estimated segments: {plan.segment_count}")
+    estimate = HistoryDB().estimate(
+        plan.segment_count,
+        config.concurrency,
+        target_lang,
+        selected_type.value,
+    )
+    if estimate is None:
+        click.echo("No historical data yet - run some translations first.")
+        return
+
+    stats = estimate.stats
+    click.echo(
+        f"Based on {stats.count} historical tasks "
+        f"(avg {stats.avg_tokens_per_second:.1f} tok/s, "
+        f"p50 {stats.median_tokens_per_second:.1f}, "
+        f"p5 {stats.p5_tokens_per_second:.1f}, "
+        f"p95 {stats.p95_tokens_per_second:.1f}):"
+    )
+    click.echo(
+        "  Estimated time: "
+        f"~{format_duration(estimate_duration_seconds(stats, plan.segment_count, 1))} "
+        "(concurrency=1)"
+    )
+    if config.concurrency != 1:
+        click.echo(
+            "  Estimated time: "
+            f"~{format_duration(estimate.seconds)} "
+            f"(concurrency={config.concurrency})"
+        )
+
+
+@main.command("history")
+@click.option("--all", "show_all", is_flag=True, help="Show all history records.")
+@click.option("--stats", "show_stats", is_flag=True, help="Show aggregate statistics.")
+@click.option("--clear", is_flag=True, help="Clear all history records.")
+def history_command(show_all: bool, show_stats: bool, clear: bool) -> None:
+    db = HistoryDB()
+    if clear:
+        if not click.confirm("Clear all history records?", default=False, err=True):
+            click.echo("History not cleared.")
+            return
+        deleted = db.clear()
+        click.echo(f"Cleared {deleted} history records.")
+        return
+
+    if show_stats:
+        _show_history_stats(db)
+        return
+
+    records = db.fetch_recent(limit=None if show_all else 10)
+    _show_history_records(records)
+
+
 def _template_kwargs(
     terms: tuple[str, ...],
     style: str | None,
@@ -234,3 +326,47 @@ def _template_kwargs(
 def _announce_tokenizer_download() -> None:
     if not TOKENIZER_PATH.exists():
         click.echo("Downloading tokenizer...", err=True)
+
+
+def _show_history_stats(db: HistoryDB) -> None:
+    stats = db.stats()
+    if stats is None:
+        click.echo("No history yet.")
+        return
+    click.echo(f"Tasks: {stats.count}")
+    click.echo(
+        "Tokens/sec: "
+        f"avg {stats.avg_tokens_per_second:.1f}, "
+        f"p50 {stats.median_tokens_per_second:.1f}, "
+        f"p5 {stats.p5_tokens_per_second:.1f}, "
+        f"p95 {stats.p95_tokens_per_second:.1f}"
+    )
+    click.echo(f"Avg output tokens/segment: {stats.avg_output_tokens_per_segment:.1f}")
+    click.echo(f"Total duration: {format_duration(stats.total_duration_seconds)}")
+    click.echo(f"Total input tokens: {stats.total_input_tokens:,}")
+    click.echo(f"Total output tokens: {stats.total_output_tokens:,}")
+
+
+def _show_history_records(records: list[TaskRecord]) -> None:
+    if not records:
+        click.echo("No history yet.")
+        return
+    click.echo(
+        f"{'ID':>4} {'Finished':<19} {'Target':<8} {'Type':<12} "
+        f"{'Seg':>3} {'Conc':>4} {'Tok/s':>7} {'Time':>9}"
+    )
+    for record in records:
+        click.echo(
+            f"{record.id or 0:>4} "
+            f"{_compact_timestamp(record.finished_at):<19} "
+            f"{record.target_lang:<8.8} "
+            f"{record.template_type:<12.12} "
+            f"{record.segments:>3} "
+            f"{record.concurrency:>4} "
+            f"{record.tokens_per_second:>7.1f} "
+            f"{format_duration(record.duration_seconds):>9}"
+        )
+
+
+def _compact_timestamp(value: str) -> str:
+    return value.replace("T", " ")[:19]
