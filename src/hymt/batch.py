@@ -384,10 +384,10 @@ def _read_sources_parallel(
 
 
 def _read_source_file(path: Path) -> BatchSourceFile | None:
-    raw = path.read_bytes()
     try:
+        raw = path.read_bytes()
         text = raw.decode("utf-8")
-    except UnicodeDecodeError:
+    except (OSError, UnicodeDecodeError):
         return None
     return BatchSourceFile(
         path=path,
