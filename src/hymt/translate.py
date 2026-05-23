@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import fcntl
 from collections import deque
-from contextlib import contextmanager
+from contextlib import AsyncExitStack, contextmanager
 from collections.abc import Callable, Generator
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -18,6 +18,7 @@ from typing import TextIO, TypeAlias
 from hymt.client import TranslationClient
 from hymt.config import HotConfig
 from hymt.history import DurationEstimate, HistoryDB, TaskRecord, format_duration
+from hymt.language import DocumentLanguagePlan, build_document_translation_plan
 from hymt.segment import Segmenter, create_segmenter
 from hymt.templates import TemplateType, build_prompt
 from hymt.timing_issue import TimingIssueData, maybe_prompt_timing_issue
@@ -55,6 +56,8 @@ class TranslationPlan:
     segments: list[str]
     available_source_tokens: int
     _segmenter: Segmenter = field(repr=False, compare=False)
+    document_plan: DocumentLanguagePlan | None = None
+    segment_section_indexes: tuple[int, ...] = ()
 
     @property
     def segment_count(self) -> int:
@@ -63,12 +66,33 @@ class TranslationPlan:
     def count_tokens(self, text: str) -> int:
         return self._segmenter.count_tokens(text)
 
+    def reconstruct(self, translations: list[str]) -> str:
+        if self.document_plan is None:
+            return "".join(translations)
+        section_translations: dict[int, list[str]] = {}
+        for section_index, translation in zip(
+            self.segment_section_indexes, translations, strict=True
+        ):
+            section_translations.setdefault(section_index, []).append(translation)
+        parts: list[str] = []
+        for section_index, section in enumerate(self.document_plan.sections):
+            if section.should_translate:
+                section_output = "".join(section_translations.get(section_index, []))
+                if section.text.endswith("\n") and not section_output.endswith("\n"):
+                    section_output = f"{section_output}\n"
+                parts.append(section_output)
+            else:
+                parts.append(section.text)
+        return "".join(parts)
+
 
 def plan_translation(
     text: str,
     target_lang: str,
     config: HotConfig,
     template_type: TemplateType = TemplateType.DEFAULT,
+    *,
+    document_plan: DocumentLanguagePlan | None = None,
     **template_kwargs: object,
 ) -> TranslationPlan:
     segmenter = create_segmenter()
@@ -85,9 +109,26 @@ def plan_translation(
     if not text:
         return TranslationPlan(0, [], available_source_tokens, segmenter)
 
+    active_document_plan = document_plan or build_document_translation_plan(
+        text, target_lang
+    )
     source_tokens = segmenter.count_tokens(text)
-    segments = segmenter.segment(text, available_source_tokens)
-    return TranslationPlan(source_tokens, segments, available_source_tokens, segmenter)
+    segments: list[str] = []
+    segment_section_indexes: list[int] = []
+    for section_index, section in enumerate(active_document_plan.sections):
+        if not section.should_translate:
+            continue
+        section_segments = segmenter.segment(section.text, available_source_tokens)
+        segments.extend(section_segments)
+        segment_section_indexes.extend([section_index] * len(section_segments))
+    return TranslationPlan(
+        source_tokens,
+        segments,
+        available_source_tokens,
+        segmenter,
+        active_document_plan,
+        tuple(segment_section_indexes),
+    )
 
 
 async def translate_text(
@@ -98,6 +139,7 @@ async def translate_text(
     *,
     stream: bool | None = None,
     on_token: TokenCallback | None = None,
+    document_plan: DocumentLanguagePlan | None = None,
     **template_kwargs: object,
 ) -> str:
     if not text:
@@ -107,7 +149,14 @@ async def translate_text(
     input_hash = _translation_cache_hash(
         text, target_lang, template_type, template_kwargs
     )
-    plan = plan_translation(text, target_lang, config, template_type, **template_kwargs)
+    plan = plan_translation(
+        text,
+        target_lang,
+        config,
+        template_type,
+        document_plan=document_plan,
+        **template_kwargs,
+    )
     print(
         f"Source tokens: {plan.source_tokens}; segments: {plan.segment_count}",
         file=sys.stderr,
@@ -142,78 +191,63 @@ async def translate_text(
         completed_tokens = 0
         missing_indexes: list[int] = []
         try:
-            for index, (segment_hash, token_count) in enumerate(
-                zip(segment_hashes, segment_tokens, strict=True)
-            ):
-                cached = history.find_segment_cached(
-                    segment_hash, target_lang, template_name, options_hash
+            if stream_enabled and on_token is not None:
+                completed, completed_tokens = await _translate_streaming_plan(
+                    history,
+                    plan,
+                    segment_hashes,
+                    segment_tokens,
+                    translations,
+                    config,
+                    target_lang,
+                    template_type,
+                    template_kwargs,
+                    options_hash,
+                    template_name,
+                    progress,
+                    completed,
+                    completed_tokens,
+                    on_token,
                 )
-                if cached is None:
-                    missing_indexes.append(index)
-                    continue
-                translations[index] = cached
-                if stream_enabled and on_token is not None:
-                    on_token(cached)
-                completed += 1
-                completed_tokens += token_count
-                progress.update(completed, completed_tokens, 0.0)
+            else:
+                for index, (segment_hash, token_count) in enumerate(
+                    zip(segment_hashes, segment_tokens, strict=True)
+                ):
+                    cached = history.find_segment_cached(
+                        segment_hash, target_lang, template_name, options_hash
+                    )
+                    if cached is None:
+                        missing_indexes.append(index)
+                        continue
+                    translations[index] = cached
+                    completed += 1
+                    completed_tokens += token_count
+                    progress.update(completed, completed_tokens, 0.0)
 
             if missing_indexes:
                 async with TranslationClient(config) as client:
-                    if stream_enabled and on_token is not None:
-                        for index in missing_indexes:
-                            segment_started = _monotonic()
-                            translated_segment = await _translate_streaming_segment(
-                                client,
-                                build_prompt(
-                                    plan.segments[index],
-                                    target_lang,
-                                    template_type,
-                                    **template_kwargs,
-                                ),
-                                on_token,
-                            )
-                            translations[index] = translated_segment
-                            history.store_segment_cache(
-                                segment_hashes[index],
-                                target_lang,
-                                template_name,
-                                translated_segment,
-                                datetime.now(timezone.utc).isoformat(
-                                    timespec="seconds"
-                                ),
-                                options_hash=options_hash,
-                            )
-                            completed += 1
-                            completed_tokens += segment_tokens[index]
-                            progress.update(
-                                completed,
-                                completed_tokens,
-                                _monotonic() - segment_started,
-                            )
-                    else:
-                        completed, completed_tokens = await _translate_missing_segments(
-                            client,
-                            history,
-                            plan,
-                            missing_indexes,
-                            segment_hashes,
-                            segment_tokens,
-                            translations,
-                            target_lang,
-                            template_type,
-                            template_kwargs,
-                            options_hash,
-                            template_name,
-                            progress,
-                            completed,
-                            completed_tokens,
-                            config.concurrency,
-                        )
+                    completed, completed_tokens = await _translate_missing_segments(
+                        client,
+                        history,
+                        plan,
+                        missing_indexes,
+                        segment_hashes,
+                        segment_tokens,
+                        translations,
+                        target_lang,
+                        template_type,
+                        template_kwargs,
+                        options_hash,
+                        template_name,
+                        progress,
+                        completed,
+                        completed_tokens,
+                        config.concurrency,
+                    )
         finally:
             progress.finish()
 
-    translated = "".join(_completed_translations(translations))
+    translated = plan.reconstruct(_completed_translations(translations))
     finished_at = datetime.now(timezone.utc)
     duration_seconds = _monotonic() - started_monotonic
     output_tokens = plan.count_tokens(translated)
@@ -271,6 +305,7 @@ async def translate_file(
     *,
     stream: bool | None = None,
     source_text: str | None = None,
+    document_plan: DocumentLanguagePlan | None = None,
     **template_kwargs: object,
 ) -> None:
     text = (
@@ -294,6 +329,7 @@ async def translate_file(
         template_type,
         stream=stream_enabled,
         on_token=write_token if output_path is None and stream_enabled else None,
+        document_plan=document_plan,
         **template_kwargs,
     )
     if output_path is None:
@@ -360,6 +396,96 @@ class TranslationProgress:
         )
         effective_concurrency = min(self._concurrency, max(1, remaining_segments))
         return average_seconds * remaining_segments / effective_concurrency
+
+
+async def _translate_streaming_plan(
+    history: HistoryDB,
+    plan: TranslationPlan,
+    segment_hashes: list[str],
+    segment_tokens: list[int],
+    translations: list[str | None],
+    config: HotConfig,
+    target_lang: str,
+    template_type: TemplateType,
+    template_kwargs: dict[str, object],
+    options_hash: str,
+    template_name: str,
+    progress: TranslationProgress,
+    completed: int,
+    completed_tokens: int,
+    on_token: TokenCallback,
+) -> tuple[int, int]:
+    async with AsyncExitStack() as stack:
+        client: TranslationClient | None = None
+
+        async def translate_index(index: int) -> None:
+            nonlocal client, completed, completed_tokens
+            cached = history.find_segment_cached(
+                segment_hashes[index], target_lang, template_name, options_hash
+            )
+            if cached is None:
+                if client is None:
+                    client = await stack.enter_async_context(TranslationClient(config))
+                segment_started = _monotonic()
+                translated_segment = await _translate_streaming_segment(
+                    client,
+                    build_prompt(
+                        plan.segments[index],
+                        target_lang,
+                        template_type,
+                        **template_kwargs,
+                    ),
+                    on_token,
+                )
+                segment_seconds = _monotonic() - segment_started
+                history.store_segment_cache(
+                    segment_hashes[index],
+                    target_lang,
+                    template_name,
+                    translated_segment,
+                    datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    options_hash=options_hash,
+                )
+            else:
+                translated_segment = cached
+                segment_seconds = 0.0
+                on_token(cached)
+            translations[index] = translated_segment
+            completed += 1
+            completed_tokens += segment_tokens[index]
+            progress.update(completed, completed_tokens, segment_seconds)
+
+        if plan.document_plan is None:
+            for index in range(plan.segment_count):
+                await translate_index(index)
+            return completed, completed_tokens
+
+        segment_index = 0
+        for section_index, section in enumerate(plan.document_plan.sections):
+            if not section.should_translate:
+                on_token(section.text)
+                continue
+            section_start = segment_index
+            while (
+                segment_index < plan.segment_count
+                and plan.segment_section_indexes[segment_index] == section_index
+            ):
+                await translate_index(segment_index)
+                segment_index += 1
+            section_output = "".join(
+                str(translations[index])
+                for index in range(section_start, segment_index)
+                if translations[index] is not None
+            )
+            if section.text.endswith("\n") and not section_output.endswith("\n"):
+                on_token("\n")
+                if segment_index > section_start:
+                    last_index = segment_index - 1
+                    translations[last_index] = f"{translations[last_index]}\n"
+        while segment_index < plan.segment_count:
+            await translate_index(segment_index)
+            segment_index += 1
+        return completed, completed_tokens
 
 
 async def _translate_streaming_segment(

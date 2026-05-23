@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 import asyncio
 from contextlib import nullcontext, redirect_stderr
 import io
@@ -10,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from hymt.history import HistoryDB, TaskRecord
+from hymt.language import analyze_document_language
 from hymt.templates import TemplateType
 from hymt.translate import _segment_cache_hash, _template_options_hash, translate_text
 
@@ -239,10 +241,74 @@ class TranslationCacheTests(unittest.TestCase):
         self.assertNotIn("File an issue with timing data?", stderr.getvalue())
         run.assert_not_called()
 
+    def test_translate_text_reconstructs_partial_document_and_skips_code_block(
+        self,
+    ) -> None:
+        source = "English paragraph.\n\n```python\nprint('hello')\n```\n\n中文段落。"
+        expected = "fresh output\n\n```python\nprint('hello')\n```\n\n中文段落。"
+
+        with temporary_home():
+            FakeTranslationClient.calls = 0
+            with (
+                patch("hymt.language._load_langdetect", return_value=FakeDetector()),
+                patch("hymt.translate.create_segmenter", return_value=FakeSegmenter()),
+                patch("hymt.translate._translation_lock", return_value=nullcontext()),
+                patch("hymt.translate.TranslationClient", FakeTranslationClient),
+                redirect_stderr(io.StringIO()),
+            ):
+                document_plan = analyze_document_language(source, "zh")
+                output = asyncio.run(
+                    translate_text(
+                        source,
+                        "zh",
+                        fake_config(),
+                        TemplateType.DEFAULT,
+                        stream=False,
+                        document_plan=document_plan,
+                    )
+                )
+
+        self.assertEqual(output, expected)
+        self.assertEqual(FakeTranslationClient.calls, 1)
+
+    def test_streaming_partial_document_emits_kept_sections_in_order(self) -> None:
+        source = "English paragraph.\n\n```python\nprint('hello')\n```\n\n中文段落。"
+        expected = "fresh output\n\n```python\nprint('hello')\n```\n\n中文段落。"
+        streamed: list[str] = []
+
+        with temporary_home():
+            with (
+                patch("hymt.language._load_langdetect", return_value=FakeDetector()),
+                patch("hymt.translate.create_segmenter", return_value=FakeSegmenter()),
+                patch("hymt.translate._translation_lock", return_value=nullcontext()),
+                patch(
+                    "hymt.translate.TranslationClient",
+                    FakeStreamingTranslationClient,
+                ),
+                redirect_stderr(io.StringIO()),
+            ):
+                document_plan = analyze_document_language(source, "zh")
+                output = asyncio.run(
+                    translate_text(
+                        source,
+                        "zh",
+                        fake_config(),
+                        TemplateType.DEFAULT,
+                        stream=True,
+                        on_token=streamed.append,
+                        document_plan=document_plan,
+                    )
+                )
+
+        self.assertEqual(output, expected)
+        self.assertEqual("".join(streamed), expected)
+
 
 class FakePlan:
     source_tokens = 11
     segments = ["source text"]
+    document_plan = None
+    segment_section_indexes: tuple[int, ...] = ()
 
     @property
     def segment_count(self) -> int:
@@ -250,6 +316,9 @@ class FakePlan:
 
     def count_tokens(self, text: str) -> int:
         return len(text)
+
+    def reconstruct(self, translations: list[str]) -> str:
+        return "".join(translations)
 
 
 class FakeTranslationClient:
@@ -267,6 +336,27 @@ class FakeTranslationClient:
     async def translate(self, prompt: str) -> str:
         FakeTranslationClient.calls += 1
         return "fresh output"
+
+
+class FakeStreamingTranslationClient(FakeTranslationClient):
+    async def translate_stream(self, prompt: str) -> AsyncIterator[str]:
+        yield "fresh"
+        yield " output"
+
+
+class FakeSegmenter:
+    def count_tokens(self, text: str) -> int:
+        return len(text)
+
+    def segment(self, text: str, max_tokens: int) -> list[str]:
+        return [text] if text else []
+
+
+class FakeDetector:
+    def detect(self, text: str) -> str:
+        if any("\u4e00" <= char <= "\u9fff" for char in text):
+            return "zh"
+        return "en"
 
 
 class InteractiveStdin(io.StringIO):
@@ -342,6 +432,8 @@ def seed_estimate_history() -> None:
 
 def fake_config() -> SimpleNamespace:
     return SimpleNamespace(
+        context_window=4096,
+        max_output_tokens=128,
         concurrency=1,
         config_version=1,
         model="test-model",

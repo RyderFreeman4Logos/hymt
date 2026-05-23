@@ -5,56 +5,121 @@ import io
 import unittest
 from unittest.mock import patch
 
-from hymt.cli import _confirm_translation_if_needed
-from hymt.language import LanguageDetectionResult
+from hymt.cli import _select_document_translation_plan
+from hymt.language import analyze_document_language
 
 
 class LanguageDetectionPromptTests(unittest.TestCase):
-    def test_confirm_prompt_rejects_predominantly_target_language(self) -> None:
+    def test_rejects_fully_target_language_translation(self) -> None:
         stderr = io.StringIO()
 
         with (
             patch("hymt.cli.sys.stdin", InteractiveStdin("n\n")),
-            patch(
-                "hymt.cli.detect_target_language",
-                return_value=LanguageDetectionResult(
-                    target_ratio=0.75,
-                    detected_lang="en",
-                    analyzed_chars=100,
-                ),
-            ),
+            patch("hymt.language._load_langdetect", return_value=FakeDetector()),
             redirect_stderr(stderr),
         ):
-            should_translate = _confirm_translation_if_needed(
-                "already English", "en", assume_yes=False
+            plan = _select_document_translation_plan(
+                "Already English.", "en", assume_yes=False
             )
 
-        self.assertFalse(should_translate)
+        self.assertIsNone(plan)
         self.assertEqual(
             stderr.getvalue(),
             "Input appears to already be in en. Translate anyway? (y/n) ",
         )
 
-    def test_yes_skips_language_detection(self) -> None:
-        with patch("hymt.cli.detect_target_language") as detect:
-            should_translate = _confirm_translation_if_needed(
-                "already English", "en", assume_yes=True
+    def test_mixed_language_prompt_selects_partial_translation(self) -> None:
+        stderr = io.StringIO()
+
+        with (
+            patch("hymt.cli.sys.stdin", InteractiveStdin("y\n")),
+            patch("hymt.language._load_langdetect", return_value=FakeDetector()),
+            redirect_stderr(stderr),
+        ):
+            plan = _select_document_translation_plan(
+                "English paragraph.\n\n中文段落。", "zh", assume_yes=False
             )
 
-        self.assertTrue(should_translate)
-        detect.assert_not_called()
+        self.assertIsNotNone(plan)
+        if plan is None:
+            self.fail("Expected partial translation plan")
+        self.assertEqual(plan.paragraph_count, 2)
+        self.assertEqual(plan.target_paragraph_count, 1)
+        self.assertEqual(plan.translate_paragraph_count, 1)
+        self.assertIn("Partial translation plan:", stderr.getvalue())
+        self.assertIn("[1] translate (en): English paragraph.", stderr.getvalue())
+        self.assertIn("[2] keep (zh): 中文段落。", stderr.getvalue())
+        self.assertIn(
+            "1 of 2 paragraphs are already in zh. "
+            "Translate only the remaining 1 paragraphs? (y/n/all) ",
+            stderr.getvalue(),
+        )
 
-    def test_non_interactive_stdin_skips_language_detection(self) -> None:
+    def test_mixed_language_prompt_all_translates_every_paragraph(self) -> None:
+        with (
+            patch("hymt.cli.sys.stdin", InteractiveStdin("all\n")),
+            patch("hymt.language._load_langdetect", return_value=FakeDetector()),
+            redirect_stderr(io.StringIO()),
+        ):
+            plan = _select_document_translation_plan(
+                "English paragraph.\n\n中文段落。", "zh", assume_yes=False
+            )
+
+        self.assertIsNotNone(plan)
+        if plan is None:
+            self.fail("Expected translation plan")
+        self.assertEqual(plan.translate_paragraph_count, 2)
+
+    def test_yes_auto_selects_partial_translation(self) -> None:
+        with (
+            patch("hymt.language._load_langdetect", return_value=FakeDetector()),
+            redirect_stderr(io.StringIO()),
+        ):
+            plan = _select_document_translation_plan(
+                "English paragraph.\n\n中文段落。", "zh", assume_yes=True
+            )
+
+        self.assertIsNotNone(plan)
+        if plan is None:
+            self.fail("Expected partial translation plan")
+        self.assertEqual(plan.translate_paragraph_count, 1)
+
+    def test_non_interactive_stdin_auto_selects_partial_translation(self) -> None:
         with (
             patch("hymt.cli.sys.stdin", io.StringIO("")),
-            patch("hymt.cli.detect_target_language") as detect,
+            patch("hymt.language._load_langdetect", return_value=FakeDetector()),
+            redirect_stderr(io.StringIO()),
         ):
-            should_translate = _confirm_translation_if_needed(
-                "already English", "en", assume_yes=False
+            plan = _select_document_translation_plan(
+                "English paragraph.\n\n中文段落。", "zh", assume_yes=False
             )
 
-        self.assertTrue(should_translate)
-        detect.assert_not_called()
+        self.assertIsNotNone(plan)
+        if plan is None:
+            self.fail("Expected partial translation plan")
+        self.assertEqual(plan.translate_paragraph_count, 1)
+
+
+class DocumentLanguageAnalysisTests(unittest.TestCase):
+    def test_code_blocks_are_not_counted_or_translated(self) -> None:
+        text = "English paragraph.\n\n```python\nprint('hello')\n```\n\n中文段落。"
+
+        with patch("hymt.language._load_langdetect", return_value=FakeDetector()):
+            plan = analyze_document_language(text, "zh")
+
+        self.assertEqual(plan.paragraph_count, 2)
+        self.assertEqual(plan.target_paragraph_count, 1)
+        self.assertEqual(plan.translate_paragraph_count, 1)
+        code_sections = [section for section in plan.sections if section.kind == "code"]
+        self.assertEqual(len(code_sections), 1)
+        self.assertFalse(code_sections[0].should_translate)
+
+
+class FakeDetector:
+    def detect(self, text: str) -> str:
+        if any("\u4e00" <= char <= "\u9fff" for char in text):
+            return "zh"
+        return "en"
 
 
 class InteractiveStdin(io.StringIO):
