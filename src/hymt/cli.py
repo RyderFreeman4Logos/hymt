@@ -17,7 +17,7 @@ from hymt.history import (
     estimate_duration_seconds,
     format_duration,
 )
-from hymt.language import detect_target_language
+from hymt.language import DocumentLanguagePlan, analyze_document_language
 from hymt.segment import TOKENIZER_PATH, ensure_tokenizer, has_tokenizer_support
 from hymt.templates import TemplateType
 from hymt.translate import plan_translation, translate_file, translate_text
@@ -230,7 +230,10 @@ def main(
         selected_type = TemplateType(template_type)
         if input_file is not None:
             source_text = input_file.read_text(encoding="utf-8")
-            if not _confirm_translation_if_needed(source_text, target_lang, yes):
+            document_plan = _select_document_translation_plan(
+                source_text, target_lang, yes
+            )
+            if document_plan is None:
                 click.echo("Translation cancelled.", err=True)
                 return
             _announce_tokenizer_download()
@@ -243,12 +246,14 @@ def main(
                     selected_type,
                     stream=stream_enabled,
                     source_text=source_text,
+                    document_plan=document_plan,
                     **kwargs,
                 )
             )
             return
         source_text = text if text is not None else sys.stdin.read()
-        if not _confirm_translation_if_needed(source_text, target_lang, yes):
+        document_plan = _select_document_translation_plan(source_text, target_lang, yes)
+        if document_plan is None:
             click.echo("Translation cancelled.", err=True)
             return
         _announce_tokenizer_download()
@@ -270,6 +275,7 @@ def main(
                 on_token=write_token
                 if output_file is None and stream_enabled
                 else None,
+                document_plan=document_plan,
                 **kwargs,
             )
         )
@@ -388,13 +394,20 @@ def estimate_command(
             if input_file is not None
             else sys.stdin.read()
         )
-        kwargs = _template_kwargs(
-            terms, style, background_context, format_type, instructions
-        )
         config = HotConfig()
         selected_type = TemplateType(template_type)
         _announce_tokenizer_download()
-        plan = plan_translation(text, target_lang, config, selected_type, **kwargs)
+        plan = plan_translation(
+            text,
+            target_lang,
+            config,
+            selected_type,
+            terms=terms,
+            style=style,
+            background_text=background_context,
+            format_type=format_type,
+            instructions=instructions,
+        )
     except (OSError, ValueError, RuntimeError) as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -502,20 +515,58 @@ def _announce_tokenizer_download() -> None:
         click.echo("Downloading tokenizer...", err=True)
 
 
-def _confirm_translation_if_needed(
+def _select_document_translation_plan(
     text: str, target_lang: str, assume_yes: bool
-) -> bool:
+) -> DocumentLanguagePlan | None:
+    plan = analyze_document_language(text, target_lang)
+    if plan.paragraph_count == 0:
+        return plan
+    if plan.has_mixed_language:
+        _show_partial_translation_plan(plan)
+        if assume_yes or not sys.stdin.isatty():
+            return plan
+        sys.stderr.write(
+            f"{plan.target_paragraph_count} of {plan.paragraph_count} paragraphs "
+            f"are already in {target_lang}. Translate only the remaining "
+            f"{plan.translate_paragraph_count} paragraphs? (y/n/all) "
+        )
+        sys.stderr.flush()
+        answer = sys.stdin.readline().strip().lower()
+        if answer in {"y", "yes"}:
+            return plan
+        if answer == "all":
+            return plan.translate_all_paragraphs()
+        return None
+    if plan.target_paragraph_count != plan.paragraph_count:
+        return plan
     if assume_yes or not sys.stdin.isatty():
-        return True
-    detection = detect_target_language(text, target_lang)
-    if detection is None or detection.target_ratio <= 0.60:
-        return True
+        return plan.translate_all_paragraphs()
     sys.stderr.write(
         f"Input appears to already be in {target_lang}. Translate anyway? (y/n) "
     )
     sys.stderr.flush()
     answer = sys.stdin.readline().strip().lower()
-    return answer in {"y", "yes"}
+    return plan.translate_all_paragraphs() if answer in {"y", "yes"} else None
+
+
+def _show_partial_translation_plan(plan: DocumentLanguagePlan) -> None:
+    click.echo("Partial translation plan:", err=True)
+    for section in plan.sections:
+        if section.kind == "paragraph":
+            action = "translate" if section.should_translate else "keep"
+            detected = section.detected_lang or "unknown"
+            click.echo(
+                f"  [{section.paragraph_index}] {action} ({detected}): "
+                f"{_section_preview(section.text)}",
+                err=True,
+            )
+        elif section.kind == "code":
+            click.echo("  [code] keep fenced code block", err=True)
+
+
+def _section_preview(text: str, limit: int = 64) -> str:
+    preview = " ".join(text.split())
+    return preview[:limit]
 
 
 def _stream_enabled(config: HotConfig, override: bool | None) -> bool:

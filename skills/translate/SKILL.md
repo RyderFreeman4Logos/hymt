@@ -15,6 +15,7 @@ Use `hymt` when an agent should drive the local Hy-MT2 CLI instead of hand-writi
 - Force or disable streaming: `hymt -f input.txt -t ja --stream` / `hymt -f input.txt -t ja --no-stream`
 - Skip interactive checks: `hymt -f input.txt -t ja --yes`
 - If the source text matches a subcommand name, disambiguate with `--`: `hymt -t zh -- "config"`
+- Mixed-language documents use smart partial translation when language detection is available: target-language paragraphs are kept, non-target paragraphs are translated, and fenced code blocks are always preserved.
 
 ## Template types
 
@@ -55,7 +56,10 @@ Template-specific options:
 
 - Translation output goes to stdout; progress and status go to stderr.
 - Stdout translations end with a trailing newline.
-- When optional language detection support is installed, interactive runs prompt before translating text that is predominantly already in the target language. `--yes` and non-interactive stdin skip the prompt.
+- When optional language detection support is installed, mixed-language runs show a per-paragraph plan and prompt: `X of Y paragraphs are already in <target_lang>. Translate only the remaining Z paragraphs? (y/n/all)`. `y` keeps target-language paragraphs, `all` translates every non-code paragraph, and `n` cancels.
+- `--yes` and non-interactive stdin auto-select partial translation for mixed-language input.
+- If all detected paragraphs are already in the target language, interactive runs still ask whether to translate anyway.
+- Fenced code blocks are excluded from language detection and translation in every mode.
 - `[translation].stream = true` is the default. `--stream`/`--no-stream` override config for translation runs.
 - Streaming runs send tokens to stdout as the endpoint produces them; non-streaming runs buffer output until completion.
 - Progress is written to stderr as `[done/total] XX.XX% | elapsed 2m47s | eta 1m23s | NN.NN tok/s`.
