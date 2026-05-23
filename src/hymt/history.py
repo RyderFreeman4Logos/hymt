@@ -120,6 +120,8 @@ def format_duration(seconds: float) -> str:
 
 
 class HistoryDB:
+    _schema_verified_paths: set[Path] = set()
+
     def __init__(self, path: Path | str | None = None) -> None:
         self._path = Path(path).expanduser() if path is not None else history_path()
 
@@ -328,6 +330,8 @@ class HistoryDB:
 
     def _connect(self, create: bool) -> sqlite3.Connection:
         if create:
+            if not self._path.exists():
+                self._schema_verified_paths.discard(self._schema_cache_key())
             self._path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(str(self._path))
         connection.row_factory = sqlite3.Row
@@ -339,6 +343,9 @@ class HistoryDB:
         return self._connect(create=False)
 
     def _ensure_schema(self, connection: sqlite3.Connection) -> None:
+        cache_key = self._schema_cache_key()
+        if cache_key in self._schema_verified_paths:
+            return
         connection.execute(SCHEMA)
         columns = {
             str(row["name"])
@@ -347,6 +354,10 @@ class HistoryDB:
         if "output_text" not in columns:
             connection.execute("ALTER TABLE tasks ADD COLUMN output_text TEXT")
         connection.commit()
+        self._schema_verified_paths.add(cache_key)
+
+    def _schema_cache_key(self) -> Path:
+        return self._path.resolve(strict=False)
 
 
 def _record_from_row(row: sqlite3.Row) -> TaskRecord:

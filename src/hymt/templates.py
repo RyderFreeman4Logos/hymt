@@ -91,6 +91,8 @@ def build_prompt(
             return build_structured_prompt(source_text, target_name, chinese_prompt, kwargs.get("format_type") or kwargs.get("format"))
         case TemplateType.CONTEXT_AWARE:
             return build_context_prompt(source_text, target_name, chinese_prompt, kwargs.get("background_text") or kwargs.get("context"))
+        case _:
+            raise ValueError(f"Unsupported template type '{selected_type}'")
 
 
 def build_default_prompt(source_text: str, target_lang: str, chinese_prompt: bool = False) -> str:
