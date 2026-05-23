@@ -11,6 +11,7 @@ import click
 
 from hymt.batch import build_batch_plan, run_batch_translation, show_batch_preview
 from hymt.config import HotConfig, config_path, show
+from hymt.exec_wrapper import run_exec_command
 from hymt.history import (
     HistoryDB,
     TaskRecord,
@@ -324,6 +325,36 @@ def config_edit() -> None:
     result = subprocess.run(command, check=False)
     if result.returncode != 0:
         raise click.ClickException(f"Editor exited with status {result.returncode}")
+
+
+@main.group(
+    "exec",
+    invoke_without_command=True,
+    context_settings={"ignore_unknown_options": True, "allow_extra_args": True},
+    help="Run a command and translate its output after completion.",
+)
+@click.option(
+    "--target",
+    "-t",
+    "target_lang",
+    default="zh",
+    show_default=True,
+    help="Target language code.",
+)
+@click.pass_context
+def exec_command(ctx: click.Context, target_lang: str) -> None:
+    if ctx.invoked_subcommand is not None:
+        return
+    command = list(ctx.args)
+    if command and command[0] == "--":
+        command = command[1:]
+    if not command:
+        raise click.UsageError("Use 'hymt exec -- command args...'")
+    try:
+        returncode = run_exec_command(command, target_lang, HotConfig())
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    raise click.exceptions.Exit(returncode)
 
 
 @main.group()

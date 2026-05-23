@@ -27,6 +27,39 @@ repetition_penalty = 1.05
 
 [timing]
 divergence_threshold = 2.0
+
+[exec]
+shared_cache_path = "/usr/local/share/hymt/cache.db"
+translate_stderr = true
+translate_stdout = true
+skip_patterns = []
+skip_commands = []
+
+[exec.plugin]
+blocklist = [
+    "zstd",
+    "gzip",
+    "bzip2",
+    "xz",
+    "lz4",
+    "rage",
+    "age",
+    "gpg",
+    "openssl",
+    "base64",
+    "xxd",
+    "od",
+    "hexdump",
+    "dd",
+    "cp",
+    "mv",
+    "rsync",
+    "docker",
+    "podman",
+    "hymt",
+    "ssh",
+    "scp",
+]
 """
 
 
@@ -95,6 +128,61 @@ class HotConfig:
     @property
     def timing_divergence_threshold(self) -> float:
         return self._get_float_above("timing", "divergence_threshold", 2.0, 1.0)
+
+    @property
+    def exec_shared_cache_path(self) -> Path:
+        return Path(
+            self._get_str("exec", "shared_cache_path", "/usr/local/share/hymt/cache.db")
+        ).expanduser()
+
+    @property
+    def exec_translate_stderr(self) -> bool:
+        return self._get_bool("exec", "translate_stderr", True)
+
+    @property
+    def exec_translate_stdout(self) -> bool | str:
+        value = self._get_bool_or_str("exec", "translate_stdout", True)
+        return value if value in {True, False, "auto"} else True
+
+    @property
+    def exec_skip_patterns(self) -> tuple[str, ...]:
+        return self._get_str_tuple("exec", "skip_patterns", ())
+
+    @property
+    def exec_skip_commands(self) -> tuple[str, ...]:
+        return self._get_str_tuple("exec", "skip_commands", ())
+
+    @property
+    def exec_plugin_blocklist(self) -> tuple[str, ...]:
+        with self._lock:
+            plugin = self._get_section("exec").get("plugin", {})
+            value = plugin.get("blocklist", ()) if isinstance(plugin, dict) else ()
+        if isinstance(value, list) and all(isinstance(item, str) for item in value):
+            return tuple(value)
+        return (
+            "zstd",
+            "gzip",
+            "bzip2",
+            "xz",
+            "lz4",
+            "rage",
+            "age",
+            "gpg",
+            "openssl",
+            "base64",
+            "xxd",
+            "od",
+            "hexdump",
+            "dd",
+            "cp",
+            "mv",
+            "rsync",
+            "docker",
+            "podman",
+            "hymt",
+            "ssh",
+            "scp",
+        )
 
     @property
     def temperature(self) -> float:
@@ -169,6 +257,22 @@ class HotConfig:
         with self._lock:
             value = self._get_section(section_name).get(key, default)
         return value if isinstance(value, bool) else default
+
+    def _get_bool_or_str(
+        self, section_name: str, key: str, default: bool | str
+    ) -> bool | str:
+        with self._lock:
+            value = self._get_section(section_name).get(key, default)
+        return value if isinstance(value, bool | str) else default
+
+    def _get_str_tuple(
+        self, section_name: str, key: str, default: tuple[str, ...]
+    ) -> tuple[str, ...]:
+        with self._lock:
+            value = self._get_section(section_name).get(key, default)
+        if isinstance(value, list) and all(isinstance(item, str) for item in value):
+            return tuple(value)
+        return default
 
     def _get_float(self, section_name: str, key: str, default: float) -> float:
         with self._lock:

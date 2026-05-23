@@ -22,6 +22,14 @@ class DefaultConfigTests(unittest.TestCase):
         self.assertEqual(config.max_output_tokens, 4096)
         self.assertTrue(config.stream)
         self.assertEqual(config.timing_divergence_threshold, 2.0)
+        self.assertEqual(
+            str(config.exec_shared_cache_path), "/usr/local/share/hymt/cache.db"
+        )
+        self.assertTrue(config.exec_translate_stderr)
+        self.assertTrue(config.exec_translate_stdout)
+        self.assertEqual(config.exec_skip_patterns, ())
+        self.assertEqual(config.exec_skip_commands, ())
+        self.assertIn("hymt", config.exec_plugin_blocklist)
         self.assertGreater(plan.available_source_tokens, 0)
         self.assertEqual(plan.segments, ["hello"])
 
@@ -40,6 +48,15 @@ stream = false
 
 [timing]
 divergence_threshold = 3.5
+
+[exec]
+translate_stderr = false
+translate_stdout = "auto"
+skip_patterns = ["*.json"]
+skip_commands = ["curl"]
+
+[exec.plugin]
+blocklist = ["hymt", "ssh"]
 """
                 )
 
@@ -47,6 +64,11 @@ divergence_threshold = 3.5
 
         self.assertEqual(config.timing_divergence_threshold, 3.5)
         self.assertFalse(config.stream)
+        self.assertFalse(config.exec_translate_stderr)
+        self.assertEqual(config.exec_translate_stdout, "auto")
+        self.assertEqual(config.exec_skip_patterns, ("*.json",))
+        self.assertEqual(config.exec_skip_commands, ("curl",))
+        self.assertEqual(config.exec_plugin_blocklist, ("hymt", "ssh"))
 
 
 class CountingSegmenter:
