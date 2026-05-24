@@ -279,6 +279,23 @@ Commands:
                     "check",
                     _capture_help(("tool",), command_path=str(command_path)),
                 )
+                changed_stat = command_path.stat()
+                cache_path = Path(home) / ".cache" / "hymt" / "discovery-cache.db"
+                with sqlite3.connect(cache_path) as connection:
+                    rows = connection.execute(
+                        """
+                        SELECT command_path, file_mtime, file_size, help_output
+                        FROM discovery_cache
+                        WHERE command_path = ?
+                        """,
+                        (str(command_path),),
+                    ).fetchall()
+
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0][0], str(command_path))
+                self.assertEqual(rows[0][1], changed_stat.st_mtime)
+                self.assertEqual(rows[0][2], changed_stat.st_size)
+                self.assertIn("check", rows[0][3])
 
         self.assertEqual(run.call_count, 2)
 

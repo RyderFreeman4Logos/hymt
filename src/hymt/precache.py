@@ -584,6 +584,17 @@ class DiscoveryCache:
             self._available = False
             return
         try:
+            command_path = str(result.target.path)
+            file_mtime = stat.st_mtime
+            file_size = stat.st_size
+            connection.execute(
+                """
+                DELETE FROM discovery_cache
+                WHERE command_path = ?
+                  AND (file_mtime != ? OR file_size != ?)
+                """,
+                (command_path, file_mtime, file_size),
+            )
             connection.execute(
                 """
                 INSERT INTO discovery_cache (
@@ -602,9 +613,9 @@ class DiscoveryCache:
                     cached_at = excluded.cached_at
                 """,
                 (
-                    str(result.target.path),
-                    stat.st_mtime,
-                    stat.st_size,
+                    command_path,
+                    file_mtime,
+                    file_size,
                     result.help_output,
                     json.dumps(list(result.subcommands), separators=(",", ":")),
                     datetime.now(timezone.utc).isoformat(timespec="seconds"),
