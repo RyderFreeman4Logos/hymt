@@ -56,6 +56,12 @@ class BatchSkippedFile:
 
 
 @dataclass(frozen=True)
+class _ReadSourcesResult:
+    sources: tuple[BatchSourceFile, ...]
+    skipped: tuple[BatchSkippedFile, ...]
+
+
+@dataclass(frozen=True)
 class BatchFilePlan:
     source_path: Path
     relative_path: Path
@@ -133,17 +139,18 @@ def build_batch_plan(
     progress = _BatchPlanningProgress(progress_stream)
     source_paths = _scan_text_files(resolved_root, recursive=recursive)
     progress.scanned(len(source_paths))
-    sources = _read_sources_parallel(
+    read_result = _read_sources_parallel(
         source_paths,
         root=resolved_root,
         progress=progress,
     )
+    sources = read_result.sources
     db = history or HistoryDB()
     template_name = template_type.value
     options_hash = _template_options_hash(template_kwargs)
 
     files: list[BatchFilePlan] = []
-    skipped: list[BatchSkippedFile] = []
+    skipped = list(read_result.skipped)
     for index, source in enumerate(sources, start=1):
         relative_path = _relative_to_root(source.path, resolved_root)
         progress.analyzing(index, len(sources), relative_path)
@@ -365,7 +372,7 @@ class _BatchPlanningProgress:
             or not self._line_active
         ):
             return
-        self._stream.write("\r\033[K\n")
+        self._stream.write("\r\033[K")
         self._stream.flush()
         self._line_active = False
 
@@ -433,22 +440,25 @@ def _read_sources_parallel(
     *,
     root: Path,
     progress: _BatchPlanningProgress | None = None,
-) -> tuple[BatchSourceFile, ...]:
+) -> _ReadSourcesResult:
     if not paths:
-        return ()
+        return _ReadSourcesResult(sources=(), skipped=())
     with ThreadPoolExecutor() as executor:
         sources: list[BatchSourceFile] = []
+        skipped: list[BatchSkippedFile] = []
         for path, source in zip(paths, executor.map(_read_source_file, paths)):
             if source is None:
+                relative_path = _relative_to_root(path, root)
+                skipped.append(BatchSkippedFile(path, relative_path, "not valid UTF-8"))
                 if progress is not None:
                     progress.prepare_for_warning()
                 print(
-                    f"Warning: skipping {_relative_to_root(path, root)}: not valid UTF-8",
+                    f"Warning: skipping {relative_path}: not valid UTF-8",
                     file=sys.stderr,
                 )
                 continue
             sources.append(source)
-        return tuple(sources)
+        return _ReadSourcesResult(sources=tuple(sources), skipped=tuple(skipped))
 
 
 def _read_source_file(path: Path) -> BatchSourceFile | None:

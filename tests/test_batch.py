@@ -147,9 +147,12 @@ class BatchPlanTests(unittest.TestCase):
                 [
                     "Batch planning: scanned 2 file(s)",
                     "Batch planning: analyzing [1/1] valid.md",
-                    "Batch planning complete: 1 selected, 0 skipped",
+                    "Batch planning complete: 1 selected, 1 skipped",
                 ],
             )
+            self.assertEqual(len(plan.skipped), 1)
+            self.assertEqual(plan.skipped[0].relative_path, Path("invalid.md"))
+            self.assertEqual(plan.skipped[0].reason, "not valid UTF-8")
             self.assertIn(
                 "Warning: skipping invalid.md: not valid UTF-8",
                 warning.getvalue(),
@@ -181,10 +184,9 @@ class BatchPlanTests(unittest.TestCase):
             self.assertEqual(
                 progress.getvalue(),
                 "\rBatch planning: scanned 2 file(s)\033[K"
-                "\r\033[K\n"
-                "Warning: skipping invalid.md: not valid UTF-8\n"
+                "\r\033[KWarning: skipping invalid.md: not valid UTF-8\n"
                 "\rBatch planning: analyzing [1/1] valid.md\033[K"
-                "\rBatch planning complete: 1 selected, 0 skipped\033[K\n",
+                "\rBatch planning complete: 1 selected, 1 skipped\033[K\n",
             )
 
     def test_build_batch_plan_scans_filters_and_reports_cache_status(self) -> None:
@@ -412,8 +414,7 @@ class BatchPlanTests(unittest.TestCase):
                 progress.getvalue(),
                 "\rBatch planning: scanned 1 file(s)\033[K"
                 "\rBatch planning: analyzing [1/1] nested/input.md\033[K"
-                "\r\033[K\n"
-                "Warning: skipping nested/input.md: "
+                "\r\033[KWarning: skipping nested/input.md: "
                 "output path escapes output directory\n"
                 "\rBatch planning complete: 0 selected, 1 skipped\033[K\n",
             )
@@ -440,7 +441,9 @@ class BatchPlanTests(unittest.TestCase):
             self.assertEqual(
                 [file.relative_path for file in plan.files], [Path("valid.md")]
             )
-            self.assertEqual(plan.skipped, ())
+            self.assertEqual(len(plan.skipped), 1)
+            self.assertEqual(plan.skipped[0].relative_path, Path("invalid.md"))
+            self.assertEqual(plan.skipped[0].reason, "not valid UTF-8")
             text = warning.getvalue()
             self.assertIn(
                 "Warning: skipping invalid.md: not valid UTF-8",
