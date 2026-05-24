@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import os
+import shlex
+import shutil
+import subprocess
 import tempfile
 import unittest
 
@@ -58,6 +61,26 @@ class ZshPluginTests(unittest.TestCase):
         self.assertIn("Installed", result.output)
         self.assertIn(".local/share/hymt/hymt-exec.zsh", result.output)
         self.assertTrue(zshrc_exists)
+
+    @unittest.skipIf(shutil.which("zsh") is None, "zsh is required")
+    def test_generated_plugin_loads_with_existing_t_alias(self) -> None:
+        with temporary_home() as home:
+            result = install_zsh_plugin(HotConfig())
+            command = (
+                "alias t='echo alias'; "
+                f"source {shlex.quote(str(result.plugin_path))}; "
+                "whence -w t"
+            )
+            completed = subprocess.run(
+                ["zsh", "-df", "-ic", command],
+                check=False,
+                capture_output=True,
+                env={**os.environ, "HOME": home},
+                text=True,
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "t: function")
 
 
 class temporary_home:

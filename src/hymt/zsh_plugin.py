@@ -114,6 +114,10 @@ _hymt_exec_safe() {{
   return 0
 }}
 
+# The plugin owns the public t command. Remove a pre-existing alias so zsh
+# does not expand it while parsing the function definition.
+unalias t 2>/dev/null || true
+
 t() {{
   if (( $# == 0 )); then
     command hymt exec --help
