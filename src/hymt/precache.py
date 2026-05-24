@@ -240,11 +240,12 @@ def _shell_history_paths() -> tuple[Path, ...]:
 
 def _read_history_commands(path: Path) -> tuple[str, ...]:
     try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        with path.open("r", encoding="utf-8", errors="replace") as file:
+            lines: deque[str] = deque(file, maxlen=RECENT_HISTORY_LINE_LIMIT)
     except OSError:
         return ()
     commands: list[str] = []
-    for line in reversed(lines[-RECENT_HISTORY_LINE_LIMIT:]):
+    for line in reversed(lines):
         command = _extract_history_command(line)
         if command is not None:
             commands.append(command)
@@ -677,7 +678,7 @@ class DiscoveryProgress:
             "command help/subcommands"
         )
         if self._uses_carriage_return:
-            self._stream.write(f"\r{line}")
+            self._stream.write(f"\r\033[K{line}")
         else:
             self._stream.write(f"{line}\n")
         self._stream.flush()
@@ -709,7 +710,7 @@ class ItemProgress:
             f"{items_per_second:.2f} items/s"
         )
         if self._uses_carriage_return:
-            self._stream.write(f"\r{line}")
+            self._stream.write(f"\r\033[K{line}")
         else:
             self._stream.write(f"{line}\n")
         self._stream.flush()

@@ -16,12 +16,16 @@ from click.testing import CliRunner
 from hymt.cli import main
 from hymt.config import HotConfig
 from hymt.precache import (
+    DiscoveryProgress,
+    ItemProgress,
     PrecacheItem,
     PrecacheSummary,
+    RECENT_HISTORY_LINE_LIMIT,
     _capture_help,
     _discover_manpage_items,
     _discover_items,
     _extract_subcommands,
+    _read_history_commands,
     run_precache,
 )
 
@@ -119,6 +123,28 @@ Options:
             [item.label for item in items],
             ["man kubectl", "man git", "kubectl", "git"],
         )
+
+    def test_read_history_commands_streams_recent_lines(self) -> None:
+        with temporary_home() as home:
+            history = Path(home) / ".zsh_history"
+            history.write_text(
+                "".join(
+                    f": {1770000000 + index}:0;cmd{index}\n"
+                    for index in range(RECENT_HISTORY_LINE_LIMIT + 5)
+                ),
+                encoding="utf-8",
+            )
+
+            with patch(
+                "pathlib.Path.read_text",
+                side_effect=AssertionError("history must be streamed"),
+            ):
+                commands = _read_history_commands(history)
+
+        self.assertEqual(len(commands), RECENT_HISTORY_LINE_LIMIT)
+        self.assertEqual(commands[0], f"cmd{RECENT_HISTORY_LINE_LIMIT + 4}")
+        self.assertEqual(commands[-1], "cmd5")
+        self.assertNotIn("cmd0", commands)
 
     def test_explicit_filters_include_plugin_blocklisted_commands(self) -> None:
         with temporary_home():
@@ -244,6 +270,24 @@ Commands:
             items,
         )
 
+    def test_tty_progress_updates_clear_previous_line(self) -> None:
+        progress = TtyStringIO()
+
+        discovery = DiscoveryProgress(10, progress)
+        discovery.start()
+        discovery.update(10)
+
+        item = ItemProgress(10, progress)
+        item.update(1, 0.1)
+        item.update(10, 0.1)
+        item.finish()
+
+        output = progress.getvalue()
+        self.assertIn("\r\033[KDiscovering... [0/10]", output)
+        self.assertIn("\r\033[KDiscovering... [10/10]", output)
+        self.assertIn("\r\033[K[1/10]", output)
+        self.assertIn("\r\033[K[10/10]", output)
+
     def test_help_discovery_cache_reuses_and_invalidates_by_file_stat(self) -> None:
         with temporary_home() as home:
             command_path = Path(home) / "bin" / "tool"
@@ -309,6 +353,11 @@ async def fake_translate(
 ) -> str:
     del command, subcommand, target_lang, config
     return f"ZH:{text}"
+
+
+class TtyStringIO(io.StringIO):
+    def isatty(self) -> bool:
+        return True
 
 
 class temporary_home:
