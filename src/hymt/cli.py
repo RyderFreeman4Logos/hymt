@@ -664,6 +664,7 @@ def batch_command(
             selected_type,
             kwargs,
             recursive=recursive,
+            progress_stream=sys.stderr,
         )
         show_batch_preview(plan, sys.stderr)
         if not write:

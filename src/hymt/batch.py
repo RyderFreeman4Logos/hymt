@@ -127,9 +127,12 @@ def build_batch_plan(
     *,
     recursive: bool = False,
     history: HistoryDB | None = None,
+    progress_stream: TextIO | None = None,
 ) -> BatchPlan:
     resolved_root = directory.expanduser().resolve(strict=True)
+    progress = _BatchPlanningProgress(progress_stream)
     source_paths = _scan_text_files(resolved_root, recursive=recursive)
+    progress.scanned(len(source_paths))
     sources = _read_sources_parallel(source_paths, root=resolved_root)
     db = history or HistoryDB()
     template_name = template_type.value
@@ -137,8 +140,9 @@ def build_batch_plan(
 
     files: list[BatchFilePlan] = []
     skipped: list[BatchSkippedFile] = []
-    for source in sources:
+    for index, source in enumerate(sources, start=1):
         relative_path = _relative_to_root(source.path, resolved_root)
+        progress.analyzing(index, len(sources), relative_path)
         try:
             output_path = _output_path(
                 source.path,
@@ -201,6 +205,7 @@ def build_batch_plan(
             )
         )
 
+    progress.complete(selected=len(files), skipped=len(skipped))
     return BatchPlan(
         root=resolved_root,
         files=tuple(files),
@@ -330,6 +335,26 @@ class BatchProgress:
             self._recent_file_seconds
         )
         return average_seconds * remaining_files
+
+
+class _BatchPlanningProgress:
+    def __init__(self, stream: TextIO | None) -> None:
+        self._stream = stream
+
+    def scanned(self, file_count: int) -> None:
+        self._write(f"Batch planning: scanned {file_count} file(s)")
+
+    def analyzing(self, index: int, total: int, relative_path: Path) -> None:
+        self._write(f"Batch planning: analyzing [{index}/{total}] {relative_path}")
+
+    def complete(self, *, selected: int, skipped: int) -> None:
+        self._write(f"Batch planning complete: {selected} selected, {skipped} skipped")
+
+    def _write(self, line: str) -> None:
+        if self._stream is None:
+            return
+        print(line, file=self._stream)
+        self._stream.flush()
 
 
 def _scan_text_files(root: Path, *, recursive: bool) -> tuple[Path, ...]:

@@ -48,6 +48,41 @@ class BatchPlanTests(unittest.TestCase):
                 [Path("top.md")],
             )
 
+    def test_build_batch_plan_reports_planning_progress_when_requested(self) -> None:
+        with temporary_home(), tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "alpha.md").write_text("fresh", encoding="utf-8")
+            nested = root / "nested"
+            nested.mkdir()
+            (nested / "beta.txt").write_text("fresh", encoding="utf-8")
+            (root / "target.md").write_text("中文段落。", encoding="utf-8")
+
+            progress = io.StringIO()
+            with patched_batch_dependencies():
+                plan = build_batch_plan(
+                    root,
+                    root / "out",
+                    "zh",
+                    fake_config(),
+                    TemplateType.DEFAULT,
+                    {},
+                    recursive=True,
+                    progress_stream=progress,
+                )
+
+            self.assertEqual(len(plan.files), 2)
+            self.assertEqual(len(plan.skipped), 1)
+            self.assertEqual(
+                progress.getvalue().splitlines(),
+                [
+                    "Batch planning: scanned 3 file(s)",
+                    "Batch planning: analyzing [1/3] alpha.md",
+                    "Batch planning: analyzing [2/3] nested/beta.txt",
+                    "Batch planning: analyzing [3/3] target.md",
+                    "Batch planning complete: 2 selected, 1 skipped",
+                ],
+            )
+
     def test_build_batch_plan_scans_filters_and_reports_cache_status(self) -> None:
         with temporary_home(), tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -345,6 +380,17 @@ class BatchCliTests(unittest.TestCase):
 
             self.assertEqual(result.exit_code, 0, result.output)
             self.assertIn("Dry run: no files written.", result.output)
+            scanning_index = result.output.index("Batch planning: scanned 1 file(s)")
+            analyzing_index = result.output.index(
+                "Batch planning: analyzing [1/1] input.md"
+            )
+            complete_index = result.output.index(
+                "Batch planning complete: 1 selected, 0 skipped"
+            )
+            preview_index = result.output.index("Batch root:")
+            self.assertLess(scanning_index, preview_index)
+            self.assertLess(analyzing_index, preview_index)
+            self.assertLess(complete_index, preview_index)
             self.assertFalse((root / "input.zh.md").exists())
 
     def test_batch_recursive_scans_subdirectories(self) -> None:

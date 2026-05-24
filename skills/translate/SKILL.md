@@ -29,6 +29,7 @@ Use `hymt` when an agent should drive the local Hy-MT2 CLI instead of hand-writi
 - Files whose resolved output path would leave the scan root or `--output-dir` are skipped with a stderr warning.
 - Batch target names accept only ASCII letters, digits, and hyphens; dots, path separators, and other characters are rejected.
 - Files already detected as target-language documents are skipped. Mixed-language files keep target-language paragraphs and translate the remaining paragraphs.
+- Batch planning progress is written to stderr before the preview, including scanned file count, per-file analysis, and selected/skipped totals.
 - The preview lists every selected file with `full`, `partial`, or `none` segment-cache status, cached segment counts, per-file ETA, and total ETA.
 - `--write` writes outputs even for fully cached files, so deleted output files can be regenerated from cache.
 - Batch progress and per-file translation progress are written to stderr in the standard `[done/total] XX.XX% | elapsed ... | eta ... | NN.NN tok/s` format.
