@@ -142,7 +142,7 @@ def build_batch_plan(
     skipped: list[BatchSkippedFile] = []
     for index, source in enumerate(sources, start=1):
         relative_path = _relative_to_root(source.path, resolved_root)
-        progress.analyzing(index, len(sources), relative_path)
+        progress.analyzing(index, len(source_paths), relative_path)
         try:
             output_path = _output_path(
                 source.path,
@@ -357,7 +357,7 @@ class _BatchPlanningProgress:
         if self._stream is None:
             return
         if self._uses_carriage_return:
-            self._stream.write(f"\r{line}\033[K")
+            self._stream.write(f"\r{line}\033[K\r")
         else:
             self._stream.write(f"{line}\n")
         self._stream.flush()
