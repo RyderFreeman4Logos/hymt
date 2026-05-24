@@ -24,6 +24,7 @@ from hymt.precache import (
     _capture_help,
     _discover_manpage_items,
     _discover_items,
+    _extract_history_command,
     _extract_subcommands,
     _read_history_commands,
     run_precache,
@@ -145,6 +146,21 @@ Options:
         self.assertEqual(commands[0], f"cmd{RECENT_HISTORY_LINE_LIMIT + 4}")
         self.assertEqual(commands[-1], "cmd5")
         self.assertNotIn("cmd0", commands)
+
+    def test_extract_history_command_preserves_binary_paths(self) -> None:
+        self.assertEqual(_extract_history_command("./bin/tool --help"), "./bin/tool")
+        self.assertEqual(
+            _extract_history_command("/opt/tools/my-tool run"), "/opt/tools/my-tool"
+        )
+
+    def test_extract_history_command_skips_privilege_wrapper_options(self) -> None:
+        self.assertEqual(_extract_history_command("sudo -u root git status"), "git")
+        self.assertEqual(_extract_history_command("sudo --user root git status"), "git")
+        self.assertEqual(_extract_history_command("sudo -u=root git status"), "git")
+        self.assertEqual(
+            _extract_history_command("doas -u root ./scripts/deploy --check"),
+            "./scripts/deploy",
+        )
 
     def test_explicit_filters_include_plugin_blocklisted_commands(self) -> None:
         with temporary_home():

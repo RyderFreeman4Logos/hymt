@@ -61,6 +61,22 @@ SHELL_BUILTINS = {
     "unset",
     "wait",
 }
+PRIVILEGE_WRAPPER_OPTIONS_WITH_ARGUMENTS = {
+    "-C",
+    "-D",
+    "-R",
+    "-T",
+    "-g",
+    "-p",
+    "-u",
+    "--chdir",
+    "--chroot",
+    "--close-from",
+    "--command-timeout",
+    "--group",
+    "--prompt",
+    "--user",
+}
 
 DISCOVERY_SCHEMA = """
 CREATE TABLE IF NOT EXISTS discovery_cache (
@@ -267,7 +283,7 @@ def _extract_history_command(line: str) -> str | None:
     command = _first_command_token(tokens)
     if command is None:
         return None
-    return Path(command).name if _has_path_separator(command) else command
+    return command
 
 
 def _is_bash_history_timestamp(line: str) -> bool:
@@ -284,7 +300,12 @@ def _first_command_token(tokens: list[str]) -> str | None:
         if "=" in token and not _has_path_separator(token):
             index += 1
             continue
-        if token in {"sudo", "doas", "command", "builtin", "noglob"}:
+        if token in {"sudo", "doas"}:
+            index = _skip_leading_options(
+                tokens, index + 1, PRIVILEGE_WRAPPER_OPTIONS_WITH_ARGUMENTS
+            )
+            continue
+        if token in {"command", "builtin", "noglob"}:
             index += 1
             continue
         if token == "env":
@@ -296,6 +317,24 @@ def _first_command_token(tokens: list[str]) -> str | None:
             return None
         return token
     return None
+
+
+def _skip_leading_options(
+    tokens: list[str], index: int, options_with_arguments: set[str]
+) -> int:
+    while index < len(tokens) and tokens[index].startswith("-"):
+        option = tokens[index]
+        index += 1
+        if option == "--":
+            break
+        option_name = option.split("=", 1)[0]
+        if (
+            option_name in options_with_arguments
+            and "=" not in option
+            and index < len(tokens)
+        ):
+            index += 1
+    return index
 
 
 def _has_path_separator(value: str) -> bool:
