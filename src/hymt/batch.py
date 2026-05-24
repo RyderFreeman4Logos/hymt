@@ -133,7 +133,11 @@ def build_batch_plan(
     progress = _BatchPlanningProgress(progress_stream)
     source_paths = _scan_text_files(resolved_root, recursive=recursive)
     progress.scanned(len(source_paths))
-    sources = _read_sources_parallel(source_paths, root=resolved_root)
+    sources = _read_sources_parallel(
+        source_paths,
+        root=resolved_root,
+        progress=progress,
+    )
     db = history or HistoryDB()
     template_name = template_type.value
     options_hash = _template_options_hash(template_kwargs)
@@ -142,7 +146,7 @@ def build_batch_plan(
     skipped: list[BatchSkippedFile] = []
     for index, source in enumerate(sources, start=1):
         relative_path = _relative_to_root(source.path, resolved_root)
-        progress.analyzing(index, len(source_paths), relative_path)
+        progress.analyzing(index, len(sources), relative_path)
         try:
             output_path = _output_path(
                 source.path,
@@ -152,6 +156,7 @@ def build_batch_plan(
             )
         except _BatchOutputPathEscapeError as error:
             skipped.append(BatchSkippedFile(source.path, relative_path, error.reason))
+            progress.prepare_for_warning()
             print(
                 f"Warning: skipping {relative_path}: {error.reason}",
                 file=sys.stderr,
@@ -341,7 +346,7 @@ class _BatchPlanningProgress:
     def __init__(self, stream: TextIO | None) -> None:
         self._stream = stream
         self._uses_carriage_return = stream.isatty() if stream is not None else False
-        self._printed = False
+        self._line_active = False
 
     def scanned(self, file_count: int) -> None:
         self._write(f"Batch planning: scanned {file_count} file(s)")
@@ -353,20 +358,37 @@ class _BatchPlanningProgress:
         self._write(f"Batch planning complete: {selected} selected, {skipped} skipped")
         self._finish()
 
+    def prepare_for_warning(self) -> None:
+        if (
+            self._stream is None
+            or not self._uses_carriage_return
+            or not self._line_active
+        ):
+            return
+        self._stream.write("\r\033[K\n")
+        self._stream.flush()
+        self._line_active = False
+
     def _write(self, line: str) -> None:
         if self._stream is None:
             return
         if self._uses_carriage_return:
-            self._stream.write(f"\r{line}\033[K\r")
+            self._stream.write(f"\r{line}\033[K")
+            self._line_active = True
         else:
             self._stream.write(f"{line}\n")
+            self._line_active = False
         self._stream.flush()
-        self._printed = True
 
     def _finish(self) -> None:
-        if self._printed and self._uses_carriage_return and self._stream is not None:
+        if (
+            self._line_active
+            and self._uses_carriage_return
+            and self._stream is not None
+        ):
             self._stream.write("\n")
             self._stream.flush()
+            self._line_active = False
 
 
 def _scan_text_files(root: Path, *, recursive: bool) -> tuple[Path, ...]:
@@ -407,7 +429,10 @@ def _scan_text_files(root: Path, *, recursive: bool) -> tuple[Path, ...]:
 
 
 def _read_sources_parallel(
-    paths: tuple[Path, ...], *, root: Path
+    paths: tuple[Path, ...],
+    *,
+    root: Path,
+    progress: _BatchPlanningProgress | None = None,
 ) -> tuple[BatchSourceFile, ...]:
     if not paths:
         return ()
@@ -415,6 +440,8 @@ def _read_sources_parallel(
         sources: list[BatchSourceFile] = []
         for path, source in zip(paths, executor.map(_read_source_file, paths)):
             if source is None:
+                if progress is not None:
+                    progress.prepare_for_warning()
                 print(
                     f"Warning: skipping {_relative_to_root(path, root)}: not valid UTF-8",
                     file=sys.stderr,

@@ -111,14 +111,14 @@ class BatchPlanTests(unittest.TestCase):
             self.assertEqual(len(plan.skipped), 1)
             self.assertEqual(
                 progress.getvalue(),
-                "\rBatch planning: scanned 3 file(s)\033[K\r"
-                "\rBatch planning: analyzing [1/3] alpha.md\033[K\r"
-                "\rBatch planning: analyzing [2/3] nested/beta.txt\033[K\r"
-                "\rBatch planning: analyzing [3/3] target.md\033[K\r"
-                "\rBatch planning complete: 2 selected, 1 skipped\033[K\r\n",
+                "\rBatch planning: scanned 3 file(s)\033[K"
+                "\rBatch planning: analyzing [1/3] alpha.md\033[K"
+                "\rBatch planning: analyzing [2/3] nested/beta.txt\033[K"
+                "\rBatch planning: analyzing [3/3] target.md\033[K"
+                "\rBatch planning complete: 2 selected, 1 skipped\033[K\n",
             )
 
-    def test_build_batch_plan_progress_total_uses_scanned_count_after_read_failure(
+    def test_build_batch_plan_progress_total_uses_readable_count_after_read_failure(
         self,
     ) -> None:
         with temporary_home(), tempfile.TemporaryDirectory() as tmpdir:
@@ -146,7 +146,7 @@ class BatchPlanTests(unittest.TestCase):
                 progress.getvalue().splitlines(),
                 [
                     "Batch planning: scanned 2 file(s)",
-                    "Batch planning: analyzing [1/2] valid.md",
+                    "Batch planning: analyzing [1/1] valid.md",
                     "Batch planning complete: 1 selected, 0 skipped",
                 ],
             )
@@ -180,10 +180,11 @@ class BatchPlanTests(unittest.TestCase):
             )
             self.assertEqual(
                 progress.getvalue(),
-                "\rBatch planning: scanned 2 file(s)\033[K\r"
+                "\rBatch planning: scanned 2 file(s)\033[K"
+                "\r\033[K\n"
                 "Warning: skipping invalid.md: not valid UTF-8\n"
-                "\rBatch planning: analyzing [1/2] valid.md\033[K\r"
-                "\rBatch planning complete: 1 selected, 0 skipped\033[K\r\n",
+                "\rBatch planning: analyzing [1/1] valid.md\033[K"
+                "\rBatch planning complete: 1 selected, 0 skipped\033[K\n",
             )
 
     def test_build_batch_plan_scans_filters_and_reports_cache_status(self) -> None:
@@ -375,6 +376,46 @@ class BatchPlanTests(unittest.TestCase):
                 "Warning: skipping nested/input.md: "
                 "output path escapes output directory",
                 warning.getvalue(),
+            )
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "requires symlink support")
+    def test_build_batch_plan_tty_progress_clears_before_output_escape_warning(
+        self,
+    ) -> None:
+        with temporary_home(), tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            nested = root / "nested"
+            nested.mkdir()
+            (nested / "input.md").write_text("fresh", encoding="utf-8")
+            output_dir = root / "out"
+            output_dir.mkdir()
+            escape_dir = root / "escape"
+            escape_dir.mkdir()
+            os.symlink(escape_dir, output_dir / "nested")
+
+            progress = TtyStringIO()
+            with patched_batch_dependencies(), redirect_stderr(progress):
+                plan = build_batch_plan(
+                    root,
+                    output_dir,
+                    "zh",
+                    fake_config(),
+                    TemplateType.DEFAULT,
+                    {},
+                    recursive=True,
+                    progress_stream=progress,
+                )
+
+            self.assertEqual(plan.files, ())
+            self.assertEqual(len(plan.skipped), 1)
+            self.assertEqual(
+                progress.getvalue(),
+                "\rBatch planning: scanned 1 file(s)\033[K"
+                "\rBatch planning: analyzing [1/1] nested/input.md\033[K"
+                "\r\033[K\n"
+                "Warning: skipping nested/input.md: "
+                "output path escapes output directory\n"
+                "\rBatch planning complete: 0 selected, 1 skipped\033[K\n",
             )
 
     @unittest.skipUnless(hasattr(os, "symlink"), "requires symlink support")
