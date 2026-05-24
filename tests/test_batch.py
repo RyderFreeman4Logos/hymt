@@ -48,6 +48,147 @@ class BatchPlanTests(unittest.TestCase):
                 [Path("top.md")],
             )
 
+    def test_build_batch_plan_reports_planning_progress_when_requested(self) -> None:
+        with temporary_home(), tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "alpha.md").write_text("fresh", encoding="utf-8")
+            nested = root / "nested"
+            nested.mkdir()
+            (nested / "beta.txt").write_text("fresh", encoding="utf-8")
+            (root / "target.md").write_text("中文段落。", encoding="utf-8")
+
+            progress = io.StringIO()
+            with patched_batch_dependencies():
+                plan = build_batch_plan(
+                    root,
+                    root / "out",
+                    "zh",
+                    fake_config(),
+                    TemplateType.DEFAULT,
+                    {},
+                    recursive=True,
+                    progress_stream=progress,
+                )
+
+            self.assertEqual(len(plan.files), 2)
+            self.assertEqual(len(plan.skipped), 1)
+            self.assertEqual(
+                progress.getvalue().splitlines(),
+                [
+                    "Batch planning: scanned 3 file(s)",
+                    "Batch planning: analyzing [1/3] alpha.md",
+                    "Batch planning: analyzing [2/3] nested/beta.txt",
+                    "Batch planning: analyzing [3/3] target.md",
+                    "Batch planning complete: 2 selected, 1 skipped",
+                ],
+            )
+
+    def test_build_batch_plan_rewrites_and_clears_planning_progress_for_tty(
+        self,
+    ) -> None:
+        with temporary_home(), tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "alpha.md").write_text("fresh", encoding="utf-8")
+            nested = root / "nested"
+            nested.mkdir()
+            (nested / "beta.txt").write_text("fresh", encoding="utf-8")
+            (root / "target.md").write_text("中文段落。", encoding="utf-8")
+
+            progress = TtyStringIO()
+            with patched_batch_dependencies():
+                plan = build_batch_plan(
+                    root,
+                    root / "out",
+                    "zh",
+                    fake_config(),
+                    TemplateType.DEFAULT,
+                    {},
+                    recursive=True,
+                    progress_stream=progress,
+                )
+
+            self.assertEqual(len(plan.files), 2)
+            self.assertEqual(len(plan.skipped), 1)
+            self.assertEqual(
+                progress.getvalue(),
+                "\rBatch planning: scanned 3 file(s)\033[K"
+                "\rBatch planning: analyzing [1/3] alpha.md\033[K"
+                "\rBatch planning: analyzing [2/3] nested/beta.txt\033[K"
+                "\rBatch planning: analyzing [3/3] target.md\033[K"
+                "\rBatch planning complete: 2 selected, 1 skipped\033[K\n",
+            )
+
+    def test_build_batch_plan_progress_total_uses_readable_count_after_read_failure(
+        self,
+    ) -> None:
+        with temporary_home(), tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "invalid.md").write_bytes(b"\xff\xfe\xfd")
+            (root / "valid.md").write_text("fresh", encoding="utf-8")
+
+            progress = io.StringIO()
+            warning = io.StringIO()
+            with patched_batch_dependencies(), redirect_stderr(warning):
+                plan = build_batch_plan(
+                    root,
+                    root / "out",
+                    "zh",
+                    fake_config(),
+                    TemplateType.DEFAULT,
+                    {},
+                    progress_stream=progress,
+                )
+
+            self.assertEqual(
+                [file.relative_path for file in plan.files], [Path("valid.md")]
+            )
+            self.assertEqual(
+                progress.getvalue().splitlines(),
+                [
+                    "Batch planning: scanned 2 file(s)",
+                    "Batch planning: analyzing [1/1] valid.md",
+                    "Batch planning complete: 1 selected, 1 skipped",
+                ],
+            )
+            self.assertEqual(len(plan.skipped), 1)
+            self.assertEqual(plan.skipped[0].relative_path, Path("invalid.md"))
+            self.assertEqual(plan.skipped[0].reason, "not valid UTF-8")
+            self.assertIn(
+                "Warning: skipping invalid.md: not valid UTF-8",
+                warning.getvalue(),
+            )
+
+    def test_build_batch_plan_tty_progress_returns_to_column_zero_before_warning(
+        self,
+    ) -> None:
+        with temporary_home(), tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "invalid.md").write_bytes(b"\xff\xfe\xfd")
+            (root / "valid.md").write_text("fresh", encoding="utf-8")
+
+            progress = TtyStringIO()
+            with patched_batch_dependencies(), redirect_stderr(progress):
+                plan = build_batch_plan(
+                    root,
+                    root / "out",
+                    "zh",
+                    fake_config(),
+                    TemplateType.DEFAULT,
+                    {},
+                    progress_stream=progress,
+                )
+
+            self.assertEqual(
+                [file.relative_path for file in plan.files], [Path("valid.md")]
+            )
+            self.assertEqual(
+                progress.getvalue(),
+                "\rBatch planning: scanned 2 file(s)\033[K"
+                "\r\033[KWarning: skipping invalid.md: not valid UTF-8\n"
+                "\rBatch planning: analyzing [1/1] valid.md\033[K"
+                "\rBatch planning complete: 1 selected, 1 skipped\033[K\n",
+            )
+
     def test_build_batch_plan_scans_filters_and_reports_cache_status(self) -> None:
         with temporary_home(), tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -240,6 +381,45 @@ class BatchPlanTests(unittest.TestCase):
             )
 
     @unittest.skipUnless(hasattr(os, "symlink"), "requires symlink support")
+    def test_build_batch_plan_tty_progress_clears_before_output_escape_warning(
+        self,
+    ) -> None:
+        with temporary_home(), tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            nested = root / "nested"
+            nested.mkdir()
+            (nested / "input.md").write_text("fresh", encoding="utf-8")
+            output_dir = root / "out"
+            output_dir.mkdir()
+            escape_dir = root / "escape"
+            escape_dir.mkdir()
+            os.symlink(escape_dir, output_dir / "nested")
+
+            progress = TtyStringIO()
+            with patched_batch_dependencies(), redirect_stderr(progress):
+                plan = build_batch_plan(
+                    root,
+                    output_dir,
+                    "zh",
+                    fake_config(),
+                    TemplateType.DEFAULT,
+                    {},
+                    recursive=True,
+                    progress_stream=progress,
+                )
+
+            self.assertEqual(plan.files, ())
+            self.assertEqual(len(plan.skipped), 1)
+            self.assertEqual(
+                progress.getvalue(),
+                "\rBatch planning: scanned 1 file(s)\033[K"
+                "\rBatch planning: analyzing [1/1] nested/input.md\033[K"
+                "\r\033[KWarning: skipping nested/input.md: "
+                "output path escapes output directory\n"
+                "\rBatch planning complete: 0 selected, 1 skipped\033[K\n",
+            )
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "requires symlink support")
     def test_build_batch_plan_skips_invalid_utf8_and_broken_symlink(self) -> None:
         with temporary_home(), tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -261,7 +441,9 @@ class BatchPlanTests(unittest.TestCase):
             self.assertEqual(
                 [file.relative_path for file in plan.files], [Path("valid.md")]
             )
-            self.assertEqual(plan.skipped, ())
+            self.assertEqual(len(plan.skipped), 1)
+            self.assertEqual(plan.skipped[0].relative_path, Path("invalid.md"))
+            self.assertEqual(plan.skipped[0].reason, "not valid UTF-8")
             text = warning.getvalue()
             self.assertIn(
                 "Warning: skipping invalid.md: not valid UTF-8",
@@ -345,6 +527,17 @@ class BatchCliTests(unittest.TestCase):
 
             self.assertEqual(result.exit_code, 0, result.output)
             self.assertIn("Dry run: no files written.", result.output)
+            scanning_index = result.output.index("Batch planning: scanned 1 file(s)")
+            analyzing_index = result.output.index(
+                "Batch planning: analyzing [1/1] input.md"
+            )
+            complete_index = result.output.index(
+                "Batch planning complete: 1 selected, 0 skipped"
+            )
+            preview_index = result.output.index("Batch root:")
+            self.assertLess(scanning_index, preview_index)
+            self.assertLess(analyzing_index, preview_index)
+            self.assertLess(complete_index, preview_index)
             self.assertFalse((root / "input.zh.md").exists())
 
     def test_batch_recursive_scans_subdirectories(self) -> None:
@@ -397,6 +590,11 @@ class FakeSegmenter:
 
     def segment(self, text: str, max_tokens: int) -> list[str]:
         return [part for part in text.split("|") if part]
+
+
+class TtyStringIO(io.StringIO):
+    def isatty(self) -> bool:
+        return True
 
 
 class temporary_home:

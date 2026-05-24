@@ -56,6 +56,12 @@ class BatchSkippedFile:
 
 
 @dataclass(frozen=True)
+class _ReadSourcesResult:
+    sources: tuple[BatchSourceFile, ...]
+    skipped: tuple[BatchSkippedFile, ...]
+
+
+@dataclass(frozen=True)
 class BatchFilePlan:
     source_path: Path
     relative_path: Path
@@ -127,18 +133,27 @@ def build_batch_plan(
     *,
     recursive: bool = False,
     history: HistoryDB | None = None,
+    progress_stream: TextIO | None = None,
 ) -> BatchPlan:
     resolved_root = directory.expanduser().resolve(strict=True)
+    progress = _BatchPlanningProgress(progress_stream)
     source_paths = _scan_text_files(resolved_root, recursive=recursive)
-    sources = _read_sources_parallel(source_paths, root=resolved_root)
+    progress.scanned(len(source_paths))
+    read_result = _read_sources_parallel(
+        source_paths,
+        root=resolved_root,
+        progress=progress,
+    )
+    sources = read_result.sources
     db = history or HistoryDB()
     template_name = template_type.value
     options_hash = _template_options_hash(template_kwargs)
 
     files: list[BatchFilePlan] = []
-    skipped: list[BatchSkippedFile] = []
-    for source in sources:
+    skipped = list(read_result.skipped)
+    for index, source in enumerate(sources, start=1):
         relative_path = _relative_to_root(source.path, resolved_root)
+        progress.analyzing(index, len(sources), relative_path)
         try:
             output_path = _output_path(
                 source.path,
@@ -148,6 +163,7 @@ def build_batch_plan(
             )
         except _BatchOutputPathEscapeError as error:
             skipped.append(BatchSkippedFile(source.path, relative_path, error.reason))
+            progress.prepare_for_warning()
             print(
                 f"Warning: skipping {relative_path}: {error.reason}",
                 file=sys.stderr,
@@ -201,6 +217,7 @@ def build_batch_plan(
             )
         )
 
+    progress.complete(selected=len(files), skipped=len(skipped))
     return BatchPlan(
         root=resolved_root,
         files=tuple(files),
@@ -332,6 +349,55 @@ class BatchProgress:
         return average_seconds * remaining_files
 
 
+class _BatchPlanningProgress:
+    def __init__(self, stream: TextIO | None) -> None:
+        self._stream = stream
+        self._uses_carriage_return = stream.isatty() if stream is not None else False
+        self._line_active = False
+
+    def scanned(self, file_count: int) -> None:
+        self._write(f"Batch planning: scanned {file_count} file(s)")
+
+    def analyzing(self, index: int, total: int, relative_path: Path) -> None:
+        self._write(f"Batch planning: analyzing [{index}/{total}] {relative_path}")
+
+    def complete(self, *, selected: int, skipped: int) -> None:
+        self._write(f"Batch planning complete: {selected} selected, {skipped} skipped")
+        self._finish()
+
+    def prepare_for_warning(self) -> None:
+        if (
+            self._stream is None
+            or not self._uses_carriage_return
+            or not self._line_active
+        ):
+            return
+        self._stream.write("\r\033[K")
+        self._stream.flush()
+        self._line_active = False
+
+    def _write(self, line: str) -> None:
+        if self._stream is None:
+            return
+        if self._uses_carriage_return:
+            self._stream.write(f"\r{line}\033[K")
+            self._line_active = True
+        else:
+            self._stream.write(f"{line}\n")
+            self._line_active = False
+        self._stream.flush()
+
+    def _finish(self) -> None:
+        if (
+            self._line_active
+            and self._uses_carriage_return
+            and self._stream is not None
+        ):
+            self._stream.write("\n")
+            self._stream.flush()
+            self._line_active = False
+
+
 def _scan_text_files(root: Path, *, recursive: bool) -> tuple[Path, ...]:
     if not root.is_dir():
         raise NotADirectoryError(str(root))
@@ -370,21 +436,29 @@ def _scan_text_files(root: Path, *, recursive: bool) -> tuple[Path, ...]:
 
 
 def _read_sources_parallel(
-    paths: tuple[Path, ...], *, root: Path
-) -> tuple[BatchSourceFile, ...]:
+    paths: tuple[Path, ...],
+    *,
+    root: Path,
+    progress: _BatchPlanningProgress | None = None,
+) -> _ReadSourcesResult:
     if not paths:
-        return ()
+        return _ReadSourcesResult(sources=(), skipped=())
     with ThreadPoolExecutor() as executor:
         sources: list[BatchSourceFile] = []
+        skipped: list[BatchSkippedFile] = []
         for path, source in zip(paths, executor.map(_read_source_file, paths)):
             if source is None:
+                relative_path = _relative_to_root(path, root)
+                skipped.append(BatchSkippedFile(path, relative_path, "not valid UTF-8"))
+                if progress is not None:
+                    progress.prepare_for_warning()
                 print(
-                    f"Warning: skipping {_relative_to_root(path, root)}: not valid UTF-8",
+                    f"Warning: skipping {relative_path}: not valid UTF-8",
                     file=sys.stderr,
                 )
                 continue
             sources.append(source)
-        return tuple(sources)
+        return _ReadSourcesResult(sources=tuple(sources), skipped=tuple(skipped))
 
 
 def _read_source_file(path: Path) -> BatchSourceFile | None:
