@@ -357,7 +357,7 @@ class _BatchPlanningProgress:
         if self._stream is None:
             return
         if self._uses_carriage_return:
-            self._stream.write(f"\r{line}")
+            self._stream.write(f"\r{line}\033[K")
         else:
             self._stream.write(f"{line}\n")
         self._stream.flush()

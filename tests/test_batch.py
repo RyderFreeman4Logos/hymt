@@ -83,7 +83,9 @@ class BatchPlanTests(unittest.TestCase):
                 ],
             )
 
-    def test_build_batch_plan_rewrites_planning_progress_for_tty(self) -> None:
+    def test_build_batch_plan_rewrites_and_clears_planning_progress_for_tty(
+        self,
+    ) -> None:
         with temporary_home(), tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "alpha.md").write_text("fresh", encoding="utf-8")
@@ -109,11 +111,11 @@ class BatchPlanTests(unittest.TestCase):
             self.assertEqual(len(plan.skipped), 1)
             self.assertEqual(
                 progress.getvalue(),
-                "\rBatch planning: scanned 3 file(s)"
-                "\rBatch planning: analyzing [1/3] alpha.md"
-                "\rBatch planning: analyzing [2/3] nested/beta.txt"
-                "\rBatch planning: analyzing [3/3] target.md"
-                "\rBatch planning complete: 2 selected, 1 skipped\n",
+                "\rBatch planning: scanned 3 file(s)\033[K"
+                "\rBatch planning: analyzing [1/3] alpha.md\033[K"
+                "\rBatch planning: analyzing [2/3] nested/beta.txt\033[K"
+                "\rBatch planning: analyzing [3/3] target.md\033[K"
+                "\rBatch planning complete: 2 selected, 1 skipped\033[K\n",
             )
 
     def test_build_batch_plan_scans_filters_and_reports_cache_status(self) -> None:
