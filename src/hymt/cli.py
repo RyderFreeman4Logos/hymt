@@ -452,8 +452,9 @@ def exec_install_command(update: bool) -> None:
     help="Also translate discovered subcommand --help output.",
 )
 @click.option("--section", help="Only translate a specific man section.")
+@click.argument("commands", nargs=-1)
 def exec_precache_command(
-    target_lang: str, recursive: bool, section: str | None
+    target_lang: str, recursive: bool, section: str | None, commands: tuple[str, ...]
 ) -> None:
     try:
         summary = run_precache(
@@ -461,6 +462,7 @@ def exec_precache_command(
             HotConfig(),
             recursive=recursive,
             section=section,
+            command_filters=commands,
             progress_stream=sys.stderr,
         )
     except (OSError, ValueError, RuntimeError) as exc:
