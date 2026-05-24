@@ -340,6 +340,8 @@ class BatchProgress:
 class _BatchPlanningProgress:
     def __init__(self, stream: TextIO | None) -> None:
         self._stream = stream
+        self._uses_carriage_return = stream.isatty() if stream is not None else False
+        self._printed = False
 
     def scanned(self, file_count: int) -> None:
         self._write(f"Batch planning: scanned {file_count} file(s)")
@@ -349,12 +351,22 @@ class _BatchPlanningProgress:
 
     def complete(self, *, selected: int, skipped: int) -> None:
         self._write(f"Batch planning complete: {selected} selected, {skipped} skipped")
+        self._finish()
 
     def _write(self, line: str) -> None:
         if self._stream is None:
             return
-        print(line, file=self._stream)
+        if self._uses_carriage_return:
+            self._stream.write(f"\r{line}")
+        else:
+            self._stream.write(f"{line}\n")
         self._stream.flush()
+        self._printed = True
+
+    def _finish(self) -> None:
+        if self._printed and self._uses_carriage_return and self._stream is not None:
+            self._stream.write("\n")
+            self._stream.flush()
 
 
 def _scan_text_files(root: Path, *, recursive: bool) -> tuple[Path, ...]:
