@@ -147,6 +147,26 @@ Options:
         self.assertEqual(commands[-1], "cmd5")
         self.assertNotIn("cmd0", commands)
 
+    def test_read_history_commands_filters_fish_metadata(self) -> None:
+        with temporary_home() as home:
+            fish_dir = Path(home) / ".local" / "share" / "fish"
+            fish_dir.mkdir(parents=True)
+            history = fish_dir / "fish_history"
+            history.write_text(
+                "- cmd: git status\n"
+                "  when: 1770000000\n"
+                "  paths:\n"
+                "    - /tmp/project\n"
+                "- cmd: kubectl get pods\n"
+                "  when: 1770000001\n",
+                encoding="utf-8",
+            )
+
+            commands = _read_history_commands(history)
+
+        self.assertEqual(commands, ("kubectl", "git"))
+        self.assertNotIn("when:", commands)
+
     def test_extract_history_command_preserves_binary_paths(self) -> None:
         self.assertEqual(_extract_history_command("./bin/tool --help"), "./bin/tool")
         self.assertEqual(
@@ -358,6 +378,82 @@ Commands:
                 self.assertIn("check", rows[0][3])
 
         self.assertEqual(run.call_count, 2)
+
+    def test_help_discovery_cache_keys_by_command_arguments(self) -> None:
+        with temporary_home() as home:
+            command_path = Path(home) / "bin" / "tool"
+            command_path.parent.mkdir()
+            command_path.write_text("#!/bin/sh\n", encoding="utf-8")
+            command_path.chmod(0o755)
+            top_level = SimpleNamespace(returncode=0, stdout=b"Usage: tool\n")
+            subcommand = SimpleNamespace(returncode=0, stdout=b"Usage: tool run\n")
+
+            with patch(
+                "hymt.precache.subprocess.run",
+                side_effect=[top_level, subcommand],
+            ) as run:
+                self.assertIn(
+                    "Usage: tool",
+                    _capture_help(("tool",), command_path=str(command_path)),
+                )
+                self.assertIn(
+                    "Usage: tool run",
+                    _capture_help(("tool", "run"), command_path=str(command_path)),
+                )
+                self.assertIn(
+                    "Usage: tool",
+                    _capture_help(("tool",), command_path=str(command_path)),
+                )
+                self.assertIn(
+                    "Usage: tool run",
+                    _capture_help(("tool", "run"), command_path=str(command_path)),
+                )
+
+            cache_path = Path(home) / ".cache" / "hymt" / "discovery-cache.db"
+            with sqlite3.connect(cache_path) as connection:
+                rows = connection.execute(
+                    """
+                    SELECT help_args, help_output
+                    FROM discovery_cache
+                    WHERE command_path = ?
+                    ORDER BY help_args
+                    """,
+                    (str(command_path),),
+                ).fetchall()
+
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(
+            rows,
+            [
+                ('["tool","run"]', "Usage: tool run\n"),
+                ('["tool"]', "Usage: tool\n"),
+            ],
+        )
+
+    def test_help_discovery_cache_hit_does_not_store_again(self) -> None:
+        with temporary_home() as home:
+            command_path = Path(home) / "bin" / "tool"
+            command_path.parent.mkdir()
+            command_path.write_text("#!/bin/sh\n", encoding="utf-8")
+            command_path.chmod(0o755)
+            completed = SimpleNamespace(returncode=0, stdout=b"Usage: tool\n")
+
+            with patch("hymt.precache.subprocess.run", return_value=completed) as run:
+                _capture_help(("tool",), command_path=str(command_path))
+
+            with (
+                patch("hymt.precache.subprocess.run", return_value=completed) as run,
+                patch(
+                    "hymt.precache.DiscoveryCache.store",
+                    side_effect=AssertionError("cache hit must not be stored"),
+                ),
+            ):
+                self.assertIn(
+                    "Usage: tool",
+                    _capture_help(("tool",), command_path=str(command_path)),
+                )
+
+        run.assert_not_called()
 
 
 async def fake_translate(

@@ -81,12 +81,13 @@ PRIVILEGE_WRAPPER_OPTIONS_WITH_ARGUMENTS = {
 DISCOVERY_SCHEMA = """
 CREATE TABLE IF NOT EXISTS discovery_cache (
     command_path TEXT NOT NULL,
+    help_args TEXT NOT NULL,
     file_mtime REAL NOT NULL,
     file_size INTEGER NOT NULL,
     help_output TEXT NOT NULL,
     subcommands TEXT NOT NULL,
     cached_at TEXT NOT NULL,
-    PRIMARY KEY (command_path, file_mtime, file_size)
+    PRIMARY KEY (command_path, help_args, file_mtime, file_size)
 );
 """
 
@@ -115,8 +116,15 @@ class CommandTarget:
 @dataclass(frozen=True)
 class CommandHelp:
     target: CommandTarget
+    args: tuple[str, ...]
     help_output: str
     subcommands: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CommandHelpResult:
+    help: CommandHelp
+    cache_hit: bool
 
 
 def run_precache(
@@ -128,6 +136,8 @@ def run_precache(
     command_filters: Sequence[str] = (),
     progress_stream: TextIO = sys.stderr,
 ) -> PrecacheSummary:
+    discovery_cache = DiscoveryCache(user_discovery_cache_path())
+    discovery_cache.initialize()
     items = _discover_items(
         config,
         recursive=recursive,
@@ -141,7 +151,7 @@ def run_precache(
     for item in items:
         started = time.monotonic()
         try:
-            text = _load_item_text(item)
+            text = _load_item_text(item, discovery_cache=discovery_cache)
             if text.strip():
                 cache_command, cache_subcommand = _cache_identity(item)
                 asyncio.run(
@@ -260,8 +270,11 @@ def _read_history_commands(path: Path) -> tuple[str, ...]:
             lines: deque[str] = deque(file, maxlen=RECENT_HISTORY_LINE_LIMIT)
     except OSError:
         return ()
+    is_fish_history = path.name == "fish_history" or "fish" in path.parts
     commands: list[str] = []
     for line in reversed(lines):
+        if is_fish_history and not line.strip().startswith("- cmd:"):
+            continue
         command = _extract_history_command(line)
         if command is not None:
             commands.append(command)
@@ -403,11 +416,17 @@ def _discover_manpage_items(section: str | None) -> list[PrecacheItem]:
     return items
 
 
-def _load_item_text(item: PrecacheItem) -> str:
+def _load_item_text(
+    item: PrecacheItem, *, discovery_cache: DiscoveryCache | None = None
+) -> str:
     if item.kind == "man":
         return _capture_man(item.args)
     if item.kind == "help":
-        return _capture_help(item.args, command_path=item.command_path)
+        return _capture_help(
+            item.args,
+            command_path=item.command_path,
+            discovery_cache=discovery_cache,
+        )
     raise ValueError(f"Unsupported precache item kind: {item.kind}")
 
 
@@ -419,15 +438,24 @@ def _cache_identity(item: PrecacheItem) -> tuple[str, str]:
     return item.kind, " ".join(item.args)
 
 
-def _capture_help(args: tuple[str, ...], *, command_path: str | None = None) -> str:
-    if command_path is not None and len(args) == 1:
-        cache = DiscoveryCache(user_discovery_cache_path())
-        cache.initialize()
+def _capture_help(
+    args: tuple[str, ...],
+    *,
+    command_path: str | None = None,
+    discovery_cache: DiscoveryCache | None = None,
+) -> str:
+    if command_path is not None:
+        cache = discovery_cache or DiscoveryCache(user_discovery_cache_path())
+        if discovery_cache is None:
+            cache.initialize()
         result = _discover_command_help(
-            CommandTarget(args[0], Path(command_path)), cache
+            CommandTarget(args[0], Path(command_path)),
+            args,
+            cache,
         )
-        cache.store(result)
-        return result.help_output
+        if not result.cache_hit:
+            cache.store(result.help)
+        return result.help.help_output
     return _capture_uncached_help(args, command_path=command_path)
 
 
@@ -462,7 +490,7 @@ def _discover_command_help_parallel(
     cache.initialize()
     with ThreadPoolExecutor() as executor:
         futures = [
-            executor.submit(_discover_command_help, target, cache)
+            executor.submit(_discover_command_help, target, (target.name,), cache)
             for target in targets_with_paths
         ]
         completed = 0
@@ -473,29 +501,38 @@ def _discover_command_help_parallel(
             except (OSError, RuntimeError, ValueError):
                 progress.update(completed)
                 continue
-            results[result.target.name] = result
-            cache.store(result)
+            results[result.help.target.name] = result.help
+            if not result.cache_hit:
+                cache.store(result.help)
             progress.update(completed)
     progress.finish()
     return results
 
 
 def _discover_command_help(
-    target: CommandTarget, cache: DiscoveryCache | None = None
-) -> CommandHelp:
+    target: CommandTarget,
+    args: tuple[str, ...],
+    cache: DiscoveryCache | None = None,
+) -> CommandHelpResult:
     if target.path is None:
-        help_output = _capture_uncached_help((target.name,))
-        return CommandHelp(target, help_output, _extract_subcommands(help_output))
+        help_output = _capture_uncached_help(args)
+        help_result = CommandHelp(
+            target, args, help_output, _extract_subcommands(help_output)
+        )
+        return CommandHelpResult(help_result, cache_hit=False)
     discovery_cache = (
         cache if cache is not None else DiscoveryCache(user_discovery_cache_path())
     )
     if cache is None:
         discovery_cache.initialize()
-    cached = discovery_cache.find(target)
+    cached = discovery_cache.find(target, args)
     if cached is not None:
-        return cached
-    help_output = _capture_uncached_help((target.name,), command_path=str(target.path))
-    return CommandHelp(target, help_output, _extract_subcommands(help_output))
+        return CommandHelpResult(cached, cache_hit=True)
+    help_output = _capture_uncached_help(args, command_path=str(target.path))
+    help_result = CommandHelp(
+        target, args, help_output, _extract_subcommands(help_output)
+    )
+    return CommandHelpResult(help_result, cache_hit=False)
 
 
 def user_discovery_cache_path() -> Path:
@@ -572,7 +609,7 @@ class DiscoveryCache:
         finally:
             connection.close()
 
-    def find(self, target: CommandTarget) -> CommandHelp | None:
+    def find(self, target: CommandTarget, args: tuple[str, ...]) -> CommandHelp | None:
         if (
             target.path is None
             or not self._initialized
@@ -590,16 +627,18 @@ class DiscoveryCache:
             self._available = False
             return None
         try:
+            help_args = _encode_help_args(args)
             row = connection.execute(
                 """
                 SELECT help_output, subcommands
                 FROM discovery_cache
                 WHERE command_path = ?
+                  AND help_args = ?
                   AND file_mtime = ?
                   AND file_size = ?
                 LIMIT 1
                 """,
-                (str(target.path), stat.st_mtime, stat.st_size),
+                (str(target.path), help_args, stat.st_mtime, stat.st_size),
             ).fetchone()
         except sqlite3.Error:
             self._available = False
@@ -609,7 +648,7 @@ class DiscoveryCache:
         if row is None:
             return None
         subcommands = _decode_subcommands(row["subcommands"])
-        return CommandHelp(target, str(row["help_output"]), subcommands)
+        return CommandHelp(target, args, str(row["help_output"]), subcommands)
 
     def store(self, result: CommandHelp) -> None:
         if result.target.path is None or not self._initialized or not self._available:
@@ -625,6 +664,7 @@ class DiscoveryCache:
             return
         try:
             command_path = str(result.target.path)
+            help_args = _encode_help_args(result.args)
             file_mtime = stat.st_mtime
             file_size = stat.st_size
             connection.execute(
@@ -639,14 +679,15 @@ class DiscoveryCache:
                 """
                 INSERT INTO discovery_cache (
                     command_path,
+                    help_args,
                     file_mtime,
                     file_size,
                     help_output,
                     subcommands,
                     cached_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(command_path, file_mtime, file_size)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(command_path, help_args, file_mtime, file_size)
                 DO UPDATE SET
                     help_output = excluded.help_output,
                     subcommands = excluded.subcommands,
@@ -654,6 +695,7 @@ class DiscoveryCache:
                 """,
                 (
                     command_path,
+                    help_args,
                     file_mtime,
                     file_size,
                     result.help_output,
@@ -676,7 +718,18 @@ class DiscoveryCache:
 
     def _ensure_schema(self, connection: sqlite3.Connection) -> None:
         connection.executescript(DISCOVERY_SCHEMA)
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(discovery_cache)")
+        }
+        if "help_args" not in columns:
+            connection.execute("DROP TABLE discovery_cache")
+            connection.executescript(DISCOVERY_SCHEMA)
         connection.commit()
+
+
+def _encode_help_args(args: tuple[str, ...]) -> str:
+    return json.dumps(list(args), separators=(",", ":"))
 
 
 def _decode_subcommands(raw: str) -> tuple[str, ...]:
