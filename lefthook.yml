@@ -18,5 +18,8 @@ post-commit:
   commands:
     auto-translate-readme:
       run: bash scripts/hooks/auto-translate-readme.sh
+
+post-push:
+  commands:
     reinstall:
       run: scripts/hooks/post-push-reinstall.sh
