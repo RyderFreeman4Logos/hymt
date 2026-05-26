@@ -205,6 +205,11 @@ def _is_attached_short_value(arg: str) -> bool:
     default=None,
     help="Override [translation].stream for stdout streaming.",
 )
+@click.option(
+    "--progress",
+    is_flag=True,
+    help="Force progress/status output when stderr is not a TTY.",
+)
 @click.pass_context
 def main(
     ctx: click.Context,
@@ -219,6 +224,7 @@ def main(
     instructions: tuple[str, ...],
     yes: bool,
     stream: bool | None,
+    progress: bool,
 ) -> None:
     if ctx.invoked_subcommand is not None:
         return
@@ -251,6 +257,7 @@ def main(
                     config,
                     selected_type,
                     stream=stream_enabled,
+                    progress=True if progress else None,
                     source_text=source_text,
                     document_plan=document_plan,
                     **kwargs,
@@ -278,6 +285,7 @@ def main(
                 config,
                 selected_type,
                 stream=stream_enabled,
+                progress=True if progress else None,
                 on_token=write_token
                 if output_file is None and stream_enabled
                 else None,

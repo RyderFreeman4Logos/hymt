@@ -42,6 +42,73 @@ class TranslationCacheTests(unittest.TestCase):
                         "en",
                         SimpleNamespace(concurrency=1, config_version=1, model=""),
                         TemplateType.DEFAULT,
+                        progress=True,
+                    )
+                )
+
+        self.assertEqual(output, "cached output")
+        self.assertIn("Source tokens: 11; segments: 1", stderr.getvalue())
+        self.assertIn("[1/1] 100.00%", stderr.getvalue())
+        client_cls.assert_not_called()
+
+    def test_translate_text_suppresses_progress_when_stderr_is_not_tty(self) -> None:
+        source = "source text"
+        segment_hash = _segment_cache_hash(source)
+
+        with temporary_home():
+            HistoryDB().store_segment_cache(
+                segment_hash,
+                "en",
+                TemplateType.DEFAULT.value,
+                "cached output",
+                "2026-05-23T00:00:00+00:00",
+            )
+            stderr = io.StringIO()
+
+            with (
+                patch("hymt.translate.plan_translation", return_value=FakePlan()),
+                patch("hymt.translate.TranslationClient") as client_cls,
+                redirect_stderr(stderr),
+            ):
+                output = asyncio.run(
+                    translate_text(
+                        source,
+                        "en",
+                        SimpleNamespace(concurrency=1, config_version=1, model=""),
+                        TemplateType.DEFAULT,
+                    )
+                )
+
+        self.assertEqual(output, "cached output")
+        self.assertEqual(stderr.getvalue(), "")
+        client_cls.assert_not_called()
+
+    def test_translate_text_progress_opt_in_writes_to_non_tty_stderr(self) -> None:
+        source = "source text"
+        segment_hash = _segment_cache_hash(source)
+
+        with temporary_home():
+            HistoryDB().store_segment_cache(
+                segment_hash,
+                "en",
+                TemplateType.DEFAULT.value,
+                "cached output",
+                "2026-05-23T00:00:00+00:00",
+            )
+            stderr = io.StringIO()
+
+            with (
+                patch("hymt.translate.plan_translation", return_value=FakePlan()),
+                patch("hymt.translate.TranslationClient") as client_cls,
+                redirect_stderr(stderr),
+            ):
+                output = asyncio.run(
+                    translate_text(
+                        source,
+                        "en",
+                        SimpleNamespace(concurrency=1, config_version=1, model=""),
+                        TemplateType.DEFAULT,
+                        progress=True,
                     )
                 )
 

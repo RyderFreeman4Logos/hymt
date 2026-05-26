@@ -76,6 +76,23 @@ class StdoutNewlineTests(unittest.TestCase):
         translate.assert_awaited_once()
         self.assertEqual(translate.await_args.args[0], "config")
 
+    def test_cli_progress_flag_forces_translation_progress(self) -> None:
+        with temporary_home() as home:
+            runner = CliRunner()
+            translate = AsyncMock(return_value="translated")
+            with (
+                patch("hymt.cli.HotConfig", return_value=SimpleNamespace()),
+                patch("hymt.cli._announce_tokenizer_download"),
+                patch("hymt.cli.translate_text", new=translate),
+            ):
+                result = runner.invoke(
+                    main, ["--progress", "-t", "en", "source"], env={"HOME": home}
+                )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        translate.assert_awaited_once()
+        self.assertIs(translate.await_args.kwargs["progress"], True)
+
     def test_cli_output_write_error_becomes_click_error(self) -> None:
         with temporary_home() as home, tempfile.TemporaryDirectory() as tmpdir:
             output_path = Path(tmpdir) / "existing-dir"

@@ -30,7 +30,7 @@ TokenCallback: TypeAlias = Callable[[str], None]
 
 
 @contextmanager
-def _translation_lock() -> Generator[None]:
+def _translation_lock(*, progress: bool = True) -> Generator[None]:
     lock_path = Path.home() / ".cache" / "hymt" / "translate.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd = open(lock_path, "w")  # noqa: SIM115
@@ -38,7 +38,8 @@ def _translation_lock() -> Generator[None]:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
-            print("Waiting for translation lock...", file=sys.stderr)
+            if progress:
+                print("Waiting for translation lock...", file=sys.stderr)
             fcntl.flock(fd, fcntl.LOCK_EX)
         yield
     finally:
@@ -138,6 +139,7 @@ async def translate_text(
     template_type: TemplateType = TemplateType.DEFAULT,
     *,
     stream: bool | None = None,
+    progress: bool | None = None,
     on_token: TokenCallback | None = None,
     document_plan: DocumentLanguagePlan | None = None,
     **template_kwargs: object,
@@ -157,10 +159,12 @@ async def translate_text(
         document_plan=document_plan,
         **template_kwargs,
     )
-    print(
-        f"Source tokens: {plan.source_tokens}; segments: {plan.segment_count}",
-        file=sys.stderr,
-    )
+    progress_enabled = _progress_enabled(sys.stderr, progress)
+    if progress_enabled:
+        print(
+            f"Source tokens: {plan.source_tokens}; segments: {plan.segment_count}",
+            file=sys.stderr,
+        )
     history = HistoryDB()
     cv = config.config_version
     initial_estimate = history.estimate(
@@ -170,7 +174,7 @@ async def translate_text(
         template_name,
         config_version=cv,
     )
-    if initial_estimate is not None:
+    if progress_enabled and initial_estimate is not None:
         _print_estimate(initial_estimate)
     stream_enabled = _stream_enabled(config, stream)
     options_hash = _template_options_hash(template_kwargs)
@@ -178,14 +182,15 @@ async def translate_text(
     segment_tokens = [plan.count_tokens(segment) for segment in plan.segments]
     translations: list[str | None] = [None] * plan.segment_count
 
-    with _translation_lock():
+    with _translation_lock(progress=progress_enabled):
         started_at = datetime.now(timezone.utc)
         started_monotonic = _monotonic()
-        progress = TranslationProgress(
+        progress_reporter = TranslationProgress(
             plan.segment_count,
             config.concurrency,
             started_monotonic,
             sys.stderr,
+            enabled=progress_enabled,
         )
         completed = 0
         completed_tokens = 0
@@ -204,7 +209,7 @@ async def translate_text(
                     template_kwargs,
                     options_hash,
                     template_name,
-                    progress,
+                    progress_reporter,
                     completed,
                     completed_tokens,
                     on_token,
@@ -222,7 +227,7 @@ async def translate_text(
                     translations[index] = cached
                     completed += 1
                     completed_tokens += token_count
-                    progress.update(completed, completed_tokens, 0.0)
+                    progress_reporter.update(completed, completed_tokens, 0.0)
 
             if missing_indexes:
                 async with TranslationClient(config) as client:
@@ -239,13 +244,13 @@ async def translate_text(
                         template_kwargs,
                         options_hash,
                         template_name,
-                        progress,
+                        progress_reporter,
                         completed,
                         completed_tokens,
                         config.concurrency,
                     )
         finally:
-            progress.finish()
+            progress_reporter.finish()
 
     translated = plan.reconstruct(_completed_translations(translations))
     finished_at = datetime.now(timezone.utc)
@@ -275,6 +280,7 @@ async def translate_text(
             input_hash=input_hash,
             config_version=cv,
         ),
+        progress=progress_enabled,
     )
     maybe_prompt_timing_issue(
         history,
@@ -304,6 +310,7 @@ async def translate_file(
     template_type: TemplateType = TemplateType.DEFAULT,
     *,
     stream: bool | None = None,
+    progress: bool | None = None,
     source_text: str | None = None,
     document_plan: DocumentLanguagePlan | None = None,
     **template_kwargs: object,
@@ -328,6 +335,7 @@ async def translate_file(
         config,
         template_type,
         stream=stream_enabled,
+        progress=progress,
         on_token=write_token if output_path is None and stream_enabled else None,
         document_plan=document_plan,
         **template_kwargs,
@@ -350,11 +358,14 @@ class TranslationProgress:
         concurrency: int,
         started_monotonic: float,
         stream: TextIO,
+        *,
+        enabled: bool = True,
     ) -> None:
         self._total_segments = total_segments
         self._concurrency = max(1, concurrency)
         self._started_monotonic = started_monotonic
         self._stream = stream
+        self._enabled = enabled
         self._recent_segment_seconds: deque[float] = deque(maxlen=5)
         self._uses_carriage_return = stream.isatty()
         self._printed = False
@@ -362,6 +373,8 @@ class TranslationProgress:
     def update(
         self, completed_segments: int, completed_tokens: int, segment_seconds: float
     ) -> None:
+        if not self._enabled:
+            return
         if self._total_segments == 0:
             return
         self._recent_segment_seconds.append(max(0.0, segment_seconds))
@@ -384,6 +397,8 @@ class TranslationProgress:
         self._printed = True
 
     def finish(self) -> None:
+        if not self._enabled:
+            return
         if self._printed and self._uses_carriage_return:
             self._stream.write("\n")
             self._stream.flush()
@@ -562,6 +577,12 @@ def _stream_enabled(config: HotConfig, override: bool | None) -> bool:
     return value if isinstance(value, bool) else True
 
 
+def _progress_enabled(stream: TextIO, override: bool | None) -> bool:
+    if override is not None:
+        return override
+    return stream.isatty()
+
+
 def _print_estimate(est: DurationEstimate) -> None:
     stats = est.stats
     if len(est.versions_used) <= 1:
@@ -582,11 +603,15 @@ def _print_estimate(est: DurationEstimate) -> None:
     )
 
 
-def _record_successful_translation(history: HistoryDB, record: TaskRecord) -> None:
+def _record_successful_translation(
+    history: HistoryDB, record: TaskRecord, *, progress: bool = True
+) -> None:
     try:
         history.insert_task(record)
     except (OSError, sqlite3.Error) as exc:
         print(f"Warning: failed to record timing history: {exc}", file=sys.stderr)
+        return
+    if not progress:
         return
     print(
         f"Completed in {format_duration(record.duration_seconds)} | "

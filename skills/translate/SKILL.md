@@ -13,6 +13,7 @@ Use `hymt` when an agent should drive the local Hy-MT2 CLI instead of hand-writi
 - File input: `hymt -f input.txt -t ja -o output.txt`
 - Stdin pipeline: `cat article.txt | hymt -t fr`
 - Force or disable streaming: `hymt -f input.txt -t ja --stream` / `hymt -f input.txt -t ja --no-stream`
+- Force progress/status output for non-TTY stderr: `cat article.txt | hymt -t fr --progress`
 - Skip interactive checks: `hymt -f input.txt -t ja --yes`
 - If the source text matches a subcommand name, disambiguate with `--`: `hymt -t zh -- "config"`
 - Mixed-language documents use smart partial translation when language detection is available: target-language paragraphs are kept, non-target paragraphs are translated, and fenced code blocks are always preserved.
@@ -90,7 +91,7 @@ Related skills cover command/documentation translation:
 
 ## Behavior
 
-- Translation output goes to stdout; progress and status go to stderr.
+- Translation output goes to stdout; progress and status go to stderr when stderr is a TTY, or when direct translation uses `--progress`.
 - Stdout translations end with a trailing newline.
 - When optional language detection support is installed, mixed-language runs show a per-paragraph plan and prompt: `X of Y paragraphs are already in <target_lang>. Translate only the remaining Z paragraphs? (y/n/all)`. `y` keeps target-language paragraphs, `all` translates every non-code paragraph, and `n` cancels.
 - `--yes` and non-interactive stdin auto-select partial translation for mixed-language input.
@@ -98,7 +99,7 @@ Related skills cover command/documentation translation:
 - Fenced code blocks are excluded from language detection and translation in every mode.
 - `[translation].stream = true` is the default. `--stream`/`--no-stream` override config for translation runs.
 - Streaming runs send tokens to stdout as the endpoint produces them; non-streaming runs buffer output until completion.
-- Progress is written to stderr as `[done/total] XX.XX% | elapsed 2m47s | eta 1m23s | NN.NN tok/s`.
+- Progress is written to stderr as `[done/total] XX.XX% | elapsed 2m47s | eta 1m23s | NN.NN tok/s` for TTY stderr or explicit `--progress`.
 - Identical source segments, target language, template type, and template-specific options reuse cached segment translations.
 - `translate-doc` persists each completed segment immediately, so watch-mode retries and interrupted runs can resume from the segment cache.
 - After a completed interactive translation, if actual runtime diverges from the estimate by `[timing].divergence_threshold` (default `2.0`), `hymt` can prompt to file a GitHub timing-data issue.
