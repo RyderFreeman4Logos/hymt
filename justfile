@@ -84,9 +84,9 @@ install:
     set -euo pipefail
     cd "{{_repo_root}}"
     if command -v mise >/dev/null 2>&1; then
-        mise x -- uv tool install --force "{{_repo_root}}"
+        mise x -- uv tool install --force --reinstall "{{_repo_root}}"
     elif command -v uv >/dev/null 2>&1; then
-        uv tool install --force "{{_repo_root}}"
+        uv tool install --force --reinstall "{{_repo_root}}"
     else
         echo "ERROR: mise or uv required" >&2
         exit 1
