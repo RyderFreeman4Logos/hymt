@@ -147,7 +147,7 @@ def plan_translation(
             "Config context_window is too small for the selected template and max_output_tokens"
         )
     expansion_ratio = _expansion_ratio(target_lang)
-    max_safe_source = int(config.max_output_tokens / expansion_ratio)
+    max_safe_source = int(config.max_output_tokens / expansion_ratio * _SAFETY_MARGIN)
     available_source_tokens = min(base_source_budget, max_safe_source)
     if available_source_tokens <= 0:
         raise ValueError(
@@ -714,6 +714,8 @@ def _completed_translations(translations: list[str | None]) -> list[str]:
         raise RuntimeError(f"Missing translated segments: {missing}")
     return [str(translation) for translation in translations]
 
+
+_SAFETY_MARGIN = 0.80
 
 _EXPANSION_RATIOS: dict[str, float] = {
     "en": 1.8,

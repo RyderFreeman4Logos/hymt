@@ -237,6 +237,12 @@ def _extract_translation(data: dict[str, object]) -> str:
     first = choices[0]
     if not isinstance(first, dict):
         raise TranslationError("Translation response choice must be an object")
+    finish_reason = first.get("finish_reason", "")
+    if finish_reason == "length":
+        raise TranslationError(
+            "Segment truncated (hit max_tokens). "
+            "Reduce context_window or increase max_output_tokens."
+        )
     message = first.get("message")
     if isinstance(message, dict):
         content = message.get("content")
@@ -288,6 +294,12 @@ def _extract_stream_token(data: dict[str, object]) -> str:
     first = choices[0]
     if not isinstance(first, dict):
         return ""
+    finish_reason = first.get("finish_reason", "")
+    if finish_reason == "length":
+        raise TranslationError(
+            "Segment truncated (hit max_tokens). "
+            "Reduce context_window or increase max_output_tokens."
+        )
     delta = first.get("delta")
     if isinstance(delta, dict):
         content = delta.get("content")
