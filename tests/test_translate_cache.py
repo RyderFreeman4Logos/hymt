@@ -370,6 +370,35 @@ class TranslationCacheTests(unittest.TestCase):
         self.assertEqual(output, expected)
         self.assertEqual("".join(streamed), expected)
 
+    def test_streaming_packed_paragraphs_skip_internal_original_sections(self) -> None:
+        source = "First paragraph.\n\nSecond paragraph."
+        expected = "fresh output"
+        streamed: list[str] = []
+
+        with temporary_home():
+            with (
+                patch("hymt.translate.create_segmenter", return_value=FakeSegmenter()),
+                patch("hymt.translate._translation_lock", return_value=nullcontext()),
+                patch(
+                    "hymt.translate.TranslationClient",
+                    FakeStreamingTranslationClient,
+                ),
+                redirect_stderr(io.StringIO()),
+            ):
+                output = asyncio.run(
+                    translate_text(
+                        source,
+                        "zh",
+                        fake_config(),
+                        TemplateType.DEFAULT,
+                        stream=True,
+                        on_token=streamed.append,
+                    )
+                )
+
+        self.assertEqual(output, expected)
+        self.assertEqual("".join(streamed), expected)
+
 
 class FakePlan:
     source_tokens = 11

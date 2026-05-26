@@ -18,7 +18,11 @@ from typing import TextIO, TypeAlias
 from hymt.client import TranslationClient
 from hymt.config import HotConfig
 from hymt.history import DurationEstimate, HistoryDB, TaskRecord, format_duration
-from hymt.language import DocumentLanguagePlan, build_document_translation_plan
+from hymt.language import (
+    DocumentLanguagePlan,
+    DocumentSection,
+    build_document_translation_plan,
+)
 from hymt.segment import Segmenter, create_segmenter
 from hymt.templates import TemplateType, build_prompt
 from hymt.timing_issue import TimingIssueData, maybe_prompt_timing_issue
@@ -59,6 +63,7 @@ class TranslationPlan:
     _segmenter: Segmenter = field(repr=False, compare=False)
     document_plan: DocumentLanguagePlan | None = None
     segment_section_indexes: tuple[int, ...] = ()
+    segment_section_groups: tuple[tuple[int, ...], ...] = ()
 
     @property
     def segment_count(self) -> int:
@@ -70,6 +75,8 @@ class TranslationPlan:
     def reconstruct(self, translations: list[str]) -> str:
         if self.document_plan is None:
             return "".join(translations)
+        if self.segment_section_groups:
+            return self._reconstruct_section_groups(translations)
         section_translations: dict[int, list[str]] = {}
         for section_index, translation in zip(
             self.segment_section_indexes, translations, strict=True
@@ -80,6 +87,39 @@ class TranslationPlan:
             if section.should_translate:
                 section_output = "".join(section_translations.get(section_index, []))
                 if section.text.endswith("\n") and not section_output.endswith("\n"):
+                    section_output = f"{section_output}\n"
+                parts.append(section_output)
+            else:
+                parts.append(section.text)
+        return "".join(parts)
+
+    def _reconstruct_section_groups(self, translations: list[str]) -> str:
+        if self.document_plan is None:
+            return "".join(translations)
+        group_translations: dict[int, list[str]] = {}
+        group_texts: dict[int, str] = {}
+        covered_sections: set[int] = set()
+        for section_group, translation in zip(
+            self.segment_section_groups, translations, strict=True
+        ):
+            if not section_group:
+                continue
+            first_section_index = section_group[0]
+            group_translations.setdefault(first_section_index, []).append(translation)
+            if first_section_index not in group_texts:
+                group_texts[first_section_index] = "".join(
+                    self.document_plan.sections[index].text for index in section_group
+                )
+            covered_sections.update(section_group)
+
+        parts: list[str] = []
+        for section_index, section in enumerate(self.document_plan.sections):
+            if section_index in covered_sections:
+                if section_index not in group_translations:
+                    continue
+                section_output = "".join(group_translations[section_index])
+                group_text = group_texts[section_index]
+                if group_text.endswith("\n") and not section_output.endswith("\n"):
                     section_output = f"{section_output}\n"
                 parts.append(section_output)
             else:
@@ -114,14 +154,11 @@ def plan_translation(
         text, target_lang
     )
     source_tokens = segmenter.count_tokens(text)
-    segments: list[str] = []
-    segment_section_indexes: list[int] = []
-    for section_index, section in enumerate(active_document_plan.sections):
-        if not section.should_translate:
-            continue
-        section_segments = segmenter.segment(section.text, available_source_tokens)
-        segments.extend(section_segments)
-        segment_section_indexes.extend([section_index] * len(section_segments))
+    (
+        segments,
+        segment_section_indexes,
+        segment_section_groups,
+    ) = _segment_document_plan(active_document_plan, segmenter, available_source_tokens)
     return TranslationPlan(
         source_tokens,
         segments,
@@ -129,7 +166,66 @@ def plan_translation(
         segmenter,
         active_document_plan,
         tuple(segment_section_indexes),
+        tuple(segment_section_groups),
     )
+
+
+def _segment_document_plan(
+    document_plan: DocumentLanguagePlan,
+    segmenter: Segmenter,
+    available_source_tokens: int,
+) -> tuple[list[str], list[int], list[tuple[int, ...]]]:
+    segments: list[str] = []
+    segment_section_indexes: list[int] = []
+    segment_section_groups: list[tuple[int, ...]] = []
+    for section_group in _translation_section_groups(document_plan):
+        section_text = "".join(
+            document_plan.sections[index].text for index in section_group
+        )
+        section_segments = segmenter.segment(section_text, available_source_tokens)
+        segments.extend(section_segments)
+        segment_section_indexes.extend([section_group[0]] * len(section_segments))
+        segment_section_groups.extend([section_group] * len(section_segments))
+    return segments, segment_section_indexes, segment_section_groups
+
+
+def _translation_section_groups(
+    document_plan: DocumentLanguagePlan,
+) -> list[tuple[int, ...]]:
+    groups: list[tuple[int, ...]] = []
+    current_group: list[int] = []
+    sections = document_plan.sections
+
+    for section_index, section in enumerate(sections):
+        if section.should_translate:
+            current_group.append(section_index)
+            continue
+        if section.kind == "separator" and current_group:
+            next_content_index = _next_content_section_index(sections, section_index)
+            if (
+                next_content_index is not None
+                and sections[next_content_index].should_translate
+            ):
+                current_group.append(section_index)
+                continue
+        if current_group:
+            groups.append(tuple(current_group))
+            current_group = []
+
+    if current_group:
+        groups.append(tuple(current_group))
+    return groups
+
+
+def _next_content_section_index(
+    sections: tuple[DocumentSection, ...],
+    section_index: int,
+) -> int | None:
+    for next_index in range(section_index + 1, len(sections)):
+        section = sections[next_index]
+        if section.kind != "separator":
+            return next_index
+    return None
 
 
 async def translate_text(
@@ -475,6 +571,34 @@ async def _translate_streaming_plan(
                 await translate_index(index)
             return completed, completed_tokens
 
+        if plan.segment_section_groups:
+            (
+                group_segment_indexes,
+                covered_sections,
+                group_texts,
+            ) = _streaming_section_groups(plan)
+            for section_index, section in enumerate(plan.document_plan.sections):
+                if section_index not in covered_sections:
+                    on_token(section.text)
+                    continue
+                if section_index not in group_segment_indexes:
+                    continue
+
+                segment_indexes = group_segment_indexes[section_index]
+                for index in segment_indexes:
+                    await translate_index(index)
+                group_output = "".join(
+                    str(translations[index])
+                    for index in segment_indexes
+                    if translations[index] is not None
+                )
+                group_text = group_texts[section_index]
+                if group_text.endswith("\n") and not group_output.endswith("\n"):
+                    on_token("\n")
+                    last_index = segment_indexes[-1]
+                    translations[last_index] = f"{translations[last_index]}\n"
+            return completed, completed_tokens
+
         segment_index = 0
         for section_index, section in enumerate(plan.document_plan.sections):
             if not section.should_translate:
@@ -501,6 +625,28 @@ async def _translate_streaming_plan(
             await translate_index(segment_index)
             segment_index += 1
         return completed, completed_tokens
+
+
+def _streaming_section_groups(
+    plan: TranslationPlan,
+) -> tuple[dict[int, list[int]], set[int], dict[int, str]]:
+    if plan.document_plan is None:
+        return {}, set(), {}
+
+    group_segment_indexes: dict[int, list[int]] = {}
+    covered_sections: set[int] = set()
+    group_texts: dict[int, str] = {}
+    for segment_index, section_group in enumerate(plan.segment_section_groups):
+        if not section_group:
+            continue
+        first_section_index = section_group[0]
+        group_segment_indexes.setdefault(first_section_index, []).append(segment_index)
+        if first_section_index not in group_texts:
+            group_texts[first_section_index] = "".join(
+                plan.document_plan.sections[index].text for index in section_group
+            )
+        covered_sections.update(section_group)
+    return group_segment_indexes, covered_sections, group_texts
 
 
 async def _translate_streaming_segment(
