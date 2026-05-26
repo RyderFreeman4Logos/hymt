@@ -19,6 +19,7 @@ def show_translated_man(
     *,
     original: bool = False,
     refresh: bool = False,
+    explicit_target: bool = True,
 ) -> int:
     if not args:
         raise ValueError("man page or man arguments are required")
@@ -26,7 +27,13 @@ def show_translated_man(
         return subprocess.call(["man", *args])
     text = _capture_man(args)
     translated = _translate_document(
-        "man", " ".join(args), text, target_lang, config, refresh
+        "man",
+        " ".join(args),
+        text,
+        target_lang,
+        config,
+        refresh,
+        explicit_target=explicit_target,
     )
     return _page_text(translated)
 
@@ -38,6 +45,7 @@ def show_translated_info(
     *,
     original: bool = False,
     refresh: bool = False,
+    explicit_target: bool = True,
 ) -> int:
     if not args:
         raise ValueError("info topic or info arguments are required")
@@ -45,7 +53,13 @@ def show_translated_info(
         return subprocess.call(["info", *args])
     text = _capture_info(args)
     translated = _translate_document(
-        "info", " ".join(args), text, target_lang, config, refresh
+        "info",
+        " ".join(args),
+        text,
+        target_lang,
+        config,
+        refresh,
+        explicit_target=explicit_target,
     )
     return _page_text(translated)
 
@@ -97,6 +111,8 @@ def _translate_document(
     target_lang: str,
     config: HotConfig,
     refresh: bool,
+    *,
+    explicit_target: bool,
 ) -> str:
     return asyncio.run(
         translate_cached_text(
@@ -106,6 +122,7 @@ def _translate_document(
             target_lang,
             config,
             refresh=refresh,
+            explicit_target=explicit_target,
         )
     )
 

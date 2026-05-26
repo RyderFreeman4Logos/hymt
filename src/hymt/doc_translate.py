@@ -12,7 +12,7 @@ from types import ModuleType
 from typing import TextIO
 
 from hymt.config import HotConfig
-from hymt.language import analyze_document_language
+from hymt.language import analyze_document_language, resolve_target_language
 from hymt.templates import TemplateType
 from hymt.translate import translate_text
 
@@ -33,6 +33,7 @@ WATCH_POLL_SECONDS = 0.25
 class DocTranslationTarget:
     source_path: Path
     output_path: Path
+    target_lang: str = ""
 
 
 @dataclass(frozen=True)
@@ -55,13 +56,16 @@ def run_doc_translation(
     template_type: TemplateType = TemplateType.DEFAULT,
     template_kwargs: dict[str, object] | None = None,
     progress_stream: TextIO,
+    explicit_target: bool = True,
 ) -> None:
     targets = build_doc_translation_targets(
         source,
         target_lang,
+        config=config,
         output_path=output_path,
         output_dir=output_dir,
         recursive=recursive,
+        explicit_target=explicit_target,
     )
     if source.expanduser().is_dir():
         if watch:
@@ -71,7 +75,6 @@ def run_doc_translation(
         asyncio.run(
             _translate_targets(
                 targets,
-                target_lang,
                 config,
                 stream=stream,
                 template_type=template_type,
@@ -87,7 +90,6 @@ def run_doc_translation(
         asyncio.run(
             _watch_target(
                 target,
-                target_lang,
                 config,
                 stream=stream,
                 template_type=template_type,
@@ -99,7 +101,6 @@ def run_doc_translation(
     asyncio.run(
         _translate_target_until_stable(
             target,
-            target_lang,
             config,
             stream=stream,
             template_type=template_type,
@@ -113,16 +114,21 @@ def build_doc_translation_targets(
     source: Path,
     target_lang: str,
     *,
+    config: HotConfig | None = None,
     output_path: Path | None = None,
     output_dir: Path | None = None,
     recursive: bool = False,
+    explicit_target: bool = True,
 ) -> tuple[DocTranslationTarget, ...]:
     resolved_source = source.expanduser().resolve(strict=True)
-    target_suffix = _target_lang_path_suffix(target_lang)
     if resolved_source.is_file():
         _validate_markdown_source(resolved_source)
         if output_path is not None and output_dir is not None:
             raise ValueError("Use either --output or --output-dir, not both")
+        effective_target_lang = _resolve_file_target_lang(
+            resolved_source, target_lang, config, explicit_target=explicit_target
+        )
+        target_suffix = _target_lang_path_suffix(effective_target_lang)
         resolved_output = _file_output_path(
             resolved_source,
             resolved_source.parent,
@@ -130,7 +136,11 @@ def build_doc_translation_targets(
             output_dir,
             target_suffix,
         )
-        return (DocTranslationTarget(resolved_source, resolved_output),)
+        return (
+            DocTranslationTarget(
+                resolved_source, resolved_output, effective_target_lang
+            ),
+        )
 
     if not resolved_source.is_dir():
         raise ValueError(f"Unsupported translate-doc source: {resolved_source}")
@@ -140,13 +150,17 @@ def build_doc_translation_targets(
     files = _scan_markdown_files(resolved_source, recursive=recursive)
     targets: list[DocTranslationTarget] = []
     for path in files:
-        if path.stem.endswith(f".{target_suffix}"):
-            continue
         if not _is_utf8_text_file(path):
             print(
                 f"Warning: skipping {path.relative_to(resolved_source)}: not valid UTF-8",
                 file=sys.stderr,
             )
+            continue
+        effective_target_lang = _resolve_file_target_lang(
+            path, target_lang, config, explicit_target=explicit_target
+        )
+        target_suffix = _target_lang_path_suffix(effective_target_lang)
+        if path.stem.endswith(f".{target_suffix}"):
             continue
         targets.append(
             DocTranslationTarget(
@@ -154,6 +168,7 @@ def build_doc_translation_targets(
                 _file_output_path(
                     path, resolved_source, None, output_dir, target_suffix
                 ),
+                effective_target_lang,
             )
         )
     return tuple(targets)
@@ -161,7 +176,6 @@ def build_doc_translation_targets(
 
 async def _translate_targets(
     targets: Sequence[DocTranslationTarget],
-    target_lang: str,
     config: HotConfig,
     *,
     stream: bool | None,
@@ -179,7 +193,6 @@ async def _translate_targets(
         )
         await _translate_target_until_stable(
             target,
-            target_lang,
             config,
             stream=stream,
             template_type=template_type,
@@ -190,7 +203,6 @@ async def _translate_targets(
 
 async def _watch_target(
     target: DocTranslationTarget,
-    target_lang: str,
     config: HotConfig,
     *,
     stream: bool | None,
@@ -204,7 +216,6 @@ async def _watch_target(
     )
     last_state = await _translate_target_until_stable(
         target,
-        target_lang,
         config,
         stream=stream,
         template_type=template_type,
@@ -215,7 +226,6 @@ async def _watch_target(
         await _wait_for_path_change(target.source_path, last_state)
         last_state = await _translate_target_until_stable(
             target,
-            target_lang,
             config,
             stream=stream,
             template_type=template_type,
@@ -226,7 +236,6 @@ async def _watch_target(
 
 async def _translate_target_until_stable(
     target: DocTranslationTarget,
-    target_lang: str,
     config: HotConfig,
     *,
     stream: bool | None,
@@ -245,7 +254,6 @@ async def _translate_target_until_stable(
         translate_task = asyncio.create_task(
             _translate_target_once(
                 target,
-                target_lang,
                 config,
                 stream=stream,
                 template_type=template_type,
@@ -285,7 +293,6 @@ async def _translate_target_until_stable(
 
 async def _translate_target_once(
     target: DocTranslationTarget,
-    target_lang: str,
     config: HotConfig,
     *,
     stream: bool | None,
@@ -293,6 +300,7 @@ async def _translate_target_once(
     template_kwargs: dict[str, object],
 ) -> str:
     source_text = target.source_path.read_text(encoding="utf-8")
+    target_lang = target.target_lang
     document_plan = analyze_document_language(source_text, target_lang)
     return await translate_text(
         source_text,
@@ -415,6 +423,23 @@ def _target_lang_path_suffix(target_lang: str) -> str:
             "document target language must contain only ASCII letters, digits, or hyphens"
         )
     return TARGET_SUFFIX_ALIASES.get(suffix, suffix)
+
+
+def _resolve_file_target_lang(
+    path: Path,
+    requested_target_lang: str,
+    config: HotConfig | None,
+    *,
+    explicit_target: bool,
+) -> str:
+    if config is None or explicit_target:
+        return requested_target_lang
+    return resolve_target_language(
+        path.read_text(encoding="utf-8"),
+        requested_target_lang,
+        config,
+        explicit_target=False,
+    )
 
 
 def _is_utf8_text_file(path: Path) -> bool:

@@ -16,6 +16,7 @@ Use `hymt` when an agent should drive the local Hy-MT2 CLI instead of hand-writi
 - Force progress/status output for non-TTY stderr: `cat article.txt | hymt -t fr --progress`
 - Skip interactive checks: `hymt -f input.txt -t ja --yes`
 - If the source text matches a subcommand name, disambiguate with `--`: `hymt -t zh -- "config"`
+- Without an explicit `-t/--target`, hymt routes between `[language].primary` (default `zh`) and `[language].secondary` (default `en`): mostly-primary input targets secondary, otherwise it targets primary.
 - Mixed-language documents use smart partial translation when language detection is available: target-language paragraphs are kept, non-target paragraphs are translated, and fenced code blocks are always preserved.
 
 ## Batch translate directories
@@ -26,7 +27,7 @@ Use `hymt` when an agent should drive the local Hy-MT2 CLI instead of hand-writi
 - Skip confirmation for automation: `hymt batch ./docs -t zh --write --yes`
 - Write to a separate tree while preserving source-relative paths: `hymt batch ./docs -t zh --write --output-dir translated-docs`
 - Batch mode scans the top-level directory by default; add `--recursive` to descend into subdirectories. It follows symlinks and selects `.txt` and `.md` files.
-- Output names are `{stem}.{target}.{ext}`; for the default target this writes `README.zh.md` beside `README.md`.
+- Output names are `{stem}.{target}.{ext}` using the effective target; with default routing, English files write `README.zh.md` and mostly-primary files write `README.en.md`.
 - Files whose resolved output path would leave the scan root or `--output-dir` are skipped with a stderr warning.
 - Batch target names accept only ASCII letters, digits, and hyphens; dots, path separators, and other characters are rejected.
 - Files already detected as target-language documents are skipped. Mixed-language files keep target-language paragraphs and translate the remaining paragraphs.
@@ -42,7 +43,7 @@ Use `hymt` when an agent should drive the local Hy-MT2 CLI instead of hand-writi
 - Translate to another language: `hymt translate-doc README.md -t ja`
 - Translate a documentation tree: `hymt translate-doc docs/ --recursive`
 - Keep a file in sync while editing: `hymt translate-doc README.md --watch`
-- `translate-doc` only accepts Markdown input, normalizes `-t zh` outputs to `.zh-cn.md`, and falls back to polling when `watchfiles` is unavailable.
+- `translate-doc` only accepts Markdown input, normalizes effective `zh` outputs to `.zh-cn.md`, and falls back to polling when `watchfiles` is unavailable.
 - Watch-mode retries are bounded by `[translation].max_retranslation_retries`, and changed files reuse cached segments instead of retranslating the whole document from scratch.
 
 ## Template types
@@ -93,6 +94,7 @@ Related skills cover command/documentation translation:
 
 - Translation output goes to stdout; progress and status go to stderr when stderr is a TTY, or when direct translation uses `--progress`.
 - Stdout translations end with a trailing newline.
+- Explicit `-t/--target` disables default language routing and uses the requested target for prompts, cache/history keys, and output suffixes.
 - When optional language detection support is installed, mixed-language runs show a per-paragraph plan and prompt: `X of Y paragraphs are already in <target_lang>. Translate only the remaining Z paragraphs? (y/n/all)`. `y` keeps target-language paragraphs, `all` translates every non-code paragraph, and `n` cancels.
 - `--yes` and non-interactive stdin auto-select partial translation for mixed-language input.
 - If all detected paragraphs are already in the target language, interactive runs still ask whether to translate anyway.
@@ -103,7 +105,7 @@ Related skills cover command/documentation translation:
 - Identical source segments, target language, template type, and template-specific options reuse cached segment translations.
 - `translate-doc` persists each completed segment immediately, so watch-mode retries and interrupted runs can resume from the segment cache.
 - After a completed interactive translation, if actual runtime diverges from the estimate by `[timing].divergence_threshold` (default `2.0`), `hymt` can prompt to file a GitHub timing-data issue.
-- Config lives at `~/.config/hymt/config.toml`.
+- Config lives at `~/.config/hymt/config.toml`; `[language].primary` and `[language].secondary` configure default routing.
 - `translate-doc --watch` also reads `[translation].max_retranslation_retries` from that config.
 - The tokenizer is cached at `~/.cache/hymt/tokenizer/tokenizer.json`.
 - `hymt estimate` and translation commands auto-download the tokenizer on first use when the `tokenizers` dependency is available.

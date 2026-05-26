@@ -15,6 +15,7 @@ __all__ = [
     "analyze_document_language",
     "build_document_translation_plan",
     "detect_target_language",
+    "resolve_target_language",
 ]
 
 
@@ -85,7 +86,7 @@ def detect_target_language(
 ) -> LanguageDetectionResult | None:
     detector = _load_langdetect()
     if detector is None:
-        return None
+        return _detect_target_language_without_detector(text, target_lang)
 
     return _detect_target_language_with_detector(
         text,
@@ -93,6 +94,23 @@ def detect_target_language(
         detector,
         _langdetect_error(detector),
     )
+
+
+def resolve_target_language(
+    text: str,
+    requested_target_lang: str,
+    config: object,
+    *,
+    explicit_target: bool = True,
+) -> str:
+    if explicit_target:
+        return requested_target_lang
+    primary_lang = _configured_lang(config, "primary_lang", "zh")
+    secondary_lang = _configured_lang(config, "secondary_lang", "en")
+    detection = detect_target_language(text, primary_lang)
+    if detection is not None and detection.target_ratio > TARGET_PARAGRAPH_RATIO:
+        return secondary_lang
+    return primary_lang
 
 
 def analyze_document_language(text: str, target_lang: str) -> DocumentLanguagePlan:
@@ -177,6 +195,25 @@ def _detect_target_language_with_detector(
     )
 
 
+def _detect_target_language_without_detector(
+    text: str, target_lang: str
+) -> LanguageDetectionResult | None:
+    if "zh" not in _target_aliases(target_lang):
+        return None
+    chunks = _detection_chunks(text)
+    if not chunks:
+        return None
+    analyzed_chars = sum(1 for chunk in chunks for char in chunk if not char.isspace())
+    if analyzed_chars == 0:
+        return None
+    target_chars = sum(1 for chunk in chunks for char in chunk if _is_cjk_char(char))
+    return LanguageDetectionResult(
+        target_ratio=target_chars / analyzed_chars,
+        detected_lang="zh" if target_chars else None,
+        analyzed_chars=analyzed_chars,
+    )
+
+
 def _load_langdetect() -> ModuleType | None:
     try:
         return import_module("langdetect")
@@ -200,6 +237,18 @@ def _langdetect_error(detector: ModuleType) -> type[BaseException]:
 def _target_aliases(target_lang: str) -> set[str]:
     normalized = target_lang.strip().lower()
     return TARGET_LANGUAGE_ALIASES.get(normalized, {normalized})
+
+
+def _configured_lang(config: object, attr: str, default: str) -> str:
+    value = getattr(config, attr, default)
+    if not isinstance(value, str):
+        return default
+    normalized = value.strip().lower()
+    return normalized or default
+
+
+def _is_cjk_char(char: str) -> bool:
+    return "\u4e00" <= char <= "\u9fff"
 
 
 def _detection_chunks(text: str) -> list[str]:

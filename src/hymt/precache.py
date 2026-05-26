@@ -135,6 +135,7 @@ def run_precache(
     section: str | None = None,
     command_filters: Sequence[str] = (),
     progress_stream: TextIO = sys.stderr,
+    explicit_target: bool = True,
 ) -> PrecacheSummary:
     discovery_cache = DiscoveryCache(user_discovery_cache_path())
     discovery_cache.initialize()
@@ -161,6 +162,7 @@ def run_precache(
                         text,
                         target_lang,
                         config,
+                        explicit_target=explicit_target,
                     )
                 )
                 translated += 1

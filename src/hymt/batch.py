@@ -12,7 +12,11 @@ from typing import Final, TextIO
 
 from hymt.config import HotConfig
 from hymt.history import HistoryDB, format_duration
-from hymt.language import DocumentLanguagePlan, analyze_document_language
+from hymt.language import (
+    DocumentLanguagePlan,
+    analyze_document_language,
+    resolve_target_language,
+)
 from hymt.templates import TemplateType
 from hymt.translate import (
     _segment_cache_hash,
@@ -66,6 +70,7 @@ class BatchFilePlan:
     source_path: Path
     relative_path: Path
     output_path: Path
+    target_lang: str
     text: str
     file_hash: str
     document_plan: DocumentLanguagePlan
@@ -134,6 +139,7 @@ def build_batch_plan(
     recursive: bool = False,
     history: HistoryDB | None = None,
     progress_stream: TextIO | None = None,
+    explicit_target: bool = True,
 ) -> BatchPlan:
     resolved_root = directory.expanduser().resolve(strict=True)
     progress = _BatchPlanningProgress(progress_stream)
@@ -154,12 +160,15 @@ def build_batch_plan(
     for index, source in enumerate(sources, start=1):
         relative_path = _relative_to_root(source.path, resolved_root)
         progress.analyzing(index, len(sources), relative_path)
+        effective_target_lang = resolve_target_language(
+            source.text, target_lang, config, explicit_target=explicit_target
+        )
         try:
             output_path = _output_path(
                 source.path,
                 resolved_root,
                 output_dir,
-                target_lang,
+                effective_target_lang,
             )
         except _BatchOutputPathEscapeError as error:
             skipped.append(BatchSkippedFile(source.path, relative_path, error.reason))
@@ -169,7 +178,7 @@ def build_batch_plan(
                 file=sys.stderr,
             )
             continue
-        document_plan = analyze_document_language(source.text, target_lang)
+        document_plan = analyze_document_language(source.text, effective_target_lang)
         if _is_target_language_document(document_plan):
             skipped.append(
                 BatchSkippedFile(source.path, relative_path, "already target language")
@@ -178,7 +187,7 @@ def build_batch_plan(
 
         translation_plan = plan_translation(
             source.text,
-            target_lang,
+            effective_target_lang,
             config,
             template_type,
             document_plan=document_plan,
@@ -189,7 +198,7 @@ def build_batch_plan(
         )
         cached_hashes = db.find_cached_segment_hashes(
             segment_hashes,
-            target_lang,
+            effective_target_lang,
             template_name,
             options_hash,
         )
@@ -199,7 +208,7 @@ def build_batch_plan(
             db,
             missing_segments,
             config,
-            target_lang,
+            effective_target_lang,
             template_name,
         )
         files.append(
@@ -207,6 +216,7 @@ def build_batch_plan(
                 source_path=source.path,
                 relative_path=relative_path,
                 output_path=output_path,
+                target_lang=effective_target_lang,
                 text=source.text,
                 file_hash=source.file_hash,
                 document_plan=document_plan,
@@ -278,7 +288,7 @@ async def run_batch_translation(
             started = time.monotonic()
             translated = await translate_text(
                 file.text,
-                target_lang,
+                file.target_lang,
                 config,
                 template_type,
                 stream=stream,

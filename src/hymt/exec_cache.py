@@ -7,6 +7,7 @@ import hashlib
 import sqlite3
 
 from hymt.config import HotConfig
+from hymt.language import resolve_target_language
 from hymt.templates import TemplateType
 from hymt.translate import translate_text
 
@@ -222,14 +223,20 @@ async def translate_cached_text(
     config: HotConfig,
     *,
     refresh: bool = False,
+    explicit_target: bool = True,
 ) -> str:
+    effective_target_lang = resolve_target_language(
+        text, target_lang, config, explicit_target=explicit_target
+    )
     cache = ExecCache(config.exec_shared_cache_path)
     if not refresh:
-        cached = cache.find(command, subcommand, text, target_lang)
+        cached = cache.find(command, subcommand, text, effective_target_lang)
         if cached is not None:
             return cached
-    translated = await _translate_for_cache(text, target_lang, config, refresh=refresh)
-    cache.store_user(command, subcommand, text, target_lang, translated)
+    translated = await _translate_for_cache(
+        text, effective_target_lang, config, refresh=refresh
+    )
+    cache.store_user(command, subcommand, text, effective_target_lang, translated)
     return translated
 
 
