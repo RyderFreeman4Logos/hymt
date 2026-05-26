@@ -297,6 +297,15 @@ def _extract_stream_token(data: dict[str, object]) -> str:
     first = choices[0]
     if not isinstance(first, dict):
         return ""
+    finish_reason = first.get("finish_reason", "")
+    if finish_reason == "length":
+        import sys
+
+        print(
+            "WARNING: segment truncated (hit max_tokens). "
+            "Content may be lost. Reduce context_window or increase max_output_tokens.",
+            file=sys.stderr,
+        )
     delta = first.get("delta")
     if isinstance(delta, dict):
         content = delta.get("content")
