@@ -139,9 +139,16 @@ def plan_translation(
     segmenter = create_segmenter()
     overhead_prompt = build_prompt("", target_lang, template_type, **template_kwargs)
     prompt_overhead_tokens = segmenter.count_tokens(overhead_prompt)
-    available_source_tokens = (
+    base_source_budget = (
         config.context_window - prompt_overhead_tokens - config.max_output_tokens
     )
+    if base_source_budget <= 0:
+        raise ValueError(
+            "Config context_window is too small for the selected template and max_output_tokens"
+        )
+    expansion_ratio = _expansion_ratio(target_lang)
+    max_safe_source = int(config.max_output_tokens / expansion_ratio)
+    available_source_tokens = min(base_source_budget, max_safe_source)
     if available_source_tokens <= 0:
         raise ValueError(
             "Config context_window is too small for the selected template and max_output_tokens"
@@ -706,6 +713,22 @@ def _completed_translations(translations: list[str | None]) -> list[str]:
     if missing:
         raise RuntimeError(f"Missing translated segments: {missing}")
     return [str(translation) for translation in translations]
+
+
+_EXPANSION_RATIOS: dict[str, float] = {
+    "en": 1.8,
+    "zh": 0.7,
+    "ja": 1.0,
+    "ko": 0.9,
+    "de": 1.3,
+    "fr": 1.3,
+    "es": 1.3,
+    "ru": 1.2,
+}
+
+
+def _expansion_ratio(target_lang: str) -> float:
+    return _EXPANSION_RATIOS.get(target_lang.lower().strip(), 1.2)
 
 
 def _stream_enabled(config: HotConfig, override: bool | None) -> bool:
