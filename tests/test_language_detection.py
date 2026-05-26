@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from contextlib import redirect_stderr
 import io
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 from hymt.cli import _select_document_translation_plan
-from hymt.language import analyze_document_language
+from hymt.language import analyze_document_language, resolve_target_language
 
 
 class LanguageDetectionPromptTests(unittest.TestCase):
@@ -113,6 +114,48 @@ class DocumentLanguageAnalysisTests(unittest.TestCase):
         code_sections = [section for section in plan.sections if section.kind == "code"]
         self.assertEqual(len(code_sections), 1)
         self.assertFalse(code_sections[0].should_translate)
+
+
+class TargetLanguageRoutingTests(unittest.TestCase):
+    def test_default_route_reverses_mostly_primary_language_text(self) -> None:
+        config = SimpleNamespace(primary_lang="zh", secondary_lang="en")
+
+        with patch("hymt.language._load_langdetect", return_value=FakeDetector()):
+            target_lang = resolve_target_language(
+                "中文段落。", "zh", config, explicit_target=False
+            )
+
+        self.assertEqual(target_lang, "en")
+
+    def test_default_route_detects_chinese_without_optional_detector(self) -> None:
+        config = SimpleNamespace(primary_lang="zh", secondary_lang="en")
+
+        with patch("hymt.language._load_langdetect", return_value=None):
+            target_lang = resolve_target_language(
+                "中文段落。", "zh", config, explicit_target=False
+            )
+
+        self.assertEqual(target_lang, "en")
+
+    def test_default_route_uses_primary_for_secondary_language_text(self) -> None:
+        config = SimpleNamespace(primary_lang="zh", secondary_lang="en")
+
+        with patch("hymt.language._load_langdetect", return_value=FakeDetector()):
+            target_lang = resolve_target_language(
+                "English paragraph.", "zh", config, explicit_target=False
+            )
+
+        self.assertEqual(target_lang, "zh")
+
+    def test_explicit_target_disables_reverse_routing(self) -> None:
+        config = SimpleNamespace(primary_lang="zh", secondary_lang="en")
+
+        with patch("hymt.language._load_langdetect", return_value=FakeDetector()):
+            target_lang = resolve_target_language(
+                "中文段落。", "zh", config, explicit_target=True
+            )
+
+        self.assertEqual(target_lang, "zh")
 
 
 class FakeDetector:

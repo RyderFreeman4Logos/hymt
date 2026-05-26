@@ -90,8 +90,9 @@ async def fake_translate(
     text: str,
     target_lang: str,
     config: HotConfig,
+    **kwargs: object,
 ) -> str:
-    del command, subcommand, target_lang, config
+    del command, subcommand, target_lang, config, kwargs
     return f"ZH:{text}"
 
 

@@ -29,14 +29,26 @@ class ExecResult:
 
 
 def run_exec_command(
-    command: list[str], target_lang: str, config: HotConfig | None = None
+    command: list[str],
+    target_lang: str,
+    config: HotConfig | None = None,
+    *,
+    explicit_target: bool = True,
 ) -> int:
     if not command:
         raise ValueError("command is required after '--'")
     active_config = config or HotConfig()
     result = _run_command(command)
     try:
-        asyncio.run(_translate_result(command, result, target_lang, active_config))
+        asyncio.run(
+            _translate_result(
+                command,
+                result,
+                target_lang,
+                active_config,
+                explicit_target=explicit_target,
+            )
+        )
     except KeyboardInterrupt:
         print("hymt: translation cancelled.", file=sys.stderr)
     except (OSError, RuntimeError, ValueError) as exc:
@@ -96,13 +108,22 @@ def _write_bytes(stream: TextIO, data: bytes) -> None:
 
 
 async def _translate_result(
-    command: list[str], result: ExecResult, target_lang: str, config: HotConfig
+    command: list[str],
+    result: ExecResult,
+    target_lang: str,
+    config: HotConfig,
+    *,
+    explicit_target: bool,
 ) -> None:
     if config.exec_translate_stderr and result.stderr:
         stderr_text = _decode_for_translation(result.stderr)
         if stderr_text is not None:
             translated = await _translate_output(
-                command, stderr_text, target_lang, config
+                command,
+                stderr_text,
+                target_lang,
+                config,
+                explicit_target=explicit_target,
             )
             _write_translation("stderr", translated, sys.stderr, ANSI_YELLOW)
     if _should_translate_stdout(command, result.stdout, target_lang, config):
@@ -110,13 +131,22 @@ async def _translate_result(
         if stdout_text is not None:
             stream = sys.stdout if sys.stdout.isatty() else sys.stderr
             translated = await _translate_output(
-                command, stdout_text, target_lang, config
+                command,
+                stdout_text,
+                target_lang,
+                config,
+                explicit_target=explicit_target,
             )
             _write_translation("stdout", translated, stream, ANSI_CYAN)
 
 
 async def _translate_output(
-    command: list[str], text: str, target_lang: str, config: HotConfig
+    command: list[str],
+    text: str,
+    target_lang: str,
+    config: HotConfig,
+    *,
+    explicit_target: bool,
 ) -> str:
     cache_command, cache_subcommand = _cache_identity(command)
     return await translate_cached_text(
@@ -125,6 +155,7 @@ async def _translate_output(
         text,
         target_lang,
         config,
+        explicit_target=explicit_target,
     )
 
 

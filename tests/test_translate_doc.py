@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from click.testing import CliRunner
@@ -33,6 +34,23 @@ class TranslateDocTargetTests(unittest.TestCase):
 
         self.assertEqual(len(targets), 1)
         self.assertEqual(targets[0].output_path.name, "README.zh-cn.md")
+
+    def test_build_targets_routes_default_target_for_primary_language_file(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "README.md"
+            source.write_text("# 中文\n", encoding="utf-8")
+            config = SimpleNamespace(primary_lang="zh", secondary_lang="en")
+
+            with patch("hymt.language._load_langdetect", return_value=FakeDetector()):
+                targets = build_doc_translation_targets(
+                    source, "zh", config=config, explicit_target=False
+                )
+
+        self.assertEqual(len(targets), 1)
+        self.assertEqual(targets[0].target_lang, "en")
+        self.assertEqual(targets[0].output_path.name, "README.en.md")
 
     def test_build_targets_scans_directories_recursively(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -140,7 +158,6 @@ class TranslateDocRuntimeTests(unittest.TestCase):
                 asyncio.run(
                     _translate_target_until_stable(
                         target,
-                        "zh",
                         FakeConfig(),  # type: ignore[arg-type]
                         stream=None,
                         template_type=TemplateType.DEFAULT,
@@ -199,6 +216,13 @@ class TranslateDocCliTests(unittest.TestCase):
         self.assertEqual(run.call_args.args[1], "ja")
         self.assertTrue(run.call_args.kwargs["watch"])
         self.assertTrue(run.call_args.kwargs["stream"])
+
+
+class FakeDetector:
+    def detect(self, text: str) -> str:
+        if any("\u4e00" <= char <= "\u9fff" for char in text):
+            return "zh"
+        return "en"
 
 
 if __name__ == "__main__":

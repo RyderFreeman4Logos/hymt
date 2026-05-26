@@ -20,6 +20,10 @@ max_retranslation_retries = 10
 config_version = 1
 timeout = 600
 
+[language]
+primary = "zh"
+secondary = "en"
+
 [inference]
 temperature = 0.7
 top_p = 0.6
@@ -129,6 +133,14 @@ class HotConfig:
     @property
     def timeout(self) -> float:
         return self._get_float("translation", "timeout", 600.0)
+
+    @property
+    def primary_lang(self) -> str:
+        return self._get_str("language", "primary", "zh")
+
+    @property
+    def secondary_lang(self) -> str:
+        return self._get_str("language", "secondary", "en")
 
     @property
     def timing_divergence_threshold(self) -> float:

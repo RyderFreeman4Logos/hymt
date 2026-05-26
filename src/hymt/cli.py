@@ -21,7 +21,11 @@ from hymt.history import (
     estimate_duration_seconds,
     format_duration,
 )
-from hymt.language import DocumentLanguagePlan, analyze_document_language
+from hymt.language import (
+    DocumentLanguagePlan,
+    analyze_document_language,
+    resolve_target_language,
+)
 from hymt.precache import run_precache
 from hymt.segment import TOKENIZER_PATH, ensure_tokenizer, has_tokenizer_support
 from hymt.templates import TemplateType
@@ -240,10 +244,14 @@ def main(
         config = HotConfig()
         stream_enabled = _stream_enabled(config, stream)
         selected_type = TemplateType(template_type)
+        explicit_target = _target_lang_explicit(ctx)
         if input_file is not None:
             source_text = input_file.read_text(encoding="utf-8")
+            effective_target_lang = resolve_target_language(
+                source_text, target_lang, config, explicit_target=explicit_target
+            )
             document_plan = _select_document_translation_plan(
-                source_text, target_lang, yes
+                source_text, effective_target_lang, yes
             )
             if document_plan is None:
                 click.echo("Translation cancelled.", err=True)
@@ -253,7 +261,7 @@ def main(
                 translate_file(
                     input_file,
                     output_file,
-                    target_lang,
+                    effective_target_lang,
                     config,
                     selected_type,
                     stream=stream_enabled,
@@ -265,7 +273,12 @@ def main(
             )
             return
         source_text = text if text is not None else sys.stdin.read()
-        document_plan = _select_document_translation_plan(source_text, target_lang, yes)
+        effective_target_lang = resolve_target_language(
+            source_text, target_lang, config, explicit_target=explicit_target
+        )
+        document_plan = _select_document_translation_plan(
+            source_text, effective_target_lang, yes
+        )
         if document_plan is None:
             click.echo("Translation cancelled.", err=True)
             return
@@ -281,7 +294,7 @@ def main(
         translated = asyncio.run(
             translate_text(
                 source_text,
-                target_lang,
+                effective_target_lang,
                 config,
                 selected_type,
                 stream=stream_enabled,
@@ -354,8 +367,13 @@ def config_edit() -> None:
 @click.option("--original", is_flag=True, help="Show the untranslated system manpage.")
 @click.option("--refresh", is_flag=True, help="Force a fresh translation.")
 @click.argument("man_args", nargs=-1, type=click.UNPROCESSED)
+@click.pass_context
 def man_command(
-    target_lang: str, original: bool, refresh: bool, man_args: tuple[str, ...]
+    ctx: click.Context,
+    target_lang: str,
+    original: bool,
+    refresh: bool,
+    man_args: tuple[str, ...],
 ) -> None:
     try:
         returncode = show_translated_man(
@@ -364,6 +382,7 @@ def man_command(
             HotConfig(),
             original=original,
             refresh=refresh,
+            explicit_target=_target_lang_explicit(ctx),
         )
     except (OSError, ValueError, RuntimeError) as exc:
         raise click.ClickException(str(exc)) from exc
@@ -385,8 +404,13 @@ def man_command(
 @click.option("--original", is_flag=True, help="Show the untranslated info page.")
 @click.option("--refresh", is_flag=True, help="Force a fresh translation.")
 @click.argument("info_args", nargs=-1, type=click.UNPROCESSED)
+@click.pass_context
 def info_command(
-    target_lang: str, original: bool, refresh: bool, info_args: tuple[str, ...]
+    ctx: click.Context,
+    target_lang: str,
+    original: bool,
+    refresh: bool,
+    info_args: tuple[str, ...],
 ) -> None:
     try:
         returncode = show_translated_info(
@@ -395,6 +419,7 @@ def info_command(
             HotConfig(),
             original=original,
             refresh=refresh,
+            explicit_target=_target_lang_explicit(ctx),
         )
     except (OSError, ValueError, RuntimeError) as exc:
         raise click.ClickException(str(exc)) from exc
@@ -425,7 +450,12 @@ def exec_command(ctx: click.Context, target_lang: str) -> None:
     if not command:
         raise click.UsageError("Use 'hymt exec -- command args...'")
     try:
-        returncode = run_exec_command(command, target_lang, HotConfig())
+        returncode = run_exec_command(
+            command,
+            target_lang,
+            HotConfig(),
+            explicit_target=_target_lang_explicit(ctx),
+        )
     except (OSError, ValueError, RuntimeError) as exc:
         raise click.ClickException(str(exc)) from exc
     raise click.exceptions.Exit(returncode)
@@ -461,8 +491,13 @@ def exec_install_command(update: bool) -> None:
 )
 @click.option("--section", help="Only translate a specific man section.")
 @click.argument("commands", nargs=-1)
+@click.pass_context
 def exec_precache_command(
-    target_lang: str, recursive: bool, section: str | None, commands: tuple[str, ...]
+    ctx: click.Context,
+    target_lang: str,
+    recursive: bool,
+    section: str | None,
+    commands: tuple[str, ...],
 ) -> None:
     try:
         summary = run_precache(
@@ -472,6 +507,7 @@ def exec_precache_command(
             section=section,
             command_filters=commands,
             progress_stream=sys.stderr,
+            explicit_target=_target_lang_explicit(ctx),
         )
     except (OSError, ValueError, RuntimeError) as exc:
         raise click.ClickException(str(exc)) from exc
@@ -644,7 +680,9 @@ def estimate_command(
     default=None,
     help="Override [translation].stream for batch translation.",
 )
+@click.pass_context
 def batch_command(
+    ctx: click.Context,
     directory: Path,
     target_lang: str,
     output_dir: Path | None,
@@ -675,6 +713,7 @@ def batch_command(
             kwargs,
             recursive=recursive,
             progress_stream=sys.stderr,
+            explicit_target=_target_lang_explicit(ctx),
         )
         show_batch_preview(plan, sys.stderr)
         if not write:
@@ -809,7 +848,9 @@ def recall_command(position: int, show_list: bool) -> None:
     default=None,
     help="Override [translation].stream for document translation.",
 )
+@click.pass_context
 def translate_doc_command(
+    ctx: click.Context,
     source: Path,
     target_lang: str,
     output_path: Path | None,
@@ -841,6 +882,7 @@ def translate_doc_command(
             template_type=TemplateType(template_type),
             template_kwargs=kwargs,
             progress_stream=sys.stderr,
+            explicit_target=_target_lang_explicit(ctx),
         )
     except (OSError, UnicodeError, ValueError, RuntimeError) as exc:
         raise click.ClickException(str(exc)) from exc
@@ -865,6 +907,13 @@ def _template_kwargs(
 def _announce_tokenizer_download() -> None:
     if has_tokenizer_support() and not TOKENIZER_PATH.exists():
         click.echo("Downloading tokenizer...", err=True)
+
+
+def _target_lang_explicit(ctx: click.Context) -> bool:
+    return (
+        ctx.get_parameter_source("target_lang")
+        is click.core.ParameterSource.COMMANDLINE
+    )
 
 
 def _select_document_translation_plan(

@@ -114,6 +114,42 @@ class StdoutNewlineTests(unittest.TestCase):
         self.assertNotEqual(result.exit_code, 0)
         self.assertIn("Error:", result.output)
 
+    def test_cli_default_target_routes_primary_language_input_to_secondary(
+        self,
+    ) -> None:
+        with temporary_home() as home:
+            runner = CliRunner()
+            config = SimpleNamespace(primary_lang="zh", secondary_lang="en")
+            translate = AsyncMock(return_value="translated")
+            with (
+                patch("hymt.cli.HotConfig", return_value=config),
+                patch("hymt.cli._announce_tokenizer_download"),
+                patch("hymt.language._load_langdetect", return_value=FakeDetector()),
+                patch("hymt.cli.translate_text", new=translate),
+            ):
+                result = runner.invoke(main, ["中文"], env={"HOME": home})
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        translate.assert_awaited_once()
+        self.assertEqual(translate.await_args.args[1], "en")
+
+    def test_cli_explicit_target_disables_default_routing(self) -> None:
+        with temporary_home() as home:
+            runner = CliRunner()
+            config = SimpleNamespace(primary_lang="zh", secondary_lang="en")
+            translate = AsyncMock(return_value="translated")
+            with (
+                patch("hymt.cli.HotConfig", return_value=config),
+                patch("hymt.cli._announce_tokenizer_download"),
+                patch("hymt.language._load_langdetect", return_value=FakeDetector()),
+                patch("hymt.cli.translate_text", new=translate),
+            ):
+                result = runner.invoke(main, ["-t", "zh", "中文"], env={"HOME": home})
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        translate.assert_awaited_once()
+        self.assertEqual(translate.await_args.args[1], "zh")
+
 
 class temporary_home:
     def __enter__(self) -> str:
@@ -128,6 +164,13 @@ class temporary_home:
         else:
             os.environ["HOME"] = self._old_home
         self._tmpdir.cleanup()
+
+
+class FakeDetector:
+    def detect(self, text: str) -> str:
+        if any("\u4e00" <= char <= "\u9fff" for char in text):
+            return "zh"
+        return "en"
 
 
 if __name__ == "__main__":

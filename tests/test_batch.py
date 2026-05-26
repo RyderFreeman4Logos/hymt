@@ -243,6 +243,29 @@ class BatchPlanTests(unittest.TestCase):
             self.assertIn("cache=partial", text)
             self.assertIn("Total estimated time:", text)
 
+    def test_build_batch_plan_routes_default_target_per_file(self) -> None:
+        with temporary_home(), tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "english.md").write_text("English.", encoding="utf-8")
+            (root / "chinese.md").write_text("中文段落。", encoding="utf-8")
+
+            with patched_batch_dependencies():
+                plan = build_batch_plan(
+                    root,
+                    root / "out",
+                    "zh",
+                    fake_config(),
+                    TemplateType.DEFAULT,
+                    {},
+                    explicit_target=False,
+                )
+
+            by_name = {file.relative_path.name: file for file in plan.files}
+            self.assertEqual(by_name["english.md"].target_lang, "zh")
+            self.assertEqual(by_name["english.md"].output_path.name, "english.zh.md")
+            self.assertEqual(by_name["chinese.md"].target_lang, "en")
+            self.assertEqual(by_name["chinese.md"].output_path.name, "chinese.en.md")
+
     def test_build_batch_plan_rejects_path_unsafe_target_lang(self) -> None:
         with temporary_home(), tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -620,6 +643,8 @@ def fake_config() -> SimpleNamespace:
         config_version=1,
         model="test-model",
         timing_divergence_threshold=2.0,
+        primary_lang="zh",
+        secondary_lang="en",
     )
 
 

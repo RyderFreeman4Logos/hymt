@@ -53,6 +53,31 @@ class ExecCacheTests(unittest.TestCase):
         self.assertEqual(translated, "cached")
         tx.assert_not_awaited()
 
+    def test_translate_cached_text_uses_effective_target_for_cache_key(self) -> None:
+        with temporary_home() as home:
+            shared = Path(home) / "shared.db"
+            write_config(home, shared)
+            cache = ExecCache(shared)
+            cache.store_user("man", "git", "中文段落。", "en", "cached")
+
+            with (
+                patch("hymt.language._load_langdetect", return_value=FakeDetector()),
+                patch("hymt.exec_cache.translate_text", new_callable=AsyncMock) as tx,
+            ):
+                translated = asyncio.run(
+                    translate_cached_text(
+                        "man",
+                        "git",
+                        "中文段落。",
+                        "zh",
+                        HotConfig(),
+                        explicit_target=False,
+                    )
+                )
+
+        self.assertEqual(translated, "cached")
+        tx.assert_not_awaited()
+
     def test_translate_cached_text_stores_live_translation_in_user_cache(self) -> None:
         with temporary_home() as home:
             shared = Path(home) / "shared.db"
@@ -106,6 +131,13 @@ class temporary_home:
         else:
             os.environ["HOME"] = self._old_home
         self._tmpdir.cleanup()
+
+
+class FakeDetector:
+    def detect(self, text: str) -> str:
+        if any("\u4e00" <= char <= "\u9fff" for char in text):
+            return "zh"
+        return "en"
 
 
 if __name__ == "__main__":
