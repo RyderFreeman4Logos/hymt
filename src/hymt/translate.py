@@ -463,7 +463,7 @@ class TranslationProgress:
         self._stream = stream
         self._enabled = enabled
         self._recent_segment_seconds: deque[float] = deque(maxlen=5)
-        self._uses_carriage_return = stream.isatty()
+        self._uses_carriage_return = stream.isatty() and not sys.stdout.isatty()
         self._printed = False
 
     def update(
