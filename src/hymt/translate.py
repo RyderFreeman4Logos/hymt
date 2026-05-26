@@ -463,7 +463,6 @@ class TranslationProgress:
         self._stream = stream
         self._enabled = enabled
         self._recent_segment_seconds: deque[float] = deque(maxlen=5)
-        self._uses_carriage_return = stream.isatty() and not sys.stdout.isatty()
         self._printed = False
 
     def update(
@@ -485,19 +484,12 @@ class TranslationProgress:
             f"eta {format_duration(eta_seconds)} | "
             f"{tokens_per_second:.2f} tok/s"
         )
-        if self._uses_carriage_return:
-            self._stream.write(f"\r{line}")
-        else:
-            self._stream.write(f"{line}\n")
+        self._stream.write(f"{line}\n")
         self._stream.flush()
         self._printed = True
 
     def finish(self) -> None:
-        if not self._enabled:
-            return
-        if self._printed and self._uses_carriage_return:
-            self._stream.write("\n")
-            self._stream.flush()
+        pass
 
     def _estimate_remaining_seconds(self, remaining_segments: int) -> float:
         if remaining_segments == 0 or not self._recent_segment_seconds:
