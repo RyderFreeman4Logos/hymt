@@ -1,5 +1,5 @@
 [Unit]
-Description=Hy-MT2-7B Translation (Quality: Q6_K, 2 slots, Q8 KV)
+Description=Hy-MT2-7B Translation (Quality: Q6_K, 3 slots, Q8 KV)
 After=network.target
 Conflicts=hy-mt2-throughput.service
 
@@ -11,8 +11,8 @@ ExecStart=/usr/local/share/mise/installs/llama-cpp/9334-cuda/llama-server \
   -fit off \
   -fa on \
   -ctk q8_0 -ctv q8_0 \
-  -c 16384 \
-  --parallel 2 \
+  -c 24576 \
+  --parallel 3 \
   -cb \
   -ub 256 \
   --temp 0.7 \
