@@ -23,6 +23,16 @@ use hymt_core::language::{build_document_translation_plan, DocumentLanguagePlan,
 use hymt_core::templates::{build_prompt, PromptOpts, TemplateType};
 use hymt_segment::Segmenter;
 
+// ── TranslationCtx ────────────────────────────────────────────────────────────
+
+/// Shared translation service dependencies threaded through the pipeline.
+pub struct TranslationCtx<'a> {
+    pub config: &'a HotConfig,
+    pub client: &'a TranslationClient,
+    pub segmenter: &'a Segmenter,
+    pub history: &'a HistoryDB,
+}
+
 // ── Token budget constants (matches translate.py) ─────────────────────────────
 
 const OUTPUT_SAFETY_FACTOR: f64 = 1.5;
@@ -410,23 +420,19 @@ async fn translate_segment_with_completeness(
 /// All segments are checked against the cache first; only missing or incomplete
 /// cached segments are translated.  Results are stored back to the cache and a
 /// task record is written to the history DB.
-#[allow(clippy::too_many_arguments)]
 pub async fn translate_text(
     text: &str,
     target_lang: &str,
-    config: &HotConfig,
-    client: &TranslationClient,
-    segmenter: &Segmenter,
-    history: &HistoryDB,
     template: &TemplateType,
     opts: &PromptOpts,
+    ctx: &TranslationCtx<'_>,
 ) -> Result<String> {
     if text.is_empty() {
         return Ok(String::new());
     }
 
     let template_name = template.as_str();
-    let plan = plan_translation(text, target_lang, config, segmenter, template, opts)?;
+    let plan = plan_translation(text, target_lang, ctx.config, ctx.segmenter, template, opts)?;
 
     eprintln!(
         "Source tokens: {}; segments: {}",
@@ -443,7 +449,7 @@ pub async fn translate_text(
     let _seg_tokens: Vec<usize> = plan
         .segments
         .iter()
-        .map(|s| segmenter.count_tokens(s))
+        .map(|s| ctx.segmenter.count_tokens(s))
         .collect();
 
     let started_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
@@ -455,14 +461,17 @@ pub async fn translate_text(
     let mut missing: Vec<usize> = Vec::new();
 
     for (i, hash) in seg_hashes.iter().enumerate() {
-        match history.find_segment_cached(hash, target_lang, template_name, &options_hash) {
+        match ctx
+            .history
+            .find_segment_cached(hash, target_lang, template_name, &options_hash)
+        {
             Ok(Some(cached))
                 if cached_segment_is_complete(
                     i,
                     &plan.segments[i],
                     &cached,
                     target_lang,
-                    config,
+                    ctx.config,
                 ) =>
             {
                 translations[i] = Some(cached);
@@ -481,12 +490,12 @@ pub async fn translate_text(
         let mut join_set: JoinSet<Result<(usize, String)>> = JoinSet::new();
 
         for &idx in &missing {
-            let client = client.clone();
+            let client = ctx.client.clone();
             let segment = plan.segments[idx].clone();
             let target = target_lang.to_owned();
             let tmpl = template.clone();
             let cloned_opts = opts.clone();
-            let cfg = config.clone();
+            let cfg = ctx.config.clone();
 
             join_set.spawn(async move {
                 let (translated, _elapsed) = translate_segment_with_completeness(
@@ -507,7 +516,7 @@ pub async fn translate_text(
             match res {
                 Ok(Ok((idx, translated))) => {
                     let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-                    if let Err(e) = history.store_segment_cache(
+                    if let Err(e) = ctx.history.store_segment_cache(
                         &seg_hashes[idx],
                         target_lang,
                         template_name,
@@ -535,7 +544,7 @@ pub async fn translate_text(
 
     let translated = plan.reconstruct(&completed);
     let duration = wall_start.elapsed().as_secs_f64();
-    let output_tokens = segmenter.count_tokens(&translated);
+    let output_tokens = ctx.segmenter.count_tokens(&translated);
     let tps = if duration > 0.0 {
         output_tokens as f64 / duration
     } else {
@@ -550,12 +559,12 @@ pub async fn translate_text(
         input_tokens: plan.source_tokens as i64,
         output_tokens: output_tokens as i64,
         segments: plan.segment_count() as i64,
-        concurrency: config.concurrency() as i64,
+        concurrency: ctx.config.concurrency() as i64,
         source_lang: None,
         target_lang: target_lang.to_owned(),
         template_type: template_name.to_owned(),
         model: {
-            let m = config.model();
+            let m = ctx.config.model();
             if m.is_empty() {
                 None
             } else {
@@ -567,10 +576,10 @@ pub async fn translate_text(
         output_chars: translated.len() as i64,
         output_text: Some(translated.clone()),
         input_hash: None,
-        config_version: config.config_version() as i64,
+        config_version: ctx.config.config_version() as i64,
     };
 
-    if let Err(e) = history.insert_task(&record) {
+    if let Err(e) = ctx.history.insert_task(&record) {
         eprintln!("Warning: failed to record timing history: {e}");
     } else {
         eprintln!(
@@ -582,9 +591,9 @@ pub async fn translate_text(
 
     // Check for timing divergence
     let seg_count: i64 = plan.segment_count() as i64;
-    let concurrency = config.concurrency() as i64;
-    let cfg_ver = config.config_version() as i64;
-    if let Ok(Some(estimate)) = history.estimate(
+    let concurrency = ctx.config.concurrency() as i64;
+    let cfg_ver = ctx.config.config_version() as i64;
+    if let Ok(Some(estimate)) = ctx.history.estimate(
         seg_count,
         concurrency,
         Some(target_lang),
@@ -592,7 +601,7 @@ pub async fn translate_text(
         Some(cfg_ver),
         None,
     ) {
-        let threshold = config.timing_divergence_threshold();
+        let threshold = ctx.config.timing_divergence_threshold();
         let data = hymt_cache::TimingIssueData {
             input_tokens: plan.source_tokens as i64,
             output_tokens: output_tokens as i64,
@@ -619,33 +628,19 @@ pub async fn translate_text(
 // ── translate_file ─────────────────────────────────────────────────────────────
 
 /// Read `path`, translate it, and write the result to `output_path` (or stdout if `None`).
-#[allow(clippy::too_many_arguments)]
 pub async fn translate_file(
     path: &Path,
     output_path: Option<&Path>,
     target_lang: &str,
-    config: &HotConfig,
-    client: &TranslationClient,
-    segmenter: &Segmenter,
-    history: &HistoryDB,
     template: &TemplateType,
     opts: &PromptOpts,
+    ctx: &TranslationCtx<'_>,
 ) -> Result<String> {
     let text = tokio::fs::read_to_string(path)
         .await
         .with_context(|| format!("reading {}", path.display()))?;
 
-    let translated = translate_text(
-        &text,
-        target_lang,
-        config,
-        client,
-        segmenter,
-        history,
-        template,
-        opts,
-    )
-    .await?;
+    let translated = translate_text(&text, target_lang, template, opts, ctx).await?;
 
     if let Some(out) = output_path {
         if let Some(parent) = out.parent() {

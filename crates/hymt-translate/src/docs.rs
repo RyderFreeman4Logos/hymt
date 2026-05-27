@@ -16,27 +16,33 @@ use hymt_core::language::resolve_target_language;
 use hymt_segment::Segmenter;
 
 use crate::exec_wrapper::translate_cached;
+use crate::translate::TranslationCtx;
+
+// ── Public types ─────────────────────────────────────────────────────────────
+
+/// Shared options for man/info translation commands.
+pub struct ManInfoOpts<'a> {
+    pub target_lang: &'a str,
+    pub config: &'a HotConfig,
+    pub client: &'a TranslationClient,
+    pub segmenter: &'a Segmenter,
+    pub history: &'a HistoryDB,
+    /// Show original (untranslated) output.
+    pub original: bool,
+    /// Whether the caller explicitly specified the target language.
+    pub explicit_target: bool,
+}
 
 // ── Public entry points ───────────────────────────────────────────────────────
 
 /// Capture, translate, and page a man page.
 ///
 /// Returns the pager exit code, or 0 when stdout is not a TTY (direct write).
-#[allow(clippy::too_many_arguments)]
-pub async fn run_man_command(
-    args: &[&str],
-    target_lang: &str,
-    config: &HotConfig,
-    client: &TranslationClient,
-    segmenter: &Segmenter,
-    history: &HistoryDB,
-    original: bool,
-    explicit_target: bool,
-) -> Result<i32> {
+pub async fn run_man_command(args: &[&str], opts: &ManInfoOpts<'_>) -> Result<i32> {
     if args.is_empty() {
         anyhow::bail!("man page or man arguments are required");
     }
-    if original {
+    if opts.original {
         let code = Command::new("man")
             .args(args)
             .status()
@@ -45,40 +51,27 @@ pub async fn run_man_command(
         return Ok(code);
     }
     let text = capture_man(args)?;
-    let effective_lang = resolve_effective_lang(&text, target_lang, config, explicit_target);
+    let effective_lang =
+        resolve_effective_lang(&text, opts.target_lang, opts.config, opts.explicit_target);
     let subcmd = args.join(" ");
-    let cache = ExecCache::new(config.exec_shared_cache_path());
-    let translated = translate_cached(
-        "man",
-        &subcmd,
-        &text,
-        &effective_lang,
-        &cache,
-        config,
-        client,
-        segmenter,
-        history,
-    )
-    .await?;
+    let cache = ExecCache::new(opts.config.exec_shared_cache_path());
+    let tctx = TranslationCtx {
+        config: opts.config,
+        client: opts.client,
+        segmenter: opts.segmenter,
+        history: opts.history,
+    };
+    let translated =
+        translate_cached("man", &subcmd, &text, &effective_lang, &cache, &tctx).await?;
     page_text(&translated)
 }
 
 /// Capture, translate, and page an info page.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_info_command(
-    args: &[&str],
-    target_lang: &str,
-    config: &HotConfig,
-    client: &TranslationClient,
-    segmenter: &Segmenter,
-    history: &HistoryDB,
-    original: bool,
-    explicit_target: bool,
-) -> Result<i32> {
+pub async fn run_info_command(args: &[&str], opts: &ManInfoOpts<'_>) -> Result<i32> {
     if args.is_empty() {
         anyhow::bail!("info topic or info arguments are required");
     }
-    if original {
+    if opts.original {
         let code = Command::new("info")
             .args(args)
             .status()
@@ -87,21 +80,18 @@ pub async fn run_info_command(
         return Ok(code);
     }
     let text = capture_info(args)?;
-    let effective_lang = resolve_effective_lang(&text, target_lang, config, explicit_target);
+    let effective_lang =
+        resolve_effective_lang(&text, opts.target_lang, opts.config, opts.explicit_target);
     let subcmd = args.join(" ");
-    let cache = ExecCache::new(config.exec_shared_cache_path());
-    let translated = translate_cached(
-        "info",
-        &subcmd,
-        &text,
-        &effective_lang,
-        &cache,
-        config,
-        client,
-        segmenter,
-        history,
-    )
-    .await?;
+    let cache = ExecCache::new(opts.config.exec_shared_cache_path());
+    let tctx = TranslationCtx {
+        config: opts.config,
+        client: opts.client,
+        segmenter: opts.segmenter,
+        history: opts.history,
+    };
+    let translated =
+        translate_cached("info", &subcmd, &text, &effective_lang, &cache, &tctx).await?;
     page_text(&translated)
 }
 
@@ -191,7 +181,13 @@ fn resolve_effective_lang(
     if explicit {
         return target_lang.to_owned();
     }
-    let sample = &text[..text.len().min(4096)];
+    // Walk backward from the byte limit to the nearest char boundary.
+    let max = text.len().min(4096);
+    let end = (0..=max)
+        .rev()
+        .find(|&i| text.is_char_boundary(i))
+        .unwrap_or(0);
+    let sample = &text[..end];
     resolve_target_language(
         sample,
         target_lang,

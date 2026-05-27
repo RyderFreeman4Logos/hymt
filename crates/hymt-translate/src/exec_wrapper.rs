@@ -17,7 +17,7 @@ use hymt_core::language::resolve_target_language;
 use hymt_core::templates::{PromptOpts, TemplateType};
 use hymt_segment::Segmenter;
 
-use crate::translate::translate_text;
+use crate::translate::{translate_text, TranslationCtx};
 
 const ANSI_CYAN: &str = "\x1b[36m";
 const ANSI_YELLOW: &str = "\x1b[33m";
@@ -64,23 +64,18 @@ pub async fn run_exec_command(
         .unwrap_or_else(|| command[0].to_owned());
     let subcmd = command.get(1).copied().unwrap_or("").to_owned();
 
+    let tctx = TranslationCtx {
+        config,
+        client,
+        segmenter,
+        history,
+    };
+
     // Translate stderr if configured
     if config.exec_translate_stderr() && !stderr_bytes.is_empty() {
         if let Some(text) = decode_for_translation(&stderr_bytes) {
             let cache = ExecCache::new(config.exec_shared_cache_path());
-            match translate_cached(
-                &exe,
-                &subcmd,
-                &text,
-                &effective_lang,
-                &cache,
-                config,
-                client,
-                segmenter,
-                history,
-            )
-            .await
-            {
+            match translate_cached(&exe, &subcmd, &text, &effective_lang, &cache, &tctx).await {
                 Ok(translated) => {
                     write_translation("stderr", &translated, false, ANSI_YELLOW);
                 }
@@ -95,19 +90,7 @@ pub async fn run_exec_command(
         if let Some(text) = decode_for_translation(&stdout_bytes) {
             let cache = ExecCache::new(config.exec_shared_cache_path());
             let use_tty = std::io::stdout().is_terminal();
-            match translate_cached(
-                &exe,
-                &subcmd,
-                &text,
-                &effective_lang,
-                &cache,
-                config,
-                client,
-                segmenter,
-                history,
-            )
-            .await
-            {
+            match translate_cached(&exe, &subcmd, &text, &effective_lang, &cache, &tctx).await {
                 Ok(translated) => {
                     write_translation("stdout", &translated, use_tty, ANSI_CYAN);
                 }
@@ -137,34 +120,20 @@ fn run_subprocess(command: &[&str]) -> Result<(Vec<u8>, Vec<u8>, i32)> {
     Ok((output.stdout, output.stderr, code))
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn translate_cached(
     command: &str,
     subcommand: &str,
     text: &str,
     target_lang: &str,
     cache: &ExecCache,
-    config: &HotConfig,
-    client: &TranslationClient,
-    segmenter: &Segmenter,
-    history: &HistoryDB,
+    ctx: &TranslationCtx<'_>,
 ) -> Result<String> {
     if let Ok(Some(cached)) = cache.find(command, subcommand, text, target_lang) {
         return Ok(cached);
     }
 
     let opts = PromptOpts::default();
-    let translated = translate_text(
-        text,
-        target_lang,
-        config,
-        client,
-        segmenter,
-        history,
-        &TemplateType::Default,
-        &opts,
-    )
-    .await?;
+    let translated = translate_text(text, target_lang, &TemplateType::Default, &opts, ctx).await?;
 
     if let Err(e) = cache.store_user(command, subcommand, text, target_lang, &translated) {
         eprintln!("Warning: exec cache store failed: {e}");

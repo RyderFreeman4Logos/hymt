@@ -15,7 +15,7 @@ use hymt_core::language::resolve_target_language;
 use hymt_core::templates::{PromptOpts, TemplateType};
 use hymt_segment::Segmenter;
 
-use crate::translate::translate_text;
+use crate::translate::{translate_text, TranslationCtx};
 
 // ── Output path helpers ───────────────────────────────────────────────────────
 
@@ -194,36 +194,42 @@ fn scan_markdown_files(dir: &Path, recursive: bool) -> Vec<PathBuf> {
         .collect()
 }
 
+// ── DocTranslationOpts ────────────────────────────────────────────────────────
+
+/// Options for [`run_doc_translation`].
+pub struct DocTranslationOpts<'a> {
+    pub target_lang: &'a str,
+    pub config: &'a HotConfig,
+    pub client: &'a TranslationClient,
+    pub segmenter: &'a Segmenter,
+    pub history: &'a HistoryDB,
+    pub output_path: Option<&'a Path>,
+    pub output_dir: Option<&'a Path>,
+    pub recursive: bool,
+    /// Reserved for future watch-mode support (requires the `watch` feature).
+    pub watch: bool,
+    pub template: &'a TemplateType,
+    pub prompt_opts: &'a PromptOpts,
+    /// Whether the caller explicitly specified the target language.
+    pub explicit_target: bool,
+}
+
 // ── run_doc_translation ───────────────────────────────────────────────────────
 
 /// Translate `source` (file or directory of `.md` files) to `target_lang`.
 ///
-/// Writes each translated file atomically via a temp file in the same directory.
-/// The `watch` argument requires the `watch` crate feature.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_doc_translation(
-    source: &Path,
-    target_lang: &str,
-    config: &HotConfig,
-    client: &TranslationClient,
-    segmenter: &Segmenter,
-    history: &HistoryDB,
-    output_path: Option<&Path>,
-    output_dir: Option<&Path>,
-    recursive: bool,
-    _watch: bool,
-    template: &TemplateType,
-    opts: &PromptOpts,
-    explicit_target: bool,
-) -> Result<()> {
+/// Writes each translated file atomically via a uniquely-named temp file in
+/// the same directory, preventing races when multiple translations run in
+/// parallel.
+pub async fn run_doc_translation(source: &Path, opts: &DocTranslationOpts<'_>) -> Result<()> {
     let targets = build_doc_translation_targets(
         source,
-        target_lang,
-        Some(config),
-        output_path,
-        output_dir,
-        recursive,
-        explicit_target,
+        opts.target_lang,
+        Some(opts.config),
+        opts.output_path,
+        opts.output_dir,
+        opts.recursive,
+        opts.explicit_target,
     )?;
 
     if targets.is_empty() {
@@ -244,23 +250,34 @@ pub async fn run_doc_translation(
             .await
             .with_context(|| format!("reading {}", target.source_path.display()))?;
 
+        let tctx = TranslationCtx {
+            config: opts.config,
+            client: opts.client,
+            segmenter: opts.segmenter,
+            history: opts.history,
+        };
         let translated = translate_text(
             &text,
             &target.target_lang,
-            config,
-            client,
-            segmenter,
-            history,
-            template,
-            opts,
+            opts.template,
+            opts.prompt_opts,
+            &tctx,
         )
         .await?;
 
-        // Atomic write via temp file
+        // Atomic write: PID + epoch-ns suffix prevents concurrent temp-file collisions.
         if let Some(parent) = target.output_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let tmp = target.output_path.with_extension("tmp");
+        let uid = format!(
+            "tmp.{}.{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let tmp = target.output_path.with_extension(uid);
         tokio::fs::write(&tmp, &translated)
             .await
             .with_context(|| format!("writing temp file {}", tmp.display()))?;

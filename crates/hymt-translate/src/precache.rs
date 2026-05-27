@@ -17,6 +17,7 @@ use hymt_segment::Segmenter;
 
 use crate::docs::capture_man;
 use crate::exec_wrapper::{decode_for_translation, translate_cached};
+use crate::translate::TranslationCtx;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -322,25 +323,19 @@ pub async fn run_precache(
     let total = commands.len();
     let mut translated = 0usize;
     let mut failed = 0usize;
+    let tctx = TranslationCtx {
+        config,
+        client,
+        segmenter,
+        history,
+    };
 
     for cmd in &commands {
         // Translate man page
         match capture_man(&[cmd.as_str()]) {
             Ok(text) if !text.trim().is_empty() => {
                 let cache = ExecCache::new(config.exec_shared_cache_path());
-                match translate_cached(
-                    "man",
-                    cmd,
-                    &text,
-                    target_lang,
-                    &cache,
-                    config,
-                    client,
-                    segmenter,
-                    history,
-                )
-                .await
-                {
+                match translate_cached("man", cmd, &text, target_lang, &cache, &tctx).await {
                     Ok(_) => {
                         translated += 1;
                         eprintln!("hymt precache: translated man {cmd}");
@@ -358,19 +353,7 @@ pub async fn run_precache(
         // Translate --help output
         if let Some(text) = capture_help(cmd) {
             let cache = ExecCache::new(config.exec_shared_cache_path());
-            match translate_cached(
-                cmd,
-                "--help",
-                &text,
-                target_lang,
-                &cache,
-                config,
-                client,
-                segmenter,
-                history,
-            )
-            .await
-            {
+            match translate_cached(cmd, "--help", &text, target_lang, &cache, &tctx).await {
                 Ok(_) => {
                     translated += 1;
                     eprintln!("hymt precache: translated {cmd} --help");

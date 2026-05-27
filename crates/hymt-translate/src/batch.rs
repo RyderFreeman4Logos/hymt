@@ -18,7 +18,7 @@ use hymt_segment::Segmenter;
 
 use crate::doc_translate::{build_output_path, target_lang_path_suffix};
 use crate::translate::{
-    plan_translation, segment_cache_hash, template_options_hash, translate_text,
+    plan_translation, segment_cache_hash, template_options_hash, translate_text, TranslationCtx,
 };
 
 // Supported source file extensions
@@ -98,23 +98,37 @@ impl BatchPlan {
     }
 }
 
+// ── BatchPlanOpts ─────────────────────────────────────────────────────────────
+
+/// Configuration options for [`build_batch_plan`].
+pub struct BatchPlanOpts<'a> {
+    pub output_dir: Option<&'a Path>,
+    pub target_lang: &'a str,
+    pub template: &'a TemplateType,
+    pub prompt_opts: &'a PromptOpts,
+    pub recursive: bool,
+    pub explicit_target: bool,
+}
+
 // ── build_batch_plan ──────────────────────────────────────────────────────────
 
 /// Scan `directory`, plan translations for all supported text files, and check
 /// the cache to determine which segments still need translating.
-#[allow(clippy::too_many_arguments)]
 pub fn build_batch_plan(
     directory: &Path,
-    output_dir: Option<&Path>,
-    target_lang: &str,
     config: &HotConfig,
     segmenter: &Segmenter,
     history: &HistoryDB,
-    template: &TemplateType,
-    opts: &PromptOpts,
-    recursive: bool,
-    explicit_target: bool,
+    opts: &BatchPlanOpts<'_>,
 ) -> Result<BatchPlan> {
+    let (output_dir, target_lang, template, prompt_opts, recursive, explicit_target) = (
+        opts.output_dir,
+        opts.target_lang,
+        opts.template,
+        opts.prompt_opts,
+        opts.recursive,
+        opts.explicit_target,
+    );
     let root = directory
         .canonicalize()
         .with_context(|| format!("resolving {}", directory.display()))?;
@@ -123,7 +137,7 @@ pub fn build_batch_plan(
     eprintln!("Scanned {} files in {}", source_paths.len(), root.display());
 
     let template_name = template.as_str();
-    let options_hash = template_options_hash(opts);
+    let options_hash = template_options_hash(prompt_opts);
     let mut files = Vec::new();
     let mut skipped = Vec::new();
 
@@ -182,8 +196,14 @@ pub fn build_batch_plan(
 
         let output_path = build_output_path(&path, &root, None, output_dir, suffix);
 
-        let plan_result =
-            plan_translation(&text, &effective_lang, config, segmenter, template, opts);
+        let plan_result = plan_translation(
+            &text,
+            &effective_lang,
+            config,
+            segmenter,
+            template,
+            prompt_opts,
+        );
         let plan = match plan_result {
             Ok(p) => p,
             Err(e) => {
@@ -320,18 +340,15 @@ pub async fn run_batch_translation(
             file.output_path.display()
         );
 
-        let translated = translate_text(
-            &file.text,
-            &file.target_lang,
+        let tctx = TranslationCtx {
             config,
             client,
             segmenter,
             history,
-            template,
-            opts,
-        )
-        .await
-        .with_context(|| format!("translating {}", file.source_path.display()))?;
+        };
+        let translated = translate_text(&file.text, &file.target_lang, template, opts, &tctx)
+            .await
+            .with_context(|| format!("translating {}", file.source_path.display()))?;
 
         if let Some(parent) = file.output_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
