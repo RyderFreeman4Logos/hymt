@@ -937,14 +937,13 @@ async fn run_batch(
 
 fn run_history(args: HistoryArgs) -> Result<()> {
     let history = HistoryDB::default();
+    let n_recent = match &args.action {
+        Some(HistoryAction::Recent { n }) => *n,
+        _ => 10,
+    };
     match args.action {
-        None | Some(HistoryAction::Recent { n: _ }) => {
-            let n = if let Some(HistoryAction::Recent { n }) = args.action {
-                n
-            } else {
-                10
-            };
-            let previews = history.fetch_recent_translations(n)?;
+        None | Some(HistoryAction::Recent { .. }) => {
+            let previews = history.fetch_recent_translations(n_recent)?;
             if previews.is_empty() {
                 eprintln!("No translation history found.");
                 return Ok(());

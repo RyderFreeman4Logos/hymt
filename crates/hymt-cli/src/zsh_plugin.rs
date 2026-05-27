@@ -57,7 +57,7 @@ t() {{
     command "$@"
     return
   fi
-  hymt exec "$@"
+  hymt exec -- "$@"
 }}
 "#,
         header = PLUGIN_HEADER,
@@ -152,7 +152,7 @@ mod tests {
     fn render_empty_blocklist() {
         let script = render_zsh_plugin(&[]);
         assert!(script.contains("_HYMT_EXEC_BLOCKLIST=()"));
-        assert!(script.contains("hymt exec \"$@\""));
+        assert!(script.contains("hymt exec -- \"$@\""));
     }
 
     #[test]
