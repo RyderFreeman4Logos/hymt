@@ -15,7 +15,12 @@ import sys
 import time
 from typing import TextIO, TypeAlias
 
-from hymt.client import TranslationClient
+from hymt.client import TranslationClient, TranslationError
+from hymt.completeness import (
+    CompletenessResult,
+    CompletenessThresholds,
+    validate_completeness,
+)
 from hymt.config import HotConfig
 from hymt.history import DurationEstimate, HistoryDB, TaskRecord, format_duration
 from hymt.language import (
@@ -327,6 +332,11 @@ async def translate_text(
                     if cached is None:
                         missing_indexes.append(index)
                         continue
+                    if not _cached_segment_is_complete(
+                        index, plan.segments[index], cached, target_lang, config
+                    ):
+                        missing_indexes.append(index)
+                        continue
                     translations[index] = cached
                     completed += 1
                     completed_tokens += token_count
@@ -350,6 +360,7 @@ async def translate_text(
                         progress_reporter,
                         completed,
                         completed_tokens,
+                        config,
                         config.concurrency,
                     )
         finally:
@@ -533,21 +544,26 @@ async def _translate_streaming_plan(
             cached = history.find_segment_cached(
                 segment_hashes[index], target_lang, template_name, options_hash
             )
+            if cached is not None and not _cached_segment_is_complete(
+                index, plan.segments[index], cached, target_lang, config
+            ):
+                cached = None
             if cached is None:
                 if client is None:
                     client = await stack.enter_async_context(TranslationClient(config))
-                segment_started = _monotonic()
-                translated_segment = await _translate_streaming_segment(
+                (
+                    translated_segment,
+                    segment_seconds,
+                ) = await _translate_segment_with_completeness(
+                    index,
                     client,
-                    build_prompt(
-                        plan.segments[index],
-                        target_lang,
-                        template_type,
-                        **template_kwargs,
-                    ),
+                    plan.segments[index],
+                    target_lang,
+                    template_type,
+                    template_kwargs,
+                    config,
                     on_token,
                 )
-                segment_seconds = _monotonic() - segment_started
                 history.store_segment_cache(
                     segment_hashes[index],
                     target_lang,
@@ -648,14 +664,132 @@ def _streaming_section_groups(
     return group_segment_indexes, covered_sections, group_texts
 
 
-async def _translate_streaming_segment(
-    client: TranslationClient, prompt: str, on_token: TokenCallback
-) -> str:
+async def _translate_streaming_segment(client: TranslationClient, prompt: str) -> str:
     parts: list[str] = []
     async for token in client.translate_stream(prompt):
         parts.append(token)
-        on_token(token)
     return "".join(parts)
+
+
+async def _translate_segment_with_completeness(
+    index: int,
+    client: TranslationClient,
+    segment: str,
+    target_lang: str,
+    template_type: TemplateType,
+    template_kwargs: dict[str, object],
+    config: HotConfig,
+    on_token: TokenCallback | None = None,
+) -> tuple[str, float]:
+    max_retries = _completeness_max_retries(config)
+    last_result: CompletenessResult | None = None
+    for attempt in range(max_retries + 1):
+        prompt = _build_segment_prompt(
+            segment, target_lang, template_type, template_kwargs, attempt
+        )
+        segment_started = _monotonic()
+        if on_token is None:
+            translated_segment = await client.translate(prompt)
+        else:
+            translated_segment = await _translate_streaming_segment(client, prompt)
+        segment_seconds = _monotonic() - segment_started
+        result = _validate_segment_completeness(
+            segment, translated_segment, target_lang, config
+        )
+        if result.is_complete:
+            if on_token is not None:
+                on_token(translated_segment)
+            return translated_segment, segment_seconds
+
+        last_result = result
+        _warn_incomplete_segment(index, result, attempt, max_retries)
+
+    raise TranslationError(
+        "Segment "
+        f"{index + 1} failed completeness validation after {max_retries} retries: "
+        f"{_format_completeness_result(last_result)}"
+    )
+
+
+def _build_segment_prompt(
+    segment: str,
+    target_lang: str,
+    template_type: TemplateType,
+    template_kwargs: dict[str, object],
+    attempt: int,
+) -> str:
+    prompt = build_prompt(segment, target_lang, template_type, **template_kwargs)
+    if attempt == 0:
+        return prompt
+    return f"{prompt}\n\nTranslate the COMPLETE input. Do not stop early."
+
+
+def _validate_segment_completeness(
+    segment: str, translated_segment: str, target_lang: str, config: HotConfig
+) -> CompletenessResult:
+    return validate_completeness(
+        segment,
+        translated_segment,
+        target_lang,
+        CompletenessThresholds(
+            zh_to_en_min_ratio=getattr(config, "completeness_zh_to_en_min_ratio", 0.3),
+            en_to_zh_min_ratio=getattr(config, "completeness_en_to_zh_min_ratio", 0.4),
+            min_paragraph_ratio=getattr(
+                config, "completeness_min_paragraph_ratio", 0.5
+            ),
+        ),
+    )
+
+
+def _cached_segment_is_complete(
+    index: int,
+    segment: str,
+    cached: str,
+    target_lang: str,
+    config: HotConfig,
+) -> bool:
+    result = _validate_segment_completeness(segment, cached, target_lang, config)
+    if result.is_complete:
+        return True
+    print(
+        "Warning: cached segment "
+        f"{index + 1} failed completeness validation; retranslating: "
+        f"{_format_completeness_result(result)}",
+        file=sys.stderr,
+    )
+    return False
+
+
+def _warn_incomplete_segment(
+    index: int, result: CompletenessResult, attempt: int, max_retries: int
+) -> None:
+    action = "retrying" if attempt < max_retries else "retries exhausted"
+    print(
+        "Warning: segment "
+        f"{index + 1} failed completeness validation "
+        f"(attempt {attempt + 1}/{max_retries + 1}, {action}): "
+        f"{_format_completeness_result(result)}",
+        file=sys.stderr,
+    )
+
+
+def _format_completeness_result(result: CompletenessResult | None) -> str:
+    if result is None:
+        return "no completeness result available"
+    return (
+        f"checks_failed={result.checks_failed}; "
+        f"input_chars={result.input_stats.char_count}; "
+        f"output_chars={result.output_stats.char_count}; "
+        f"input_paragraphs={result.input_stats.paragraph_count}; "
+        f"output_paragraphs={result.output_stats.paragraph_count}; "
+        f"input_headings={result.input_stats.heading_count}; "
+        f"output_headings={result.output_stats.heading_count}"
+    )
+
+
+def _completeness_max_retries(config: HotConfig) -> int:
+    value = getattr(config, "completeness_max_retries", 2)
+    return value if isinstance(value, int) and not isinstance(value, bool) else 2
 
 
 async def _translate_missing_segments(
@@ -674,6 +808,7 @@ async def _translate_missing_segments(
     progress: TranslationProgress,
     completed: int,
     completed_tokens: int,
+    config: HotConfig,
     concurrency: int,
 ) -> tuple[int, int]:
     semaphore = asyncio.Semaphore(max(1, concurrency))
@@ -681,13 +816,19 @@ async def _translate_missing_segments(
 
     async def run(index: int) -> None:
         nonlocal completed, completed_tokens
-        prompt = build_prompt(
-            plan.segments[index], target_lang, template_type, **template_kwargs
-        )
         async with semaphore:
-            segment_started = _monotonic()
-            translated_segment = await client.translate(prompt)
-            segment_seconds = _monotonic() - segment_started
+            (
+                translated_segment,
+                segment_seconds,
+            ) = await _translate_segment_with_completeness(
+                index,
+                client,
+                plan.segments[index],
+                target_lang,
+                template_type,
+                template_kwargs,
+                config,
+            )
         translations[index] = translated_segment
         history.store_segment_cache(
             segment_hashes[index],

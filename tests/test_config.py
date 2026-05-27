@@ -25,6 +25,10 @@ class DefaultConfigTests(unittest.TestCase):
         self.assertEqual(config.primary_lang, "zh")
         self.assertEqual(config.secondary_lang, "en")
         self.assertEqual(config.timing_divergence_threshold, 2.0)
+        self.assertEqual(config.completeness_zh_to_en_min_ratio, 0.3)
+        self.assertEqual(config.completeness_en_to_zh_min_ratio, 0.4)
+        self.assertEqual(config.completeness_min_paragraph_ratio, 0.5)
+        self.assertEqual(config.completeness_max_retries, 2)
         self.assertEqual(
             str(config.exec_shared_cache_path), "/usr/local/share/hymt/cache.db"
         )
@@ -57,6 +61,12 @@ secondary = "en"
 [timing]
 divergence_threshold = 3.5
 
+[completeness]
+zh_to_en_min_ratio = 0.25
+en_to_zh_min_ratio = 0.35
+min_paragraph_ratio = 0.6
+max_retries = 4
+
 [exec]
 translate_stderr = false
 translate_stdout = "auto"
@@ -75,6 +85,10 @@ blocklist = ["hymt", "ssh"]
         self.assertEqual(config.max_retranslation_retries, 7)
         self.assertEqual(config.primary_lang, "ja")
         self.assertEqual(config.secondary_lang, "en")
+        self.assertEqual(config.completeness_zh_to_en_min_ratio, 0.25)
+        self.assertEqual(config.completeness_en_to_zh_min_ratio, 0.35)
+        self.assertEqual(config.completeness_min_paragraph_ratio, 0.6)
+        self.assertEqual(config.completeness_max_retries, 4)
         self.assertFalse(config.exec_translate_stderr)
         self.assertEqual(config.exec_translate_stdout, "auto")
         self.assertEqual(config.exec_skip_patterns, ("*.json",))

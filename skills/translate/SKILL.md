@@ -100,12 +100,13 @@ Related skills cover command/documentation translation:
 - If all detected paragraphs are already in the target language, interactive runs still ask whether to translate anyway.
 - Fenced code blocks are excluded from language detection and translation in every mode.
 - `[translation].stream = true` is the default. `--stream`/`--no-stream` override config for translation runs.
-- Streaming runs send tokens to stdout as the endpoint produces them; non-streaming runs buffer output until completion.
+- Streaming runs buffer each translated segment until completeness validation passes, then send that segment to stdout; non-streaming runs buffer output until completion.
 - Progress is written to stderr as `[done/total] XX.XX% | elapsed 2m47s | eta 1m23s | NN.NN tok/s` for TTY stderr or explicit `--progress`.
 - Identical source segments, target language, template type, and template-specific options reuse cached segment translations.
+- Each segment is validated for minimum output/input character ratio, paragraph retention, and Markdown heading preservation. Failed segments are retried up to `[completeness].max_retries` (default `2`) before raising an error.
 - `translate-doc` persists each completed segment immediately, so watch-mode retries and interrupted runs can resume from the segment cache.
 - After a completed interactive translation, if actual runtime diverges from the estimate by `[timing].divergence_threshold` (default `2.0`), `hymt` can prompt to file a GitHub timing-data issue.
-- Config lives at `~/.config/hymt/config.toml`; `[language].primary` and `[language].secondary` configure default routing.
+- Config lives at `~/.config/hymt/config.toml`; `[language].primary` and `[language].secondary` configure default routing, and `[completeness]` configures segment validation thresholds.
 - `translate-doc --watch` also reads `[translation].max_retranslation_retries` from that config.
 - The tokenizer is cached at `~/.cache/hymt/tokenizer/tokenizer.json`.
 - `hymt estimate` and translation commands auto-download the tokenizer on first use when the `tokenizers` dependency is available.
