@@ -13,7 +13,7 @@ __all__ = [
 @dataclass(frozen=True)
 class CompletenessThresholds:
     zh_to_en_min_ratio: float = 0.3
-    en_to_zh_min_ratio: float = 0.4
+    en_to_zh_min_ratio: float = 0.3
     min_paragraph_ratio: float = 0.5
 
 

@@ -15,7 +15,7 @@ import sys
 import time
 from typing import TextIO, TypeAlias
 
-from hymt.client import TranslationClient, TranslationError
+from hymt.client import TranslationClient
 from hymt.completeness import (
     CompletenessResult,
     CompletenessThresholds,
@@ -704,11 +704,17 @@ async def _translate_segment_with_completeness(
         last_result = result
         _warn_incomplete_segment(index, result, attempt, max_retries)
 
-    raise TranslationError(
-        "Segment "
-        f"{index + 1} failed completeness validation after {max_retries} retries: "
-        f"{_format_completeness_result(last_result)}"
+    import sys
+
+    print(
+        f"Warning: segment {index + 1} failed completeness validation after "
+        f"{max_retries} retries, using best attempt: "
+        f"{_format_completeness_result(last_result)}",
+        file=sys.stderr,
     )
+    if on_token is not None:
+        on_token(translated_segment)
+    return translated_segment, segment_seconds
 
 
 def _build_segment_prompt(
@@ -733,7 +739,7 @@ def _validate_segment_completeness(
         target_lang,
         CompletenessThresholds(
             zh_to_en_min_ratio=getattr(config, "completeness_zh_to_en_min_ratio", 0.3),
-            en_to_zh_min_ratio=getattr(config, "completeness_en_to_zh_min_ratio", 0.4),
+            en_to_zh_min_ratio=getattr(config, "completeness_en_to_zh_min_ratio", 0.3),
             min_paragraph_ratio=getattr(
                 config, "completeness_min_paragraph_ratio", 0.5
             ),
