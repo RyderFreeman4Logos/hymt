@@ -83,15 +83,39 @@ install:
     #!/usr/bin/env bash
     set -euo pipefail
     cd "{{_repo_root}}"
-    if command -v mise >/dev/null 2>&1; then
-        mise x -- uv tool install --force --reinstall "{{_repo_root}}"
-    elif command -v uv >/dev/null 2>&1; then
-        uv tool install --force --reinstall "{{_repo_root}}"
-    else
-        echo "ERROR: mise or uv required" >&2
-        exit 1
+    # Uninstall Python hymt if present before installing Rust binary
+    if command -v uv >/dev/null 2>&1; then
+        uv tool uninstall hymt 2>/dev/null || true
     fi
-    echo "hymt installed from {{_repo_root}}"
+    cargo install --path "{{_repo_root}}/crates/hymt-cli" --force
+    echo "hymt (Rust) installed from {{_repo_root}}"
+
+# ==============================================================================
+# Rust Quality Gates
+# ==============================================================================
+
+rust-fmt:
+    cargo fmt --all -- --check
+
+rust-lint:
+    cargo clippy --workspace -- -D warnings
+
+rust-check:
+    cargo check --workspace
+
+rust-test:
+    cargo test --workspace
+
+rust-pre-commit:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just rust-fmt
+    just rust-lint
+    just rust-test
+
+# ==============================================================================
+# Misc
+# ==============================================================================
 
 doc-translate-sync:
     #!/usr/bin/env bash
