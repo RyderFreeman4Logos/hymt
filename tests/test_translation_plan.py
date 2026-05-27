@@ -90,6 +90,42 @@ class TranslationPlanPackingTests(unittest.TestCase):
         )
 
 
+class TranslationPlanBudgetTests(unittest.TestCase):
+    def test_source_budget_caps_for_worst_case_one_to_one_expansion(self) -> None:
+        # En->zh has a typical ratio of 0.7, but dense technical content
+        # (code blocks, tables, paths) translates near 1:1. The budget must
+        # cap source tokens so a 1:1 output never exceeds max_output_tokens.
+        text = "x" * 200_000
+
+        with (
+            temporary_config_path() as config_path,
+            patch("hymt.translate.create_segmenter", return_value=CountingSegmenter()),
+        ):
+            config = HotConfig(config_path)
+            plan = plan_translation(text, "zh", config)
+
+        # Worst-case output (assuming 1:1) must stay under max_output_tokens.
+        self.assertLess(plan.available_source_tokens, config.max_output_tokens)
+
+    def test_deterministic_segmentation(self) -> None:
+        text = (
+            "First paragraph with some content.\n\n"
+            "Second paragraph with more content.\n\n"
+            "Third paragraph here."
+        )
+
+        with (
+            temporary_config_path() as config_path,
+            patch("hymt.translate.create_segmenter", return_value=CountingSegmenter()),
+        ):
+            config = HotConfig(config_path)
+            plan_a = plan_translation(text, "zh", config)
+            plan_b = plan_translation(text, "zh", config)
+
+        self.assertEqual(plan_a.segments, plan_b.segments)
+        self.assertEqual(plan_a.available_source_tokens, plan_b.available_source_tokens)
+
+
 class CountingSegmenter:
     def count_tokens(self, text: str) -> int:
         return len(text)
