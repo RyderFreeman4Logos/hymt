@@ -10,7 +10,7 @@ Use `hymt exec` when an agent or user wants original command output preserved an
 ## Wrap commands
 
 - Basic form: `hymt exec -- <command> [args...]`
-- Target language: `hymt exec -t zh -- cargo build`
+- Target language: `hymt -l zh exec -- cargo build`
 - Original stdout and stderr are streamed unchanged while the command runs.
 - After completion, stderr is translated when textual. Stdout is translated by default, but binary, JSON, XML, YAML-like structured output, configured skip patterns, and configured skip commands are skipped.
 - Translated stderr is yellow on a TTY; translated stdout is cyan on a TTY. When stdout is piped, translated stdout is written to stderr so the command's stdout stays pipe-safe.
@@ -27,14 +27,7 @@ Use `hymt exec` when an agent or user wants original command output preserved an
 
 ## Precache
 
-- Precache recent shell-history command manpages and top-level `--help`: `hymt exec precache`
-- Precache selected commands: `hymt exec precache git docker kubectl`
-- Include subcommand help discovered from help output: `hymt exec precache --recursive`
-- Limit manpages to a section: `hymt exec precache --section 1`
-- Recursive discovery writes progress to stderr before translation progress starts.
-- Command help/subcommand discovery is cached in `~/.cache/hymt/discovery-cache.db` by command path, file mtime, and file size.
-- Progress is written to stderr as `[done/total] XX.XX% | elapsed ... | eta ... | NN.NN items/s`.
-- Precache uses the same user/shared exec cache and the segment cache for deduplication.
+- Pre-cache translations for recently used commands: `hymt exec precache`
 
 ## Config
 
