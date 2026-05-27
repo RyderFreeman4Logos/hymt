@@ -109,7 +109,7 @@ impl std::fmt::Display for TemplateType {
 // ── Options ──────────────────────────────────────────────────────────────────
 
 /// Extra parameters for prompt templates that require them.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PromptOpts {
     /// Terminology pairs for `Terminology` template: `(source_term, target_term)`.
     pub terms: Option<Vec<(String, String)>>,
