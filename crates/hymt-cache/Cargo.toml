@@ -8,3 +8,10 @@ license.workspace = true
 hymt-core = { path = "../hymt-core" }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+rusqlite = { version = "0.31", features = ["bundled"] }
+sha2 = "0.10"
+hex = "0.4"
+chrono = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
