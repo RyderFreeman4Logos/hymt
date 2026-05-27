@@ -92,7 +92,7 @@ struct ChoiceContent {
 struct Inner {
     config: HotConfig,
     http: reqwest::Client,
-    semaphore: Semaphore,
+    semaphore: Arc<Semaphore>,
 }
 
 // ── TranslationClient ─────────────────────────────────────────────────────────
@@ -112,13 +112,18 @@ impl TranslationClient {
     /// (endpoint URL, model, token limits) are refreshed on each call via `maybe_reload`.
     pub fn new(config: HotConfig) -> Result<Self, ClientError> {
         let concurrency = config.concurrency() as usize;
-        let timeout = Duration::from_secs_f64(config.timeout());
+        let timeout_secs = config.timeout();
+        let timeout = if timeout_secs.is_finite() && timeout_secs > 0.0 {
+            Duration::from_secs_f64(timeout_secs.min(86_400.0))
+        } else {
+            Duration::from_secs(300)
+        };
         let http = reqwest::Client::builder().timeout(timeout).build()?;
         Ok(Self {
             inner: Arc::new(Inner {
                 config,
                 http,
-                semaphore: Semaphore::new(concurrency),
+                semaphore: Arc::new(Semaphore::new(concurrency)),
             }),
         })
     }
@@ -156,6 +161,11 @@ impl TranslationClient {
     ) -> Result<impl Stream<Item = Result<String, ClientError>>, ClientError> {
         let _ = self.inner.config.maybe_reload();
 
+        let permit = Arc::clone(&self.inner.semaphore)
+            .acquire_owned()
+            .await
+            .map_err(|_| ClientError::SemaphoreClosed)?;
+
         let payload = self.build_payload(prompt, true);
         let headers = self.build_headers();
         let url = self.chat_url();
@@ -167,6 +177,7 @@ impl TranslationClient {
 
         let is_sse = is_event_stream(&response);
         tokio::spawn(async move {
+            let _permit = permit; // held for the entire stream duration
             if is_sse {
                 parse_sse(response, tx).await;
             } else {
@@ -436,7 +447,7 @@ pub fn tokens_from_sse_data(data_lines: &[String]) -> Option<Result<String, Clie
 
 // ── Response extraction ───────────────────────────────────────────────────────
 
-pub(crate) fn extract_from_response(resp: ChatResponse) -> Result<String, ClientError> {
+fn extract_from_response(resp: ChatResponse) -> Result<String, ClientError> {
     let choices = resp.choices.unwrap_or_default();
     let first = choices
         .into_iter()
@@ -459,7 +470,7 @@ pub(crate) fn extract_from_response(resp: ChatResponse) -> Result<String, Client
     Err(ClientError::MissingContent)
 }
 
-pub(crate) fn extract_stream_token(resp: ChatResponse) -> Result<String, ClientError> {
+fn extract_stream_token(resp: ChatResponse) -> Result<String, ClientError> {
     let choices = resp.choices.unwrap_or_default();
     let first = match choices.into_iter().next() {
         Some(c) => c,
