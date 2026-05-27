@@ -1,5 +1,8 @@
 use crate::{
-    split::{is_cjk_character, split_clauses, split_paragraphs, split_sentences},
+    split::{
+        is_cjk_character, split_clauses, split_list_items, split_markdown_blocks, split_paragraphs,
+        split_sentences, MarkdownBlock,
+    },
     Segmenter,
 };
 
@@ -201,6 +204,141 @@ fn is_cjk_detects_hiragana_katakana() {
 #[test]
 fn is_cjk_detects_hangul() {
     assert!(is_cjk_character('한'));
+}
+
+// ── markdown-aware block splitting ───────────────────────────────────────────
+
+#[test]
+fn blockquote_stays_together() {
+    let text = "> Line one.\n> Line two.\n> Line three.";
+    let blocks = split_markdown_blocks(text);
+    assert_eq!(blocks.len(), 1);
+    assert!(matches!(&blocks[0], MarkdownBlock::Blockquote(_)));
+    assert_eq!(blocks[0].as_str(), text);
+}
+
+#[test]
+fn nested_blockquote_stays_together() {
+    let text = "> Outer.\n>> Nested deeper.\n> Back to outer.";
+    let blocks = split_markdown_blocks(text);
+    assert_eq!(blocks.len(), 1);
+    assert!(matches!(&blocks[0], MarkdownBlock::Blockquote(_)));
+}
+
+#[test]
+fn fenced_code_block_stays_together() {
+    let text = "```rust\nfn hello() {\n    println!(\"hi\");\n}\n```";
+    let blocks = split_markdown_blocks(text);
+    assert_eq!(blocks.len(), 1);
+    assert!(matches!(&blocks[0], MarkdownBlock::FencedCode(_)));
+    assert_eq!(blocks[0].as_str(), text);
+}
+
+#[test]
+fn table_stays_together() {
+    let text = "| A | B |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |";
+    let blocks = split_markdown_blocks(text);
+    assert_eq!(blocks.len(), 1);
+    assert!(matches!(&blocks[0], MarkdownBlock::Table(_)));
+    assert_eq!(blocks[0].as_str(), text);
+}
+
+#[test]
+fn mixed_content_splits_correctly() {
+    let text = "Intro paragraph.\n\n> Blockquote line.\n\nOutro paragraph.";
+    let blocks = split_markdown_blocks(text);
+    assert_eq!(blocks.len(), 3, "blocks: {blocks:?}");
+    assert!(matches!(&blocks[0], MarkdownBlock::Normal(_)));
+    assert!(matches!(&blocks[1], MarkdownBlock::Blockquote(_)));
+    assert!(matches!(&blocks[2], MarkdownBlock::Normal(_)));
+}
+
+#[test]
+fn split_markdown_blocks_reassembles_to_original() {
+    let text = "Intro.\n\n> Quote block.\n\nCode:\n\n```\nlet x = 1;\n```\n\nOutro.";
+    let blocks = split_markdown_blocks(text);
+    let joined: String = blocks.into_iter().map(|b| b.into_string()).collect();
+    assert_eq!(joined, text);
+}
+
+#[test]
+fn split_markdown_blocks_plain_text_unchanged() {
+    let text = "First paragraph.\n\nSecond paragraph.";
+    let blocks = split_markdown_blocks(text);
+    assert!(blocks.iter().all(|b| matches!(b, MarkdownBlock::Normal(_))));
+    let joined: String = blocks.into_iter().map(|b| b.into_string()).collect();
+    assert_eq!(joined, text);
+}
+
+#[test]
+fn list_block_detected() {
+    let text = "- item one\n- item two\n- item three";
+    let blocks = split_markdown_blocks(text);
+    assert_eq!(blocks.len(), 1);
+    assert!(matches!(&blocks[0], MarkdownBlock::List(_)));
+}
+
+#[test]
+fn split_list_items_basic() {
+    let text = "- item one\n- item two\n- item three";
+    let items = split_list_items(text);
+    assert_eq!(items.len(), 3);
+    assert!(items[0].contains("item one"));
+    assert!(items[1].contains("item two"));
+    assert!(items[2].contains("item three"));
+}
+
+// ── segment() with markdown blocks ───────────────────────────────────────────
+
+#[test]
+fn segment_fenced_code_not_split_when_oversized() {
+    // A code block with many lines exceeding a tiny token budget.
+    let code = "```\n".to_owned() + &"x = 1;\n".repeat(20) + "```\n";
+    let result = seg().segment(&code, 5).unwrap();
+    assert_eq!(result.len(), 1, "code block must not be split: {result:?}");
+    assert_eq!(result[0], code);
+}
+
+#[test]
+fn segment_table_not_split_when_oversized() {
+    let table = "| A | B |\n|---|---|\n".to_owned() + &"| x | y |\n".repeat(10);
+    let result = seg().segment(&table, 5).unwrap();
+    assert_eq!(result.len(), 1, "table must not be split: {result:?}");
+    assert_eq!(result[0], table);
+}
+
+#[test]
+fn segment_blockquote_stays_together_within_budget() {
+    let text = "> Short quote.";
+    let result = seg().segment(text, 100).unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0], text);
+}
+
+#[test]
+fn segment_oversized_blockquote_preserves_prefix() {
+    // Build a large blockquote that must be split.
+    let bq: String = (1..=30).map(|i| format!("> Line {i}.\n")).collect();
+    let result = seg().segment(&bq, 5).unwrap();
+    assert!(
+        result.len() > 1,
+        "oversized blockquote should produce multiple segments"
+    );
+    for seg_item in &result {
+        let first = seg_item.lines().next().unwrap_or("");
+        assert!(
+            first.trim_start().starts_with('>'),
+            "every blockquote segment must start with '>': {seg_item:?}"
+        );
+    }
+}
+
+#[test]
+fn segment_markdown_reassembles_to_original() {
+    let text = "Intro.\n\n> Quote block.\n\nCode:\n\n```\nlet x = 1;\n```\n\nOutro.";
+    let result = seg().segment(text, 5).unwrap();
+    let joined: String = result.join("");
+    assert_eq!(joined, text);
 }
 
 // ── edge cases ────────────────────────────────────────────────────────────────
