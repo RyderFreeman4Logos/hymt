@@ -26,7 +26,7 @@ class DefaultConfigTests(unittest.TestCase):
         self.assertEqual(config.secondary_lang, "en")
         self.assertEqual(config.timing_divergence_threshold, 2.0)
         self.assertEqual(config.completeness_zh_to_en_min_ratio, 0.3)
-        self.assertEqual(config.completeness_en_to_zh_min_ratio, 0.4)
+        self.assertEqual(config.completeness_en_to_zh_min_ratio, 0.3)
         self.assertEqual(config.completeness_min_paragraph_ratio, 0.5)
         self.assertEqual(config.completeness_max_retries, 2)
         self.assertEqual(

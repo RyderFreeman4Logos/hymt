@@ -35,7 +35,7 @@ divergence_threshold = 2.0
 
 [completeness]
 zh_to_en_min_ratio = 0.3
-en_to_zh_min_ratio = 0.4
+en_to_zh_min_ratio = 0.3
 min_paragraph_ratio = 0.5
 max_retries = 2
 
@@ -158,7 +158,7 @@ class HotConfig:
 
     @property
     def completeness_en_to_zh_min_ratio(self) -> float:
-        return self._get_float_above("completeness", "en_to_zh_min_ratio", 0.4, 0.0)
+        return self._get_float_above("completeness", "en_to_zh_min_ratio", 0.3, 0.0)
 
     @property
     def completeness_min_paragraph_ratio(self) -> float:

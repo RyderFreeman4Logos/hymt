@@ -5,7 +5,7 @@ Conflicts=hy-mt2-throughput.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/share/mise/installs/llama-cpp/9334-cuda/llama-server \
+ExecStart=/home/obj/.local/share/llama-cpp-cuda/llama-server \
   -m /ssd/mirror-rootfs/home/obj/models/hy-mt2/Hy-MT2-7B.i1-Q6_K.gguf \
   -ngl 99 \
   -fit off \
@@ -24,7 +24,7 @@ ExecStart=/usr/local/share/mise/installs/llama-cpp/9334-cuda/llama-server \
 Restart=on-failure
 RestartSec=5
 Environment=CUDA_VISIBLE_DEVICES=0
-Environment=LD_LIBRARY_PATH=/usr/local/share/mise/installs/llama-cpp/9334-cuda
+Environment=LD_LIBRARY_PATH=/home/obj/.local/share/llama-cpp-cuda
 
 [Install]
 WantedBy=default.target

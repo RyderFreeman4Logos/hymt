@@ -20,8 +20,8 @@ from hymt.translate import translate_text
 
 class CompletenessValidatorTests(unittest.TestCase):
     def test_token_ratio_uses_directional_thresholds(self) -> None:
-        self.assertFalse(validate_completeness("a" * 100, "b" * 39, "zh").is_complete)
-        self.assertTrue(validate_completeness("a" * 100, "b" * 40, "zh").is_complete)
+        self.assertFalse(validate_completeness("a" * 100, "b" * 29, "zh").is_complete)
+        self.assertTrue(validate_completeness("a" * 100, "b" * 30, "zh").is_complete)
         self.assertFalse(validate_completeness("a" * 100, "b" * 29, "en").is_complete)
         self.assertTrue(validate_completeness("a" * 100, "b" * 30, "en").is_complete)
 
