@@ -151,8 +151,15 @@ def plan_translation(
         raise ValueError(
             "Config context_window is too small for the selected template and max_output_tokens"
         )
+    # Cap source so worst-case output stays under max_output_tokens.
+    # Dense technical content (code blocks, tables, paths) translates near 1:1
+    # regardless of language pair — never assume below-1.0 shrinkage when budgeting.
+    # Apply _OUTPUT_SAFETY_FACTOR for variance headroom (e.g. bursty content).
     expansion_ratio = _expansion_ratio(target_lang)
-    max_safe_source = int(config.max_output_tokens / expansion_ratio * _SAFETY_MARGIN)
+    budget_ratio = max(expansion_ratio, _MIN_EXPANSION_FOR_BUDGET)
+    max_safe_source = int(
+        config.max_output_tokens / (budget_ratio * _OUTPUT_SAFETY_FACTOR)
+    )
     available_source_tokens = min(base_source_budget, max_safe_source)
     if available_source_tokens <= 0:
         raise ValueError(
@@ -862,7 +869,8 @@ def _completed_translations(translations: list[str | None]) -> list[str]:
     return [str(translation) for translation in translations]
 
 
-_SAFETY_MARGIN = 0.80
+_OUTPUT_SAFETY_FACTOR = 1.5
+_MIN_EXPANSION_FOR_BUDGET = 1.0
 
 _EXPANSION_RATIOS: dict[str, float] = {
     "en": 1.8,
