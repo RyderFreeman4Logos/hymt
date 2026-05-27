@@ -4,7 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Reserved: lingua-rs language detection (not yet wired to a concrete dependency)
+lingua = []
+
 [dependencies]
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
+toml = "0.8"
