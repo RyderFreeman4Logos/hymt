@@ -621,17 +621,44 @@ async fn run_translate_stdin(
         println!();
         return Ok(());
     }
-    let words: Vec<String> = vec![text];
-    run_translate_text(
-        &words,
-        target_lang,
-        template,
-        opts,
-        explicit_target,
-        show_plan,
+    // Stdin content is always text; never interpret as a file path.
+    let segmenter = make_segmenter();
+    let history = HistoryDB::default();
+    let effective_lang = if explicit_target {
+        target_lang.to_owned()
+    } else {
+        resolve_target_language(
+            &text,
+            target_lang,
+            &config.primary_lang(),
+            &config.secondary_lang(),
+            false,
+        )
+    };
+
+    if show_plan {
+        let plan = plan_translation(&text, &effective_lang, config, &segmenter, template, opts)?;
+        eprintln!(
+            "Plan: {} segments, ~{} tokens",
+            plan.segments.len(),
+            plan.source_tokens
+        );
+        return Ok(());
+    }
+
+    let client = make_client(config)?;
+    let tctx = TranslationCtx {
         config,
-    )
-    .await
+        client: &client,
+        segmenter: &segmenter,
+        history: &history,
+    };
+    let translated = translate_text(&text, &effective_lang, template, opts, &tctx).await?;
+    print!("{translated}");
+    if !translated.ends_with('\n') {
+        println!();
+    }
+    Ok(())
 }
 
 async fn run_translate_path(

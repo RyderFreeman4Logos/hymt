@@ -11,7 +11,7 @@ Use `hymt translate-doc` when you want file-oriented Markdown translation instea
 
 - Default Simplified Chinese output: `hymt translate-doc README.md`
 - Explicit target: `hymt translate-doc README.md -l ja`
-- Explicit output path: `hymt translate-doc README.md -l zh -o README.zh-cn.md`
+- Explicit output path: `hymt translate-doc README.md -l zh --output README.zh-cn.md`
 - Directory tree: `hymt translate-doc docs/ --recursive`
 - Preserve a separate output tree: `hymt translate-doc docs/ --recursive --output-dir translated-docs`
 - Watch a file and re-translate on change: `hymt translate-doc README.md --watch`
