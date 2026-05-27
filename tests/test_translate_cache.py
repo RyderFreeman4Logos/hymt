@@ -534,6 +534,7 @@ def fake_config() -> SimpleNamespace:
         config_version=1,
         model="test-model",
         timing_divergence_threshold=2.0,
+        completeness_en_to_zh_min_ratio=0.3,
     )
 
 

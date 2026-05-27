@@ -33,6 +33,12 @@ repetition_penalty = 1.05
 [timing]
 divergence_threshold = 2.0
 
+[completeness]
+zh_to_en_min_ratio = 0.3
+en_to_zh_min_ratio = 0.4
+min_paragraph_ratio = 0.5
+max_retries = 2
+
 [exec]
 shared_cache_path = "/usr/local/share/hymt/cache.db"
 translate_stderr = true
@@ -145,6 +151,22 @@ class HotConfig:
     @property
     def timing_divergence_threshold(self) -> float:
         return self._get_float_above("timing", "divergence_threshold", 2.0, 1.0)
+
+    @property
+    def completeness_zh_to_en_min_ratio(self) -> float:
+        return self._get_float_above("completeness", "zh_to_en_min_ratio", 0.3, 0.0)
+
+    @property
+    def completeness_en_to_zh_min_ratio(self) -> float:
+        return self._get_float_above("completeness", "en_to_zh_min_ratio", 0.4, 0.0)
+
+    @property
+    def completeness_min_paragraph_ratio(self) -> float:
+        return self._get_float_above("completeness", "min_paragraph_ratio", 0.5, 0.0)
+
+    @property
+    def completeness_max_retries(self) -> int:
+        return self._get_non_negative_int("completeness", "max_retries", 2)
 
     @property
     def exec_shared_cache_path(self) -> Path:
@@ -267,6 +289,13 @@ class HotConfig:
         with self._lock:
             value = self._get_section(section_name).get(key, default)
         if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+        return default
+
+    def _get_non_negative_int(self, section_name: str, key: str, default: int) -> int:
+        with self._lock:
+            value = self._get_section(section_name).get(key, default)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
             return value
         return default
 
