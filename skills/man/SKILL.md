@@ -1,6 +1,6 @@
 ---
 name: hymt-man
-description: "Use when viewing translated Unix manpages with hymt man, including apropos searches, specific sections, cache refreshes, and original passthrough."
+description: "Use when viewing translated Unix manpages with hymt man, including apropos searches, specific sections, and original passthrough."
 ---
 
 # Hymt Man
@@ -12,9 +12,8 @@ Use `hymt man` when a user wants a translated manpage or apropos result.
 - Translate a page: `hymt man git-rebase`
 - Specific section: `hymt man 5 crontab`
 - Apropos search: `hymt man -k "file system"`
-- Target language: `hymt man -t zh git-rebase`
+- Target language: `hymt man -l zh git-rebase`
 - Original passthrough: `hymt man --original git-rebase`
-- Force re-translation: `hymt man --refresh git-rebase`
 
 ## Behavior
 

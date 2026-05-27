@@ -10,8 +10,8 @@ Use `hymt translate-doc` when you want file-oriented Markdown translation instea
 ## Commands
 
 - Default Simplified Chinese output: `hymt translate-doc README.md`
-- Explicit target: `hymt translate-doc README.md -t ja`
-- Explicit output path: `hymt translate-doc README.md -t zh -o README.zh-cn.md`
+- Explicit target: `hymt translate-doc README.md -l ja`
+- Explicit output path: `hymt translate-doc README.md -l zh --output README.zh-cn.md`
 - Directory tree: `hymt translate-doc docs/ --recursive`
 - Preserve a separate output tree: `hymt translate-doc docs/ --recursive --output-dir translated-docs`
 - Watch a file and re-translate on change: `hymt translate-doc README.md --watch`
@@ -19,7 +19,7 @@ Use `hymt translate-doc` when you want file-oriented Markdown translation instea
 ## Behavior
 
 - `translate-doc` only accepts Markdown sources.
-- For `-t zh`, output file names normalize to `.zh-cn.md`.
+- For `-l zh`, output file names normalize to `.zh-cn.md`.
 - Mixed-language Markdown uses the same paragraph-level partial translation rules as the main `hymt` command.
 - Fenced code blocks are preserved.
 - Progress is written to stderr as `[done/total] XX.XX% | elapsed ... | eta ... | NN.NN tok/s`.

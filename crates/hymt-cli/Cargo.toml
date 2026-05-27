@@ -16,3 +16,4 @@ hymt-cache = { path = "../hymt-cache" }
 hymt-translate = { path = "../hymt-translate" }
 anyhow = { workspace = true }
 tokio = { workspace = true }
+clap = { version = "4", features = ["derive"] }

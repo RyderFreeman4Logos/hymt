@@ -1,6 +1,6 @@
 ---
 name: hymt-info
-description: "Use when viewing translated GNU info pages with hymt info, including cache refreshes and original passthrough."
+description: "Use when viewing translated GNU info pages with hymt info, including original passthrough."
 ---
 
 # Hymt Info
@@ -11,9 +11,8 @@ Use `hymt info` when a user wants a translated GNU info page.
 
 - Translate a topic: `hymt info coreutils`
 - Translate a node path: `hymt info emacs buffers`
-- Target language: `hymt info -t zh coreutils`
+- Target language: `hymt info -l zh coreutils`
 - Original passthrough: `hymt info --original coreutils`
-- Force re-translation: `hymt info --refresh coreutils`
 
 ## Behavior
 
