@@ -121,27 +121,88 @@ impl Segmenter {
 
         let mut units: Vec<String> = Vec::new();
 
-        for paragraph in split::split_paragraphs(text) {
-            if self.count_tokens(&paragraph) <= max_tokens {
-                units.push(paragraph);
-                continue;
-            }
-            for sentence in split::split_sentences(&paragraph) {
-                if self.count_tokens(&sentence) <= max_tokens {
-                    units.push(sentence);
-                    continue;
+        for block in split::split_markdown_blocks(text) {
+            match block {
+                // Fenced code and tables are atomic even when oversized.
+                split::MarkdownBlock::FencedCode(s) | split::MarkdownBlock::Table(s) => {
+                    units.push(s);
                 }
-                for clause in split::split_clauses(&sentence) {
-                    if self.count_tokens(&clause) <= max_tokens {
-                        units.push(clause);
-                        continue;
+                // Blockquotes are split at line boundaries when oversized,
+                // preserving the `>` prefix on every resulting segment.
+                split::MarkdownBlock::Blockquote(s) => {
+                    if self.count_tokens(&s) <= max_tokens {
+                        units.push(s);
+                    } else {
+                        units.extend(self.split_blockquote(&s, max_tokens));
                     }
-                    units.extend(self.split_word_or_character(&clause, max_tokens)?);
+                }
+                // Lists split at top-level item boundaries when oversized.
+                split::MarkdownBlock::List(s) => {
+                    if self.count_tokens(&s) <= max_tokens {
+                        units.push(s);
+                    } else {
+                        for item in split::split_list_items(&s) {
+                            self.add_text_units(&mut units, &item, max_tokens)?;
+                        }
+                    }
+                }
+                // Normal paragraphs use the sentence→clause→word→char hierarchy.
+                split::MarkdownBlock::Normal(s) => {
+                    self.add_text_units(&mut units, &s, max_tokens)?;
                 }
             }
         }
 
         self.pack_units(units, max_tokens)
+    }
+
+    /// Recursively split a normal text chunk using sentence → clause → word → char.
+    fn add_text_units(
+        &self,
+        units: &mut Vec<String>,
+        text: &str,
+        max_tokens: usize,
+    ) -> Result<(), SegmentError> {
+        if self.count_tokens(text) <= max_tokens {
+            units.push(text.to_owned());
+            return Ok(());
+        }
+        for sentence in split::split_sentences(text) {
+            if self.count_tokens(&sentence) <= max_tokens {
+                units.push(sentence);
+                continue;
+            }
+            for clause in split::split_clauses(&sentence) {
+                if self.count_tokens(&clause) <= max_tokens {
+                    units.push(clause);
+                    continue;
+                }
+                units.extend(self.split_word_or_character(&clause, max_tokens)?);
+            }
+        }
+        Ok(())
+    }
+
+    /// Split an oversized blockquote at line boundaries, keeping `>` prefixes.
+    fn split_blockquote(&self, text: &str, max_tokens: usize) -> Vec<String> {
+        let mut segments: Vec<String> = Vec::new();
+        let mut current = String::new();
+
+        for line in text.split_inclusive('\n') {
+            let candidate = format!("{current}{line}");
+            if !current.is_empty() && self.count_tokens(&candidate) > max_tokens {
+                segments.push(std::mem::take(&mut current));
+                current = line.to_owned();
+            } else {
+                current = candidate;
+            }
+        }
+
+        if !current.is_empty() {
+            segments.push(current);
+        }
+
+        segments
     }
 
     fn split_word_or_character(
@@ -203,8 +264,14 @@ impl Segmenter {
             if unit.is_empty() {
                 continue;
             }
+            // Protected blocks (fenced code, tables) may be legitimately oversized.
+            // Emit them as their own segment rather than erroring.
             if self.count_tokens(&unit) > max_tokens {
-                return Err(SegmentError::UnitExceedsMaxTokens);
+                if !current.is_empty() {
+                    segments.push(std::mem::take(&mut current));
+                }
+                segments.push(unit);
+                continue;
             }
             let candidate = format!("{current}{unit}");
             if !current.is_empty() && self.count_tokens(&candidate) > max_tokens {
