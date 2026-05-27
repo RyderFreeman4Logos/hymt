@@ -62,6 +62,28 @@ pub fn build_output_path(
     source.parent().unwrap_or(Path::new("")).join(&new_name)
 }
 
+/// Validate that a language suffix is safe to embed in a file path.
+///
+/// Only ASCII alphanumeric characters, hyphens, and underscores are allowed.
+/// This blocks path traversal (`..`), path separators (`/`, `\`), null bytes,
+/// and any other character that could be misinterpreted by the filesystem.
+fn validate_lang_suffix(suffix: &str) -> Result<()> {
+    if suffix.is_empty() {
+        anyhow::bail!("target language suffix must not be empty");
+    }
+    if suffix
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "invalid target language suffix {:?}: only ASCII alphanumeric, hyphens, and underscores are allowed",
+            suffix
+        )
+    }
+}
+
 // ── DocTranslationTarget ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -95,6 +117,7 @@ pub fn build_doc_translation_targets(
         validate_markdown(&resolved)?;
         let effective = resolve_file_target_lang(&resolved, target_lang, config, explicit_target);
         let suffix = target_lang_path_suffix(&effective);
+        validate_lang_suffix(suffix)?;
         let out = build_output_path(
             &resolved,
             resolved.parent().unwrap_or(&resolved),
@@ -118,6 +141,7 @@ pub fn build_doc_translation_targets(
     for path in files {
         let effective = resolve_file_target_lang(&path, target_lang, config, explicit_target);
         let suffix = target_lang_path_suffix(&effective);
+        validate_lang_suffix(suffix)?;
         // Skip files whose stem already ends with the target suffix
         if path
             .file_stem()
@@ -361,6 +385,51 @@ mod tests {
         let files = scan_markdown_files(dir.path(), false);
         assert_eq!(files.len(), 1);
         assert!(files[0].file_name().unwrap() == "a.md");
+    }
+
+    // ── validate_lang_suffix ──────────────────────────────────────────────────
+
+    #[test]
+    fn lang_suffix_accepts_valid_codes() {
+        assert!(validate_lang_suffix("zh-cn").is_ok());
+        assert!(validate_lang_suffix("en").is_ok());
+        assert!(validate_lang_suffix("pt_BR").is_ok());
+        assert!(validate_lang_suffix("fr").is_ok());
+    }
+
+    #[test]
+    fn lang_suffix_rejects_empty() {
+        assert!(validate_lang_suffix("").is_err());
+    }
+
+    #[test]
+    fn lang_suffix_rejects_path_traversal() {
+        assert!(validate_lang_suffix("../etc").is_err());
+        assert!(validate_lang_suffix("../../evil").is_err());
+        assert!(validate_lang_suffix("..").is_err());
+    }
+
+    #[test]
+    fn lang_suffix_rejects_forward_slash() {
+        assert!(validate_lang_suffix("zh/cn").is_err());
+        assert!(validate_lang_suffix("/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn lang_suffix_rejects_backslash() {
+        assert!(validate_lang_suffix("zh\\cn").is_err());
+    }
+
+    #[test]
+    fn lang_suffix_rejects_null_byte() {
+        assert!(validate_lang_suffix("zh\x00cn").is_err());
+    }
+
+    #[test]
+    fn lang_suffix_rejects_spaces_and_special() {
+        assert!(validate_lang_suffix("zh cn").is_err());
+        assert!(validate_lang_suffix("zh!cn").is_err());
+        assert!(validate_lang_suffix("zh.cn").is_err());
     }
 
     #[test]
