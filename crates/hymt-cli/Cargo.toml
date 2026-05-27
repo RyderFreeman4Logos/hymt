@@ -1,0 +1,18 @@
+[package]
+name = "hymt-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hymt"
+path = "src/main.rs"
+
+[dependencies]
+hymt-core = { path = "../hymt-core" }
+hymt-segment = { path = "../hymt-segment" }
+hymt-client = { path = "../hymt-client" }
+hymt-cache = { path = "../hymt-cache" }
+hymt-translate = { path = "../hymt-translate" }
+anyhow = { workspace = true }
+tokio = { workspace = true }

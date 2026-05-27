@@ -1,0 +1,10 @@
+[package]
+name = "hymt-segment"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hymt-core = { path = "../hymt-core" }
+anyhow = { workspace = true }
+thiserror = { workspace = true }

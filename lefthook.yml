@@ -8,6 +8,8 @@ pre-commit:
   commands:
     quality-gates:
       run: just pre-commit
+    rust-quality-gates:
+      run: just rust-pre-commit
 
 pre-push:
   commands:
