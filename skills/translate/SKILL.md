@@ -39,7 +39,7 @@ Use `hymt` when an agent should drive the local Hy-MT2 CLI instead of hand-writi
 ## Translate Markdown docs
 
 - Translate one Markdown file to Simplified Chinese: `hymt translate-doc README.md`
-- Explicit output path: `hymt translate-doc README.md -l zh -o README.zh-cn.md`
+- Explicit output path: `hymt translate-doc README.md -l zh --output README.zh-cn.md`
 - Translate to another language: `hymt translate-doc README.md -l ja`
 - Translate a documentation tree: `hymt translate-doc docs/ --recursive`
 - Keep a file in sync while editing: `hymt translate-doc README.md --watch`
@@ -97,7 +97,7 @@ Related skills cover command/documentation translation:
 - `--yes` and non-interactive stdin auto-select partial translation for mixed-language input.
 - If all detected paragraphs are already in the target language, interactive runs still ask whether to translate anyway.
 - Fenced code blocks are excluded from language detection and translation in every mode.
-- `[translation].stream = true` is the default. `--stream`/`--no-stream` override config for translation runs.
+- `[translation].stream = true` is the default. `--stream`/`--no-stream` are accepted for forward compatibility; the effective streaming mode is controlled by `[translation].stream` in config.
 - Streaming runs buffer each translated segment until completeness validation passes, then send that segment to stdout; non-streaming runs buffer output until completion.
 - Progress is written to stderr as `[done/total] XX.XX% | elapsed 2m47s | eta 1m23s | NN.NN tok/s`.
 - Identical source segments, target language, template type, and template-specific options reuse cached segment translations.
