@@ -487,49 +487,79 @@ pub async fn translate_text(
     // ── Phase 2: parallel translate missing segments ───────────────────────────
 
     if !missing.is_empty() {
-        let mut join_set: JoinSet<Result<(usize, String)>> = JoinSet::new();
-
-        for &idx in &missing {
-            let client = ctx.client.clone();
-            let segment = plan.segments[idx].clone();
-            let target = target_lang.to_owned();
-            let tmpl = template.clone();
-            let cloned_opts = opts.clone();
-            let cfg = ctx.config.clone();
-
-            join_set.spawn(async move {
-                let (translated, _elapsed) = translate_segment_with_completeness(
-                    idx,
-                    &client,
-                    &segment,
-                    &target,
-                    &tmpl,
-                    &cloned_opts,
-                    &cfg,
-                )
-                .await?;
-                Ok((idx, translated))
-            });
+        // Pipeline mode: translate chunk 0 exclusively first so it gets full GPU
+        // throughput and can be displayed while the remaining chunks are translating.
+        if ctx.config.first_chunk_priority() && missing.first() == Some(&0) {
+            missing.retain(|&i| i != 0);
+            let (translated, _) = translate_segment_with_completeness(
+                0,
+                ctx.client,
+                &plan.segments[0],
+                target_lang,
+                template,
+                opts,
+                ctx.config,
+            )
+            .await?;
+            let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+            if let Err(e) = ctx.history.store_segment_cache(
+                &seg_hashes[0],
+                target_lang,
+                template_name,
+                &translated,
+                &now,
+                &options_hash,
+            ) {
+                eprintln!("Warning: cache store error: {e}");
+            }
+            translations[0] = Some(translated);
         }
 
-        while let Some(res) = join_set.join_next().await {
-            match res {
-                Ok(Ok((idx, translated))) => {
-                    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-                    if let Err(e) = ctx.history.store_segment_cache(
-                        &seg_hashes[idx],
-                        target_lang,
-                        template_name,
-                        &translated,
-                        &now,
-                        &options_hash,
-                    ) {
-                        eprintln!("Warning: cache store error: {e}");
+        if !missing.is_empty() {
+            let mut join_set: JoinSet<Result<(usize, String)>> = JoinSet::new();
+
+            for &idx in &missing {
+                let client = ctx.client.clone();
+                let segment = plan.segments[idx].clone();
+                let target = target_lang.to_owned();
+                let tmpl = template.clone();
+                let cloned_opts = opts.clone();
+                let cfg = ctx.config.clone();
+
+                join_set.spawn(async move {
+                    let (translated, _elapsed) = translate_segment_with_completeness(
+                        idx,
+                        &client,
+                        &segment,
+                        &target,
+                        &tmpl,
+                        &cloned_opts,
+                        &cfg,
+                    )
+                    .await?;
+                    Ok((idx, translated))
+                });
+            }
+
+            while let Some(res) = join_set.join_next().await {
+                match res {
+                    Ok(Ok((idx, translated))) => {
+                        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                        if let Err(e) = ctx.history.store_segment_cache(
+                            &seg_hashes[idx],
+                            target_lang,
+                            template_name,
+                            &translated,
+                            &now,
+                            &options_hash,
+                        ) {
+                            eprintln!("Warning: cache store error: {e}");
+                        }
+                        translations[idx] = Some(translated);
                     }
-                    translations[idx] = Some(translated);
+                    Ok(Err(e)) => return Err(e.context("segment translation failed")),
+                    Err(e) => return Err(anyhow!("segment task panicked: {e}")),
                 }
-                Ok(Err(e)) => return Err(e.context("segment translation failed")),
-                Err(e) => return Err(anyhow!("segment task panicked: {e}")),
             }
         }
     }
@@ -828,5 +858,76 @@ mod tests {
         assert!((expansion_ratio("zh") - 0.7).abs() < f64::EPSILON);
         assert!((expansion_ratio("ja") - 1.0).abs() < f64::EPSILON);
         assert!((expansion_ratio("unknown") - 1.2).abs() < f64::EPSILON);
+    }
+
+    // ── first_chunk_priority config ───────────────────────────────────────────
+
+    fn make_config_with_fcp(fcp: bool) -> hymt_core::config::HotConfig {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[translation]\ncontext_window = 4096\nmax_output_tokens = 512\nfirst_chunk_priority = {fcp}\n"
+            ),
+        )
+        .unwrap();
+        // Keep tempdir alive by leaking it for the test scope (acceptable in tests)
+        std::mem::forget(dir);
+        hymt_core::config::HotConfig::from_path(&path).unwrap()
+    }
+
+    #[test]
+    fn first_chunk_priority_false_by_default_in_plan() {
+        // Config default must be false so existing behaviour is unchanged
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[translation]\ncontext_window = 4096\nmax_output_tokens = 512\n",
+        )
+        .unwrap();
+        let cfg = hymt_core::config::HotConfig::from_path(&path).unwrap();
+        assert!(!cfg.first_chunk_priority());
+    }
+
+    #[test]
+    fn first_chunk_priority_true_reads_from_config() {
+        let cfg = make_config_with_fcp(true);
+        assert!(cfg.first_chunk_priority());
+    }
+
+    #[test]
+    fn first_chunk_priority_false_reads_from_config() {
+        let cfg = make_config_with_fcp(false);
+        assert!(!cfg.first_chunk_priority());
+    }
+
+    // Tests that the `missing` vec manipulation logic is correct when chunk 0
+    // is present.  These are pure unit tests of the filtering invariant
+    // (no I/O or async needed).
+    #[test]
+    fn pipeline_mode_removes_chunk0_from_missing() {
+        let mut missing: Vec<usize> = vec![0, 1, 2];
+        // Simulate the retain call used in the pipeline path
+        missing.retain(|&i| i != 0);
+        assert_eq!(missing, vec![1, 2]);
+    }
+
+    #[test]
+    fn pipeline_mode_chunk0_not_in_missing_leaves_vec_unchanged() {
+        let mut missing: Vec<usize> = vec![1, 2, 3];
+        // first_chunk_priority guard: only enters pipeline path when missing[0] == 0
+        if missing.first() == Some(&0) {
+            missing.retain(|&i| i != 0);
+        }
+        assert_eq!(missing, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn pipeline_mode_only_chunk0_leaves_empty_after_retain() {
+        let mut missing: Vec<usize> = vec![0];
+        missing.retain(|&i| i != 0);
+        assert!(missing.is_empty());
     }
 }
