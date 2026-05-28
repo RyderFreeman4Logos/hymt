@@ -413,6 +413,28 @@ async fn translate_segment_with_completeness(
     Ok((best, started.elapsed().as_secs_f64()))
 }
 
+// ── Pipeline partition helper ─────────────────────────────────────────────────
+
+/// Split `missing` into a priority chunk and the remaining parallel chunks.
+///
+/// When `first_chunk_priority` is enabled and chunk 0 is the first uncached
+/// segment, it is returned as the exclusive priority chunk so it gets dedicated
+/// GPU throughput before the rest are dispatched concurrently.  In all other
+/// cases `priority_chunk` is `None` and `parallel` is a copy of `missing`.
+fn partition_pipeline(
+    missing: &[usize],
+    first_chunk_priority: bool,
+) -> (Option<usize>, Vec<usize>) {
+    if first_chunk_priority && missing.first() == Some(&0) {
+        (
+            Some(0),
+            missing.iter().copied().filter(|&i| i != 0).collect(),
+        )
+    } else {
+        (None, missing.to_vec())
+    }
+}
+
 // ── translate_text ─────────────────────────────────────────────────────────────
 
 /// Translate `text` to `target_lang`, caching and translating segments in parallel.
@@ -489,12 +511,14 @@ pub async fn translate_text(
     if !missing.is_empty() {
         // Pipeline mode: translate chunk 0 exclusively first so it gets full GPU
         // throughput and can be displayed while the remaining chunks are translating.
-        if ctx.config.first_chunk_priority() && missing.first() == Some(&0) {
-            missing.retain(|&i| i != 0);
+        let (priority_chunk, remaining) =
+            partition_pipeline(&missing, ctx.config.first_chunk_priority());
+        missing = remaining;
+        if let Some(chunk_idx) = priority_chunk {
             let (translated, _) = translate_segment_with_completeness(
-                0,
+                chunk_idx,
                 ctx.client,
-                &plan.segments[0],
+                &plan.segments[chunk_idx],
                 target_lang,
                 template,
                 opts,
@@ -503,7 +527,7 @@ pub async fn translate_text(
             .await?;
             let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
             if let Err(e) = ctx.history.store_segment_cache(
-                &seg_hashes[0],
+                &seg_hashes[chunk_idx],
                 target_lang,
                 template_name,
                 &translated,
@@ -512,7 +536,7 @@ pub async fn translate_text(
             ) {
                 eprintln!("Warning: cache store error: {e}");
             }
-            translations[0] = Some(translated);
+            translations[chunk_idx] = Some(translated);
         }
 
         if !missing.is_empty() {
@@ -929,5 +953,57 @@ mod tests {
         let mut missing: Vec<usize> = vec![0];
         missing.retain(|&i| i != 0);
         assert!(missing.is_empty());
+    }
+
+    // ── partition_pipeline ────────────────────────────────────────────────────
+
+    #[test]
+    fn partition_pipeline_fcp_true_chunk0_first_splits_correctly() {
+        let (priority, parallel) = partition_pipeline(&[0, 1, 2], true);
+        assert_eq!(priority, Some(0));
+        assert_eq!(parallel, vec![1, 2]);
+    }
+
+    #[test]
+    fn partition_pipeline_fcp_false_never_prioritizes_even_with_chunk0() {
+        let (priority, parallel) = partition_pipeline(&[0, 1, 2], false);
+        assert_eq!(priority, None);
+        assert_eq!(parallel, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn partition_pipeline_fcp_true_chunk0_not_in_missing_returns_none() {
+        // Cache hit for chunk 0 means it is absent from `missing`
+        let (priority, parallel) = partition_pipeline(&[1, 2, 3], true);
+        assert_eq!(priority, None);
+        assert_eq!(parallel, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn partition_pipeline_single_chunk0_leaves_parallel_empty() {
+        let (priority, parallel) = partition_pipeline(&[0], true);
+        assert_eq!(priority, Some(0));
+        assert!(parallel.is_empty());
+    }
+
+    #[test]
+    fn partition_pipeline_preserves_order_of_remaining_chunks() {
+        let (priority, parallel) = partition_pipeline(&[0, 3, 1, 2], true);
+        assert_eq!(priority, Some(0));
+        assert_eq!(parallel, vec![3, 1, 2]);
+    }
+
+    #[test]
+    fn partition_pipeline_empty_missing_returns_none_and_empty() {
+        let (priority, parallel) = partition_pipeline(&[], true);
+        assert_eq!(priority, None);
+        assert!(parallel.is_empty());
+    }
+
+    #[test]
+    fn partition_pipeline_fcp_false_empty_missing_returns_none_and_empty() {
+        let (priority, parallel) = partition_pipeline(&[], false);
+        assert_eq!(priority, None);
+        assert!(parallel.is_empty());
     }
 }
