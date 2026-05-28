@@ -12,6 +12,6 @@ tokenizer = ["dep:tokenizers", "dep:hf-hub"]
 hymt-core = { path = "../hymt-core" }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
-tokenizers = { version = "0.19", optional = true }
+tokenizers = { version = "0.19", default-features = false, features = ["onig"], optional = true }
 hf-hub = { version = "0.3", optional = true }
 unicode-segmentation = "1"
