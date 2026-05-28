@@ -22,6 +22,7 @@ stream = true
 max_retranslation_retries = 10
 config_version = 1
 timeout = 600
+first_chunk_priority = false
 
 [language]
 primary = "zh"
@@ -192,6 +193,15 @@ impl HotConfig {
 
     pub fn timeout(&self) -> f64 {
         self.get_number_as_f64("translation", "timeout", 600.0)
+    }
+
+    /// When true, chunk 0 is translated alone before remaining chunks run in parallel.
+    ///
+    /// This gives the first output segment priority GPU access so callers can
+    /// display it immediately while the rest of the document is still being
+    /// translated.  Defaults to `false` (all missing chunks are parallelised).
+    pub fn first_chunk_priority(&self) -> bool {
+        self.get_bool("translation", "first_chunk_priority", false)
     }
 
     // ── language ────────────────────────────────────────────────────────────
@@ -546,6 +556,21 @@ url = "http://localhost:8401/v1/""#,
         let cfg = HotConfig::from_path(&path).unwrap();
         // 0.5 ≤ 1.0, falls back to default 2.0
         assert!((cfg.timing_divergence_threshold() - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn first_chunk_priority_defaults_false() {
+        let path = temp_config_path("fcp_default");
+        let cfg = HotConfig::from_path(&path).unwrap();
+        assert!(!cfg.first_chunk_priority());
+    }
+
+    #[test]
+    fn first_chunk_priority_reads_true() {
+        let path = temp_config_path("fcp_true");
+        fs::write(&path, "[translation]\nfirst_chunk_priority = true").unwrap();
+        let cfg = HotConfig::from_path(&path).unwrap();
+        assert!(cfg.first_chunk_priority());
     }
 
     #[test]
