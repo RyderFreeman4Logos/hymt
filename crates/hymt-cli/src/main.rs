@@ -501,7 +501,9 @@ async fn run() -> Result<()> {
             run_exec(args, target_lang, explicit_target, &config, &prompt_opts).await
         }
         Some(Cmd::Tokenizer(args)) => run_tokenizer(args).await,
-        Some(Cmd::Estimate(args)) => run_estimate(args, target_lang, &template, &config).await,
+        Some(Cmd::Estimate(args)) => {
+            run_estimate(args, target_lang, &template, &prompt_opts, &config).await
+        }
         Some(Cmd::Batch(args)) => {
             run_batch(
                 args,
@@ -974,20 +976,27 @@ async fn run_estimate(
     args: EstimateArgs,
     target_lang: &str,
     template: &TemplateType,
+    opts: &PromptOpts,
     config: &HotConfig,
 ) -> Result<()> {
-    let source_chars = i64::try_from(args.source_chars)
-        .map_err(|_| anyhow::anyhow!("source character count is too large"))?;
+    let segmenter = make_segmenter();
+    let plan = plan_translation("", target_lang, config, &segmenter, template, opts)?;
+    let source_lang = estimate_source_lang(target_lang, config);
+    let chars_per_segment =
+        estimate_chars_per_segment(plan.available_source_tokens, &segmenter, &source_lang);
+    let segments = estimate_segment_count(args.source_chars, chars_per_segment)?;
+
     let history = HistoryDB::default();
     let concurrency = config.concurrency() as i64;
 
     eprintln!(
-        "Source characters: {source_chars}, concurrency: {concurrency}, template: {}",
-        template.as_str()
+        "Source characters: {}, estimated segments: {segments}, ~{chars_per_segment} chars/segment, concurrency: {concurrency}, template: {}",
+        args.source_chars,
+        template.as_str(),
     );
 
     match history.estimate(
-        source_chars,
+        segments,
         concurrency,
         Some(target_lang),
         Some(template.as_str()),
@@ -1008,6 +1017,60 @@ async fn run_estimate(
         }
     }
     Ok(())
+}
+
+fn estimate_source_lang(target_lang: &str, config: &HotConfig) -> String {
+    let primary = config.primary_lang();
+    let secondary = config.secondary_lang();
+    if normalize_lang(target_lang) == normalize_lang(&primary) {
+        secondary
+    } else {
+        primary
+    }
+}
+
+fn normalize_lang(lang: &str) -> String {
+    lang.trim().to_ascii_lowercase()
+}
+
+fn estimate_chars_per_segment(
+    available_source_tokens: usize,
+    segmenter: &Segmenter,
+    source_lang: &str,
+) -> u64 {
+    let sample = build_source_sample(source_lang, 512);
+    let sample_chars = sample.chars().count().max(1);
+    let sample_tokens = segmenter.count_tokens(&sample).max(1);
+    let chars_per_segment =
+        (available_source_tokens as u128 * sample_chars as u128) / sample_tokens as u128;
+    chars_per_segment.clamp(1, u64::MAX as u128) as u64
+}
+
+fn build_source_sample(source_lang: &str, min_chars: usize) -> String {
+    let unit = representative_source_text(source_lang);
+    let mut sample = String::new();
+    while sample.chars().count() < min_chars {
+        sample.push_str(unit);
+    }
+    sample
+}
+
+fn representative_source_text(source_lang: &str) -> &'static str {
+    match normalize_lang(source_lang).as_str() {
+        "zh" | "zh-cn" | "zh-tw" => "天地玄黄宇宙洪荒日月盈昃辰宿列张",
+        "ja" => "これは日本語の文章です。翻訳の見積もりに使います。",
+        "ko" => "이것은 한국어 문장입니다. 번역 추정에 사용합니다.",
+        _ => "This is sample source text used to estimate translation segment size. ",
+    }
+}
+
+fn estimate_segment_count(source_chars: u64, chars_per_segment: u64) -> Result<i64> {
+    let segments = if source_chars == 0 {
+        0
+    } else {
+        ((source_chars - 1) / chars_per_segment.max(1)) + 1
+    };
+    i64::try_from(segments).map_err(|_| anyhow::anyhow!("estimated segment count is too large"))
 }
 
 // ── batch ─────────────────────────────────────────────────────────────────────
@@ -1226,6 +1289,24 @@ mod tests {
 
         let segmenter = make_segmenter_from_path(tokenizer_path);
         assert_eq!(segmenter.count_tokens("abcd"), 1);
+    }
+
+    #[test]
+    fn estimate_segment_count_uses_ceiling_division() {
+        assert_eq!(estimate_segment_count(0, 2_000).unwrap(), 0);
+        assert_eq!(estimate_segment_count(1, 2_000).unwrap(), 1);
+        assert_eq!(estimate_segment_count(4_000, 2_000).unwrap(), 2);
+        assert_eq!(estimate_segment_count(4_001, 2_000).unwrap(), 3);
+    }
+
+    #[test]
+    fn estimate_chars_per_segment_depends_on_source_language() {
+        let segmenter = Segmenter::fallback();
+        let zh_chars = estimate_chars_per_segment(1_500, &segmenter, "zh");
+        let en_chars = estimate_chars_per_segment(1_500, &segmenter, "en");
+
+        assert!(zh_chars > 0);
+        assert!(en_chars > zh_chars);
     }
 
     #[test]
