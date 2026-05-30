@@ -301,8 +301,6 @@ struct HistoryArgs {
 enum HistoryAction {
     /// Show performance statistics
     Stats,
-    /// Clear all history
-    Clear,
     /// Show recent translation entries
     Recent {
         /// Number of entries to show
@@ -1104,10 +1102,6 @@ fn run_history(args: HistoryArgs) -> Result<()> {
             }
             None => eprintln!("No history data."),
         },
-        Some(HistoryAction::Clear) => {
-            let n = history.clear()?;
-            eprintln!("Cleared {n} history entries.");
-        }
     }
     Ok(())
 }
