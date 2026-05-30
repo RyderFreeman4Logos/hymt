@@ -537,7 +537,7 @@ fn make_segmenter() -> Segmenter {
 }
 
 fn make_segmenter_from_path(tokenizer_path: PathBuf) -> Segmenter {
-    if tokenizer_path.exists() {
+    if hymt_segment::has_tokenizer_support() && tokenizer_path.exists() {
         Segmenter::new(Some(tokenizer_path)).unwrap_or_else(|_| Segmenter::fallback())
     } else {
         Segmenter::fallback()
