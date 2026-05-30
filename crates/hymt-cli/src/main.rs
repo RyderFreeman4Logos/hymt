@@ -1,10 +1,11 @@
 mod zsh_plugin;
 
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Args, CommandFactory, Parser, Subcommand};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use hymt_cache::history::HistoryDB;
 use hymt_client::TranslationClient;
@@ -746,32 +747,43 @@ async fn translate_text_to_stdout_streaming(
 }
 
 async fn print_stream_events(mut rx: tokio::sync::mpsc::Receiver<StreamEvent>) -> Result<()> {
-    let mut stdout = io::stdout();
+    let mut stdout = tokio::io::stdout();
+    write_stream_events(&mut rx, &mut stdout).await
+}
+
+async fn write_stream_events<W>(
+    rx: &mut tokio::sync::mpsc::Receiver<StreamEvent>,
+    stdout: &mut W,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     let mut streamed_prefix = String::new();
 
     while let Some(event) = rx.recv().await {
         match event {
             StreamEvent::Token(token) => {
-                stdout.write_all(token.as_bytes())?;
-                stdout.flush()?;
+                stdout.write_all(token.as_bytes()).await?;
+                stdout.flush().await?;
                 streamed_prefix.push_str(&token);
             }
             StreamEvent::SegmentDone(_) => {}
             StreamEvent::AllDone(translated) => {
                 if let Some(rest) = translated.strip_prefix(&streamed_prefix) {
-                    stdout.write_all(rest.as_bytes())?;
+                    stdout.write_all(rest.as_bytes()).await?;
                 } else if streamed_prefix.is_empty() {
-                    stdout.write_all(translated.as_bytes())?;
+                    stdout.write_all(translated.as_bytes()).await?;
                 } else {
                     eprintln!(
                         "Warning: streamed prefix differed from final translation; \
-                         final translation retained in history/cache"
+                         replaying final translation to avoid truncating stdout"
                     );
+                    stdout.write_all(translated.as_bytes()).await?;
                 }
                 if !translated.ends_with('\n') {
-                    stdout.write_all(b"\n")?;
+                    stdout.write_all(b"\n").await?;
                 }
-                stdout.flush()?;
+                stdout.flush().await?;
             }
         }
     }

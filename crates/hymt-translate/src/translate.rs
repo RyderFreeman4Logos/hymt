@@ -473,6 +473,7 @@ async fn translate_segment_with_completeness_streaming(
         .await
         .map_err(|e| anyhow!("HTTP streaming translation failed: {e}"))?;
     let mut translated = String::new();
+    let mut streamed_tokens: Vec<String> = Vec::new();
     let mut first_token_tx = first_token_tx;
 
     while let Some(item) = stream.next().await {
@@ -481,15 +482,21 @@ async fn translate_segment_with_completeness_streaming(
             continue;
         }
         translated.push_str(&token);
-        send_stream_event(event_tx, StreamEvent::Token(token)).await?;
-        if let Some(tx) = first_token_tx.take() {
-            let _ = tx.send(()).await;
-        }
+        streamed_tokens.push(token);
     }
 
     let mut best = translated;
     let result = check_completeness(request.segment, &best, request.target_lang, request.config);
     if result.is_complete {
+        // Tokens are replayed only after completeness validation.  This delays
+        // TTFT until segment 0 is known-good, but prevents stdout from receiving
+        // a superseded first attempt that cannot be un-emitted after a retry.
+        for token in streamed_tokens {
+            send_stream_event(event_tx, StreamEvent::Token(token)).await?;
+            if let Some(tx) = first_token_tx.take() {
+                let _ = tx.send(()).await;
+            }
+        }
         send_stream_event(event_tx, StreamEvent::SegmentDone(request.index)).await?;
         return Ok((best, started.elapsed().as_secs_f64()));
     }
@@ -531,6 +538,12 @@ async fn translate_segment_with_completeness_streaming(
         best = translated;
 
         if result.is_complete {
+            if !best.is_empty() {
+                send_stream_event(event_tx, StreamEvent::Token(best.clone())).await?;
+                if let Some(tx) = first_token_tx.take() {
+                    let _ = tx.send(()).await;
+                }
+            }
             send_stream_event(event_tx, StreamEvent::SegmentDone(request.index)).await?;
             return Ok((best, started.elapsed().as_secs_f64()));
         }
@@ -555,6 +568,12 @@ async fn translate_segment_with_completeness_streaming(
         request.index + 1,
         max_retries
     );
+    if !best.is_empty() {
+        send_stream_event(event_tx, StreamEvent::Token(best.clone())).await?;
+        if let Some(tx) = first_token_tx.take() {
+            let _ = tx.send(()).await;
+        }
+    }
     send_stream_event(event_tx, StreamEvent::SegmentDone(request.index)).await?;
     Ok((best, started.elapsed().as_secs_f64()))
 }
@@ -827,9 +846,10 @@ pub async fn translate_text(
 
 /// Translate `text` and emit incremental output events for the pipeline path.
 ///
-/// The existing non-streaming behavior is preserved when first-chunk priority is
-/// disabled or segment 0 is already cached. In that case the final translation is
-/// emitted as [`StreamEvent::AllDone`] after the normal translation completes.
+/// Token events are emitted only for uncached segment 0 after completeness is
+/// known. When first-chunk priority is disabled or segment 0 is already cached,
+/// the final translation is emitted as [`StreamEvent::AllDone`] after the normal
+/// translation completes.
 pub async fn translate_text_stream(
     text: &str,
     target_lang: &str,
@@ -1198,11 +1218,217 @@ pub async fn translate_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    use chrono::{SecondsFormat, Utc};
+    use hymt_cache::history::HistoryDB;
     use hymt_core::templates::TemplateType;
     use hymt_segment::Segmenter;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
 
     fn fallback_segmenter() -> Segmenter {
         Segmenter::fallback()
+    }
+
+    enum MockResponse {
+        Json(String),
+        Sse(Vec<String>),
+    }
+
+    struct MockServer {
+        endpoint_url: String,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for MockServer {
+        fn drop(&mut self) {
+            self.handle.abort();
+        }
+    }
+
+    async fn start_mock_server(responses: Vec<MockResponse>) -> MockServer {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let responses = Arc::new(Mutex::new(VecDeque::from(responses)));
+        let server_responses = Arc::clone(&responses);
+        let handle = tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                let responses = Arc::clone(&server_responses);
+                tokio::spawn(async move {
+                    let _ = serve_mock_connection(socket, responses).await;
+                });
+            }
+        });
+
+        MockServer {
+            endpoint_url: format!("http://{addr}/v1"),
+            handle,
+        }
+    }
+
+    async fn serve_mock_connection(
+        mut socket: TcpStream,
+        responses: Arc<Mutex<VecDeque<MockResponse>>>,
+    ) -> std::io::Result<()> {
+        let mut buf = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let n = socket.read(&mut chunk).await?;
+            if n == 0 {
+                return Ok(());
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        let response = {
+            responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("mock response queue exhausted")
+        };
+        let (content_type, body) = mock_response_body(response);
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\n\
+             content-type: {content_type}\r\n\
+             content-length: {}\r\n\
+             connection: close\r\n\r\n",
+            body.len()
+        );
+        socket.write_all(headers.as_bytes()).await?;
+        socket.write_all(body.as_bytes()).await?;
+        socket.shutdown().await?;
+        Ok(())
+    }
+
+    fn mock_response_body(response: MockResponse) -> (&'static str, String) {
+        match response {
+            MockResponse::Json(content) => (
+                "application/json",
+                format!(
+                    r#"{{"choices":[{{"finish_reason":"stop","message":{{"content":"{content}"}}}}]}}"#
+                ),
+            ),
+            MockResponse::Sse(tokens) => {
+                let mut body = String::new();
+                for token in tokens {
+                    body.push_str(&format!(
+                        r#"data: {{"choices":[{{"finish_reason":null,"delta":{{"content":"{token}"}}}}]}}"#
+                    ));
+                    body.push_str("\n\n");
+                }
+                body.push_str("data: [DONE]\n\n");
+                ("text/event-stream", body)
+            }
+        }
+    }
+
+    fn temp_path(tag: &str) -> PathBuf {
+        let unique = format!(
+            "{}-{}-{}",
+            std::process::id(),
+            tag,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(format!("hymt-translate-test-{unique}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("test-file")
+    }
+
+    fn make_stream_config(endpoint_url: &str) -> hymt_core::config::HotConfig {
+        let path = temp_path("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"[endpoint]
+url = "{endpoint_url}"
+
+[translation]
+context_window = 512
+max_output_tokens = 40
+concurrency = 1
+first_chunk_priority = true
+timeout = 5
+
+[completeness]
+zh_to_en_min_ratio = 0.3
+en_to_zh_min_ratio = 0.3
+min_paragraph_ratio = 0.5
+max_retries = 1
+"#
+            ),
+        )
+        .unwrap();
+        hymt_core::config::HotConfig::from_path(&path).unwrap()
+    }
+
+    fn streaming_regression_source() -> String {
+        "Alpha zero text carries enough source material for cache validation and ordering checks. \
+         Bravo one text carries enough source material for cache validation and ordering checks."
+            .to_owned()
+    }
+
+    fn complete_translation(label: &str, source_segment: &str) -> String {
+        let filler = "x".repeat((source_segment.len() / 2).max(40));
+        format!("{label}_{filler} ")
+    }
+
+    async fn render_events_as_stdout(
+        mut rx: tokio::sync::mpsc::Receiver<StreamEvent>,
+    ) -> Result<String> {
+        let mut stdout = String::new();
+        let mut streamed_prefix = String::new();
+
+        while let Some(event) = rx.recv().await {
+            match event {
+                StreamEvent::Token(token) => {
+                    stdout.push_str(&token);
+                    streamed_prefix.push_str(&token);
+                }
+                StreamEvent::SegmentDone(_) => {}
+                StreamEvent::AllDone(translated) => {
+                    if let Some(rest) = translated.strip_prefix(&streamed_prefix) {
+                        stdout.push_str(rest);
+                    } else {
+                        stdout.push_str(&translated);
+                    }
+                    if !translated.ends_with('\n') {
+                        stdout.push('\n');
+                    }
+                }
+            }
+        }
+
+        Ok(stdout)
+    }
+
+    async fn translate_and_render_stdout(
+        text: &str,
+        cfg: &hymt_core::config::HotConfig,
+        segmenter: &Segmenter,
+        history: &HistoryDB,
+    ) -> Result<(String, String)> {
+        let client = TranslationClient::new(cfg.clone())?;
+        let ctx = TranslationCtx {
+            config: cfg,
+            client: &client,
+            segmenter,
+            history,
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let opts = PromptOpts::default();
+        let translate = translate_text_stream(text, "zh", &TemplateType::Default, &opts, &ctx, tx);
+        let render = render_events_as_stdout(rx);
+        tokio::try_join!(translate, render)
     }
 
     // ── Hashing ───────────────────────────────────────────────────────────────
@@ -1485,5 +1711,110 @@ mod tests {
         let (priority, parallel) = partition_pipeline(&[], false);
         assert_eq!(priority, None);
         assert!(parallel.is_empty());
+    }
+
+    #[tokio::test]
+    async fn streaming_stdout_is_complete_when_segment0_is_cached() {
+        let text = streaming_regression_source();
+        let planning_cfg = make_stream_config("http://127.0.0.1:1/v1");
+        let segmenter = fallback_segmenter();
+        let plan = plan_translation(
+            &text,
+            "zh",
+            &planning_cfg,
+            &segmenter,
+            &TemplateType::Default,
+            &PromptOpts::default(),
+        )
+        .unwrap();
+        assert!(
+            plan.segment_count() >= 2,
+            "test source must split into multiple segments"
+        );
+
+        let translations: Vec<String> = plan
+            .segments
+            .iter()
+            .enumerate()
+            .map(|(i, segment)| complete_translation(&format!("SEGMENT_{i}"), segment))
+            .collect();
+        let expected = plan.reconstruct(&translations);
+        let responses = translations
+            .iter()
+            .skip(1)
+            .cloned()
+            .map(MockResponse::Json)
+            .collect();
+        let server = start_mock_server(responses).await;
+        let cfg = make_stream_config(&server.endpoint_url);
+        let history = HistoryDB::new(temp_path("cached-history.db"));
+        history
+            .store_segment_cache(
+                &segment_cache_hash(&plan.segments[0]),
+                "zh",
+                TemplateType::Default.as_str(),
+                &translations[0],
+                &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                "",
+            )
+            .unwrap();
+
+        let (translated, stdout) = translate_and_render_stdout(&text, &cfg, &segmenter, &history)
+            .await
+            .unwrap();
+
+        assert_eq!(translated, expected);
+        assert_eq!(stdout, format!("{expected}\n"));
+        assert!(stdout.starts_with(&translations[0]));
+    }
+
+    #[tokio::test]
+    async fn streaming_stdout_uses_retry_text_when_segment0_completeness_fails() {
+        let text = streaming_regression_source();
+        let planning_cfg = make_stream_config("http://127.0.0.1:1/v1");
+        let segmenter = fallback_segmenter();
+        let plan = plan_translation(
+            &text,
+            "zh",
+            &planning_cfg,
+            &segmenter,
+            &TemplateType::Default,
+            &PromptOpts::default(),
+        )
+        .unwrap();
+        assert!(
+            plan.segment_count() >= 2,
+            "test source must split into multiple segments"
+        );
+
+        let translations: Vec<String> = plan
+            .segments
+            .iter()
+            .enumerate()
+            .map(|(i, segment)| complete_translation(&format!("SEGMENT_{i}"), segment))
+            .collect();
+        let expected = plan.reconstruct(&translations);
+        let mut responses = vec![
+            MockResponse::Sse(vec!["short".to_owned()]),
+            MockResponse::Json(translations[0].clone()),
+        ];
+        responses.extend(translations.iter().skip(1).cloned().map(MockResponse::Json));
+        let server = start_mock_server(responses).await;
+        let cfg = make_stream_config(&server.endpoint_url);
+        let history = HistoryDB::new(temp_path("retry-history.db"));
+
+        let (translated, stdout) = translate_and_render_stdout(&text, &cfg, &segmenter, &history)
+            .await
+            .unwrap();
+
+        assert_eq!(translated, expected);
+        assert_eq!(stdout, format!("{expected}\n"));
+        assert!(!stdout.contains("short"));
+        for segment in translations.iter().skip(1) {
+            assert!(
+                stdout.contains(segment),
+                "stdout dropped translated segment: {segment}"
+            );
+        }
     }
 }
