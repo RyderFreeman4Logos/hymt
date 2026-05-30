@@ -533,11 +533,11 @@ async fn run() -> Result<()> {
 // ── Shared init helpers ───────────────────────────────────────────────────────
 
 fn make_segmenter() -> Segmenter {
-    if hymt_segment::has_tokenizer_support() {
-        Segmenter::new(None).unwrap_or_else(|_| Segmenter::fallback())
-    } else {
-        Segmenter::fallback()
-    }
+    make_segmenter_with(hymt_segment::create_segmenter)
+}
+
+fn make_segmenter_with(load_segmenter: impl FnOnce(bool) -> Segmenter) -> Segmenter {
+    load_segmenter(false)
 }
 
 fn make_client(config: &HotConfig) -> Result<TranslationClient> {
@@ -1223,6 +1223,18 @@ mod tests {
         let terms = vec!["noequalssign".to_owned(), "valid=pair".to_owned()];
         let parsed = parse_terms(&terms);
         assert_eq!(parsed, vec![("valid".to_owned(), "pair".to_owned())]);
+    }
+
+    #[test]
+    fn make_segmenter_uses_tokenizer_loader_without_forcing_download() {
+        let force_download = std::cell::Cell::new(None);
+        let segmenter = make_segmenter_with(|force| {
+            force_download.set(Some(force));
+            Segmenter::fallback()
+        });
+
+        assert_eq!(force_download.get(), Some(false));
+        assert_eq!(segmenter.count_tokens("abcd"), 1);
     }
 
     #[test]
