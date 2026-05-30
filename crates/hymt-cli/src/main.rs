@@ -533,8 +533,12 @@ async fn run() -> Result<()> {
 // ── Shared init helpers ───────────────────────────────────────────────────────
 
 fn make_segmenter() -> Segmenter {
-    if hymt_segment::has_tokenizer_support() {
-        Segmenter::new(None).unwrap_or_else(|_| Segmenter::fallback())
+    make_segmenter_from_path(hymt_segment::tokenizer_path())
+}
+
+fn make_segmenter_from_path(tokenizer_path: PathBuf) -> Segmenter {
+    if hymt_segment::has_tokenizer_support() && tokenizer_path.exists() {
+        Segmenter::new(Some(tokenizer_path)).unwrap_or_else(|_| Segmenter::fallback())
     } else {
         Segmenter::fallback()
     }
@@ -1223,6 +1227,15 @@ mod tests {
         let terms = vec!["noequalssign".to_owned(), "valid=pair".to_owned()];
         let parsed = parse_terms(&terms);
         assert_eq!(parsed, vec![("valid".to_owned(), "pair".to_owned())]);
+    }
+
+    #[test]
+    fn make_segmenter_falls_back_without_cached_tokenizer() {
+        let tokenizer_path = PathBuf::from("target/test-missing-tokenizer/tokenizer.json");
+        assert!(!tokenizer_path.exists());
+
+        let segmenter = make_segmenter_from_path(tokenizer_path);
+        assert_eq!(segmenter.count_tokens("abcd"), 1);
     }
 
     #[test]
