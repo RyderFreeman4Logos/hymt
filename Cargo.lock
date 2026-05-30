@@ -735,10 +735,8 @@ checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 name = "hymt-cache"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "chrono",
  "hex",
- "hymt-core",
  "rusqlite",
  "sha2",
  "tempfile",
@@ -763,7 +761,6 @@ dependencies = [
 name = "hymt-client"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "futures-core",
  "hymt-core",
  "reqwest",
@@ -778,7 +775,6 @@ dependencies = [
 name = "hymt-core"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "serde",
  "thiserror 1.0.69",
  "toml",
@@ -788,12 +784,9 @@ dependencies = [
 name = "hymt-segment"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "hf-hub",
- "hymt-core",
  "thiserror 1.0.69",
  "tokenizers",
- "unicode-segmentation",
 ]
 
 [[package]]
@@ -810,7 +803,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
- "thiserror 1.0.69",
  "tokio",
  "tokio-stream",
  "walkdir",
