@@ -40,9 +40,6 @@ pub enum ClientError {
     #[error("translation response missing message content")]
     MissingContent,
 
-    #[error("batch task panicked")]
-    TaskPanicked,
-
     #[error("semaphore closed")]
     SemaphoreClosed,
 }
@@ -193,26 +190,6 @@ impl TranslationClient {
         });
 
         Ok(ReceiverStream::new(rx))
-    }
-
-    /// Translates multiple prompts concurrently, bounded by the concurrency semaphore.
-    ///
-    /// Output order matches input order.  The first error aborts collection but does
-    /// not cancel in-flight tasks.
-    pub async fn translate_batch(&self, prompts: &[String]) -> Result<Vec<String>, ClientError> {
-        let mut handles = Vec::with_capacity(prompts.len());
-        for prompt in prompts {
-            let client = self.clone();
-            let p = prompt.clone();
-            handles.push(tokio::spawn(async move { client.translate(&p).await }));
-        }
-
-        let mut results = Vec::with_capacity(handles.len());
-        for handle in handles {
-            let r = handle.await.map_err(|_| ClientError::TaskPanicked)??;
-            results.push(r);
-        }
-        Ok(results)
     }
 
     // ── Private helpers ────────────────────────────────────────────────────────

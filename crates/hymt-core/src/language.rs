@@ -72,29 +72,6 @@ pub struct DocumentLanguagePlan {
 }
 
 impl DocumentLanguagePlan {
-    pub fn paragraph_count(&self) -> usize {
-        self.sections
-            .iter()
-            .filter(|s| s.kind == SectionKind::Paragraph)
-            .count()
-    }
-
-    pub fn target_paragraph_count(&self) -> usize {
-        self.sections
-            .iter()
-            .filter(|s| s.is_target_language)
-            .count()
-    }
-
-    pub fn translate_paragraph_count(&self) -> usize {
-        self.sections.iter().filter(|s| s.should_translate).count()
-    }
-
-    pub fn has_mixed_language(&self) -> bool {
-        let t = self.target_paragraph_count();
-        t > 0 && t < self.paragraph_count()
-    }
-
     /// Returns a new plan with every paragraph marked for translation.
     pub fn translate_all_paragraphs(mut self) -> Self {
         for section in &mut self.sections {

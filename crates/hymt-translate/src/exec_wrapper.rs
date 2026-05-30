@@ -330,58 +330,6 @@ pub fn looks_like_build_progress(text: &str) -> bool {
         .all(|l| PREFIXES.iter().any(|p| l.to_lowercase().starts_with(p)))
 }
 
-// ── Agent-descendant detection (Linux-specific) ───────────────────────────────
-
-/// Returns `true` if the process tree contains a known AI-agent process.
-#[cfg(target_os = "linux")]
-pub fn is_agent_descendant() -> bool {
-    const AGENTS: &[&str] = &[
-        "claude",
-        "claude-code",
-        "csa",
-        "codex",
-        "gemini-cli",
-        "gemini",
-        "opencode",
-        "aider",
-        "cursor",
-        "copilot",
-    ];
-    let mut pid = std::process::id();
-    loop {
-        if pid <= 1 {
-            return false;
-        }
-        let comm_path = format!("/proc/{pid}/comm");
-        if let Ok(comm) = std::fs::read_to_string(&comm_path) {
-            let comm = comm.trim().to_lowercase();
-            if AGENTS.iter().any(|&a| comm == a) {
-                return true;
-            }
-        }
-        // Read parent PID from /proc/{pid}/status
-        let status_path = format!("/proc/{pid}/status");
-        let status = match std::fs::read_to_string(&status_path) {
-            Ok(s) => s,
-            Err(_) => return false,
-        };
-        let ppid = status
-            .lines()
-            .find(|l| l.starts_with("PPid:"))
-            .and_then(|l| l.split_whitespace().nth(1))
-            .and_then(|s| s.parse::<u32>().ok());
-        match ppid {
-            Some(p) if p > 0 => pid = p,
-            _ => return false,
-        }
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn is_agent_descendant() -> bool {
-    false
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

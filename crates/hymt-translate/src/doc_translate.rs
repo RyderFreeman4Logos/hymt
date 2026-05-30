@@ -87,7 +87,7 @@ fn validate_lang_suffix(suffix: &str) -> Result<()> {
 // ── DocTranslationTarget ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
-pub struct DocTranslationTarget {
+pub(crate) struct DocTranslationTarget {
     pub source_path: PathBuf,
     pub output_path: PathBuf,
     pub target_lang: String,
@@ -100,7 +100,7 @@ pub struct DocTranslationTarget {
 /// If `source` is a directory, all `.md` files are discovered (recursively if
 /// `recursive` is set).  The language suffix suffix files (e.g. `foo.zh-cn.md`)
 /// are skipped to avoid translating already-translated output.
-pub fn build_doc_translation_targets(
+pub(crate) fn build_doc_translation_targets(
     source: &Path,
     target_lang: &str,
     config: Option<&HotConfig>,
