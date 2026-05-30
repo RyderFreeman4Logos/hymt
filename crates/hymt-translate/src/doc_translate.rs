@@ -1,4 +1,4 @@
-//! Markdown document translation with optional watch mode.
+//! Markdown document translation.
 //!
 //! Output naming convention: `source.md` → `source.zh-cn.md`
 //! (language suffix inserted between the stem and the extension).
@@ -230,8 +230,6 @@ pub struct DocTranslationOpts<'a> {
     pub output_path: Option<&'a Path>,
     pub output_dir: Option<&'a Path>,
     pub recursive: bool,
-    /// Reserved for future watch-mode support (requires the `watch` feature).
-    pub watch: bool,
     pub template: &'a TemplateType,
     pub prompt_opts: &'a PromptOpts,
     /// Whether the caller explicitly specified the target language.
