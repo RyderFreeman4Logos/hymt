@@ -1,6 +1,6 @@
 ---
 name: translate-doc
-description: "Use when translating Markdown documents or README trees with hymt translate-doc, including watch-mode retries and bilingual sync workflows."
+description: "Use when translating Markdown documents or README trees with hymt translate-doc and bilingual sync workflows."
 ---
 
 # Translate Doc
@@ -14,7 +14,6 @@ Use `hymt translate-doc` when you want file-oriented Markdown translation instea
 - Explicit output path: `hymt translate-doc README.md -l zh --output README.zh-cn.md`
 - Directory tree: `hymt translate-doc docs/ --recursive`
 - Preserve a separate output tree: `hymt translate-doc docs/ --recursive --output-dir translated-docs`
-- Watch a file and re-translate on change: `hymt translate-doc README.md --watch`
 
 ## Behavior
 
@@ -24,19 +23,23 @@ Use `hymt translate-doc` when you want file-oriented Markdown translation instea
 - Fenced code blocks are preserved.
 - Progress is written to stderr as `[done/total] XX.XX% | elapsed ... | eta ... | NN.NN tok/s`.
 - Each completed segment is written to the shared segment cache immediately, so interrupted runs resume cheaply.
-- In `--watch` mode, source changes cancel the in-flight translation attempt, then `hymt` re-segments and retries with cache reuse.
-- `watchfiles` is used when installed; otherwise `translate-doc` falls back to polling.
 
 ## Config
 
 ```toml
 [translation]
 stream = true
-max_retranslation_retries = 10
+
+[completeness]
+zh_to_en_min_ratio = 0.3
+en_to_zh_min_ratio = 0.3
+min_paragraph_ratio = 0.5
+max_retries = 2
 ```
 
 - `stream` controls streaming requests to the endpoint.
-- `max_retranslation_retries` bounds how many source-change retries are allowed in one watch cycle.
+- Completeness validation checks translated segments for minimum character ratio, paragraph retention, and Markdown heading preservation.
+- Failed segments retry up to `[completeness].max_retries`; after retries are exhausted, `hymt` warns and continues with the best attempt.
 
 ## Notes
 

@@ -70,6 +70,9 @@ config_version = 1
 timeout = 600
 
 [completeness]
+zh_to_en_min_ratio = 0.3
+en_to_zh_min_ratio = 0.3
+min_paragraph_ratio = 0.5
 max_retries = 2
 
 [timing]
@@ -146,7 +149,8 @@ hymt translate-doc docs/ --recursive
 
 - 默认目标语言为`zh`，Markdown输出文件会自动命名为`.zh-cn.md`。
 - 当使用`--output-dir`参数时，目录模式会翻译Markdown文件并保留相对路径。
-- 完整性校验重试次数由`[completeness].max_retries`控制。
+- 完整性校验会检查已翻译片段的最小字符比例、段落保留率和 Markdown 标题保留情况。
+- 失败片段最多按`[completeness].max_retries`重试；重试耗尽后，`hymt`会告警并继续使用最佳尝试。
 
 ## 批量翻译目录树
 

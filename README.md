@@ -70,6 +70,9 @@ config_version = 1
 timeout = 600
 
 [completeness]
+zh_to_en_min_ratio = 0.3
+en_to_zh_min_ratio = 0.3
+min_paragraph_ratio = 0.5
 max_retries = 2
 
 [timing]
@@ -146,7 +149,8 @@ Behavior:
 
 - Default target is `zh`, and Markdown outputs normalize to `.zh-cn.md`.
 - Directory mode translates Markdown files and preserves relative paths when `--output-dir` is used.
-- Completeness retry count is controlled by `[completeness].max_retries`.
+- Completeness validation checks translated segments for minimum character ratio, paragraph retention, and Markdown heading preservation.
+- Failed segments retry up to `[completeness].max_retries`; after retries are exhausted, `hymt` warns and continues with the best attempt.
 
 ## Batch translate directory trees
 
