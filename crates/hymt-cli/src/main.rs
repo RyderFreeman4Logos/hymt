@@ -157,7 +157,7 @@ enum Cmd {
     Exec(ExecArgs),
     /// Manage the tokenizer model
     Tokenizer(TokenizerArgs),
-    /// Estimate translation time for text or a file
+    /// Estimate translation time for a source character count
     Estimate(EstimateArgs),
     /// Translate all text files in a directory
     Batch(BatchArgs),
@@ -263,9 +263,9 @@ enum TokenizerAction {
 
 #[derive(Args)]
 struct EstimateArgs {
-    /// File to estimate (reads from stdin if omitted)
-    #[arg(value_name = "FILE")]
-    file: Option<PathBuf>,
+    /// Source character count to estimate
+    #[arg(value_name = "SOURCE_CHARS")]
+    source_chars: u64,
 }
 
 // ── batch ─────────────────────────────────────────────────────────────────────
@@ -979,37 +979,32 @@ async fn run_estimate(
     opts: &PromptOpts,
     config: &HotConfig,
 ) -> Result<()> {
-    let text = match args.file {
-        Some(ref path) => std::fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?,
-        None => {
-            let mut s = String::new();
-            io::stdin().read_to_string(&mut s)?;
-            s
-        }
-    };
-
     let segmenter = make_segmenter();
+    let plan = plan_translation("sample", target_lang, config, &segmenter, template, opts)?;
+    let source_lang = estimate_source_lang(target_lang, config);
+    let chars_per_segment =
+        estimate_chars_per_segment(plan.available_source_tokens, &segmenter, &source_lang);
+    let segments = estimate_segment_count(args.source_chars, chars_per_segment)?;
+
     let history = HistoryDB::default();
-    let plan = plan_translation(&text, target_lang, config, &segmenter, template, opts)?;
-    let segments = plan.segments.len() as i64;
+    let source_chars = args.source_chars;
     let concurrency = config.concurrency() as i64;
+    let template_name = template.as_str();
 
     eprintln!(
-        "Segments: {segments}, concurrency: {concurrency}, template: {}",
-        template.as_str()
+        "Source characters: {source_chars}, estimated segments: {segments}, ~{chars_per_segment} chars/segment, concurrency: {concurrency}, template: {template_name}",
     );
 
     match history.estimate(
         segments,
         concurrency,
         Some(target_lang),
-        Some(template.as_str()),
+        Some(template_name),
         Some(config.config_version() as i64),
         None,
     ) {
         Ok(Some(est)) => {
-            eprintln!(
+            println!(
                 "Estimated time: {:.1}s ({} samples)",
                 est.seconds, est.stats.count
             );
@@ -1022,6 +1017,69 @@ async fn run_estimate(
         }
     }
     Ok(())
+}
+
+fn estimate_source_lang(target_lang: &str, config: &HotConfig) -> String {
+    let primary = config.primary_lang();
+    let secondary = config.secondary_lang();
+    let norm_target = normalize_lang(target_lang);
+    let norm_primary = normalize_lang(&primary);
+    if base_lang(&norm_target) == base_lang(&norm_primary) {
+        secondary
+    } else {
+        primary
+    }
+}
+
+fn normalize_lang(lang: &str) -> String {
+    lang.trim().to_ascii_lowercase()
+}
+
+fn base_lang(lang: &str) -> &str {
+    lang.split(['-', '_']).next().unwrap_or("")
+}
+
+fn estimate_chars_per_segment(
+    available_source_tokens: usize,
+    segmenter: &Segmenter,
+    source_lang: &str,
+) -> u64 {
+    let sample = build_source_sample(source_lang, 512);
+    let sample_chars = sample.chars().count().max(1);
+    let sample_tokens = segmenter.count_tokens(&sample).max(1);
+    let chars_per_segment =
+        (available_source_tokens as u128 * sample_chars as u128) / sample_tokens as u128;
+    chars_per_segment.clamp(1, u64::MAX as u128) as u64
+}
+
+fn build_source_sample(source_lang: &str, min_chars: usize) -> String {
+    let unit = representative_source_text(source_lang);
+    let unit_chars = unit.chars().count();
+    if min_chars == 0 || unit_chars == 0 {
+        return String::new();
+    }
+
+    let repeat_count = min_chars.div_ceil(unit_chars);
+    let mut sample = String::with_capacity(unit.len() * repeat_count);
+    for _ in 0..repeat_count {
+        sample.push_str(unit);
+    }
+    sample
+}
+
+fn representative_source_text(source_lang: &str) -> &'static str {
+    let norm = normalize_lang(source_lang);
+    match base_lang(&norm) {
+        "zh" => "天地玄黄宇宙洪荒日月盈昃辰宿列张",
+        "ja" => "これは日本語の文章です。翻訳の見積もりに使います。",
+        "ko" => "이것은 한국어 문장입니다. 번역 추정에 사용합니다.",
+        _ => "This is sample source text used to estimate translation segment size. ",
+    }
+}
+
+fn estimate_segment_count(source_chars: u64, chars_per_segment: u64) -> Result<i64> {
+    let segments = source_chars.div_ceil(chars_per_segment.max(1));
+    i64::try_from(segments).map_err(|_| anyhow::anyhow!("estimated segment count is too large"))
 }
 
 // ── batch ─────────────────────────────────────────────────────────────────────
@@ -1243,6 +1301,70 @@ mod tests {
     }
 
     #[test]
+    fn estimate_segment_count_uses_ceiling_division() {
+        assert_eq!(estimate_segment_count(0, 2_000).unwrap(), 0);
+        assert_eq!(estimate_segment_count(1, 2_000).unwrap(), 1);
+        assert_eq!(estimate_segment_count(4_000, 2_000).unwrap(), 2);
+        assert_eq!(estimate_segment_count(4_001, 2_000).unwrap(), 3);
+    }
+
+    #[test]
+    fn estimate_chars_per_segment_depends_on_source_language() {
+        let segmenter = Segmenter::fallback();
+        let zh_chars = estimate_chars_per_segment(1_500, &segmenter, "zh");
+        let en_chars = estimate_chars_per_segment(1_500, &segmenter, "en");
+
+        assert!(zh_chars > 0);
+        assert!(en_chars > zh_chars);
+    }
+
+    #[test]
+    fn estimate_source_lang_matches_language_subtags() {
+        let config_path = PathBuf::from("target/test-estimate-source-lang-subtags/config.toml");
+        let _ = std::fs::remove_file(&config_path);
+        let config = HotConfig::from_path(&config_path).unwrap();
+
+        assert_eq!(estimate_source_lang("zh-cn", &config), "en");
+        assert_eq!(estimate_source_lang("zh_cn", &config), "en");
+        assert_eq!(estimate_source_lang("ja-jp", &config), "zh");
+    }
+
+    #[test]
+    fn representative_source_text_matches_language_subtags() {
+        assert_eq!(
+            representative_source_text("zh-tw"),
+            representative_source_text("zh")
+        );
+        assert_eq!(
+            representative_source_text("zh_cn"),
+            representative_source_text("zh")
+        );
+        assert_eq!(
+            representative_source_text("ja-jp"),
+            representative_source_text("ja")
+        );
+        assert_eq!(
+            representative_source_text("ja_jp"),
+            representative_source_text("ja")
+        );
+        assert_eq!(
+            representative_source_text("ko-kr"),
+            representative_source_text("ko")
+        );
+        assert_eq!(
+            representative_source_text("ko_kr"),
+            representative_source_text("ko")
+        );
+    }
+
+    #[test]
+    fn build_source_sample_reaches_minimum_chars() {
+        let sample = build_source_sample("ja-jp", 513);
+
+        assert!(sample.chars().count() >= 513);
+    }
+
+    #[test]
     fn parses_history_clear_flag() {
         let cli = Cli::try_parse_from(["hymt", "history", "--clear"]).unwrap();
         match cli.cmd {
@@ -1261,6 +1383,26 @@ mod tests {
             Err(err) => err,
         };
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn parses_estimate_source_character_count() {
+        let cli = Cli::try_parse_from(["hymt", "estimate", "10000"]).unwrap();
+        match cli.cmd {
+            Some(Cmd::Estimate(args)) => {
+                assert_eq!(args.source_chars, 10_000);
+            }
+            _ => panic!("expected estimate command"),
+        }
+    }
+
+    #[test]
+    fn rejects_estimate_non_integer() {
+        let err = match Cli::try_parse_from(["hymt", "estimate", "README.md"]) {
+            Ok(_) => panic!("expected parse error"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     #[test]
