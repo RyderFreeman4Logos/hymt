@@ -39,7 +39,7 @@ max_retries = 2
 
 - `stream` controls streaming requests to the endpoint.
 - Completeness validation checks translated segments for minimum character ratio, paragraph retention, and Markdown heading preservation.
-- Failed segments retry up to `[completeness].max_retries`; after retries are exhausted, `hymt` warns and continues with the best attempt.
+- Failed segments retry up to `[completeness].max_retries`, the shared completeness retry setting used by normal, streaming, batch, and `translate-doc` segment validation; after retries are exhausted, `hymt` warns and continues with the best attempt.
 
 ## Notes
 

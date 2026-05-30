@@ -150,7 +150,7 @@ Behavior:
 - Default target is `zh`, and Markdown outputs normalize to `.zh-cn.md`.
 - Directory mode translates Markdown files and preserves relative paths when `--output-dir` is used.
 - Completeness validation checks translated segments for minimum character ratio, paragraph retention, and Markdown heading preservation.
-- Failed segments retry up to `[completeness].max_retries`; after retries are exhausted, `hymt` warns and continues with the best attempt.
+- Failed segments retry up to `[completeness].max_retries`; the same value applies to normal, streaming, batch, and `translate-doc` segment validation. After retries are exhausted, `hymt` warns and continues with the best attempt.
 
 ## Batch translate directory trees
 

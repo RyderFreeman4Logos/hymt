@@ -150,7 +150,7 @@ hymt translate-doc docs/ --recursive
 - 默认目标语言为`zh`，Markdown输出文件会自动命名为`.zh-cn.md`。
 - 当使用`--output-dir`参数时，目录模式会翻译Markdown文件并保留相对路径。
 - 完整性校验会检查已翻译片段的最小字符比例、段落保留率和 Markdown 标题保留情况。
-- 失败片段最多按`[completeness].max_retries`重试；重试耗尽后，`hymt`会告警并继续使用最佳尝试。
+- 失败片段最多按`[completeness].max_retries`重试；普通、流式、批量和`translate-doc`的片段完整性校验都使用同一个值。重试耗尽后，`hymt`会告警并继续使用最佳尝试。
 
 ## 批量翻译目录树
 
