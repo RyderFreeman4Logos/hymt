@@ -790,6 +790,7 @@ where
                     stdout.write_all(b"\n").await?;
                 }
                 stdout.flush().await?;
+                break;
             }
         }
     }
