@@ -10,7 +10,6 @@ default = []
 lingua = []
 
 [dependencies]
-anyhow = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 toml = "0.8"

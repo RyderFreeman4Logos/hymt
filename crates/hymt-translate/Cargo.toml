@@ -10,7 +10,6 @@ hymt-segment = { path = "../hymt-segment" }
 hymt-client = { path = "../hymt-client" }
 hymt-cache = { path = "../hymt-cache" }
 anyhow = { workspace = true }
-thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = "0.1"
 serde_json = "1"
