@@ -21,7 +21,7 @@ Hy-MT2是一款实用的命令行工具：具备分词器感知的分段功能�
 - 可批量处理整个目录树，在写入前预览缓存状态及预计完成时间。  
 - 可用`hymt exec`封装任意shell命令，或查看已翻译的`man`和`info`页面。  
 - 可调出之前的翻译结果，并查看包含处理效率统计信息的翻译历史记录。  
-- 使用`hymt translate-doc`及基于监视器的重新翻译功能，可保持双语Markdown文档的同步。
+- 使用`hymt translate-doc`可保持双语Markdown文档的同步。
 
 ## 安装
 
@@ -31,24 +31,23 @@ Hy-MT2是一款实用的命令行工具：具备分词器感知的分段功能�
 uv tool install .
 ```
 
-如果您希望在本地可编辑的安装版本中获得可选的语言检测和文件监控功能：
+如果您希望在本地可编辑的安装版本中获得可选的语言检测功能：
 
 ```bash
-uv pip install --system -e ".[detect,watch]"
+uv pip install --system -e ".[detect]"
 mise reshim
 ```
 
 这样你就得到了：
 
 - `langdetect`，用于混合语言的局部翻译。
-- `watchfiles`，用于在支持该功能的平台上通过inotify实现`translate-doc --watch`功能。
 
 ### Termux / 安卓
 
 Android版本会跳过Rust的`tokenizers`依赖，因此`hymt`会自动采用近似的方式计算词元数量。翻译功能依然可用，只是分词精度不如基于Linux词法分析器的方案。
 
 ```bash
-uv pip install --system -e ".[detect,watch]"
+uv pip install --system -e ".[detect]"
 mise reshim
 ```
 
@@ -75,7 +74,7 @@ timeout = 600
 divergence_threshold = 2.0
 ```
 
-该配置支持热加载。长时间运行的或基于监控的工作流无需重启即可应用更改。
+该配置支持热加载。长时间运行的工作流无需重启即可应用更改。
 
 ## 快速开始
 
@@ -139,15 +138,12 @@ hymt translate-doc README.md
 hymt translate-doc README.md -t ja
 hymt translate-doc README.md -t zh -o README.zh-cn.md
 hymt translate-doc docs/ --recursive
-hymt translate-doc README.md --watch
 ```
 
 行为：
 
 - 默认目标语言为`zh`，Markdown输出文件会自动命名为`.zh-cn.md`。
 - 当使用`--output-dir`参数时，目录模式会翻译Markdown文件并保留相对路径。
-- `--watch`功能在支持`watchfiles`时会使用该工具，否则则采用轮询方式。
-- 如果在翻译过程中源文件发生变化，`hymt`会取消正在处理的请求，重新对文件进行分割，然后重试并复用缓存。
 - 重试次数由`[translation].max_retranslation_retries`控制。
 
 ## 批量翻译目录树

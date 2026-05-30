@@ -21,7 +21,7 @@ Hy-MT2 as a practical CLI: tokenizer-aware segmentation, per-segment cache reuse
 - Batch entire directory trees and preview cache status plus ETA before writing.
 - Wrap arbitrary shell commands with `hymt exec`, or browse translated `man` and `info` pages.
 - Recall previous outputs and inspect translation history with throughput statistics.
-- Keep bilingual Markdown in sync with `hymt translate-doc` and watch-based retranslation.
+- Keep bilingual Markdown in sync with `hymt translate-doc`.
 
 ## Install
 
@@ -31,24 +31,23 @@ Hy-MT2 as a practical CLI: tokenizer-aware segmentation, per-segment cache reuse
 uv tool install .
 ```
 
-If you want optional language detection and file watching support in a local editable install:
+If you want optional language detection support in a local editable install:
 
 ```bash
-uv pip install --system -e ".[detect,watch]"
+uv pip install --system -e ".[detect]"
 mise reshim
 ```
 
 That gives you:
 
 - `langdetect` for mixed-language partial translation.
-- `watchfiles` for inotify-backed `translate-doc --watch` on platforms where it is available.
 
 ### Termux / Android
 
 Android builds skip the Rust `tokenizers` dependency, so `hymt` automatically falls back to approximate token counting. Translation still works; segmentation is just less precise than the Linux tokenizer-backed path.
 
 ```bash
-uv pip install --system -e ".[detect,watch]"
+uv pip install --system -e ".[detect]"
 mise reshim
 ```
 
@@ -75,7 +74,7 @@ timeout = 600
 divergence_threshold = 2.0
 ```
 
-The config is hot-reloadable. Long-running or watch-driven workflows pick up edits without restarting the process.
+The config is hot-reloadable. Long-running workflows pick up edits without restarting the process.
 
 ## Quick start
 
@@ -139,15 +138,12 @@ hymt translate-doc README.md
 hymt translate-doc README.md -t ja
 hymt translate-doc README.md -t zh -o README.zh-cn.md
 hymt translate-doc docs/ --recursive
-hymt translate-doc README.md --watch
 ```
 
 Behavior:
 
 - Default target is `zh`, and Markdown outputs normalize to `.zh-cn.md`.
 - Directory mode translates Markdown files and preserves relative paths when `--output-dir` is used.
-- `--watch` uses `watchfiles` when available and falls back to polling otherwise.
-- If the source changes mid-translation, `hymt` cancels the in-flight request, re-segments the file, and retries with cache reuse.
 - Retry count is controlled by `[translation].max_retranslation_retries`.
 
 ## Batch translate directory trees
@@ -239,7 +235,7 @@ Both bind to the Tailscale interface only (`100.78.159.38:8401`), not `0.0.0.0`.
 - `src/hymt/translate.py`: core translate pipeline, cache lookup, streaming, progress, timing history
 - `src/hymt/history.py`: SQLite task history, recall, and ETA statistics
 - `src/hymt/batch.py`: directory planning, cache preview, and batch writes
-- `src/hymt/doc_translate.py`: Markdown-focused translate/watch workflow
+- `src/hymt/doc_translate.py`: Markdown-focused translation workflow
 - `src/hymt/docs.py`: translated `man` and `info`
 - `src/hymt/exec_wrapper.py`: command wrapper and translated post-run output
 - `src/hymt/cli.py`: Click CLI entry point

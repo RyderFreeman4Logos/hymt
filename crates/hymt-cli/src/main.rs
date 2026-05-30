@@ -333,9 +333,6 @@ struct TranslateDocArgs {
     /// Recursively translate subdirectories
     #[arg(short = 'r', long)]
     recursive: bool,
-    /// Watch source for changes and re-translate (reserved; not yet implemented)
-    #[arg(long)]
-    watch: bool,
 }
 
 // ── Smart arg routing ─────────────────────────────────────────────────────────
@@ -1204,7 +1201,6 @@ async fn run_translate_doc(
         output_path: args.output.as_deref(),
         output_dir: args.output_dir.as_deref(),
         recursive: args.recursive,
-        watch: args.watch,
         template,
         prompt_opts: opts,
         explicit_target,

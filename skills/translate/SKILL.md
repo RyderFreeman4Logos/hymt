@@ -42,9 +42,7 @@ Use `hymt` when an agent should drive the local Hy-MT2 CLI instead of hand-writi
 - Explicit output path: `hymt translate-doc README.md -l zh --output README.zh-cn.md`
 - Translate to another language: `hymt translate-doc README.md -l ja`
 - Translate a documentation tree: `hymt translate-doc docs/ --recursive`
-- Keep a file in sync while editing: `hymt translate-doc README.md --watch`
-- `translate-doc` only accepts Markdown input, normalizes effective `zh` outputs to `.zh-cn.md`, and falls back to polling when `watchfiles` is unavailable.
-- Watch-mode retries are bounded by `[translation].max_retranslation_retries`, and changed files reuse cached segments instead of retranslating the whole document from scratch.
+- `translate-doc` only accepts Markdown input and normalizes effective `zh` outputs to `.zh-cn.md`.
 
 ## Template types
 
@@ -75,7 +73,7 @@ Template-specific options:
 - `hymt history --clear`
 - `hymt history recent [N]`
 - `hymt recall [<position>]`
-- `hymt translate-doc <FILE|DIR> [-l <lang>] [--recursive] [--watch] [--output-dir <dir>]`
+- `hymt translate-doc <FILE|DIR> [-l <lang>] [--recursive] [--output-dir <dir>]`
 - `hymt config show`
 - `hymt config path`
 - `hymt config edit`
@@ -102,10 +100,9 @@ Related skills cover command/documentation translation:
 - Progress is written to stderr as `[done/total] XX.XX% | elapsed 2m47s | eta 1m23s | NN.NN tok/s`.
 - Identical source segments, target language, template type, and template-specific options reuse cached segment translations.
 - Each segment is validated for minimum output/input character ratio, paragraph retention, and Markdown heading preservation. Failed segments are retried up to `[completeness].max_retries` (default `2`) before raising an error.
-- `translate-doc` persists each completed segment immediately, so watch-mode retries and interrupted runs can resume from the segment cache.
+- `translate-doc` persists each completed segment immediately, so interrupted runs can resume from the segment cache.
 - After a completed interactive translation, if actual runtime diverges from the estimate by `[timing].divergence_threshold` (default `2.0`), `hymt` can prompt to file a GitHub timing-data issue.
 - Config lives at `~/.config/hymt/config.toml`; `[language].primary` and `[language].secondary` configure default routing, and `[completeness]` configures segment validation thresholds.
-- `translate-doc --watch` also reads `[translation].max_retranslation_retries` from that config.
 - The tokenizer is cached at `~/.cache/hymt/tokenizer/tokenizer.json`.
 - Translation commands use the cached tokenizer when present; otherwise they use approximate token counting. Run `hymt tokenizer download` to fetch the tokenizer explicitly.
 - On Android/Termux installs, `hymt` uses approximate token counting for segmentation because Rust tokenizer wheels are unavailable.
