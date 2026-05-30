@@ -289,6 +289,9 @@ struct BatchArgs {
 
 #[derive(Args)]
 struct HistoryArgs {
+    /// Clear all history
+    #[arg(long)]
+    clear: bool,
     #[command(subcommand)]
     action: Option<HistoryAction>,
 }
@@ -1060,6 +1063,12 @@ async fn run_batch(
 
 fn run_history(args: HistoryArgs) -> Result<()> {
     let history = HistoryDB::default();
+    if args.clear {
+        let n = history.clear()?;
+        eprintln!("Cleared {n} history entries.");
+        return Ok(());
+    }
+
     let n_recent = match &args.action {
         Some(HistoryAction::Recent { n }) => *n,
         _ => 10,
@@ -1236,6 +1245,18 @@ mod tests {
 
         let segmenter = make_segmenter_from_path(tokenizer_path);
         assert_eq!(segmenter.count_tokens("abcd"), 1);
+    }
+
+    #[test]
+    fn parses_history_clear_flag() {
+        let cli = Cli::try_parse_from(["hymt", "history", "--clear"]).unwrap();
+        match cli.cmd {
+            Some(Cmd::History(args)) => {
+                assert!(args.clear);
+                assert!(args.action.is_none());
+            }
+            _ => panic!("expected history command"),
+        }
     }
 
     #[test]
