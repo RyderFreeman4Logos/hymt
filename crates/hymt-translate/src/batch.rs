@@ -70,10 +70,6 @@ pub struct BatchPlan {
 }
 
 impl BatchPlan {
-    pub fn total_source_tokens(&self) -> usize {
-        self.files.iter().map(|f| f.source_tokens).sum()
-    }
-
     pub fn total_segments(&self) -> usize {
         self.files.iter().map(|f| f.segment_count).sum()
     }
