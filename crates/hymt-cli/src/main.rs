@@ -1036,7 +1036,7 @@ fn normalize_lang(lang: &str) -> String {
 }
 
 fn base_lang(lang: &str) -> &str {
-    lang.split('-').next().unwrap_or("")
+    lang.split(['-', '_']).next().unwrap_or("")
 }
 
 fn estimate_chars_per_segment(
@@ -1325,6 +1325,7 @@ mod tests {
         let config = HotConfig::from_path(&config_path).unwrap();
 
         assert_eq!(estimate_source_lang("zh-cn", &config), "en");
+        assert_eq!(estimate_source_lang("zh_cn", &config), "en");
         assert_eq!(estimate_source_lang("ja-jp", &config), "zh");
     }
 
@@ -1335,11 +1336,23 @@ mod tests {
             representative_source_text("zh")
         );
         assert_eq!(
+            representative_source_text("zh_cn"),
+            representative_source_text("zh")
+        );
+        assert_eq!(
             representative_source_text("ja-jp"),
             representative_source_text("ja")
         );
         assert_eq!(
+            representative_source_text("ja_jp"),
+            representative_source_text("ja")
+        );
+        assert_eq!(
             representative_source_text("ko-kr"),
+            representative_source_text("ko")
+        );
+        assert_eq!(
+            representative_source_text("ko_kr"),
             representative_source_text("ko")
         );
     }
