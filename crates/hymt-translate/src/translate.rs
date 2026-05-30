@@ -109,8 +109,12 @@ impl TranslationPlan {
         }
     }
 
-    /// Return untranslated source text that reconstructs before `segment_index`.
+    /// Return untranslated source text that reconstructs before priority segment 0.
     fn reconstruct_prefix_before_segment(&self, segment_index: usize) -> String {
+        debug_assert_eq!(
+            segment_index, 0,
+            "reconstruct_prefix_before_segment is only valid for segment 0"
+        );
         let Some(plan) = &self.document_plan else {
             return String::new();
         };
@@ -1055,34 +1059,23 @@ pub async fn translate_text_stream_with_mode(
                     });
                 }
 
-                if let Some((idx, translated)) = priority_done {
-                    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-                    if let Err(e) = ctx.history.store_segment_cache(
-                        &seg_hashes[idx],
-                        target_lang,
-                        template_name,
-                        &translated,
-                        &now,
-                        &options_hash,
-                    ) {
-                        eprintln!("Warning: cache store error: {e}");
-                    }
-                    translations[idx] = Some(translated);
+                let (idx, translated) = if let Some(done) = priority_done {
+                    done
                 } else {
-                    let (idx, translated) = joined_segment(priority_task.await)?;
-                    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-                    if let Err(e) = ctx.history.store_segment_cache(
-                        &seg_hashes[idx],
-                        target_lang,
-                        template_name,
-                        &translated,
-                        &now,
-                        &options_hash,
-                    ) {
-                        eprintln!("Warning: cache store error: {e}");
-                    }
-                    translations[idx] = Some(translated);
+                    joined_segment(priority_task.await)?
+                };
+                let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                if let Err(e) = ctx.history.store_segment_cache(
+                    &seg_hashes[idx],
+                    target_lang,
+                    template_name,
+                    &translated,
+                    &now,
+                    &options_hash,
+                ) {
+                    eprintln!("Warning: cache store error: {e}");
                 }
+                translations[idx] = Some(translated);
 
                 while let Some(res) = join_set.join_next().await {
                     let (idx, translated) = joined_segment(res)?;

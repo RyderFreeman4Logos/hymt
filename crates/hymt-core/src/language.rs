@@ -374,7 +374,7 @@ fn split_yaml_frontmatter(text: &str) -> Option<(&str, &str)> {
 }
 
 fn is_yaml_frontmatter_marker(line: &str) -> bool {
-    line.trim() == "---"
+    line.trim_end() == "---"
 }
 
 /// Iterates over lines of `text`, preserving line endings.
@@ -536,6 +536,14 @@ mod tests {
         assert!(sections
             .iter()
             .any(|s| s.kind == SectionKind::Paragraph && s.text == "Body paragraph.\n"));
+    }
+
+    #[test]
+    fn indented_yaml_marker_remains_paragraph() {
+        let text = " ---\ntitle: Test\n---\n\nBody paragraph.\n";
+        let sections = split_document_sections(text);
+        assert_eq!(sections[0].kind, SectionKind::Paragraph);
+        assert_eq!(sections[0].text, " ---\ntitle: Test\n---\n");
     }
 
     #[test]
