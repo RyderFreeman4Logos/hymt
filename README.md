@@ -200,7 +200,7 @@ hymt history
 hymt history --stats
 hymt recall
 hymt recall --list
-hymt estimate -f README.md -t zh
+hymt estimate 10000 -l zh
 ```
 
 History powers:

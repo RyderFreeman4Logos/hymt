@@ -157,7 +157,7 @@ enum Cmd {
     Exec(ExecArgs),
     /// Manage the tokenizer model
     Tokenizer(TokenizerArgs),
-    /// Estimate translation time for text or a file
+    /// Estimate translation time for a source character count
     Estimate(EstimateArgs),
     /// Translate all text files in a directory
     Batch(BatchArgs),
@@ -263,9 +263,9 @@ enum TokenizerAction {
 
 #[derive(Args)]
 struct EstimateArgs {
-    /// File to estimate (reads from stdin if omitted)
-    #[arg(value_name = "FILE")]
-    file: Option<PathBuf>,
+    /// Source character count to estimate
+    #[arg(value_name = "SOURCE_CHARS")]
+    source_chars: u64,
 }
 
 // ── batch ─────────────────────────────────────────────────────────────────────
@@ -501,9 +501,7 @@ async fn run() -> Result<()> {
             run_exec(args, target_lang, explicit_target, &config, &prompt_opts).await
         }
         Some(Cmd::Tokenizer(args)) => run_tokenizer(args).await,
-        Some(Cmd::Estimate(args)) => {
-            run_estimate(args, target_lang, &template, &prompt_opts, &config).await
-        }
+        Some(Cmd::Estimate(args)) => run_estimate(args, target_lang, &template, &config).await,
         Some(Cmd::Batch(args)) => {
             run_batch(
                 args,
@@ -976,32 +974,20 @@ async fn run_estimate(
     args: EstimateArgs,
     target_lang: &str,
     template: &TemplateType,
-    opts: &PromptOpts,
     config: &HotConfig,
 ) -> Result<()> {
-    let text = match args.file {
-        Some(ref path) => std::fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?,
-        None => {
-            let mut s = String::new();
-            io::stdin().read_to_string(&mut s)?;
-            s
-        }
-    };
-
-    let segmenter = make_segmenter();
+    let source_chars = i64::try_from(args.source_chars)
+        .map_err(|_| anyhow::anyhow!("source character count is too large"))?;
     let history = HistoryDB::default();
-    let plan = plan_translation(&text, target_lang, config, &segmenter, template, opts)?;
-    let segments = plan.segments.len() as i64;
     let concurrency = config.concurrency() as i64;
 
     eprintln!(
-        "Segments: {segments}, concurrency: {concurrency}, template: {}",
+        "Source characters: {source_chars}, concurrency: {concurrency}, template: {}",
         template.as_str()
     );
 
     match history.estimate(
-        segments,
+        source_chars,
         concurrency,
         Some(target_lang),
         Some(template.as_str()),
@@ -1009,7 +995,7 @@ async fn run_estimate(
         None,
     ) {
         Ok(Some(est)) => {
-            eprintln!(
+            println!(
                 "Estimated time: {:.1}s ({} samples)",
                 est.seconds, est.stats.count
             );
@@ -1261,6 +1247,26 @@ mod tests {
             Err(err) => err,
         };
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn parses_estimate_source_character_count() {
+        let cli = Cli::try_parse_from(["hymt", "estimate", "10000"]).unwrap();
+        match cli.cmd {
+            Some(Cmd::Estimate(args)) => {
+                assert_eq!(args.source_chars, 10_000);
+            }
+            _ => panic!("expected estimate command"),
+        }
+    }
+
+    #[test]
+    fn rejects_estimate_non_integer() {
+        let err = match Cli::try_parse_from(["hymt", "estimate", "README.md"]) {
+            Ok(_) => panic!("expected parse error"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     #[test]

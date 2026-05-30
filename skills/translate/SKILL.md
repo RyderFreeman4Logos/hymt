@@ -68,7 +68,7 @@ Template-specific options:
 
 ## Utility commands
 
-- `hymt estimate [FILE]`
+- `hymt estimate <SOURCE_CHARS>`
 - `hymt batch DIRECTORY [-l <lang>] [--recursive] [--dry-run] [--output-dir <dir>] [--yes]`
 - `hymt history`
 - `hymt history stats`
@@ -107,5 +107,5 @@ Related skills cover command/documentation translation:
 - Config lives at `~/.config/hymt/config.toml`; `[language].primary` and `[language].secondary` configure default routing, and `[completeness]` configures segment validation thresholds.
 - `translate-doc --watch` also reads `[translation].max_retranslation_retries` from that config.
 - The tokenizer is cached at `~/.cache/hymt/tokenizer/tokenizer.json`.
-- `hymt estimate` and translation commands use the cached tokenizer when present; otherwise they use approximate token counting. Run `hymt tokenizer download` to fetch the tokenizer explicitly.
+- Translation commands use the cached tokenizer when present; otherwise they use approximate token counting. Run `hymt tokenizer download` to fetch the tokenizer explicitly.
 - On Android/Termux installs, `hymt` uses approximate token counting for segmentation because Rust tokenizer wheels are unavailable.
