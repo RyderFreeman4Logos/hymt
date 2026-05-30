@@ -97,8 +97,8 @@ Related skills cover command/documentation translation:
 - `--yes` and non-interactive stdin auto-select partial translation for mixed-language input.
 - If all detected paragraphs are already in the target language, interactive runs still ask whether to translate anyway.
 - Fenced code blocks are excluded from language detection and translation in every mode.
-- `[translation].stream = true` is the default. `--stream`/`--no-stream` are accepted for forward compatibility; the effective streaming mode is controlled by `[translation].stream` in config.
-- Streaming runs buffer each translated segment until completeness validation passes, then send that segment to stdout; non-streaming runs buffer output until completion.
+- `--stream` enables immediate stdout token output for the first pipeline chunk when `[translation].first_chunk_priority = true`; after the first token, remaining chunks start concurrently. `--no-stream` keeps the existing buffered stdout behavior.
+- Streaming still validates completeness after the first chunk stream completes, caches completed segments, and emits the final reconstructed remainder after all chunks finish.
 - Progress is written to stderr as `[done/total] XX.XX% | elapsed 2m47s | eta 1m23s | NN.NN tok/s`.
 - Identical source segments, target language, template type, and template-specific options reuse cached segment translations.
 - Each segment is validated for minimum output/input character ratio, paragraph retention, and Markdown heading preservation. Failed segments are retried up to `[completeness].max_retries` (default `2`) before raising an error.

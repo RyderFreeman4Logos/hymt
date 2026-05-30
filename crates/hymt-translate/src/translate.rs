@@ -13,7 +13,9 @@ use std::time::Instant;
 use anyhow::{anyhow, Context, Result};
 use chrono::{SecondsFormat, Utc};
 use sha2::{Digest, Sha256};
+use tokio::sync::mpsc;
 use tokio::task::JoinSet;
+use tokio_stream::StreamExt as _;
 
 use hymt_cache::history::{format_duration, HistoryDB, TaskRecord};
 use hymt_client::TranslationClient;
@@ -31,6 +33,19 @@ pub struct TranslationCtx<'a> {
     pub client: &'a TranslationClient,
     pub segmenter: &'a Segmenter,
     pub history: &'a HistoryDB,
+}
+
+/// Incremental translation output emitted by [`translate_text_stream`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StreamEvent {
+    /// A streamed token from segment 0.
+    Token(String),
+    /// A segment has completed and is available for reconstruction.
+    ///
+    /// Segment indexes are zero-based and match [`TranslationPlan::segments`].
+    SegmentDone(usize),
+    /// The complete reconstructed translation.
+    AllDone(String),
 }
 
 // ── Token budget constants (matches translate.py) ─────────────────────────────
@@ -359,6 +374,16 @@ fn cached_segment_is_complete(
 
 // ── Single-segment translation with completeness retry ────────────────────────
 
+struct SegmentTranslateRequest<'a> {
+    index: usize,
+    client: &'a TranslationClient,
+    segment: &'a str,
+    target_lang: &'a str,
+    template: &'a TemplateType,
+    opts: &'a PromptOpts,
+    config: &'a HotConfig,
+}
+
 async fn translate_segment_with_completeness(
     index: usize,
     client: &TranslationClient,
@@ -410,6 +435,127 @@ async fn translate_segment_with_completeness(
         index + 1,
         max_retries
     );
+    Ok((best, started.elapsed().as_secs_f64()))
+}
+
+async fn send_stream_event(tx: &mpsc::Sender<StreamEvent>, event: StreamEvent) -> Result<()> {
+    tx.send(event)
+        .await
+        .map_err(|_| anyhow!("stream event receiver dropped"))
+}
+
+fn joined_segment(
+    res: std::result::Result<Result<(usize, String)>, tokio::task::JoinError>,
+) -> Result<(usize, String)> {
+    match res {
+        Ok(Ok(segment)) => Ok(segment),
+        Ok(Err(e)) => Err(e.context("segment translation failed")),
+        Err(e) => Err(anyhow!("segment task panicked: {e}")),
+    }
+}
+
+async fn translate_segment_with_completeness_streaming(
+    request: SegmentTranslateRequest<'_>,
+    event_tx: &mpsc::Sender<StreamEvent>,
+    first_token_tx: Option<mpsc::Sender<()>>,
+) -> Result<(String, f64)> {
+    let max_retries = request.config.completeness_max_retries() as usize;
+    let started = Instant::now();
+    let mut prompt = build_prompt(
+        request.segment,
+        request.target_lang,
+        request.template,
+        request.opts,
+    )?;
+    let mut stream = request
+        .client
+        .translate_stream(&prompt)
+        .await
+        .map_err(|e| anyhow!("HTTP streaming translation failed: {e}"))?;
+    let mut translated = String::new();
+    let mut first_token_tx = first_token_tx;
+
+    while let Some(item) = stream.next().await {
+        let token = item.map_err(|e| anyhow!("HTTP streaming translation failed: {e}"))?;
+        if token.is_empty() {
+            continue;
+        }
+        translated.push_str(&token);
+        send_stream_event(event_tx, StreamEvent::Token(token)).await?;
+        if let Some(tx) = first_token_tx.take() {
+            let _ = tx.send(()).await;
+        }
+    }
+
+    let mut best = translated;
+    let result = check_completeness(request.segment, &best, request.target_lang, request.config);
+    if result.is_complete {
+        send_stream_event(event_tx, StreamEvent::SegmentDone(request.index)).await?;
+        return Ok((best, started.elapsed().as_secs_f64()));
+    }
+
+    let action = if max_retries > 0 {
+        "retrying"
+    } else {
+        "retries exhausted"
+    };
+    eprintln!(
+        "Warning: segment {} failed completeness (attempt 1/{}, {}): {:?}",
+        request.index + 1,
+        max_retries + 1,
+        action,
+        result.checks_failed
+    );
+
+    for attempt in 1..=max_retries {
+        prompt = build_prompt(
+            request.segment,
+            request.target_lang,
+            request.template,
+            request.opts,
+        )?;
+        prompt.push_str("\n\nTranslate the COMPLETE input. Do not stop early.");
+
+        let translated = request
+            .client
+            .translate(&prompt)
+            .await
+            .map_err(|e| anyhow!("HTTP translation failed: {e}"))?;
+
+        let result = check_completeness(
+            request.segment,
+            &translated,
+            request.target_lang,
+            request.config,
+        );
+        best = translated;
+
+        if result.is_complete {
+            send_stream_event(event_tx, StreamEvent::SegmentDone(request.index)).await?;
+            return Ok((best, started.elapsed().as_secs_f64()));
+        }
+
+        let action = if attempt < max_retries {
+            "retrying"
+        } else {
+            "retries exhausted"
+        };
+        eprintln!(
+            "Warning: segment {} failed completeness (attempt {}/{}, {}): {:?}",
+            request.index + 1,
+            attempt + 1,
+            max_retries + 1,
+            action,
+            result.checks_failed
+        );
+    }
+
+    eprintln!(
+        "Warning: segment {} exceeded {} retries, using best attempt",
+        request.index + 1,
+        max_retries
+    );
+    send_stream_event(event_tx, StreamEvent::SegmentDone(request.index)).await?;
     Ok((best, started.elapsed().as_secs_f64()))
 }
 
@@ -676,6 +822,340 @@ pub async fn translate_text(
         }
     }
 
+    Ok(translated)
+}
+
+/// Translate `text` and emit incremental output events for the pipeline path.
+///
+/// The existing non-streaming behavior is preserved when first-chunk priority is
+/// disabled or segment 0 is already cached. In that case the final translation is
+/// emitted as [`StreamEvent::AllDone`] after the normal translation completes.
+pub async fn translate_text_stream(
+    text: &str,
+    target_lang: &str,
+    template: &TemplateType,
+    opts: &PromptOpts,
+    ctx: &TranslationCtx<'_>,
+    event_tx: mpsc::Sender<StreamEvent>,
+) -> Result<String> {
+    if text.is_empty() {
+        send_stream_event(&event_tx, StreamEvent::AllDone(String::new())).await?;
+        return Ok(String::new());
+    }
+
+    if !ctx.config.first_chunk_priority() {
+        let translated = translate_text(text, target_lang, template, opts, ctx).await?;
+        send_stream_event(&event_tx, StreamEvent::AllDone(translated.clone())).await?;
+        return Ok(translated);
+    }
+
+    let template_name = template.as_str();
+    let plan = plan_translation(text, target_lang, ctx.config, ctx.segmenter, template, opts)?;
+
+    eprintln!(
+        "Source tokens: {}; segments: {}",
+        plan.source_tokens,
+        plan.segment_count()
+    );
+
+    let options_hash = template_options_hash(opts);
+    let seg_hashes: Vec<String> = plan
+        .segments
+        .iter()
+        .map(|s| segment_cache_hash(s))
+        .collect();
+    let _seg_tokens: Vec<usize> = plan
+        .segments
+        .iter()
+        .map(|s| ctx.segmenter.count_tokens(s))
+        .collect();
+
+    let started_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let wall_start = Instant::now();
+
+    let mut translations: Vec<Option<String>> = vec![None; plan.segment_count()];
+    let mut missing: Vec<usize> = Vec::new();
+
+    for (i, hash) in seg_hashes.iter().enumerate() {
+        match ctx
+            .history
+            .find_segment_cached(hash, target_lang, template_name, &options_hash)
+        {
+            Ok(Some(cached))
+                if cached_segment_is_complete(
+                    i,
+                    &plan.segments[i],
+                    &cached,
+                    target_lang,
+                    ctx.config,
+                ) =>
+            {
+                translations[i] = Some(cached);
+            }
+            Ok(_) => missing.push(i),
+            Err(e) => {
+                eprintln!("Warning: cache lookup error: {e}");
+                missing.push(i);
+            }
+        }
+    }
+
+    if !missing.is_empty() {
+        let (priority_chunk, remaining) = partition_pipeline(&missing, true);
+        missing = remaining;
+
+        if let Some(chunk_idx) = priority_chunk {
+            let client = ctx.client.clone();
+            let segment = plan.segments[chunk_idx].clone();
+            let target = target_lang.to_owned();
+            let tmpl = template.clone();
+            let cloned_opts = opts.clone();
+            let cfg = ctx.config.clone();
+            let event_tx_clone = event_tx.clone();
+            let (first_token_tx, mut first_token_rx) = mpsc::channel(1);
+
+            let mut priority_task = tokio::spawn(async move {
+                let (translated, _elapsed) = translate_segment_with_completeness_streaming(
+                    SegmentTranslateRequest {
+                        index: chunk_idx,
+                        client: &client,
+                        segment: &segment,
+                        target_lang: &target,
+                        template: &tmpl,
+                        opts: &cloned_opts,
+                        config: &cfg,
+                    },
+                    &event_tx_clone,
+                    Some(first_token_tx),
+                )
+                .await?;
+                Ok((chunk_idx, translated))
+            });
+
+            let mut priority_done: Option<(usize, String)> = None;
+            if !missing.is_empty() {
+                tokio::select! {
+                    _ = first_token_rx.recv() => {}
+                    res = &mut priority_task => {
+                        priority_done = Some(joined_segment(res)?);
+                    }
+                }
+
+                let mut join_set: JoinSet<Result<(usize, String)>> = JoinSet::new();
+                for &idx in &missing {
+                    let client = ctx.client.clone();
+                    let segment = plan.segments[idx].clone();
+                    let target = target_lang.to_owned();
+                    let tmpl = template.clone();
+                    let cloned_opts = opts.clone();
+                    let cfg = ctx.config.clone();
+
+                    join_set.spawn(async move {
+                        let (translated, _elapsed) = translate_segment_with_completeness(
+                            idx,
+                            &client,
+                            &segment,
+                            &target,
+                            &tmpl,
+                            &cloned_opts,
+                            &cfg,
+                        )
+                        .await?;
+                        Ok((idx, translated))
+                    });
+                }
+
+                if let Some((idx, translated)) = priority_done {
+                    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                    if let Err(e) = ctx.history.store_segment_cache(
+                        &seg_hashes[idx],
+                        target_lang,
+                        template_name,
+                        &translated,
+                        &now,
+                        &options_hash,
+                    ) {
+                        eprintln!("Warning: cache store error: {e}");
+                    }
+                    translations[idx] = Some(translated);
+                } else {
+                    let (idx, translated) = joined_segment(priority_task.await)?;
+                    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                    if let Err(e) = ctx.history.store_segment_cache(
+                        &seg_hashes[idx],
+                        target_lang,
+                        template_name,
+                        &translated,
+                        &now,
+                        &options_hash,
+                    ) {
+                        eprintln!("Warning: cache store error: {e}");
+                    }
+                    translations[idx] = Some(translated);
+                }
+
+                while let Some(res) = join_set.join_next().await {
+                    let (idx, translated) = joined_segment(res)?;
+                    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                    if let Err(e) = ctx.history.store_segment_cache(
+                        &seg_hashes[idx],
+                        target_lang,
+                        template_name,
+                        &translated,
+                        &now,
+                        &options_hash,
+                    ) {
+                        eprintln!("Warning: cache store error: {e}");
+                    }
+                    send_stream_event(&event_tx, StreamEvent::SegmentDone(idx)).await?;
+                    translations[idx] = Some(translated);
+                }
+            } else {
+                let (idx, translated) = joined_segment(priority_task.await)?;
+                let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                if let Err(e) = ctx.history.store_segment_cache(
+                    &seg_hashes[idx],
+                    target_lang,
+                    template_name,
+                    &translated,
+                    &now,
+                    &options_hash,
+                ) {
+                    eprintln!("Warning: cache store error: {e}");
+                }
+                translations[idx] = Some(translated);
+            }
+        } else {
+            let mut join_set: JoinSet<Result<(usize, String)>> = JoinSet::new();
+
+            for &idx in &missing {
+                let client = ctx.client.clone();
+                let segment = plan.segments[idx].clone();
+                let target = target_lang.to_owned();
+                let tmpl = template.clone();
+                let cloned_opts = opts.clone();
+                let cfg = ctx.config.clone();
+
+                join_set.spawn(async move {
+                    let (translated, _elapsed) = translate_segment_with_completeness(
+                        idx,
+                        &client,
+                        &segment,
+                        &target,
+                        &tmpl,
+                        &cloned_opts,
+                        &cfg,
+                    )
+                    .await?;
+                    Ok((idx, translated))
+                });
+            }
+
+            while let Some(res) = join_set.join_next().await {
+                let (idx, translated) = joined_segment(res)?;
+                let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                if let Err(e) = ctx.history.store_segment_cache(
+                    &seg_hashes[idx],
+                    target_lang,
+                    template_name,
+                    &translated,
+                    &now,
+                    &options_hash,
+                ) {
+                    eprintln!("Warning: cache store error: {e}");
+                }
+                send_stream_event(&event_tx, StreamEvent::SegmentDone(idx)).await?;
+                translations[idx] = Some(translated);
+            }
+        }
+    }
+
+    let completed: Vec<String> = translations
+        .into_iter()
+        .enumerate()
+        .map(|(i, t)| t.ok_or_else(|| anyhow!("missing translated segment {i}")))
+        .collect::<Result<_>>()?;
+
+    let translated = plan.reconstruct(&completed);
+    let duration = wall_start.elapsed().as_secs_f64();
+    let output_tokens = ctx.segmenter.count_tokens(&translated);
+    let tps = if duration > 0.0 {
+        output_tokens as f64 / duration
+    } else {
+        0.0
+    };
+
+    let record = TaskRecord {
+        id: None,
+        started_at,
+        finished_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+        duration_seconds: duration,
+        input_tokens: plan.source_tokens as i64,
+        output_tokens: output_tokens as i64,
+        segments: plan.segment_count() as i64,
+        concurrency: ctx.config.concurrency() as i64,
+        source_lang: None,
+        target_lang: target_lang.to_owned(),
+        template_type: template_name.to_owned(),
+        model: {
+            let m = ctx.config.model();
+            if m.is_empty() {
+                None
+            } else {
+                Some(m)
+            }
+        },
+        tokens_per_second: tps,
+        input_chars: text.len() as i64,
+        output_chars: translated.len() as i64,
+        output_text: Some(translated.clone()),
+        input_hash: None,
+        config_version: ctx.config.config_version() as i64,
+    };
+
+    if let Err(e) = ctx.history.insert_task(&record) {
+        eprintln!("Warning: failed to record timing history: {e}");
+    } else {
+        eprintln!(
+            "Completed in {} | avg {:.1} tok/s | timing recorded",
+            format_duration(duration),
+            tps
+        );
+    }
+
+    let seg_count: i64 = plan.segment_count() as i64;
+    let concurrency = ctx.config.concurrency() as i64;
+    let cfg_ver = ctx.config.config_version() as i64;
+    if let Ok(Some(estimate)) = ctx.history.estimate(
+        seg_count,
+        concurrency,
+        Some(target_lang),
+        Some(template_name),
+        Some(cfg_ver),
+        None,
+    ) {
+        let threshold = ctx.config.timing_divergence_threshold();
+        let data = hymt_cache::TimingIssueData {
+            input_tokens: plan.source_tokens as i64,
+            output_tokens: output_tokens as i64,
+            segments: seg_count,
+            actual_seconds: duration,
+            estimated_seconds: estimate.seconds,
+            config_version: cfg_ver,
+            target_lang: target_lang.to_owned(),
+            template_type: template_name.to_owned(),
+            concurrency,
+            model: record.model.clone(),
+        };
+        if hymt_cache::is_divergent(&data, threshold) {
+            eprintln!(
+                "Warning: timing divergence detected (actual {:.1}s vs estimated {:.1}s)",
+                duration, estimate.seconds
+            );
+        }
+    }
+
+    send_stream_event(&event_tx, StreamEvent::AllDone(translated.clone())).await?;
     Ok(translated)
 }
 
