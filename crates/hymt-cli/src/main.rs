@@ -980,26 +980,26 @@ async fn run_estimate(
     config: &HotConfig,
 ) -> Result<()> {
     let segmenter = make_segmenter();
-    let plan = plan_translation("", target_lang, config, &segmenter, template, opts)?;
+    let plan = plan_translation("sample", target_lang, config, &segmenter, template, opts)?;
     let source_lang = estimate_source_lang(target_lang, config);
     let chars_per_segment =
         estimate_chars_per_segment(plan.available_source_tokens, &segmenter, &source_lang);
     let segments = estimate_segment_count(args.source_chars, chars_per_segment)?;
 
     let history = HistoryDB::default();
+    let source_chars = args.source_chars;
     let concurrency = config.concurrency() as i64;
+    let template_name = template.as_str();
 
     eprintln!(
-        "Source characters: {}, estimated segments: {segments}, ~{chars_per_segment} chars/segment, concurrency: {concurrency}, template: {}",
-        args.source_chars,
-        template.as_str(),
+        "Source characters: {source_chars}, estimated segments: {segments}, ~{chars_per_segment} chars/segment, concurrency: {concurrency}, template: {template_name}",
     );
 
     match history.estimate(
         segments,
         concurrency,
         Some(target_lang),
-        Some(template.as_str()),
+        Some(template_name),
         Some(config.config_version() as i64),
         None,
     ) {
@@ -1078,11 +1078,7 @@ fn representative_source_text(source_lang: &str) -> &'static str {
 }
 
 fn estimate_segment_count(source_chars: u64, chars_per_segment: u64) -> Result<i64> {
-    let segments = if source_chars == 0 {
-        0
-    } else {
-        ((source_chars - 1) / chars_per_segment.max(1)) + 1
-    };
+    let segments = source_chars.div_ceil(chars_per_segment.max(1));
     i64::try_from(segments).map_err(|_| anyhow::anyhow!("estimated segment count is too large"))
 }
 
