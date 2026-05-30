@@ -1022,7 +1022,9 @@ async fn run_estimate(
 fn estimate_source_lang(target_lang: &str, config: &HotConfig) -> String {
     let primary = config.primary_lang();
     let secondary = config.secondary_lang();
-    if normalize_lang(target_lang) == normalize_lang(&primary) {
+    let norm_target = normalize_lang(target_lang);
+    let norm_primary = normalize_lang(&primary);
+    if base_lang(&norm_target) == base_lang(&norm_primary) {
         secondary
     } else {
         primary
@@ -1031,6 +1033,10 @@ fn estimate_source_lang(target_lang: &str, config: &HotConfig) -> String {
 
 fn normalize_lang(lang: &str) -> String {
     lang.trim().to_ascii_lowercase()
+}
+
+fn base_lang(lang: &str) -> &str {
+    lang.split('-').next().unwrap_or("")
 }
 
 fn estimate_chars_per_segment(
@@ -1048,16 +1054,23 @@ fn estimate_chars_per_segment(
 
 fn build_source_sample(source_lang: &str, min_chars: usize) -> String {
     let unit = representative_source_text(source_lang);
-    let mut sample = String::new();
-    while sample.chars().count() < min_chars {
+    let unit_chars = unit.chars().count();
+    if min_chars == 0 || unit_chars == 0 {
+        return String::new();
+    }
+
+    let repeat_count = min_chars.div_ceil(unit_chars);
+    let mut sample = String::with_capacity(unit.len() * repeat_count);
+    for _ in 0..repeat_count {
         sample.push_str(unit);
     }
     sample
 }
 
 fn representative_source_text(source_lang: &str) -> &'static str {
-    match normalize_lang(source_lang).as_str() {
-        "zh" | "zh-cn" | "zh-tw" => "天地玄黄宇宙洪荒日月盈昃辰宿列张",
+    let norm = normalize_lang(source_lang);
+    match base_lang(&norm) {
+        "zh" => "天地玄黄宇宙洪荒日月盈昃辰宿列张",
         "ja" => "これは日本語の文章です。翻訳の見積もりに使います。",
         "ko" => "이것은 한국어 문장입니다. 번역 추정에 사용합니다.",
         _ => "This is sample source text used to estimate translation segment size. ",
@@ -1307,6 +1320,39 @@ mod tests {
 
         assert!(zh_chars > 0);
         assert!(en_chars > zh_chars);
+    }
+
+    #[test]
+    fn estimate_source_lang_matches_language_subtags() {
+        let config_path = PathBuf::from("target/test-estimate-source-lang-subtags/config.toml");
+        let _ = std::fs::remove_file(&config_path);
+        let config = HotConfig::from_path(&config_path).unwrap();
+
+        assert_eq!(estimate_source_lang("zh-cn", &config), "en");
+        assert_eq!(estimate_source_lang("ja-jp", &config), "zh");
+    }
+
+    #[test]
+    fn representative_source_text_matches_language_subtags() {
+        assert_eq!(
+            representative_source_text("zh-tw"),
+            representative_source_text("zh")
+        );
+        assert_eq!(
+            representative_source_text("ja-jp"),
+            representative_source_text("ja")
+        );
+        assert_eq!(
+            representative_source_text("ko-kr"),
+            representative_source_text("ko")
+        );
+    }
+
+    #[test]
+    fn build_source_sample_reaches_minimum_chars() {
+        let sample = build_source_sample("ja-jp", 513);
+
+        assert!(sample.chars().count() >= 513);
     }
 
     #[test]
