@@ -1,8 +1,7 @@
 //! Document language analysis and section-level translation planning.
 //!
-//! Without the `lingua` feature, language detection falls back to CJK character
-//! ratio counting (reliable for zh/yue targets; returns `None` for all others).
-//! With `lingua` (feature-gated), a proper multi-language detector is used.
+//! Language detection uses CJK character ratio counting, which is reliable for
+//! zh/yue targets and returns `None` for all other targets.
 
 use serde::{Deserialize, Serialize};
 
@@ -88,16 +87,8 @@ impl DocumentLanguagePlan {
 /// Detects how much of `text` is in `target_lang`.
 ///
 /// Returns `None` when detection is unsupported for the given target.
-/// Without the `lingua` feature, only CJK (zh/yue) detection is available.
+/// Only CJK (zh/yue) detection is available.
 pub fn detect_target_language(text: &str, target_lang: &str) -> Option<LanguageDetectionResult> {
-    #[cfg(feature = "lingua")]
-    {
-        let aliases = target_aliases(target_lang);
-        if let Some(result) = detect_with_lingua(text, &aliases) {
-            return Some(result);
-        }
-    }
-
     detect_without_detector(text, target_lang)
 }
 
@@ -395,16 +386,6 @@ fn is_closing_fence(line: &str, fence_char: char, fence_len: usize) -> bool {
     stripped[count..].trim().is_empty()
 }
 
-// ── Lingua stub (feature-gated) ───────────────────────────────────────────────
-
-#[cfg(feature = "lingua")]
-fn detect_with_lingua(_text: &str, _aliases: &[String]) -> Option<LanguageDetectionResult> {
-    // Placeholder: lingua-rs integration not yet wired.
-    // When implemented, build a LanguageDetector and compute target_ratio
-    // from per-chunk results, analogous to detect_chunk_sequence.
-    None
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -429,13 +410,10 @@ mod tests {
     }
 
     #[test]
-    fn non_zh_target_returns_none_without_lingua() {
-        // Without lingua, we cannot detect non-CJK languages.
+    fn non_zh_target_returns_none() {
+        // Only CJK detection is implemented.
         let result = detect_target_language("hello world", "fr");
-        #[cfg(not(feature = "lingua"))]
         assert!(result.is_none());
-        #[cfg(feature = "lingua")]
-        let _ = result; // any value is acceptable with lingua
     }
 
     #[test]

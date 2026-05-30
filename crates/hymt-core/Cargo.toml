@@ -6,8 +6,6 @@ license.workspace = true
 
 [features]
 default = []
-# Reserved: lingua-rs language detection (not yet wired to a concrete dependency)
-lingua = []
 
 [dependencies]
 thiserror = { workspace = true }
