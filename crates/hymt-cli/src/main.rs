@@ -533,11 +533,15 @@ async fn run() -> Result<()> {
 // ── Shared init helpers ───────────────────────────────────────────────────────
 
 fn make_segmenter() -> Segmenter {
-    make_segmenter_with(hymt_segment::create_segmenter)
+    make_segmenter_from_path(hymt_segment::tokenizer_path())
 }
 
-fn make_segmenter_with(load_segmenter: impl FnOnce(bool) -> Segmenter) -> Segmenter {
-    load_segmenter(false)
+fn make_segmenter_from_path(tokenizer_path: PathBuf) -> Segmenter {
+    if tokenizer_path.exists() {
+        Segmenter::new(Some(tokenizer_path)).unwrap_or_else(|_| Segmenter::fallback())
+    } else {
+        Segmenter::fallback()
+    }
 }
 
 fn make_client(config: &HotConfig) -> Result<TranslationClient> {
@@ -1226,14 +1230,11 @@ mod tests {
     }
 
     #[test]
-    fn make_segmenter_uses_tokenizer_loader_without_forcing_download() {
-        let force_download = std::cell::Cell::new(None);
-        let segmenter = make_segmenter_with(|force| {
-            force_download.set(Some(force));
-            Segmenter::fallback()
-        });
+    fn make_segmenter_falls_back_without_cached_tokenizer() {
+        let tokenizer_path = PathBuf::from("target/test-missing-tokenizer/tokenizer.json");
+        assert!(!tokenizer_path.exists());
 
-        assert_eq!(force_download.get(), Some(false));
+        let segmenter = make_segmenter_from_path(tokenizer_path);
         assert_eq!(segmenter.count_tokens("abcd"), 1);
     }
 
