@@ -288,7 +288,11 @@ struct BatchArgs {
 // ── history ───────────────────────────────────────────────────────────────────
 
 #[derive(Args)]
+#[command(args_conflicts_with_subcommands = true)]
 struct HistoryArgs {
+    /// Clear all history
+    #[arg(long)]
+    clear: bool,
     #[command(subcommand)]
     action: Option<HistoryAction>,
 }
@@ -297,8 +301,6 @@ struct HistoryArgs {
 enum HistoryAction {
     /// Show performance statistics
     Stats,
-    /// Clear all history
-    Clear,
     /// Show recent translation entries
     Recent {
         /// Number of entries to show
@@ -1060,6 +1062,12 @@ async fn run_batch(
 
 fn run_history(args: HistoryArgs) -> Result<()> {
     let history = HistoryDB::default();
+    if args.clear {
+        let n = history.clear()?;
+        eprintln!("Cleared {n} history entries.");
+        return Ok(());
+    }
+
     let n_recent = match &args.action {
         Some(HistoryAction::Recent { n }) => *n,
         _ => 10,
@@ -1094,10 +1102,6 @@ fn run_history(args: HistoryArgs) -> Result<()> {
             }
             None => eprintln!("No history data."),
         },
-        Some(HistoryAction::Clear) => {
-            let n = history.clear()?;
-            eprintln!("Cleared {n} history entries.");
-        }
     }
     Ok(())
 }
@@ -1236,6 +1240,27 @@ mod tests {
 
         let segmenter = make_segmenter_from_path(tokenizer_path);
         assert_eq!(segmenter.count_tokens("abcd"), 1);
+    }
+
+    #[test]
+    fn parses_history_clear_flag() {
+        let cli = Cli::try_parse_from(["hymt", "history", "--clear"]).unwrap();
+        match cli.cmd {
+            Some(Cmd::History(args)) => {
+                assert!(args.clear);
+                assert!(args.action.is_none());
+            }
+            _ => panic!("expected history command"),
+        }
+    }
+
+    #[test]
+    fn rejects_history_clear_with_subcommand() {
+        let err = match Cli::try_parse_from(["hymt", "history", "--clear", "stats"]) {
+            Ok(_) => panic!("expected argument conflict"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]

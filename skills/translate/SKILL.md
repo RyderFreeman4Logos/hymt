@@ -72,7 +72,7 @@ Template-specific options:
 - `hymt batch DIRECTORY [-l <lang>] [--recursive] [--dry-run] [--output-dir <dir>] [--yes]`
 - `hymt history`
 - `hymt history stats`
-- `hymt history clear`
+- `hymt history --clear`
 - `hymt history recent [N]`
 - `hymt recall [<position>]`
 - `hymt translate-doc <FILE|DIR> [-l <lang>] [--recursive] [--watch] [--output-dir <dir>]`
