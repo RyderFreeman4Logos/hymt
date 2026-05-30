@@ -1,10 +1,11 @@
 mod zsh_plugin;
 
-use std::io::{self, Read};
+use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Args, CommandFactory, Parser, Subcommand};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use hymt_cache::history::HistoryDB;
 use hymt_client::TranslationClient;
@@ -19,7 +20,10 @@ use hymt_translate::doc_translate::{run_doc_translation, DocTranslationOpts};
 use hymt_translate::docs::{run_info_command, run_man_command, ManInfoOpts};
 use hymt_translate::exec_wrapper::run_exec_command;
 use hymt_translate::precache::run_precache;
-use hymt_translate::{plan_translation, translate_file, translate_text, TranslationCtx};
+use hymt_translate::{
+    plan_translation, translate_file, translate_text, translate_text_stream_with_mode, StreamEvent,
+    StreamOutputMode, TranslationCtx,
+};
 
 // ── Known subcommand names (for smart routing) ────────────────────────────────
 
@@ -64,7 +68,7 @@ struct Cli {
     #[arg(long, global = true)]
     plan: bool,
 
-    /// Enable streaming (accepted for compatibility; no effect on backend)
+    /// Enable streaming output
     #[arg(long, global = true, overrides_with = "no_stream")]
     stream: bool,
 
@@ -446,6 +450,10 @@ async fn run() -> Result<()> {
     let target_lang = cli.lang.as_deref().unwrap_or(&default_lang);
     let explicit_target = cli.lang.is_some();
     let template = TemplateType::from(&cli.template);
+    let translate_flags = TranslateFlags {
+        show_plan: cli.plan,
+        stream_output: cli.stream && !cli.no_stream,
+    };
     let terms = parse_terms(&cli.term);
     let prompt_opts = PromptOpts {
         terms: if terms.is_empty() { None } else { Some(terms) },
@@ -463,7 +471,7 @@ async fn run() -> Result<()> {
                 &template,
                 &prompt_opts,
                 explicit_target,
-                cli.plan,
+                translate_flags,
                 &config,
             )
             .await
@@ -475,7 +483,7 @@ async fn run() -> Result<()> {
                 &template,
                 &prompt_opts,
                 explicit_target,
-                cli.plan,
+                translate_flags,
                 &config,
             )
             .await
@@ -538,13 +546,19 @@ fn make_client(config: &HotConfig) -> Result<TranslationClient> {
 
 // ── Translate text / stdin ────────────────────────────────────────────────────
 
+#[derive(Clone, Copy)]
+struct TranslateFlags {
+    show_plan: bool,
+    stream_output: bool,
+}
+
 async fn run_translate_text(
     words: &[String],
     target_lang: &str,
     template: &TemplateType,
     opts: &PromptOpts,
     explicit_target: bool,
-    show_plan: bool,
+    flags: TranslateFlags,
     config: &HotConfig,
 ) -> Result<()> {
     // If the single "word" is an existing file path, treat it as translate-file.
@@ -557,7 +571,7 @@ async fn run_translate_text(
                 template,
                 opts,
                 explicit_target,
-                show_plan,
+                flags,
                 config,
             )
             .await;
@@ -579,7 +593,7 @@ async fn run_translate_text(
         )
     };
 
-    if show_plan {
+    if flags.show_plan {
         let plan = plan_translation(&text, &effective_lang, config, &segmenter, template, opts)?;
         eprintln!(
             "Plan: {} segments, ~{} tokens",
@@ -596,6 +610,10 @@ async fn run_translate_text(
         segmenter: &segmenter,
         history: &history,
     };
+    if flags.stream_output {
+        return translate_text_to_stdout_streaming(&text, &effective_lang, template, opts, &tctx)
+            .await;
+    }
     let translated = translate_text(&text, &effective_lang, template, opts, &tctx).await?;
     print!("{translated}");
     if !translated.ends_with('\n') {
@@ -609,7 +627,7 @@ async fn run_translate_stdin(
     template: &TemplateType,
     opts: &PromptOpts,
     explicit_target: bool,
-    show_plan: bool,
+    flags: TranslateFlags,
     config: &HotConfig,
 ) -> Result<()> {
     let mut text = String::new();
@@ -636,7 +654,7 @@ async fn run_translate_stdin(
         )
     };
 
-    if show_plan {
+    if flags.show_plan {
         let plan = plan_translation(&text, &effective_lang, config, &segmenter, template, opts)?;
         eprintln!(
             "Plan: {} segments, ~{} tokens",
@@ -653,6 +671,10 @@ async fn run_translate_stdin(
         segmenter: &segmenter,
         history: &history,
     };
+    if flags.stream_output {
+        return translate_text_to_stdout_streaming(&text, &effective_lang, template, opts, &tctx)
+            .await;
+    }
     let translated = translate_text(&text, &effective_lang, template, opts, &tctx).await?;
     print!("{translated}");
     if !translated.ends_with('\n') {
@@ -667,7 +689,7 @@ async fn run_translate_path(
     template: &TemplateType,
     opts: &PromptOpts,
     explicit_target: bool,
-    show_plan: bool,
+    flags: TranslateFlags,
     config: &HotConfig,
 ) -> Result<()> {
     let text = std::fs::read_to_string(path)?;
@@ -685,7 +707,7 @@ async fn run_translate_path(
         )
     };
 
-    if show_plan {
+    if flags.show_plan {
         let plan = plan_translation(&text, &effective_lang, config, &segmenter, template, opts)?;
         eprintln!(
             "Plan: {} segments, ~{} tokens",
@@ -702,7 +724,77 @@ async fn run_translate_path(
         segmenter: &segmenter,
         history: &history,
     };
+    if flags.stream_output {
+        return translate_text_to_stdout_streaming(&text, &effective_lang, template, opts, &tctx)
+            .await;
+    }
     translate_file(path, None, &effective_lang, template, opts, &tctx).await?;
+    Ok(())
+}
+
+async fn translate_text_to_stdout_streaming(
+    text: &str,
+    target_lang: &str,
+    template: &TemplateType,
+    opts: &PromptOpts,
+    tctx: &TranslationCtx<'_>,
+) -> Result<()> {
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    let output_mode = if io::stdout().is_terminal() {
+        StreamOutputMode::Optimistic
+    } else {
+        StreamOutputMode::Validated
+    };
+    let translate =
+        translate_text_stream_with_mode(text, target_lang, template, opts, tctx, output_mode, tx);
+    let print = print_stream_events(rx);
+    let (_translated, ()) = tokio::try_join!(translate, print)?;
+    Ok(())
+}
+
+async fn print_stream_events(mut rx: tokio::sync::mpsc::Receiver<StreamEvent>) -> Result<()> {
+    let mut stdout = tokio::io::stdout();
+    write_stream_events(&mut rx, &mut stdout).await
+}
+
+async fn write_stream_events<W>(
+    rx: &mut tokio::sync::mpsc::Receiver<StreamEvent>,
+    stdout: &mut W,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut streamed_prefix = String::new();
+
+    while let Some(event) = rx.recv().await {
+        match event {
+            StreamEvent::Token(token) => {
+                stdout.write_all(token.as_bytes()).await?;
+                stdout.flush().await?;
+                streamed_prefix.push_str(&token);
+            }
+            StreamEvent::SegmentDone(_) => {}
+            StreamEvent::AllDone(translated) => {
+                if let Some(rest) = translated.strip_prefix(&streamed_prefix) {
+                    stdout.write_all(rest.as_bytes()).await?;
+                } else if streamed_prefix.is_empty() {
+                    stdout.write_all(translated.as_bytes()).await?;
+                } else {
+                    eprintln!(
+                        "Warning: streamed prefix differed from final translation; \
+                         replaying final translation to avoid truncating stdout"
+                    );
+                    stdout.write_all(translated.as_bytes()).await?;
+                }
+                if !translated.ends_with('\n') {
+                    stdout.write_all(b"\n").await?;
+                }
+                stdout.flush().await?;
+                break;
+            }
+        }
+    }
+
     Ok(())
 }
 

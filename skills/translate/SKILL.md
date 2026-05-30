@@ -96,9 +96,9 @@ Related skills cover command/documentation translation:
 - When optional language detection support is installed, mixed-language runs show a per-paragraph plan and prompt: `X of Y paragraphs are already in <target_lang>. Translate only the remaining Z paragraphs? (y/n/all)`. `y` keeps target-language paragraphs, `all` translates every non-code paragraph, and `n` cancels.
 - `--yes` and non-interactive stdin auto-select partial translation for mixed-language input.
 - If all detected paragraphs are already in the target language, interactive runs still ask whether to translate anyway.
-- Fenced code blocks are excluded from language detection and translation in every mode.
-- `[translation].stream = true` is the default. `--stream`/`--no-stream` are accepted for forward compatibility; the effective streaming mode is controlled by `[translation].stream` in config.
-- Streaming runs buffer each translated segment until completeness validation passes, then send that segment to stdout; non-streaming runs buffer output until completion.
+- Fenced code blocks and leading YAML frontmatter are excluded from language detection and translation in every mode.
+- `--stream` starts remaining chunks after segment 0's first backend token when `[translation].first_chunk_priority = true`. On a terminal, segment 0 tokens are shown optimistically for low TTFT; when stdout is a pipe/file, segment 0 output is buffered until completeness passes and leading untranslated blocks are emitted first so final stdout remains complete and in order. If segment 0 is cached or not the first missing segment, stdout stays buffered until the final translation is ready. `--no-stream` keeps the existing buffered stdout behavior.
+- Streaming caches completed segments and emits the final reconstructed remainder after all chunks finish, so stdout remains complete and in segment order.
 - Progress is written to stderr as `[done/total] XX.XX% | elapsed 2m47s | eta 1m23s | NN.NN tok/s`.
 - Identical source segments, target language, template type, and template-specific options reuse cached segment translations.
 - Each segment is validated for minimum output/input character ratio, paragraph retention, and Markdown heading preservation. Failed segments are retried up to `[completeness].max_retries` (default `2`) before raising an error.

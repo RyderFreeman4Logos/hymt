@@ -304,7 +304,14 @@ fn split_document_sections(text: &str) -> Vec<DocumentSection> {
         paragraph_lines.clear();
     };
 
-    for line in lines_with_endings(text) {
+    let body = if let Some((frontmatter, rest)) = split_yaml_frontmatter(text) {
+        sections.push(DocumentSection::raw(frontmatter, SectionKind::Code, None));
+        rest
+    } else {
+        text
+    };
+
+    for line in lines_with_endings(body) {
         if !code_lines.is_empty() {
             code_lines.push(line);
             if is_closing_fence(line, fence_char, fence_len) {
@@ -346,6 +353,28 @@ fn split_document_sections(text: &str) -> Vec<DocumentSection> {
     }
     flush_paragraph(&mut sections, &mut paragraph_lines, &mut paragraph_index);
     sections
+}
+
+fn split_yaml_frontmatter(text: &str) -> Option<(&str, &str)> {
+    let first_line_end = text.find('\n')? + 1;
+    let first_line = &text[..first_line_end];
+    if !is_yaml_frontmatter_marker(first_line) {
+        return None;
+    }
+
+    let mut offset = first_line_end;
+    for line in lines_with_endings(&text[first_line_end..]) {
+        offset += line.len();
+        if is_yaml_frontmatter_marker(line) {
+            return Some((&text[..offset], &text[offset..]));
+        }
+    }
+
+    None
+}
+
+fn is_yaml_frontmatter_marker(line: &str) -> bool {
+    line.trim_end() == "---"
 }
 
 /// Iterates over lines of `text`, preserving line endings.
@@ -495,6 +524,33 @@ mod tests {
         let text = "~~~python\nprint('hi')\n~~~\n";
         let sections = split_document_sections(text);
         assert!(sections.iter().any(|s| s.kind == SectionKind::Code));
+    }
+
+    #[test]
+    fn yaml_frontmatter_is_untranslated_code_section() {
+        let text = "---\ntitle: Test\n---\n\nBody paragraph.\n";
+        let sections = split_document_sections(text);
+        assert_eq!(sections[0].kind, SectionKind::Code);
+        assert_eq!(sections[0].text, "---\ntitle: Test\n---\n");
+        assert!(!sections[0].should_translate);
+        assert!(sections
+            .iter()
+            .any(|s| s.kind == SectionKind::Paragraph && s.text == "Body paragraph.\n"));
+    }
+
+    #[test]
+    fn indented_yaml_marker_remains_paragraph() {
+        let text = " ---\ntitle: Test\n---\n\nBody paragraph.\n";
+        let sections = split_document_sections(text);
+        assert_eq!(sections[0].kind, SectionKind::Paragraph);
+        assert_eq!(sections[0].text, " ---\ntitle: Test\n---\n");
+    }
+
+    #[test]
+    fn unclosed_document_start_marker_remains_paragraph() {
+        let text = "---\nBody paragraph.\n";
+        let sections = split_document_sections(text);
+        assert_eq!(sections[0].kind, SectionKind::Paragraph);
     }
 
     #[test]
