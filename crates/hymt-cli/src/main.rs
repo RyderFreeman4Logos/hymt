@@ -288,6 +288,7 @@ struct BatchArgs {
 // ── history ───────────────────────────────────────────────────────────────────
 
 #[derive(Args)]
+#[command(args_conflicts_with_subcommands = true)]
 struct HistoryArgs {
     /// Clear all history
     #[arg(long)]
@@ -1257,6 +1258,15 @@ mod tests {
             }
             _ => panic!("expected history command"),
         }
+    }
+
+    #[test]
+    fn rejects_history_clear_with_subcommand() {
+        let err = match Cli::try_parse_from(["hymt", "history", "--clear", "stats"]) {
+            Ok(_) => panic!("expected argument conflict"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]
