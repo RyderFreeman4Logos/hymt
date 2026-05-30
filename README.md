@@ -66,9 +66,11 @@ context_window = 65536
 max_output_tokens = 4096
 concurrency = 8
 stream = true
-max_retranslation_retries = 10
 config_version = 1
 timeout = 600
+
+[completeness]
+max_retries = 2
 
 [timing]
 divergence_threshold = 2.0
@@ -144,7 +146,7 @@ Behavior:
 
 - Default target is `zh`, and Markdown outputs normalize to `.zh-cn.md`.
 - Directory mode translates Markdown files and preserves relative paths when `--output-dir` is used.
-- Retry count is controlled by `[translation].max_retranslation_retries`.
+- Completeness retry count is controlled by `[completeness].max_retries`.
 
 ## Batch translate directory trees
 

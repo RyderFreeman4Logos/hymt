@@ -66,9 +66,11 @@ context_window = 65536
 max_output_tokens = 4096
 concurrency = 8
 stream = true
-max_retranslation_retries = 10
 config_version = 1
 timeout = 600
+
+[completeness]
+max_retries = 2
 
 [timing]
 divergence_threshold = 2.0
@@ -144,7 +146,7 @@ hymt translate-doc docs/ --recursive
 
 - 默认目标语言为`zh`，Markdown输出文件会自动命名为`.zh-cn.md`。
 - 当使用`--output-dir`参数时，目录模式会翻译Markdown文件并保留相对路径。
-- 重试次数由`[translation].max_retranslation_retries`控制。
+- 完整性校验重试次数由`[completeness].max_retries`控制。
 
 ## 批量翻译目录树
 

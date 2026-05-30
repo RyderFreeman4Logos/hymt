@@ -19,7 +19,6 @@ context_window = 16384
 max_output_tokens = 4096
 concurrency = 1
 stream = true
-max_retranslation_retries = 10
 config_version = 1
 timeout = 600
 first_chunk_priority = false
@@ -181,10 +180,6 @@ impl HotConfig {
 
     pub fn stream(&self) -> bool {
         self.get_bool("translation", "stream", true)
-    }
-
-    pub fn max_retranslation_retries(&self) -> u32 {
-        self.get_positive_u32("translation", "max_retranslation_retries", 10)
     }
 
     pub fn config_version(&self) -> u32 {
@@ -447,7 +442,6 @@ mod tests {
         assert_eq!(cfg.primary_lang(), "zh");
         assert_eq!(cfg.secondary_lang(), "en");
         assert_eq!(cfg.stream(), true);
-        assert_eq!(cfg.max_retranslation_retries(), 10);
         assert!((cfg.timeout() - 600.0).abs() < f64::EPSILON);
         assert!((cfg.completeness_zh_to_en_min_ratio() - 0.3).abs() < f64::EPSILON);
         assert!((cfg.completeness_en_to_zh_min_ratio() - 0.3).abs() < f64::EPSILON);
