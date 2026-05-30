@@ -1,6 +1,6 @@
 mod zsh_plugin;
 
-use std::io::{self, Read};
+use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -21,8 +21,8 @@ use hymt_translate::docs::{run_info_command, run_man_command, ManInfoOpts};
 use hymt_translate::exec_wrapper::run_exec_command;
 use hymt_translate::precache::run_precache;
 use hymt_translate::{
-    plan_translation, translate_file, translate_text, translate_text_stream, StreamEvent,
-    TranslationCtx,
+    plan_translation, translate_file, translate_text, translate_text_stream_with_mode, StreamEvent,
+    StreamOutputMode, TranslationCtx,
 };
 
 // ── Known subcommand names (for smart routing) ────────────────────────────────
@@ -740,7 +740,13 @@ async fn translate_text_to_stdout_streaming(
     tctx: &TranslationCtx<'_>,
 ) -> Result<()> {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
-    let translate = translate_text_stream(text, target_lang, template, opts, tctx, tx);
+    let output_mode = if io::stdout().is_terminal() {
+        StreamOutputMode::Optimistic
+    } else {
+        StreamOutputMode::Validated
+    };
+    let translate =
+        translate_text_stream_with_mode(text, target_lang, template, opts, tctx, output_mode, tx);
     let print = print_stream_events(rx);
     let (_translated, ()) = tokio::try_join!(translate, print)?;
     Ok(())

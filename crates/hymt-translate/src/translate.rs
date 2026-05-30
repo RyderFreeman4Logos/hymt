@@ -38,7 +38,7 @@ pub struct TranslationCtx<'a> {
 /// Incremental translation output emitted by [`translate_text_stream`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StreamEvent {
-    /// A streamed token from segment 0.
+    /// A streamed output chunk from the start of the reconstructed document.
     Token(String),
     /// A segment has completed and is available for reconstruction.
     ///
@@ -46,6 +46,15 @@ pub enum StreamEvent {
     SegmentDone(usize),
     /// The complete reconstructed translation.
     AllDone(String),
+}
+
+/// Controls when segment 0 output is emitted while first-chunk priority is active.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamOutputMode {
+    /// Buffer segment 0 until it passes completeness validation.
+    Validated,
+    /// Emit segment 0 tokens as soon as the streaming backend returns them.
+    Optimistic,
 }
 
 // ── Token budget constants (matches translate.py) ─────────────────────────────
@@ -98,6 +107,26 @@ impl TranslationPlan {
             }
             Some(plan) => reconstruct_sections(plan, &self.segment_section_indexes, translations),
         }
+    }
+
+    /// Return untranslated source text that reconstructs before `segment_index`.
+    fn reconstruct_prefix_before_segment(&self, segment_index: usize) -> String {
+        let Some(plan) = &self.document_plan else {
+            return String::new();
+        };
+        let first_section = self
+            .segment_section_groups
+            .get(segment_index)
+            .and_then(|group| group.first().copied())
+            .or_else(|| self.segment_section_indexes.get(segment_index).copied());
+        let Some(first_section) = first_section else {
+            return String::new();
+        };
+        plan.sections
+            .iter()
+            .take(first_section)
+            .map(|section| section.text.as_str())
+            .collect()
     }
 }
 
@@ -458,6 +487,7 @@ async fn translate_segment_with_completeness_streaming(
     request: SegmentTranslateRequest<'_>,
     event_tx: &mpsc::Sender<StreamEvent>,
     first_token_tx: Option<mpsc::Sender<()>>,
+    output_mode: StreamOutputMode,
 ) -> Result<(String, f64)> {
     let max_retries = request.config.completeness_max_retries() as usize;
     let started = Instant::now();
@@ -475,26 +505,36 @@ async fn translate_segment_with_completeness_streaming(
     let mut translated = String::new();
     let mut streamed_tokens: Vec<String> = Vec::new();
     let mut first_token_tx = first_token_tx;
+    let mut emitted_optimistically = false;
 
     while let Some(item) = stream.next().await {
         let token = item.map_err(|e| anyhow!("HTTP streaming translation failed: {e}"))?;
         if token.is_empty() {
             continue;
         }
+        if let Some(tx) = first_token_tx.take() {
+            let _ = tx.try_send(());
+        }
         translated.push_str(&token);
-        streamed_tokens.push(token);
+        match output_mode {
+            StreamOutputMode::Validated => streamed_tokens.push(token),
+            StreamOutputMode::Optimistic => {
+                emitted_optimistically = true;
+                send_stream_event(event_tx, StreamEvent::Token(token)).await?;
+            }
+        }
     }
 
     let mut best = translated;
     let result = check_completeness(request.segment, &best, request.target_lang, request.config);
     if result.is_complete {
-        // Tokens are replayed only after completeness validation.  This delays
-        // TTFT until segment 0 is known-good, but prevents stdout from receiving
-        // a superseded first attempt that cannot be un-emitted after a retry.
-        for token in streamed_tokens {
-            send_stream_event(event_tx, StreamEvent::Token(token)).await?;
-            if let Some(tx) = first_token_tx.take() {
-                let _ = tx.send(()).await;
+        // Non-tty output replays buffered tokens only after completeness
+        // validation. TTY output has already emitted them optimistically; in
+        // both modes the parallel chunks are released by the genuine first SSE
+        // token above, not by this validation point.
+        if output_mode == StreamOutputMode::Validated {
+            for token in streamed_tokens {
+                send_stream_event(event_tx, StreamEvent::Token(token)).await?;
             }
         }
         send_stream_event(event_tx, StreamEvent::SegmentDone(request.index)).await?;
@@ -538,10 +578,12 @@ async fn translate_segment_with_completeness_streaming(
         best = translated;
 
         if result.is_complete {
-            if !best.is_empty() {
+            if !best.is_empty()
+                && (output_mode == StreamOutputMode::Validated || !emitted_optimistically)
+            {
                 send_stream_event(event_tx, StreamEvent::Token(best.clone())).await?;
                 if let Some(tx) = first_token_tx.take() {
-                    let _ = tx.send(()).await;
+                    let _ = tx.try_send(());
                 }
             }
             send_stream_event(event_tx, StreamEvent::SegmentDone(request.index)).await?;
@@ -568,10 +610,10 @@ async fn translate_segment_with_completeness_streaming(
         request.index + 1,
         max_retries
     );
-    if !best.is_empty() {
+    if !best.is_empty() && (output_mode == StreamOutputMode::Validated || !emitted_optimistically) {
         send_stream_event(event_tx, StreamEvent::Token(best.clone())).await?;
         if let Some(tx) = first_token_tx.take() {
-            let _ = tx.send(()).await;
+            let _ = tx.try_send(());
         }
     }
     send_stream_event(event_tx, StreamEvent::SegmentDone(request.index)).await?;
@@ -846,9 +888,9 @@ pub async fn translate_text(
 
 /// Translate `text` and emit incremental output events for the pipeline path.
 ///
-/// Token events are emitted only for uncached segment 0 after completeness is
-/// known. When first-chunk priority is disabled or segment 0 is already cached,
-/// the final translation is emitted as [`StreamEvent::AllDone`] after the normal
+/// Segment 0 output is buffered until completeness validation passes. When
+/// first-chunk priority is disabled or segment 0 is already cached, the final
+/// translation is emitted as [`StreamEvent::AllDone`] after the normal
 /// translation completes.
 pub async fn translate_text_stream(
     text: &str,
@@ -856,6 +898,28 @@ pub async fn translate_text_stream(
     template: &TemplateType,
     opts: &PromptOpts,
     ctx: &TranslationCtx<'_>,
+    event_tx: mpsc::Sender<StreamEvent>,
+) -> Result<String> {
+    translate_text_stream_with_mode(
+        text,
+        target_lang,
+        template,
+        opts,
+        ctx,
+        StreamOutputMode::Validated,
+        event_tx,
+    )
+    .await
+}
+
+/// Translate `text` and emit incremental output events with an explicit mode.
+pub async fn translate_text_stream_with_mode(
+    text: &str,
+    target_lang: &str,
+    template: &TemplateType,
+    opts: &PromptOpts,
+    ctx: &TranslationCtx<'_>,
+    output_mode: StreamOutputMode,
     event_tx: mpsc::Sender<StreamEvent>,
 ) -> Result<String> {
     if text.is_empty() {
@@ -934,6 +998,11 @@ pub async fn translate_text_stream(
             let event_tx_clone = event_tx.clone();
             let (first_token_tx, mut first_token_rx) = mpsc::channel(1);
 
+            let leading_prefix = plan.reconstruct_prefix_before_segment(chunk_idx);
+            if !leading_prefix.is_empty() {
+                send_stream_event(&event_tx, StreamEvent::Token(leading_prefix)).await?;
+            }
+
             let mut priority_task = tokio::spawn(async move {
                 let (translated, _elapsed) = translate_segment_with_completeness_streaming(
                     SegmentTranslateRequest {
@@ -947,6 +1016,7 @@ pub async fn translate_text_stream(
                     },
                     &event_tx_clone,
                     Some(first_token_tx),
+                    output_mode,
                 )
                 .await?;
                 Ok((chunk_idx, translated))
@@ -1220,7 +1290,10 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::path::PathBuf;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    };
 
     use chrono::{SecondsFormat, Utc};
     use hymt_cache::history::HistoryDB;
@@ -1228,6 +1301,7 @@ mod tests {
     use hymt_segment::Segmenter;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::Notify;
 
     fn fallback_segmenter() -> Segmenter {
         Segmenter::fallback()
@@ -1243,7 +1317,19 @@ mod tests {
         handle: tokio::task::JoinHandle<()>,
     }
 
+    struct GatedMockServer {
+        endpoint_url: String,
+        parallel_before_stream_done: Arc<AtomicBool>,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
     impl Drop for MockServer {
+        fn drop(&mut self) {
+            self.handle.abort();
+        }
+    }
+
+    impl Drop for GatedMockServer {
         fn drop(&mut self) {
             self.handle.abort();
         }
@@ -1273,6 +1359,81 @@ mod tests {
         mut socket: TcpStream,
         responses: Arc<Mutex<VecDeque<MockResponse>>>,
     ) -> std::io::Result<()> {
+        read_http_headers(&mut socket).await?;
+        let response = {
+            responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("mock response queue exhausted")
+        };
+        write_mock_response(socket, response).await
+    }
+
+    async fn start_gated_first_token_server(
+        segment0_tokens: Vec<String>,
+        parallel_responses: Vec<String>,
+    ) -> GatedMockServer {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let segment0_tokens = Arc::new(segment0_tokens);
+        let parallel_responses = Arc::new(Mutex::new(VecDeque::from(parallel_responses)));
+        let first_request_seen = Arc::new(AtomicBool::new(false));
+        let stream_completed = Arc::new(AtomicBool::new(false));
+        let parallel_before_stream_done = Arc::new(AtomicBool::new(false));
+        let release_stream = Arc::new(Notify::new());
+
+        let handle = tokio::spawn({
+            let segment0_tokens = Arc::clone(&segment0_tokens);
+            let parallel_responses = Arc::clone(&parallel_responses);
+            let first_request_seen = Arc::clone(&first_request_seen);
+            let stream_completed = Arc::clone(&stream_completed);
+            let parallel_before_stream_done = Arc::clone(&parallel_before_stream_done);
+            let release_stream = Arc::clone(&release_stream);
+            async move {
+                while let Ok((socket, _)) = listener.accept().await {
+                    let segment0_tokens = Arc::clone(&segment0_tokens);
+                    let parallel_responses = Arc::clone(&parallel_responses);
+                    let stream_completed = Arc::clone(&stream_completed);
+                    let parallel_before_stream_done = Arc::clone(&parallel_before_stream_done);
+                    let release_stream = Arc::clone(&release_stream);
+                    let is_first = !first_request_seen.swap(true, Ordering::SeqCst);
+                    tokio::spawn(async move {
+                        if is_first {
+                            let _ = serve_gated_stream_connection(
+                                socket,
+                                segment0_tokens,
+                                release_stream,
+                                stream_completed,
+                            )
+                            .await;
+                        } else {
+                            if !stream_completed.load(Ordering::SeqCst) {
+                                parallel_before_stream_done.store(true, Ordering::SeqCst);
+                            }
+                            release_stream.notify_one();
+                            let response = {
+                                parallel_responses
+                                    .lock()
+                                    .unwrap()
+                                    .pop_front()
+                                    .expect("parallel response queue exhausted")
+                            };
+                            let _ = serve_json_connection(socket, response).await;
+                        }
+                    });
+                }
+            }
+        });
+
+        GatedMockServer {
+            endpoint_url: format!("http://{addr}/v1"),
+            parallel_before_stream_done,
+            handle,
+        }
+    }
+
+    async fn read_http_headers(socket: &mut TcpStream) -> std::io::Result<()> {
         let mut buf = Vec::new();
         let mut chunk = [0_u8; 1024];
         loop {
@@ -1285,14 +1446,13 @@ mod tests {
                 break;
             }
         }
+        Ok(())
+    }
 
-        let response = {
-            responses
-                .lock()
-                .unwrap()
-                .pop_front()
-                .expect("mock response queue exhausted")
-        };
+    async fn write_mock_response(
+        mut socket: TcpStream,
+        response: MockResponse,
+    ) -> std::io::Result<()> {
         let (content_type, body) = mock_response_body(response);
         let headers = format!(
             "HTTP/1.1 200 OK\r\n\
@@ -1305,6 +1465,49 @@ mod tests {
         socket.write_all(body.as_bytes()).await?;
         socket.shutdown().await?;
         Ok(())
+    }
+
+    async fn serve_json_connection(mut socket: TcpStream, content: String) -> std::io::Result<()> {
+        read_http_headers(&mut socket).await?;
+        write_mock_response(socket, MockResponse::Json(content)).await
+    }
+
+    async fn serve_gated_stream_connection(
+        mut socket: TcpStream,
+        tokens: Arc<Vec<String>>,
+        release_stream: Arc<Notify>,
+        stream_completed: Arc<AtomicBool>,
+    ) -> std::io::Result<()> {
+        read_http_headers(&mut socket).await?;
+        let first = tokens.first().cloned().unwrap_or_default();
+        let rest: Vec<String> = tokens.iter().skip(1).cloned().collect();
+        let first_body = sse_token_body(&first);
+        let mut rest_body = String::new();
+        for token in rest {
+            rest_body.push_str(&sse_token_body(&token));
+        }
+        rest_body.push_str("data: [DONE]\n\n");
+        let content_len = first_body.len() + rest_body.len();
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\n\
+             content-type: text/event-stream\r\n\
+             content-length: {content_len}\r\n\
+             connection: close\r\n\r\n"
+        );
+
+        socket.write_all(headers.as_bytes()).await?;
+        socket.write_all(first_body.as_bytes()).await?;
+        socket.flush().await?;
+        release_stream.notified().await;
+        socket.write_all(rest_body.as_bytes()).await?;
+        socket.shutdown().await?;
+        stream_completed.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn sse_token_body(token: &str) -> String {
+        format!(r#"data: {{"choices":[{{"finish_reason":null,"delta":{{"content":"{token}"}}}}]}}"#)
+            + "\n\n"
     }
 
     fn mock_response_body(response: MockResponse) -> (&'static str, String) {
@@ -1345,6 +1548,13 @@ mod tests {
     }
 
     fn make_stream_config(endpoint_url: &str) -> hymt_core::config::HotConfig {
+        make_stream_config_with_concurrency(endpoint_url, 1)
+    }
+
+    fn make_stream_config_with_concurrency(
+        endpoint_url: &str,
+        concurrency: usize,
+    ) -> hymt_core::config::HotConfig {
         let path = temp_path("config.toml");
         std::fs::write(
             &path,
@@ -1355,7 +1565,7 @@ url = "{endpoint_url}"
 [translation]
 context_window = 512
 max_output_tokens = 40
-concurrency = 1
+concurrency = {concurrency}
 first_chunk_priority = true
 timeout = 5
 
@@ -1377,9 +1587,21 @@ max_retries = 1
             .to_owned()
     }
 
+    fn frontmatter_regression_source() -> String {
+        "---\ntitle: Streaming Test\n---\n\n".to_owned() + &streaming_regression_source()
+    }
+
     fn complete_translation(label: &str, source_segment: &str) -> String {
         let filler = "x".repeat((source_segment.len() / 2).max(40));
         format!("{label}_{filler} ")
+    }
+
+    fn planned_complete_translations(plan: &TranslationPlan) -> Vec<String> {
+        plan.segments
+            .iter()
+            .enumerate()
+            .map(|(i, segment)| complete_translation(&format!("SEGMENT_{i}"), segment))
+            .collect()
     }
 
     async fn render_events_as_stdout(
@@ -1714,6 +1936,126 @@ max_retries = 1
     }
 
     #[tokio::test]
+    async fn streaming_stdout_is_complete_for_plain_uncached_segment0() {
+        let text = streaming_regression_source();
+        let planning_cfg = make_stream_config("http://127.0.0.1:1/v1");
+        let segmenter = fallback_segmenter();
+        let plan = plan_translation(
+            &text,
+            "zh",
+            &planning_cfg,
+            &segmenter,
+            &TemplateType::Default,
+            &PromptOpts::default(),
+        )
+        .unwrap();
+        assert!(
+            plan.segment_count() >= 2,
+            "test source must split into multiple segments"
+        );
+
+        let translations = planned_complete_translations(&plan);
+        let expected = plan.reconstruct(&translations);
+        let mut responses = vec![MockResponse::Sse(vec![translations[0].clone()])];
+        responses.extend(translations.iter().skip(1).cloned().map(MockResponse::Json));
+        let server = start_mock_server(responses).await;
+        let cfg = make_stream_config(&server.endpoint_url);
+        let history = HistoryDB::new(temp_path("plain-stream-history.db"));
+
+        let (translated, stdout) = translate_and_render_stdout(&text, &cfg, &segmenter, &history)
+            .await
+            .unwrap();
+
+        assert_eq!(translated, expected);
+        assert_eq!(stdout, format!("{expected}\n"));
+    }
+
+    #[tokio::test]
+    async fn streaming_stdout_preserves_leading_frontmatter_prefix() {
+        let text = frontmatter_regression_source();
+        let planning_cfg = make_stream_config("http://127.0.0.1:1/v1");
+        let segmenter = fallback_segmenter();
+        let plan = plan_translation(
+            &text,
+            "zh",
+            &planning_cfg,
+            &segmenter,
+            &TemplateType::Default,
+            &PromptOpts::default(),
+        )
+        .unwrap();
+        assert!(
+            plan.segment_count() >= 2,
+            "test source must split into multiple segments"
+        );
+
+        let translations = planned_complete_translations(&plan);
+        let expected = plan.reconstruct(&translations);
+        let frontmatter = "---\ntitle: Streaming Test\n---\n\n";
+        assert!(expected.starts_with(frontmatter));
+        let mut responses = vec![MockResponse::Sse(vec![translations[0].clone()])];
+        responses.extend(translations.iter().skip(1).cloned().map(MockResponse::Json));
+        let server = start_mock_server(responses).await;
+        let cfg = make_stream_config(&server.endpoint_url);
+        let history = HistoryDB::new(temp_path("frontmatter-stream-history.db"));
+
+        let (translated, stdout) = translate_and_render_stdout(&text, &cfg, &segmenter, &history)
+            .await
+            .unwrap();
+
+        assert_eq!(translated, expected);
+        assert_eq!(stdout, format!("{expected}\n"));
+        assert_eq!(stdout.matches(frontmatter).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn fcp_parallel_chunks_start_after_first_segment0_token() {
+        let text = streaming_regression_source();
+        let planning_cfg = make_stream_config_with_concurrency("http://127.0.0.1:1/v1", 4);
+        let segmenter = fallback_segmenter();
+        let plan = plan_translation(
+            &text,
+            "zh",
+            &planning_cfg,
+            &segmenter,
+            &TemplateType::Default,
+            &PromptOpts::default(),
+        )
+        .unwrap();
+        assert!(
+            plan.segment_count() >= 2,
+            "test source must split into multiple segments"
+        );
+
+        let translations = planned_complete_translations(&plan);
+        let expected = plan.reconstruct(&translations);
+        let first = "SEGMENT_0_".to_owned();
+        let rest = translations[0]
+            .strip_prefix(&first)
+            .expect("test translation must start with first token")
+            .to_owned();
+        let server =
+            start_gated_first_token_server(vec![first, rest], translations[1..].to_vec()).await;
+        let cfg = make_stream_config_with_concurrency(&server.endpoint_url, 4);
+        let history = HistoryDB::new(temp_path("first-token-gate-history.db"));
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            translate_and_render_stdout(&text, &cfg, &segmenter, &history),
+        )
+        .await
+        .expect("parallel chunks did not start after segment 0's first token")
+        .unwrap();
+
+        assert_eq!(result.0, expected);
+        assert_eq!(result.1, format!("{expected}\n"));
+        assert!(
+            server.parallel_before_stream_done.load(Ordering::SeqCst),
+            "parallel segment request arrived only after segment 0 stream completed"
+        );
+    }
+
+    #[tokio::test]
     async fn streaming_stdout_is_complete_when_segment0_is_cached() {
         let text = streaming_regression_source();
         let planning_cfg = make_stream_config("http://127.0.0.1:1/v1");
@@ -1732,12 +2074,7 @@ max_retries = 1
             "test source must split into multiple segments"
         );
 
-        let translations: Vec<String> = plan
-            .segments
-            .iter()
-            .enumerate()
-            .map(|(i, segment)| complete_translation(&format!("SEGMENT_{i}"), segment))
-            .collect();
+        let translations = planned_complete_translations(&plan);
         let expected = plan.reconstruct(&translations);
         let responses = translations
             .iter()
@@ -1786,21 +2123,20 @@ max_retries = 1
             plan.segment_count() >= 2,
             "test source must split into multiple segments"
         );
+        assert_eq!(
+            plan.segment_count(),
+            2,
+            "retry ordering test expects one parallel segment"
+        );
 
-        let translations: Vec<String> = plan
-            .segments
-            .iter()
-            .enumerate()
-            .map(|(i, segment)| complete_translation(&format!("SEGMENT_{i}"), segment))
-            .collect();
+        let translations = planned_complete_translations(&plan);
         let expected = plan.reconstruct(&translations);
-        let mut responses = vec![
-            MockResponse::Sse(vec!["short".to_owned()]),
-            MockResponse::Json(translations[0].clone()),
-        ];
-        responses.extend(translations.iter().skip(1).cloned().map(MockResponse::Json));
-        let server = start_mock_server(responses).await;
-        let cfg = make_stream_config(&server.endpoint_url);
+        let server = start_gated_first_token_server(
+            vec!["short".to_owned()],
+            vec![translations[1].clone(), translations[0].clone()],
+        )
+        .await;
+        let cfg = make_stream_config_with_concurrency(&server.endpoint_url, 2);
         let history = HistoryDB::new(temp_path("retry-history.db"));
 
         let (translated, stdout) = translate_and_render_stdout(&text, &cfg, &segmenter, &history)
