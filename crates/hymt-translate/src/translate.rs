@@ -134,6 +134,120 @@ impl TranslationPlan {
     }
 }
 
+fn untranslated_text_before_segment(
+    plan: &TranslationPlan,
+    segment_index: usize,
+    next_section_index: &mut usize,
+) -> String {
+    let Some(doc_plan) = &plan.document_plan else {
+        return String::new();
+    };
+
+    if let Some(group) = plan
+        .segment_section_groups
+        .get(segment_index)
+        .filter(|group| !group.is_empty())
+    {
+        let start = group[0];
+        if start < *next_section_index {
+            return String::new();
+        }
+        let text = doc_plan.sections[*next_section_index..start]
+            .iter()
+            .map(|section| section.text.as_str())
+            .collect();
+        if let Some(end) = group.last() {
+            *next_section_index = (*end + 1).max(*next_section_index);
+        }
+        return text;
+    }
+
+    let Some(start) = plan.segment_section_indexes.get(segment_index).copied() else {
+        return String::new();
+    };
+    if start < *next_section_index {
+        return String::new();
+    }
+    let text = doc_plan.sections[*next_section_index..start]
+        .iter()
+        .map(|section| section.text.as_str())
+        .collect();
+    *next_section_index = (start + 1).max(*next_section_index);
+    text
+}
+
+fn untranslated_text_after_segments(plan: &TranslationPlan, next_section_index: usize) -> String {
+    let Some(doc_plan) = &plan.document_plan else {
+        return String::new();
+    };
+    doc_plan
+        .sections
+        .get(next_section_index..)
+        .unwrap_or_default()
+        .iter()
+        .map(|section| section.text.as_str())
+        .collect()
+}
+
+fn reconstruction_newline_after_segment(
+    plan: &TranslationPlan,
+    translations: &[Option<String>],
+    segment_index: usize,
+) -> Option<String> {
+    let doc_plan = plan.document_plan.as_ref()?;
+
+    if let Some(group) = plan
+        .segment_section_groups
+        .get(segment_index)
+        .filter(|group| !group.is_empty())
+    {
+        if plan
+            .segment_section_groups
+            .get(segment_index + 1)
+            .is_some_and(|next| next == group)
+        {
+            return None;
+        }
+
+        let source_text: String = group
+            .iter()
+            .map(|&i| doc_plan.sections[i].text.as_str())
+            .collect();
+        if !source_text.ends_with('\n') {
+            return None;
+        }
+
+        let mut output = String::new();
+        for (idx, candidate) in plan.segment_section_groups.iter().enumerate() {
+            if candidate == group {
+                output.push_str(translations.get(idx)?.as_deref()?);
+            }
+        }
+        return (!output.ends_with('\n')).then(|| "\n".to_owned());
+    }
+
+    let section_index = *plan.segment_section_indexes.get(segment_index)?;
+    if plan
+        .segment_section_indexes
+        .get(segment_index + 1)
+        .is_some_and(|next| *next == section_index)
+    {
+        return None;
+    }
+    let section = doc_plan.sections.get(section_index)?;
+    if !section.text.ends_with('\n') {
+        return None;
+    }
+
+    let mut output = String::new();
+    for (idx, candidate) in plan.segment_section_indexes.iter().enumerate() {
+        if *candidate == section_index {
+            output.push_str(translations.get(idx)?.as_deref()?);
+        }
+    }
+    (!output.ends_with('\n')).then(|| "\n".to_owned())
+}
+
 fn reconstruct_sections(
     plan: &DocumentLanguagePlan,
     segment_section_indexes: &[usize],
@@ -961,12 +1075,6 @@ pub async fn translate_text_stream_with_mode(
         return Ok(String::new());
     }
 
-    if !ctx.config.first_chunk_priority() {
-        let translated = translate_text(text, target_lang, template, opts, ctx).await?;
-        send_stream_event(&event_tx, StreamEvent::AllDone(translated.clone())).await?;
-        return Ok(translated);
-    }
-
     let template_name = template.as_str();
     let plan = plan_translation(text, target_lang, ctx.config, ctx.segmenter, template, opts)?;
 
@@ -1018,7 +1126,62 @@ pub async fn translate_text_stream_with_mode(
         }
     }
 
-    if !missing.is_empty() {
+    if !ctx.config.first_chunk_priority() {
+        let mut next_section_index = 0;
+        for idx in 0..plan.segment_count() {
+            let prefix = untranslated_text_before_segment(&plan, idx, &mut next_section_index);
+            if !prefix.is_empty() {
+                send_stream_event(&event_tx, StreamEvent::Token(prefix)).await?;
+            }
+
+            if let Some(cached) = translations[idx].as_ref() {
+                if !cached.is_empty() {
+                    send_stream_event(&event_tx, StreamEvent::Token(cached.clone())).await?;
+                }
+                send_stream_event(&event_tx, StreamEvent::SegmentDone(idx)).await?;
+            } else {
+                let (translated, _elapsed) = translate_segment_with_completeness_streaming(
+                    SegmentTranslateRequest {
+                        index: idx,
+                        client: ctx.client,
+                        segment: &plan.segments[idx],
+                        target_lang,
+                        template,
+                        opts,
+                        config: ctx.config,
+                    },
+                    &event_tx,
+                    None,
+                    // FCP=false sequential path: always use Validated to prevent
+                    // stdout corruption when a segment fails completeness and
+                    // retries (Optimistic would leave irrevocable bad tokens).
+                    StreamOutputMode::Validated,
+                )
+                .await?;
+                let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                if let Err(e) = ctx.history.store_segment_cache(
+                    &seg_hashes[idx],
+                    target_lang,
+                    template_name,
+                    &translated,
+                    &now,
+                    &options_hash,
+                ) {
+                    eprintln!("Warning: cache store error: {e}");
+                }
+                translations[idx] = Some(translated);
+            }
+
+            if let Some(newline) = reconstruction_newline_after_segment(&plan, &translations, idx) {
+                send_stream_event(&event_tx, StreamEvent::Token(newline)).await?;
+            }
+        }
+
+        let suffix = untranslated_text_after_segments(&plan, next_section_index);
+        if !suffix.is_empty() {
+            send_stream_event(&event_tx, StreamEvent::Token(suffix)).await?;
+        }
+    } else if !missing.is_empty() {
         let (priority_chunk, remaining) = partition_pipeline(&missing, true);
         missing = remaining;
 
@@ -1578,6 +1741,21 @@ mod tests {
         endpoint_url: &str,
         concurrency: usize,
     ) -> hymt_core::config::HotConfig {
+        make_stream_config_with_concurrency_and_fcp(endpoint_url, concurrency, true)
+    }
+
+    fn make_stream_config_with_fcp(
+        endpoint_url: &str,
+        first_chunk_priority: bool,
+    ) -> hymt_core::config::HotConfig {
+        make_stream_config_with_concurrency_and_fcp(endpoint_url, 1, first_chunk_priority)
+    }
+
+    fn make_stream_config_with_concurrency_and_fcp(
+        endpoint_url: &str,
+        concurrency: usize,
+        first_chunk_priority: bool,
+    ) -> hymt_core::config::HotConfig {
         let path = temp_path("config.toml");
         std::fs::write(
             &path,
@@ -1589,7 +1767,7 @@ url = "{endpoint_url}"
 context_window = 512
 max_output_tokens = 40
 concurrency = {concurrency}
-first_chunk_priority = true
+first_chunk_priority = {first_chunk_priority}
 timeout = 5
 
 [completeness]
@@ -1991,6 +2169,93 @@ max_retries = 1
 
         assert_eq!(translated, expected);
         assert_eq!(stdout, format!("{expected}\n"));
+    }
+
+    #[tokio::test]
+    async fn streaming_emits_tokens_when_fcp_false_and_segment0_cached() {
+        let text = streaming_regression_source();
+        let planning_cfg = make_stream_config_with_fcp("http://127.0.0.1:1/v1", false);
+        let segmenter = fallback_segmenter();
+        let plan = plan_translation(
+            &text,
+            "zh",
+            &planning_cfg,
+            &segmenter,
+            &TemplateType::Default,
+            &PromptOpts::default(),
+        )
+        .unwrap();
+        assert!(
+            plan.segment_count() >= 2,
+            "test source must split into multiple segments"
+        );
+
+        let translations = planned_complete_translations(&plan);
+        let expected = plan.reconstruct(&translations);
+        let responses = translations
+            .iter()
+            .skip(1)
+            .cloned()
+            .map(|translation| MockResponse::Sse(vec![translation]))
+            .collect();
+        let server = start_mock_server(responses).await;
+        let cfg = make_stream_config_with_fcp(&server.endpoint_url, false);
+        let history = HistoryDB::new(temp_path("fcp-false-cached-history.db"));
+        history
+            .store_segment_cache(
+                &segment_cache_hash(&plan.segments[0]),
+                "zh",
+                TemplateType::Default.as_str(),
+                &translations[0],
+                &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                "",
+            )
+            .unwrap();
+
+        let client = TranslationClient::new(cfg.clone()).unwrap();
+        let ctx = TranslationCtx {
+            config: &cfg,
+            client: &client,
+            segmenter: &segmenter,
+            history: &history,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let translated = translate_text_stream(
+            &text,
+            "zh",
+            &TemplateType::Default,
+            &PromptOpts::default(),
+            &ctx,
+            tx,
+        )
+        .await
+        .unwrap();
+
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+
+        let streamed: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::Token(token) => Some(token.as_str()),
+                StreamEvent::SegmentDone(_) | StreamEvent::AllDone(_) => None,
+            })
+            .collect();
+        let all_done_index = events
+            .iter()
+            .position(|event| matches!(event, StreamEvent::AllDone(_)))
+            .expect("stream must finish with AllDone");
+        let first_token_index = events
+            .iter()
+            .position(|event| matches!(event, StreamEvent::Token(_)))
+            .expect("FCP=false streaming must emit Token events");
+
+        assert_eq!(translated, expected);
+        assert_eq!(streamed, expected);
+        assert!(first_token_index < all_done_index);
+        assert_eq!(events.last(), Some(&StreamEvent::AllDone(expected)));
     }
 
     #[tokio::test]
