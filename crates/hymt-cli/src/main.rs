@@ -1,6 +1,6 @@
 mod zsh_plugin;
 
-use std::io::{self, IsTerminal, Read};
+use std::io::{self, Read};
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -68,8 +68,13 @@ struct Cli {
     #[arg(long, global = true)]
     plan: bool,
 
-    /// Enable streaming output
-    #[arg(long, global = true, overrides_with = "no_stream")]
+    /// Enable streaming output (default: on)
+    #[arg(
+        long,
+        global = true,
+        default_value_t = true,
+        overrides_with = "no_stream"
+    )]
     stream: bool,
 
     /// Disable streaming
@@ -743,11 +748,10 @@ async fn translate_text_to_stdout_streaming(
     tctx: &TranslationCtx<'_>,
 ) -> Result<()> {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
-    let output_mode = if io::stdout().is_terminal() {
-        StreamOutputMode::Optimistic
-    } else {
-        StreamOutputMode::Validated
-    };
+    // Always use Optimistic: the user requested streaming (--stream is
+    // default-on), so emit tokens as they arrive regardless of whether
+    // stdout is a TTY or a pipe (e.g. `hymt ... | bat`).
+    let output_mode = StreamOutputMode::Optimistic;
     let translate =
         translate_text_stream_with_mode(text, target_lang, template, opts, tctx, output_mode, tx);
     let print = print_stream_events(rx);

@@ -668,15 +668,25 @@ async fn translate_segment_with_completeness_streaming(
         );
     }
     if result.is_complete {
-        // Non-tty output replays buffered tokens only after completeness
-        // validation. TTY output has already emitted them optimistically; in
-        // both modes the parallel chunks are released by the genuine first SSE
-        // token above, not by this validation point.
         if output_mode == StreamOutputMode::Validated {
             for token in streamed_tokens {
                 send_stream_event(event_tx, StreamEvent::Token(token)).await?;
             }
         }
+        send_stream_event(event_tx, StreamEvent::SegmentDone(request.index)).await?;
+        return Ok((best, started.elapsed().as_secs_f64()));
+    }
+
+    // Optimistic mode: tokens are already on stdout and cannot be retracted.
+    // Retrying would produce text that diverges from the emitted prefix,
+    // corrupting stdout. Accept the best attempt and warn instead.
+    if emitted_optimistically {
+        eprintln!(
+            "Warning: segment {} failed completeness, using streamed attempt (retry skipped \
+             — tokens already emitted): {:?}",
+            request.index + 1,
+            result.checks_failed
+        );
         send_stream_event(event_tx, StreamEvent::SegmentDone(request.index)).await?;
         return Ok((best, started.elapsed().as_secs_f64()));
     }
@@ -1152,10 +1162,7 @@ pub async fn translate_text_stream_with_mode(
                     },
                     &event_tx,
                     None,
-                    // FCP=false sequential path: always use Validated to prevent
-                    // stdout corruption when a segment fails completeness and
-                    // retries (Optimistic would leave irrevocable bad tokens).
-                    StreamOutputMode::Validated,
+                    output_mode,
                 )
                 .await?;
                 let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
