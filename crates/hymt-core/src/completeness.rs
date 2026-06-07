@@ -40,6 +40,8 @@ pub struct CompletenessResult {
     pub is_complete: bool,
     /// Names of checks that failed: `"token_ratio"`, `"paragraph_count"`, `"heading_preservation"`.
     pub checks_failed: Vec<String>,
+    /// Advisory warnings that do not trigger a retry (e.g. paragraph_count mismatch when token_ratio passes).
+    pub advisory_warnings: Vec<String>,
     pub input_stats: CompletenessStats,
     pub output_stats: CompletenessStats,
 }
@@ -60,13 +62,18 @@ pub fn validate_completeness(
     let input_stats = compute_stats(input_text);
     let output_stats = compute_stats(output_text);
     let mut checks_failed: Vec<String> = Vec::new();
+    let mut advisory_warnings: Vec<String> = Vec::new();
 
     // Check 1: character ratio.
+    let mut char_ratio_passed = None; // None means check was not applicable
     if let Some(min_ratio) = min_char_ratio(target_lang, &thresholds) {
         if input_stats.char_count > 0 {
             let actual_ratio = output_stats.char_count as f64 / input_stats.char_count as f64;
             if actual_ratio < min_ratio {
                 checks_failed.push("token_ratio".to_owned());
+                char_ratio_passed = Some(false);
+            } else {
+                char_ratio_passed = Some(true);
             }
         }
     }
@@ -75,7 +82,13 @@ pub fn validate_completeness(
     if input_stats.paragraph_count > 0 {
         let ratio = output_stats.paragraph_count as f64 / input_stats.paragraph_count as f64;
         if ratio < thresholds.min_paragraph_ratio {
-            checks_failed.push("paragraph_count".to_owned());
+            // Demote to advisory if char_ratio was applicable AND passed.
+            // If char_ratio was NOT applicable (non en/zh) or FAILED, it's a hard failure.
+            if char_ratio_passed == Some(true) {
+                advisory_warnings.push("paragraph_count".to_owned());
+            } else {
+                checks_failed.push("paragraph_count".to_owned());
+            }
         }
     }
 
@@ -87,6 +100,7 @@ pub fn validate_completeness(
     CompletenessResult {
         is_complete: checks_failed.is_empty(),
         checks_failed,
+        advisory_warnings,
         input_stats,
         output_stats,
     }
@@ -279,5 +293,53 @@ mod tests {
         let result = validate_completeness(input, output, "en", None);
         assert!(!result.is_complete);
         assert!(result.checks_failed.len() >= 2);
+    }
+
+    // ── Advisory warnings ────────────────────────────────────────────────────
+
+    #[test]
+    fn zh_to_en_paragraph_merge_is_advisory() {
+        // 3 paras in zh, 1 in en. Ratio = 0.33 < 0.5 (threshold)
+        let input = "第一段。\n\n第二段。\n\n第三段。";
+        let output = "Para one and two and three merged into one single paragraph that is long enough to pass ratio.";
+        let result = validate_completeness(input, output, "en", None);
+        // Should be complete because char_ratio passed (output is long enough)
+        assert!(result.is_complete);
+        assert!(result
+            .advisory_warnings
+            .contains(&"paragraph_count".to_owned()));
+        assert!(!result.checks_failed.contains(&"paragraph_count".to_owned()));
+    }
+
+    #[test]
+    fn en_to_zh_paragraph_merge_is_advisory() {
+        let input = "Para one.\n\nPara two.\n\nPara three.";
+        let output = "第一段、第二段和第三段被合并成了一个足够长的段落。";
+        let result = validate_completeness(input, output, "zh", None);
+        assert!(result.is_complete);
+        assert!(result
+            .advisory_warnings
+            .contains(&"paragraph_count".to_owned()));
+    }
+
+    #[test]
+    fn paragraph_loss_is_hard_failure_when_ratio_also_fails() {
+        let input = "Para one.\n\nPara two.\n\nPara three.";
+        let output = "Short."; // fails ratio AND paragraph count
+        let result = validate_completeness(input, output, "en", None);
+        assert!(!result.is_complete);
+        assert!(result.checks_failed.contains(&"token_ratio".to_owned()));
+        assert!(result.checks_failed.contains(&"paragraph_count".to_owned()));
+        assert!(result.advisory_warnings.is_empty());
+    }
+
+    #[test]
+    fn paragraph_loss_is_hard_failure_for_unsupported_lang() {
+        let input = "Para one.\n\nPara two.\n\nPara three.";
+        let output = "Short.";
+        // "fr" doesn't have char_ratio check, so paragraph_count is the only guard
+        let result = validate_completeness(input, output, "fr", None);
+        assert!(!result.is_complete);
+        assert!(result.checks_failed.contains(&"paragraph_count".to_owned()));
     }
 }
