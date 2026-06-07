@@ -1152,7 +1152,10 @@ pub async fn translate_text_stream_with_mode(
                     },
                     &event_tx,
                     None,
-                    output_mode,
+                    // FCP=false sequential path: always use Validated to prevent
+                    // stdout corruption when a segment fails completeness and
+                    // retries (Optimistic would leave irrevocable bad tokens).
+                    StreamOutputMode::Validated,
                 )
                 .await?;
                 let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
