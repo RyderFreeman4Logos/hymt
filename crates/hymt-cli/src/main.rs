@@ -68,8 +68,13 @@ struct Cli {
     #[arg(long, global = true)]
     plan: bool,
 
-    /// Enable streaming output
-    #[arg(long, global = true, overrides_with = "no_stream")]
+    /// Enable streaming output (default: on)
+    #[arg(
+        long,
+        global = true,
+        default_value_t = true,
+        overrides_with = "no_stream"
+    )]
     stream: bool,
 
     /// Disable streaming
