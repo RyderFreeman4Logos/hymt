@@ -394,6 +394,13 @@ fn cached_segment_is_complete(
     config: &HotConfig,
 ) -> bool {
     let result = check_completeness(segment, cached, target_lang, config);
+    if !result.advisory_warnings.is_empty() {
+        eprintln!(
+            "Note: cached segment {} has advisory warnings: {:?}",
+            index + 1,
+            result.advisory_warnings
+        );
+    }
     if result.is_complete {
         return true;
     }
@@ -443,6 +450,14 @@ async fn translate_segment_with_completeness(
 
         let result = check_completeness(segment, &translated, target_lang, config);
         best = translated;
+
+        if !result.advisory_warnings.is_empty() {
+            eprintln!(
+                "Note: segment {} has advisory warnings: {:?}",
+                index + 1,
+                result.advisory_warnings
+            );
+        }
 
         if result.is_complete {
             return Ok((best, started.elapsed().as_secs_f64()));
@@ -531,6 +546,13 @@ async fn translate_segment_with_completeness_streaming(
 
     let mut best = translated;
     let result = check_completeness(request.segment, &best, request.target_lang, request.config);
+    if !result.advisory_warnings.is_empty() {
+        eprintln!(
+            "Note: segment {} has advisory warnings: {:?}",
+            request.index + 1,
+            result.advisory_warnings
+        );
+    }
     if result.is_complete {
         // Non-tty output replays buffered tokens only after completeness
         // validation. TTY output has already emitted them optimistically; in
@@ -580,6 +602,14 @@ async fn translate_segment_with_completeness_streaming(
             request.config,
         );
         best = translated;
+
+        if !result.advisory_warnings.is_empty() {
+            eprintln!(
+                "Note: segment {} has advisory warnings: {:?}",
+                request.index + 1,
+                result.advisory_warnings
+            );
+        }
 
         if result.is_complete {
             if !best.is_empty()
