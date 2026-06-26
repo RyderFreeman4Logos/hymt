@@ -182,14 +182,14 @@ fn looks_like_translated_cli_help(text: &str) -> bool {
 
 fn preserves_cli_options(input_text: &str, output_text: &str) -> bool {
     let input_options = long_options(input_text);
-    if input_options.is_empty() {
+    if input_options.len() < 2 {
         return false;
     }
     let preserved = input_options
         .iter()
         .filter(|option| output_text.contains(option.as_str()))
         .count();
-    preserved >= 2 && preserved * 2 >= input_options.len()
+    preserved == input_options.len()
 }
 
 fn long_options(text: &str) -> HashSet<String> {
@@ -470,6 +470,56 @@ Examples:\n  verbatim ask \"What supports this?\"\n";
         let result = validate_completeness(input, output, "zh", Some(&tight));
 
         assert!(result.is_complete, "{:?}", result.checks_failed);
+        assert!(result
+            .advisory_warnings
+            .contains(&"cli_help_density".to_owned()));
+    }
+
+    #[test]
+    fn cli_help_translation_missing_half_of_options_still_fails() {
+        let input = "Generate a cited answer.\n\n\
+Usage: verbatim ask [OPTIONS] <QUESTION>...\n\n\
+Arguments:\n  <QUESTION>... Question text\n\n\
+Options:\n  --source-id <SOURCE_ID> Limit retrieval\n  --collection <NAME> Limit retrieval\n  --require-fresh Error on stale collection members\n  --embedding-profile <PROFILE> Use an embedding profile\n  --show-retrieval Show retrieval debug info\n  --context-only Return context without generation\n  --no-generate Alias for context-only\n  --format <FORMAT> Output format\n  --background Queue as background task\n  -h, --help Print help\n\n\
+Examples:\n  verbatim ask \"What supports this?\"\n";
+        let output = "生成带引用的回答。用法：verbatim ask [选项] <问题>...。选项：--source-id、--collection、--require-fresh、--embedding-profile、--show-retrieval。示例：verbatim ask \"有哪些证据？\"。";
+        let tight = CompletenessThresholds {
+            zh_to_en_min_ratio: 10.0,
+            en_to_zh_min_ratio: 10.0,
+            min_paragraph_ratio: 0.9,
+        };
+
+        let result = validate_completeness(input, output, "zh", Some(&tight));
+
+        assert!(!result.is_complete);
+        assert!(result.checks_failed.contains(&"token_ratio".to_owned()));
+        assert!(!result
+            .advisory_warnings
+            .contains(&"cli_help_density".to_owned()));
+    }
+
+    #[test]
+    fn cli_help_real_smoke_translation_preserves_all_options() {
+        let input = "Generate a cited answer.\n\n\
+Usage: verbatim ask [OPTIONS] <QUESTION>...\n\n\
+Arguments:\n  <QUESTION>... Question text\n\n\
+Options:\n  -s, --source-id <SOURCE_ID> Limit retrieval\n  --collection <NAME> Limit retrieval\n  --require-fresh Error on stale collection members\n  --embedding-profile <EMBEDDING_PROFILE> Use an embedding profile\n  --show-retrieval Show retrieval debug info\n  --context-only Return context without generation\n  --no-generate Alias for context-only\n  --format <FORMAT> Output format\n  --background Queue as background task\n  -h, --help Print help\n\n\
+Examples:\n  verbatim ask \"What supports this?\"\n";
+        let output = "用法：verbatim ask [选项] <问题>...\n\n\
+参数：\n  <问题>... 问题文本\n\n\
+选项：\n  -s, --source-id <SOURCE_ID>\n          仅从指定来源进行检索\n      --collection <NAME>\n          仅从指定的材料化集合中检索。如需合并多个集合的结果，可重复使用此选项\n      --require-fresh\n          若集合中的内容已过时，则直接报错而非返回警告信息\n      --embedding-profile <EMBEDDING_PROFILE>\n          使用指定的嵌入配置进行检索\n      --show-retrieval\n          显示检索来源及排序相关的调试信息\n      --context-only\n          返回检索上下文信息，而不调用聊天生成功能\n      --no-generate\n          与--context-only功能相同；不会调用任何聊天模型\n      --format <FORMAT>\n          仅当使用--context-only或--no-generate时生效的输出格式。JSON格式包含结构化的定位符/来源字段 [可选值：markdown, json]\n      --background\n          将请求作为持久后台任务排队处理，并立即返回\n  -h, --help\n          显示帮助信息（使用--help可查看更多内容）\n\n\
+示例：\n  verbatim ask \"报告得出了什么结论？\"\n  verbatim ask --source-id <source-id> --show-retrieval \"有哪些证据支持这一结论？\"\n  verbatim ask --collection articles \"哪些证据是相关的？\"\n  verbatim ask --context-only \"哪些证据是相关的？\"\n  verbatim ask --no-generate --format json \"哪些证据是相关的？\"\n\n\
+注意事项：\n  普通询问模式会在检索完成后调用已配置的聊天模型。\n  --context-only和--no-generate选项仅返回检索上下文信息，不进行聊天生成；在此模式下不支持--background选项。\n  --format选项仅适用于--context-only或--no-generate模式。";
+        let tight = CompletenessThresholds {
+            zh_to_en_min_ratio: 10.0,
+            en_to_zh_min_ratio: 10.0,
+            min_paragraph_ratio: 0.9,
+        };
+
+        let result = validate_completeness(input, output, "zh", Some(&tight));
+
+        assert!(result.is_complete, "{:?}", result.checks_failed);
+        assert!(result.checks_failed.is_empty());
         assert!(result
             .advisory_warnings
             .contains(&"cli_help_density".to_owned()));
