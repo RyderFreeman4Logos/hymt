@@ -180,17 +180,39 @@ pub fn build_prompt(
 // ── Per-template builders ─────────────────────────────────────────────────────
 
 fn build_default(source: &str, target_name: &str, chinese: bool) -> String {
+    let cli_help_note = cli_help_prompt_note(source, chinese);
     if chinese {
         format!(
-            "请将以下文本翻译成{target_name}。注意，你应该只输出翻译结果，不要添加任何解释：\n\n{source}"
+            "请将以下文本翻译成{target_name}。注意，你应该只输出翻译结果，不要添加任何解释：{cli_help_note}\n\n{source}"
         )
     } else {
         format!(
             "Translate the following text into {target_name}. \
 Note that you should only output the translated result without any additional explanation:\
-\n\n{source}"
+{cli_help_note}\n\n{source}"
         )
     }
+}
+
+fn cli_help_prompt_note(source: &str, chinese: bool) -> &'static str {
+    if !looks_like_cli_help_source(source) {
+        return "";
+    }
+    if chinese {
+        " 如果源文本是命令行帮助、用法或选项列表，它本身就是完整待译内容；请逐项翻译 Usage/Arguments/Options/Examples 等标题和说明，保留命令、参数占位符以及 -/-- 选项，不要要求用户再提供输入。"
+    } else {
+        " If the source is command-line help, usage, or an option list, that help text is the complete source to translate; translate Usage/Arguments/Options/Examples headings and descriptions item by item, preserve commands, placeholders, and -/-- options, and do not ask the user to provide more input."
+    }
+}
+
+fn looks_like_cli_help_source(source: &str) -> bool {
+    let lower = source.to_lowercase();
+    lower.contains("usage:")
+        && (lower.contains("options:")
+            || lower.contains("arguments:")
+            || lower.contains("commands:")
+            || lower.contains("examples:"))
+        && lower.contains("--")
 }
 
 fn build_terminology(
@@ -396,6 +418,20 @@ mod tests {
         assert!(p.contains("翻译成中文"));
         assert!(p.contains("Hello"));
         assert!(p.contains("只输出翻译结果"));
+        assert!(!p.contains("命令行帮助"));
+    }
+
+    #[test]
+    fn default_prompt_for_cli_help_treats_help_as_complete_source() {
+        let source = "Usage: verbatim ask [OPTIONS] <QUESTION>...\n\n\
+Options:\n  --source-id <SOURCE_ID>\n  --context-only\n\n\
+Examples:\n  verbatim ask \"What supports this?\"\n";
+        let p = build_prompt(source, "zh", &TemplateType::Default, &opts()).unwrap();
+
+        assert!(p.contains("命令行帮助"));
+        assert!(p.contains("它本身就是完整待译内容"));
+        assert!(p.contains("不要要求用户再提供输入"));
+        assert!(p.contains("--source-id"));
     }
 
     #[test]

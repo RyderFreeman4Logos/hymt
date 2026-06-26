@@ -1,5 +1,7 @@
 use crate::history::format_duration;
 
+const MIN_MEANINGFUL_ESTIMATE_SECONDS: f64 = 0.1;
+
 /// Data captured at translation completion for timing divergence analysis.
 #[derive(Debug, Clone)]
 pub struct TimingIssueData {
@@ -18,9 +20,9 @@ pub struct TimingIssueData {
 impl TimingIssueData {
     /// Ratio of actual to estimated duration.
     ///
-    /// Returns `0.0` when `estimated_seconds <= 0` (no valid estimate).
+    /// Returns `0.0` when `estimated_seconds` is too small to be meaningful.
     pub fn ratio(&self) -> f64 {
-        if self.estimated_seconds <= 0.0 {
+        if self.estimated_seconds < MIN_MEANINGFUL_ESTIMATE_SECONDS {
             return 0.0;
         }
         self.actual_seconds / self.estimated_seconds
@@ -32,12 +34,12 @@ impl TimingIssueData {
 /// `threshold` is clamped to a minimum of `2.0` — values ≤ 1.0 are nonsensical for
 /// divergence detection and default to 2.0 (i.e. 2× in either direction).
 ///
-/// A ratio of `0.0` (no valid estimate) is never considered divergent.
+/// A ratio of `0.0` (no meaningful estimate) is never considered divergent.
 pub fn is_divergent(data: &TimingIssueData, threshold: f64) -> bool {
     let effective = if threshold > 1.0 { threshold } else { 2.0 };
     let ratio = data.ratio();
     if ratio == 0.0 {
-        // No valid estimate — cannot determine divergence
+        // No meaningful estimate — cannot determine divergence
         return false;
     }
     ratio > effective || ratio < 1.0 / effective
@@ -94,6 +96,13 @@ mod tests {
     fn test_zero_estimated_not_divergent() {
         // Issue #53 context: when estimated = 0 (no history), ratio = 0 → not divergent
         let data = make_data(20.0, 0.0);
+        assert!(!is_divergent(&data, 2.0));
+    }
+
+    #[test]
+    fn test_sub_display_estimate_not_divergent() {
+        let data = make_data(6.4, 0.04);
+        assert_eq!(data.ratio(), 0.0);
         assert!(!is_divergent(&data, 2.0));
     }
 

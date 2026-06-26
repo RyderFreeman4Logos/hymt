@@ -488,7 +488,7 @@ impl HistoryDB {
         if config_version.is_some() {
             let broader = self.stats(target_lang, template_type, None)?;
             if let Some(ref s) = broader {
-                if s.avg_tokens_per_second > 0.0 {
+                if s.count >= min_samples && s.avg_tokens_per_second > 0.0 {
                     versions_used = self.distinct_versions()?;
                     return Ok(Some(build_estimate(
                         s,
@@ -515,7 +515,7 @@ impl HistoryDB {
             }
             let global = self.stats(None, None, None)?;
             if let Some(ref s) = global {
-                if s.avg_tokens_per_second > 0.0 {
+                if s.count >= min_samples && s.avg_tokens_per_second > 0.0 {
                     versions_used = self.distinct_versions()?;
                     return Ok(Some(build_estimate(
                         s,
@@ -929,6 +929,29 @@ mod tests {
         db.insert_task(&sample_record(100.0, 5, 500)).unwrap();
         let est = db.estimate(5, 1, None, None, None, Some(3)).unwrap();
         assert!(est.is_none());
+    }
+
+    #[test]
+    fn test_estimate_fallback_below_min_samples_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let db = HistoryDB::new(tmp.path().join("history.db"));
+        db.insert_task(&sample_record(100.0, 1, 1)).unwrap();
+
+        let broadened_config = db
+            .estimate(1, 1, Some("en"), Some("default"), Some(2), None)
+            .unwrap();
+        assert!(
+            broadened_config.is_none(),
+            "config-version fallback must not estimate from one sample"
+        );
+
+        let global = db
+            .estimate(1, 1, Some("zh"), Some("default"), Some(2), None)
+            .unwrap();
+        assert!(
+            global.is_none(),
+            "global fallback must not estimate from one sample"
+        );
     }
 
     #[test]
