@@ -1847,6 +1847,23 @@ max_retries = 1
         segmenter: &Segmenter,
         history: &HistoryDB,
     ) -> Result<(String, String)> {
+        translate_and_render_stdout_with_mode(
+            text,
+            cfg,
+            segmenter,
+            history,
+            StreamOutputMode::Validated,
+        )
+        .await
+    }
+
+    async fn translate_and_render_stdout_with_mode(
+        text: &str,
+        cfg: &hymt_core::config::HotConfig,
+        segmenter: &Segmenter,
+        history: &HistoryDB,
+        output_mode: StreamOutputMode,
+    ) -> Result<(String, String)> {
         let client = TranslationClient::new(cfg.clone())?;
         let ctx = TranslationCtx {
             config: cfg,
@@ -1856,7 +1873,15 @@ max_retries = 1
         };
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let opts = PromptOpts::default();
-        let translate = translate_text_stream(text, "zh", &TemplateType::Default, &opts, &ctx, tx);
+        let translate = translate_text_stream_with_mode(
+            text,
+            "zh",
+            &TemplateType::Default,
+            &opts,
+            &ctx,
+            output_mode,
+            tx,
+        );
         let render = render_events_as_stdout(rx);
         tokio::try_join!(translate, render)
     }
@@ -2447,5 +2472,57 @@ max_retries = 1
                 "stdout dropped translated segment: {segment}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn validated_streaming_retries_single_uncached_segment_before_stdout() {
+        let text = "Usage: ask [OPTIONS]\n\nOptions:\n  -h, --help Print help.\n";
+        let planning_cfg = make_stream_config_with_fcp("http://127.0.0.1:1/v1", false);
+        let segmenter = fallback_segmenter();
+        let plan = plan_translation(
+            text,
+            "zh",
+            &planning_cfg,
+            &segmenter,
+            &TemplateType::Default,
+            &PromptOpts::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.segment_count(),
+            1,
+            "single-help-output regression must stay one segment"
+        );
+
+        let retry_segment = complete_translation("RETRY", &plan.segments[0]);
+        let expected = plan.reconstruct(std::slice::from_ref(&retry_segment));
+        let server = start_mock_server(vec![
+            MockResponse::Sse(vec!["short".to_owned()]),
+            MockResponse::Json(retry_segment),
+        ])
+        .await;
+        let cfg = make_stream_config_with_fcp(&server.endpoint_url, false);
+        let history = HistoryDB::new(temp_path("single-segment-validated-retry-history.db"));
+
+        let (translated, stdout) = translate_and_render_stdout_with_mode(
+            text,
+            &cfg,
+            &segmenter,
+            &history,
+            StreamOutputMode::Validated,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(translated, expected);
+        assert_eq!(
+            stdout,
+            if expected.ends_with('\n') {
+                expected.clone()
+            } else {
+                format!("{expected}\n")
+            }
+        );
+        assert!(!stdout.contains("short"));
     }
 }

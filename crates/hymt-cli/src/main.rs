@@ -1,6 +1,6 @@
 mod zsh_plugin;
 
-use std::io::{self, Read};
+use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -619,8 +619,15 @@ async fn run_translate_text(
         history: &history,
     };
     if flags.stream_output {
-        return translate_text_to_stdout_streaming(&text, &effective_lang, template, opts, &tctx)
-            .await;
+        return translate_text_to_stdout_streaming(
+            &text,
+            &effective_lang,
+            template,
+            opts,
+            &tctx,
+            true,
+        )
+        .await;
     }
     let translated = translate_text(&text, &effective_lang, template, opts, &tctx).await?;
     print!("{translated}");
@@ -638,6 +645,7 @@ async fn run_translate_stdin(
     flags: TranslateFlags,
     config: &HotConfig,
 ) -> Result<()> {
+    let stdin_is_terminal = io::stdin().is_terminal();
     let mut text = String::new();
     io::stdin().read_to_string(&mut text)?;
     if text.is_empty() {
@@ -680,8 +688,15 @@ async fn run_translate_stdin(
         history: &history,
     };
     if flags.stream_output {
-        return translate_text_to_stdout_streaming(&text, &effective_lang, template, opts, &tctx)
-            .await;
+        return translate_text_to_stdout_streaming(
+            &text,
+            &effective_lang,
+            template,
+            opts,
+            &tctx,
+            stdin_is_terminal,
+        )
+        .await;
     }
     let translated = translate_text(&text, &effective_lang, template, opts, &tctx).await?;
     print!("{translated}");
@@ -733,8 +748,15 @@ async fn run_translate_path(
         history: &history,
     };
     if flags.stream_output {
-        return translate_text_to_stdout_streaming(&text, &effective_lang, template, opts, &tctx)
-            .await;
+        return translate_text_to_stdout_streaming(
+            &text,
+            &effective_lang,
+            template,
+            opts,
+            &tctx,
+            false,
+        )
+        .await;
     }
     translate_file(path, None, &effective_lang, template, opts, &tctx).await?;
     Ok(())
@@ -746,17 +768,30 @@ async fn translate_text_to_stdout_streaming(
     template: &TemplateType,
     opts: &PromptOpts,
     tctx: &TranslationCtx<'_>,
+    input_is_interactive: bool,
 ) -> Result<()> {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
-    // Always use Optimistic: the user requested streaming (--stream is
-    // default-on), so emit tokens as they arrive regardless of whether
-    // stdout is a TTY or a pipe (e.g. `hymt ... | bat`).
-    let output_mode = StreamOutputMode::Optimistic;
+    let output_mode = current_stream_output_mode(input_is_interactive);
     let translate =
         translate_text_stream_with_mode(text, target_lang, template, opts, tctx, output_mode, tx);
     let print = print_stream_events(rx);
     let (_translated, ()) = tokio::try_join!(translate, print)?;
     Ok(())
+}
+
+fn current_stream_output_mode(input_is_interactive: bool) -> StreamOutputMode {
+    select_stream_output_mode(input_is_interactive, io::stdout().is_terminal())
+}
+
+fn select_stream_output_mode(
+    input_is_interactive: bool,
+    stdout_is_terminal: bool,
+) -> StreamOutputMode {
+    if input_is_interactive && stdout_is_terminal {
+        StreamOutputMode::Optimistic
+    } else {
+        StreamOutputMode::Validated
+    }
 }
 
 async fn print_stream_events(mut rx: tokio::sync::mpsc::Receiver<StreamEvent>) -> Result<()> {
@@ -1298,6 +1333,30 @@ mod tests {
 
         let segmenter = make_segmenter_from_path(tokenizer_path);
         assert_eq!(segmenter.count_tokens("abcd"), 1);
+    }
+
+    #[test]
+    fn interactive_terminal_uses_optimistic_streaming() {
+        assert_eq!(
+            select_stream_output_mode(true, true),
+            StreamOutputMode::Optimistic
+        );
+    }
+
+    #[test]
+    fn stdin_pipe_uses_validated_streaming() {
+        assert_eq!(
+            select_stream_output_mode(false, true),
+            StreamOutputMode::Validated
+        );
+    }
+
+    #[test]
+    fn stdout_pipe_uses_validated_streaming() {
+        assert_eq!(
+            select_stream_output_mode(true, false),
+            StreamOutputMode::Validated
+        );
     }
 
     #[test]
