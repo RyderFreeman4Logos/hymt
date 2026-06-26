@@ -1,7 +1,7 @@
 mod zsh_plugin;
 
 use std::io::{self, IsTerminal, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use clap::{Args, CommandFactory, Parser, Subcommand};
@@ -78,8 +78,12 @@ struct Cli {
     stream: bool,
 
     /// Disable streaming
-    #[arg(long = "no-stream", global = true)]
+    #[arg(long = "no-stream", alias = "no-streaming", global = true)]
     no_stream: bool,
+
+    /// Write top-level text/stdin/file translation to this file
+    #[arg(short = 'o', long)]
+    output: Option<PathBuf>,
 
     /// Show progress indicators
     #[arg(
@@ -456,7 +460,8 @@ async fn run() -> Result<()> {
     let template = TemplateType::from(&cli.template);
     let translate_flags = TranslateFlags {
         show_plan: cli.plan,
-        stream_output: cli.stream && !cli.no_stream,
+        stream_output: should_stream_translation(cli.stream, cli.no_stream, cli.output.as_ref()),
+        output_path: cli.output.as_deref(),
     };
     let terms = parse_terms(&cli.term);
     let prompt_opts = PromptOpts {
@@ -570,9 +575,18 @@ fn piped_stdin_placeholder(words: &[String], stdin_is_terminal: bool) -> bool {
 // ── Translate text / stdin ────────────────────────────────────────────────────
 
 #[derive(Clone, Copy)]
-struct TranslateFlags {
+struct TranslateFlags<'a> {
     show_plan: bool,
     stream_output: bool,
+    output_path: Option<&'a Path>,
+}
+
+fn should_stream_translation(
+    stream_enabled: bool,
+    no_stream: bool,
+    output_path: Option<&PathBuf>,
+) -> bool {
+    stream_enabled && !no_stream && output_path.is_none()
 }
 
 async fn run_translate_text(
@@ -581,7 +595,7 @@ async fn run_translate_text(
     template: &TemplateType,
     opts: &PromptOpts,
     explicit_target: bool,
-    flags: TranslateFlags,
+    flags: TranslateFlags<'_>,
     config: &HotConfig,
 ) -> Result<()> {
     // If the single "word" is an existing file path, treat it as translate-file.
@@ -645,6 +659,13 @@ async fn run_translate_text(
         .await;
     }
     let translated = translate_text(&text, &effective_lang, template, opts, &tctx).await?;
+    if let Some(out) = flags.output_path {
+        if let Some(parent) = out.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::write(out, &translated).await?;
+        return Ok(());
+    }
     print!("{translated}");
     if !translated.ends_with('\n') {
         println!();
@@ -657,7 +678,7 @@ async fn run_translate_stdin(
     template: &TemplateType,
     opts: &PromptOpts,
     explicit_target: bool,
-    flags: TranslateFlags,
+    flags: TranslateFlags<'_>,
     config: &HotConfig,
 ) -> Result<()> {
     let stdin_is_terminal = io::stdin().is_terminal();
@@ -714,6 +735,13 @@ async fn run_translate_stdin(
         .await;
     }
     let translated = translate_text(&text, &effective_lang, template, opts, &tctx).await?;
+    if let Some(out) = flags.output_path {
+        if let Some(parent) = out.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::write(out, &translated).await?;
+        return Ok(());
+    }
     print!("{translated}");
     if !translated.ends_with('\n') {
         println!();
@@ -727,7 +755,7 @@ async fn run_translate_path(
     template: &TemplateType,
     opts: &PromptOpts,
     explicit_target: bool,
-    flags: TranslateFlags,
+    flags: TranslateFlags<'_>,
     config: &HotConfig,
 ) -> Result<()> {
     let text = std::fs::read_to_string(path)?;
@@ -773,7 +801,15 @@ async fn run_translate_path(
         )
         .await;
     }
-    translate_file(path, None, &effective_lang, template, opts, &tctx).await?;
+    translate_file(
+        path,
+        flags.output_path,
+        &effective_lang,
+        template,
+        opts,
+        &tctx,
+    )
+    .await?;
     Ok(())
 }
 
@@ -1372,6 +1408,33 @@ mod tests {
             select_stream_output_mode(true, false),
             StreamOutputMode::Validated
         );
+    }
+
+    #[test]
+    fn output_file_disables_default_streaming() {
+        let output = PathBuf::from("translated.txt");
+        assert!(!should_stream_translation(true, false, Some(&output)));
+        assert!(should_stream_translation(true, false, None));
+    }
+
+    #[test]
+    fn no_streaming_alias_disables_streaming() {
+        let cli = Cli::try_parse_from(["hymt", "--no-streaming", "hello"]).unwrap();
+        assert!(cli.no_stream);
+        assert!(!should_stream_translation(cli.stream, cli.no_stream, None));
+    }
+
+    #[test]
+    fn parses_top_level_output_for_text_translation() {
+        let cli = Cli::try_parse_from(["hymt", "--output", "translated.txt", "hello"]).unwrap();
+        assert_eq!(
+            cli.output.as_deref(),
+            Some(std::path::Path::new("translated.txt"))
+        );
+        match cli.cmd {
+            Some(Cmd::Text(words)) => assert_eq!(words, vec!["hello".to_owned()]),
+            _ => panic!("expected text command"),
+        }
     }
 
     #[test]

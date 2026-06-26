@@ -874,25 +874,36 @@ pub async fn translate_text(
     // ── Phase 2: parallel translate missing segments ───────────────────────────
 
     if !missing.is_empty() {
-        // Pipeline mode: translate chunk 0 exclusively first so it gets full GPU
-        // throughput and can be displayed while the remaining chunks are translating.
-        let (priority_chunk, remaining) =
-            partition_pipeline(&missing, ctx.config.first_chunk_priority());
-        missing = remaining;
-        if let Some(chunk_idx) = priority_chunk {
-            let (translated, _) = translate_segment_with_completeness(
-                chunk_idx,
-                ctx.client,
-                &plan.segments[chunk_idx],
-                target_lang,
-                template,
-                opts,
-                ctx.config,
-            )
-            .await?;
+        let mut join_set: JoinSet<Result<(usize, String)>> = JoinSet::new();
+
+        for &idx in &missing {
+            let client = ctx.client.clone();
+            let segment = plan.segments[idx].clone();
+            let target = target_lang.to_owned();
+            let tmpl = template.clone();
+            let cloned_opts = opts.clone();
+            let cfg = ctx.config.clone();
+
+            join_set.spawn(async move {
+                let (translated, _elapsed) = translate_segment_with_completeness(
+                    idx,
+                    &client,
+                    &segment,
+                    &target,
+                    &tmpl,
+                    &cloned_opts,
+                    &cfg,
+                )
+                .await?;
+                Ok((idx, translated))
+            });
+        }
+
+        while let Some(res) = join_set.join_next().await {
+            let (idx, translated) = joined_segment(res)?;
             let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
             if let Err(e) = ctx.history.store_segment_cache(
-                &seg_hashes[chunk_idx],
+                &seg_hashes[idx],
                 target_lang,
                 template_name,
                 &translated,
@@ -901,55 +912,7 @@ pub async fn translate_text(
             ) {
                 eprintln!("Warning: cache store error: {e}");
             }
-            translations[chunk_idx] = Some(translated);
-        }
-
-        if !missing.is_empty() {
-            let mut join_set: JoinSet<Result<(usize, String)>> = JoinSet::new();
-
-            for &idx in &missing {
-                let client = ctx.client.clone();
-                let segment = plan.segments[idx].clone();
-                let target = target_lang.to_owned();
-                let tmpl = template.clone();
-                let cloned_opts = opts.clone();
-                let cfg = ctx.config.clone();
-
-                join_set.spawn(async move {
-                    let (translated, _elapsed) = translate_segment_with_completeness(
-                        idx,
-                        &client,
-                        &segment,
-                        &target,
-                        &tmpl,
-                        &cloned_opts,
-                        &cfg,
-                    )
-                    .await?;
-                    Ok((idx, translated))
-                });
-            }
-
-            while let Some(res) = join_set.join_next().await {
-                match res {
-                    Ok(Ok((idx, translated))) => {
-                        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-                        if let Err(e) = ctx.history.store_segment_cache(
-                            &seg_hashes[idx],
-                            target_lang,
-                            template_name,
-                            &translated,
-                            &now,
-                            &options_hash,
-                        ) {
-                            eprintln!("Warning: cache store error: {e}");
-                        }
-                        translations[idx] = Some(translated);
-                    }
-                    Ok(Err(e)) => return Err(e.context("segment translation failed")),
-                    Err(e) => return Err(anyhow!("segment task panicked: {e}")),
-                }
-            }
+            translations[idx] = Some(translated);
         }
     }
 
@@ -1136,54 +1099,29 @@ pub async fn translate_text_stream_with_mode(
         }
     }
 
-    if !ctx.config.first_chunk_priority() {
-        let mut next_section_index = 0;
-        for idx in 0..plan.segment_count() {
-            let prefix = untranslated_text_before_segment(&plan, idx, &mut next_section_index);
-            if !prefix.is_empty() {
-                send_stream_event(&event_tx, StreamEvent::Token(prefix)).await?;
-            }
-
-            if let Some(cached) = translations[idx].as_ref() {
-                if !cached.is_empty() {
-                    send_stream_event(&event_tx, StreamEvent::Token(cached.clone())).await?;
-                }
-                send_stream_event(&event_tx, StreamEvent::SegmentDone(idx)).await?;
-            } else {
-                let (translated, _elapsed) = translate_segment_with_completeness_streaming(
-                    SegmentTranslateRequest {
-                        index: idx,
-                        client: ctx.client,
-                        segment: &plan.segments[idx],
-                        target_lang,
-                        template,
-                        opts,
-                        config: ctx.config,
-                    },
-                    &event_tx,
-                    None,
-                    output_mode,
-                )
-                .await?;
-                let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-                if let Err(e) = ctx.history.store_segment_cache(
-                    &seg_hashes[idx],
-                    target_lang,
-                    template_name,
-                    &translated,
-                    &now,
-                    &options_hash,
-                ) {
-                    eprintln!("Warning: cache store error: {e}");
-                }
-                translations[idx] = Some(translated);
-            }
-
-            if let Some(newline) = reconstruction_newline_after_segment(&plan, &translations, idx) {
-                send_stream_event(&event_tx, StreamEvent::Token(newline)).await?;
-            }
+    let mut next_section_index = 0;
+    let mut cached_prefix_len = 0;
+    while cached_prefix_len < plan.segment_count() && translations[cached_prefix_len].is_some() {
+        let idx = cached_prefix_len;
+        let prefix = untranslated_text_before_segment(&plan, idx, &mut next_section_index);
+        if !prefix.is_empty() {
+            send_stream_event(&event_tx, StreamEvent::Token(prefix)).await?;
         }
 
+        if let Some(cached) = translations[idx].as_ref() {
+            if !cached.is_empty() {
+                send_stream_event(&event_tx, StreamEvent::Token(cached.clone())).await?;
+            }
+        }
+        send_stream_event(&event_tx, StreamEvent::SegmentDone(idx)).await?;
+
+        if let Some(newline) = reconstruction_newline_after_segment(&plan, &translations, idx) {
+            send_stream_event(&event_tx, StreamEvent::Token(newline)).await?;
+        }
+        cached_prefix_len += 1;
+    }
+
+    if cached_prefix_len == plan.segment_count() {
         let suffix = untranslated_text_after_segments(&plan, next_section_index);
         if !suffix.is_empty() {
             send_stream_event(&event_tx, StreamEvent::Token(suffix)).await?;
@@ -1484,9 +1422,10 @@ mod tests {
     use std::collections::VecDeque;
     use std::path::PathBuf;
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     };
+    use std::time::Duration;
 
     use chrono::{SecondsFormat, Utc};
     use hymt_cache::history::HistoryDB;
@@ -1516,6 +1455,12 @@ mod tests {
         handle: tokio::task::JoinHandle<()>,
     }
 
+    struct CountedMockServer {
+        endpoint_url: String,
+        max_active: Arc<AtomicUsize>,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
     impl Drop for MockServer {
         fn drop(&mut self) {
             self.handle.abort();
@@ -1523,6 +1468,12 @@ mod tests {
     }
 
     impl Drop for GatedMockServer {
+        fn drop(&mut self) {
+            self.handle.abort();
+        }
+    }
+
+    impl Drop for CountedMockServer {
         fn drop(&mut self) {
             self.handle.abort();
         }
@@ -1561,6 +1512,69 @@ mod tests {
                 .expect("mock response queue exhausted")
         };
         write_mock_response(socket, response).await
+    }
+
+    async fn start_counted_mock_server(
+        responses: Vec<MockResponse>,
+        response_delay: Duration,
+    ) -> CountedMockServer {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let responses = Arc::new(Mutex::new(VecDeque::from(responses)));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+
+        let handle = tokio::spawn({
+            let responses = Arc::clone(&responses);
+            let active = Arc::clone(&active);
+            let max_active = Arc::clone(&max_active);
+            async move {
+                while let Ok((socket, _)) = listener.accept().await {
+                    let responses = Arc::clone(&responses);
+                    let active = Arc::clone(&active);
+                    let max_active = Arc::clone(&max_active);
+                    tokio::spawn(async move {
+                        let _ = serve_counted_mock_connection(
+                            socket,
+                            responses,
+                            active,
+                            max_active,
+                            response_delay,
+                        )
+                        .await;
+                    });
+                }
+            }
+        });
+
+        CountedMockServer {
+            endpoint_url: format!("http://{addr}/v1"),
+            max_active,
+            handle,
+        }
+    }
+
+    async fn serve_counted_mock_connection(
+        mut socket: TcpStream,
+        responses: Arc<Mutex<VecDeque<MockResponse>>>,
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+        response_delay: Duration,
+    ) -> std::io::Result<()> {
+        read_http_headers(&mut socket).await?;
+        let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+        max_active.fetch_max(now_active, Ordering::SeqCst);
+        tokio::time::sleep(response_delay).await;
+        let response = {
+            responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("mock response queue exhausted")
+        };
+        let result = write_mock_response(socket, response).await;
+        active.fetch_sub(1, Ordering::SeqCst);
+        result
     }
 
     async fn start_gated_first_token_server(
@@ -2228,7 +2242,7 @@ max_retries = 1
             .iter()
             .skip(1)
             .cloned()
-            .map(|translation| MockResponse::Sse(vec![translation]))
+            .map(MockResponse::Json)
             .collect();
         let server = start_mock_server(responses).await;
         let cfg = make_stream_config_with_fcp(&server.endpoint_url, false);
@@ -2285,7 +2299,7 @@ max_retries = 1
             .expect("FCP=false streaming must emit Token events");
 
         assert_eq!(translated, expected);
-        assert_eq!(streamed, expected);
+        assert_eq!(streamed, translations[0]);
         assert!(first_token_index < all_done_index);
         assert_eq!(events.last(), Some(&StreamEvent::AllDone(expected)));
     }
@@ -2376,6 +2390,54 @@ max_retries = 1
     }
 
     #[tokio::test]
+    async fn streaming_first_token_scheduling_ignores_fcp_config_false() {
+        let text = streaming_regression_source();
+        let planning_cfg =
+            make_stream_config_with_concurrency_and_fcp("http://127.0.0.1:1/v1", 4, false);
+        let segmenter = fallback_segmenter();
+        let plan = plan_translation(
+            &text,
+            "zh",
+            &planning_cfg,
+            &segmenter,
+            &TemplateType::Default,
+            &PromptOpts::default(),
+        )
+        .unwrap();
+        assert!(
+            plan.segment_count() >= 2,
+            "test source must split into multiple segments"
+        );
+
+        let translations = planned_complete_translations(&plan);
+        let expected = plan.reconstruct(&translations);
+        let first = "SEGMENT_0_".to_owned();
+        let rest = translations[0]
+            .strip_prefix(&first)
+            .expect("test translation must start with first token")
+            .to_owned();
+        let server =
+            start_gated_first_token_server(vec![first, rest], translations[1..].to_vec()).await;
+        let cfg = make_stream_config_with_concurrency_and_fcp(&server.endpoint_url, 4, false);
+        let history = HistoryDB::new(temp_path("first-token-fcp-false-history.db"));
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            translate_and_render_stdout(&text, &cfg, &segmenter, &history),
+        )
+        .await
+        .expect("parallel chunks did not start after segment 0's first token")
+        .unwrap();
+
+        assert_eq!(result.0, expected);
+        assert_eq!(result.1, format!("{expected}\n"));
+        assert!(
+            server.parallel_before_stream_done.load(Ordering::SeqCst),
+            "streaming must start remaining chunks before segment 0 stream completes"
+        );
+    }
+
+    #[tokio::test]
     async fn streaming_stdout_is_complete_when_segment0_is_cached() {
         let text = streaming_regression_source();
         let planning_cfg = make_stream_config("http://127.0.0.1:1/v1");
@@ -2423,6 +2485,125 @@ max_retries = 1
         assert_eq!(translated, expected);
         assert_eq!(stdout, format!("{expected}\n"));
         assert!(stdout.starts_with(&translations[0]));
+    }
+
+    #[tokio::test]
+    async fn cached_segment0_emits_before_remaining_stream_work_finishes() {
+        let text = streaming_regression_source();
+        let planning_cfg = make_stream_config("http://127.0.0.1:1/v1");
+        let segmenter = fallback_segmenter();
+        let plan = plan_translation(
+            &text,
+            "zh",
+            &planning_cfg,
+            &segmenter,
+            &TemplateType::Default,
+            &PromptOpts::default(),
+        )
+        .unwrap();
+        assert!(
+            plan.segment_count() >= 2,
+            "test source must split into multiple segments"
+        );
+
+        let translations = planned_complete_translations(&plan);
+        let responses = translations
+            .iter()
+            .skip(1)
+            .cloned()
+            .map(MockResponse::Json)
+            .collect();
+        let server = start_mock_server(responses).await;
+        let cfg = make_stream_config(&server.endpoint_url);
+        let history = HistoryDB::new(temp_path("cached-segment0-events-history.db"));
+        history
+            .store_segment_cache(
+                &segment_cache_hash(&plan.segments[0]),
+                "zh",
+                TemplateType::Default.as_str(),
+                &translations[0],
+                &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                "",
+            )
+            .unwrap();
+
+        let client = TranslationClient::new(cfg.clone()).unwrap();
+        let ctx = TranslationCtx {
+            config: &cfg,
+            client: &client,
+            segmenter: &segmenter,
+            history: &history,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let translated = translate_text_stream_with_mode(
+            &text,
+            "zh",
+            &TemplateType::Default,
+            &PromptOpts::default(),
+            &ctx,
+            StreamOutputMode::Validated,
+            tx,
+        )
+        .await
+        .unwrap();
+
+        let first_event = rx.recv().await.expect("stream must emit cached segment 0");
+        assert_eq!(first_event, StreamEvent::Token(translations[0].clone()));
+        assert!(translated.starts_with(&translations[0]));
+    }
+
+    #[tokio::test]
+    async fn non_stream_translation_respects_effective_concurrency_limit() {
+        let text = [
+            streaming_regression_source(),
+            streaming_regression_source(),
+            streaming_regression_source(),
+            streaming_regression_source(),
+        ]
+        .join("\n\n");
+        let planning_cfg =
+            make_stream_config_with_concurrency_and_fcp("http://127.0.0.1:1/v1", 2, true);
+        let segmenter = fallback_segmenter();
+        let plan = plan_translation(
+            &text,
+            "zh",
+            &planning_cfg,
+            &segmenter,
+            &TemplateType::Default,
+            &PromptOpts::default(),
+        )
+        .unwrap();
+        assert!(
+            plan.segment_count() >= 3,
+            "concurrency test needs at least three segments"
+        );
+
+        let translations = planned_complete_translations(&plan);
+        let expected = plan.reconstruct(&translations);
+        let responses = translations.into_iter().map(MockResponse::Json).collect();
+        let server = start_counted_mock_server(responses, Duration::from_millis(50)).await;
+        let cfg = make_stream_config_with_concurrency_and_fcp(&server.endpoint_url, 2, true);
+        let history = HistoryDB::new(temp_path("non-stream-concurrency-history.db"));
+        let client = TranslationClient::new(cfg.clone()).unwrap();
+        let ctx = TranslationCtx {
+            config: &cfg,
+            client: &client,
+            segmenter: &segmenter,
+            history: &history,
+        };
+
+        let translated = translate_text(
+            &text,
+            "zh",
+            &TemplateType::Default,
+            &PromptOpts::default(),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(translated, expected);
+        assert_eq!(server.max_active.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
