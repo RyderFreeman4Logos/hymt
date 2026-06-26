@@ -480,6 +480,17 @@ async fn run() -> Result<()> {
             )
             .await
         }
+        Some(Cmd::Text(words)) if piped_stdin_placeholder(&words, io::stdin().is_terminal()) => {
+            run_translate_stdin(
+                target_lang,
+                &template,
+                &prompt_opts,
+                explicit_target,
+                translate_flags,
+                &config,
+            )
+            .await
+        }
         Some(Cmd::Text(words)) => {
             run_translate_text(
                 &words,
@@ -550,6 +561,10 @@ fn make_segmenter_from_path(tokenizer_path: PathBuf) -> Segmenter {
 
 fn make_client(config: &HotConfig) -> Result<TranslationClient> {
     TranslationClient::new(config.clone()).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+fn piped_stdin_placeholder(words: &[String], stdin_is_terminal: bool) -> bool {
+    !stdin_is_terminal && words.len() == 1 && words[0] == "."
 }
 
 // ── Translate text / stdin ────────────────────────────────────────────────────
@@ -1357,6 +1372,21 @@ mod tests {
             select_stream_output_mode(true, false),
             StreamOutputMode::Validated
         );
+    }
+
+    #[test]
+    fn dot_placeholder_uses_piped_stdin() {
+        assert!(piped_stdin_placeholder(&[".".to_owned()], false));
+    }
+
+    #[test]
+    fn dot_placeholder_does_not_override_interactive_text() {
+        assert!(!piped_stdin_placeholder(&[".".to_owned()], true));
+        assert!(!piped_stdin_placeholder(&["hello".to_owned()], false));
+        assert!(!piped_stdin_placeholder(
+            &[".".to_owned(), "extra".to_owned()],
+            false
+        ));
     }
 
     #[test]

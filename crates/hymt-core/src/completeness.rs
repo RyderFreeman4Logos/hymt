@@ -3,6 +3,8 @@
 //! Prevents silent content loss caused by LLM early-stop: a translation that
 //! passes all three checks is considered complete enough to cache and use.
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 
 /// Threshold configuration for completeness checks.
@@ -97,6 +99,14 @@ pub fn validate_completeness(
         checks_failed.push("heading_preservation".to_owned());
     }
 
+    if cli_help_translation_is_complete(input_text, output_text, target_lang, &checks_failed) {
+        let before = checks_failed.len();
+        checks_failed.retain(|check| check != "token_ratio" && check != "paragraph_count");
+        if checks_failed.len() != before {
+            advisory_warnings.push("cli_help_density".to_owned());
+        }
+    }
+
     CompletenessResult {
         is_complete: checks_failed.is_empty(),
         checks_failed,
@@ -122,6 +132,106 @@ fn count_paragraphs(text: &str) -> usize {
 
 fn count_markdown_headings(text: &str) -> usize {
     text.lines().filter(|line| line.starts_with('#')).count()
+}
+
+fn cli_help_translation_is_complete(
+    input_text: &str,
+    output_text: &str,
+    target_lang: &str,
+    checks_failed: &[String],
+) -> bool {
+    if checks_failed.is_empty() || has_non_density_failure(checks_failed) {
+        return false;
+    }
+    if !looks_like_cli_help(input_text)
+        || !looks_like_translated_cli_help(output_text)
+        || generic_refusal(output_text)
+    {
+        return false;
+    }
+    output_has_target_language_signal(output_text, target_lang)
+        && preserves_cli_options(input_text, output_text)
+}
+
+fn has_non_density_failure(checks_failed: &[String]) -> bool {
+    checks_failed
+        .iter()
+        .any(|check| check != "token_ratio" && check != "paragraph_count")
+}
+
+fn looks_like_cli_help(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let has_usage = lower.contains("usage:") || lower.contains("用法");
+    let has_help_section = lower.contains("options:")
+        || lower.contains("arguments:")
+        || lower.contains("commands:")
+        || lower.contains("examples:")
+        || lower.contains("选项")
+        || lower.contains("参数")
+        || lower.contains("命令")
+        || lower.contains("示例");
+    has_usage && has_help_section && long_options(text).len() >= 2
+}
+
+fn looks_like_translated_cli_help(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let has_usage = lower.contains("usage:") || lower.contains("用法");
+    let has_options = lower.contains("options:") || lower.contains("选项");
+    has_usage && has_options
+}
+
+fn preserves_cli_options(input_text: &str, output_text: &str) -> bool {
+    let input_options = long_options(input_text);
+    if input_options.is_empty() {
+        return false;
+    }
+    let preserved = input_options
+        .iter()
+        .filter(|option| output_text.contains(option.as_str()))
+        .count();
+    preserved >= 2 && preserved * 2 >= input_options.len()
+}
+
+fn long_options(text: &str) -> HashSet<String> {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        .filter(|token| {
+            token
+                .strip_prefix("--")
+                .and_then(|name| name.chars().next())
+                .is_some_and(|c| c.is_ascii_alphanumeric())
+        })
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn output_has_target_language_signal(output_text: &str, target_lang: &str) -> bool {
+    let normalized = target_lang.to_lowercase().replace('_', "-");
+    if normalized == "zh" || normalized.starts_with("zh-") {
+        return output_text.chars().any(is_cjk_char);
+    }
+    if normalized == "en" || normalized.starts_with("en-") {
+        return output_text.chars().any(|c| c.is_ascii_alphabetic());
+    }
+    !output_text.trim().is_empty()
+}
+
+fn is_cjk_char(c: char) -> bool {
+    ('\u{4E00}'..='\u{9FFF}').contains(&c)
+}
+
+fn generic_refusal(output_text: &str) -> bool {
+    let lower = output_text.to_lowercase();
+    [
+        "please provide",
+        "no text provided",
+        "cannot translate",
+        "unable to translate",
+        "请提供",
+        "无法翻译",
+        "不能翻译",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
 }
 
 /// Returns the applicable minimum char ratio for `target_lang`, or `None`.
@@ -341,5 +451,70 @@ mod tests {
         let result = validate_completeness(input, output, "fr", None);
         assert!(!result.is_complete);
         assert!(result.checks_failed.contains(&"paragraph_count".to_owned()));
+    }
+
+    #[test]
+    fn cli_help_translation_can_be_dense_when_options_are_preserved() {
+        let input = "Generate a cited answer.\n\n\
+Usage: verbatim ask [OPTIONS] <QUESTION>...\n\n\
+Arguments:\n  <QUESTION>... Question text\n\n\
+Options:\n  --source-id <SOURCE_ID> Limit retrieval\n  --collection <NAME> Limit retrieval\n  --require-fresh Error on stale collection members\n  --embedding-profile <PROFILE> Use an embedding profile\n  --show-retrieval Show retrieval debug info\n  --context-only Return context without generation\n  --no-generate Alias for context-only\n  --format <FORMAT> Output format\n  --background Queue as background task\n  -h, --help Print help\n\n\
+Examples:\n  verbatim ask \"What supports this?\"\n";
+        let output = "生成带引用的回答。用法：verbatim ask [选项] <问题>...。参数：<问题>...。选项：--source-id、--collection、--require-fresh、--embedding-profile、--show-retrieval、--context-only、--no-generate、--format、--background、--help。示例：verbatim ask \"有哪些证据？\"。";
+
+        let tight = CompletenessThresholds {
+            zh_to_en_min_ratio: 10.0,
+            en_to_zh_min_ratio: 10.0,
+            min_paragraph_ratio: 0.9,
+        };
+        let result = validate_completeness(input, output, "zh", Some(&tight));
+
+        assert!(result.is_complete, "{:?}", result.checks_failed);
+        assert!(result
+            .advisory_warnings
+            .contains(&"cli_help_density".to_owned()));
+    }
+
+    #[test]
+    fn cli_help_generic_refusal_still_fails() {
+        let input = "Generate a cited answer.\n\n\
+Usage: verbatim ask [OPTIONS] <QUESTION>...\n\n\
+Arguments:\n  <QUESTION>... Question text\n\n\
+Options:\n  --source-id <SOURCE_ID> Limit retrieval\n  --collection <NAME> Limit retrieval\n  --require-fresh Error on stale collection members\n  --embedding-profile <PROFILE> Use an embedding profile\n  --show-retrieval Show retrieval debug info\n  --context-only Return context without generation\n  --no-generate Alias for context-only\n  --format <FORMAT> Output format\n  --background Queue as background task\n  -h, --help Print help\n\n\
+Examples:\n  verbatim ask \"What supports this?\"\n";
+        let output = "请提供需要处理的完整输入文本。";
+        let tight = CompletenessThresholds {
+            zh_to_en_min_ratio: 10.0,
+            en_to_zh_min_ratio: 10.0,
+            min_paragraph_ratio: 0.9,
+        };
+
+        let result = validate_completeness(input, output, "zh", Some(&tight));
+
+        assert!(!result.is_complete);
+        assert!(result.checks_failed.contains(&"token_ratio".to_owned()));
+    }
+
+    #[test]
+    fn cli_help_examples_only_output_still_fails() {
+        let input = "Generate a cited answer.\n\n\
+Usage: verbatim ask [OPTIONS] <QUESTION>...\n\n\
+Options:\n  --source-id <SOURCE_ID> Limit retrieval\n  --collection <NAME> Limit retrieval\n  --show-retrieval Show retrieval debug info\n  --context-only Return context without generation\n  --no-generate Alias for context-only\n  --format <FORMAT> Output format\n\n\
+Examples:\n  verbatim ask \"What supports this?\"\n";
+        let output = "verbatim ask \"报告得出了什么结论？\"\n\
+verbatim ask --source-id <source-id> --show-retrieval \"有哪些内容支持这一结论？\"\n\
+verbatim ask --collection articles \"哪些证据是相关的？\"\n\
+verbatim ask --context-only \"哪些证据是相关的？\"\n\
+verbatim ask --no-generate --format json \"哪些证据是相关的？\"";
+        let tight = CompletenessThresholds {
+            zh_to_en_min_ratio: 10.0,
+            en_to_zh_min_ratio: 10.0,
+            min_paragraph_ratio: 0.9,
+        };
+
+        let result = validate_completeness(input, output, "zh", Some(&tight));
+
+        assert!(!result.is_complete);
+        assert!(result.checks_failed.contains(&"token_ratio".to_owned()));
     }
 }

@@ -519,7 +519,7 @@ fn cached_segment_is_complete(
         return true;
     }
     eprintln!(
-        "Warning: cached segment {} failed completeness, retranslating: {:?}",
+        "Warning: cached segment {} did not pass validation, retranslating: {:?}",
         index + 1,
         result.checks_failed
     );
