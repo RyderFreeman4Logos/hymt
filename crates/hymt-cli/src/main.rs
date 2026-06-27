@@ -11,7 +11,7 @@ use hymt_cache::history::HistoryDB;
 use hymt_client::TranslationClient;
 use hymt_core::config::HotConfig;
 use hymt_core::language::resolve_target_language;
-use hymt_core::templates::{PromptOpts, TemplateType};
+use hymt_core::templates::{looks_like_cli_help_source, PromptOpts, TemplateType};
 use hymt_segment::Segmenter;
 use hymt_translate::batch::{
     build_batch_plan, run_batch_translation, show_batch_preview, BatchPlanOpts,
@@ -816,7 +816,7 @@ async fn translate_text_to_stdout_streaming(
     input_is_interactive: bool,
 ) -> Result<()> {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
-    let output_mode = current_stream_output_mode(input_is_interactive);
+    let output_mode = current_stream_output_mode(text, input_is_interactive);
     let translate =
         translate_text_stream_with_mode(text, target_lang, template, opts, tctx, output_mode, tx);
     let print = print_stream_events(rx);
@@ -824,18 +824,19 @@ async fn translate_text_to_stdout_streaming(
     Ok(())
 }
 
-fn current_stream_output_mode(input_is_interactive: bool) -> StreamOutputMode {
-    select_stream_output_mode(input_is_interactive, io::stdout().is_terminal())
+fn current_stream_output_mode(input_text: &str, input_is_interactive: bool) -> StreamOutputMode {
+    select_stream_output_mode(input_text, input_is_interactive, io::stdout().is_terminal())
 }
 
 fn select_stream_output_mode(
-    input_is_interactive: bool,
-    stdout_is_terminal: bool,
+    input_text: &str,
+    _input_is_interactive: bool,
+    _stdout_is_terminal: bool,
 ) -> StreamOutputMode {
-    if input_is_interactive && stdout_is_terminal {
-        StreamOutputMode::Optimistic
-    } else {
+    if looks_like_cli_help_source(input_text) {
         StreamOutputMode::Validated
+    } else {
+        StreamOutputMode::Optimistic
     }
 }
 
@@ -1414,23 +1415,42 @@ mod tests {
     #[test]
     fn interactive_terminal_uses_optimistic_streaming() {
         assert_eq!(
-            select_stream_output_mode(true, true),
+            select_stream_output_mode("hello", true, true),
             StreamOutputMode::Optimistic
         );
     }
 
     #[test]
-    fn stdin_pipe_uses_validated_streaming() {
+    fn stdin_pipe_uses_optimistic_streaming_for_normal_text() {
         assert_eq!(
-            select_stream_output_mode(false, true),
+            select_stream_output_mode("hello", false, true),
+            StreamOutputMode::Optimistic
+        );
+    }
+
+    #[test]
+    fn stdout_pipe_uses_optimistic_streaming_for_normal_text() {
+        assert_eq!(
+            select_stream_output_mode("hello", true, false),
+            StreamOutputMode::Optimistic
+        );
+    }
+
+    #[test]
+    fn cli_help_uses_validated_streaming() {
+        let help = "Usage: verbatim ask [OPTIONS] <QUESTION>...\n\n\
+Options:\n  --source-id <SOURCE_ID>\n  --context-only\n";
+        assert_eq!(
+            select_stream_output_mode(help, false, false),
             StreamOutputMode::Validated
         );
     }
 
     #[test]
-    fn stdout_pipe_uses_validated_streaming() {
+    fn short_option_only_cli_help_uses_validated_streaming() {
+        let help = "Usage: foo [OPTIONS]\n\nOptions:\n  -h Print help\n";
         assert_eq!(
-            select_stream_output_mode(true, false),
+            select_stream_output_mode(help, false, false),
             StreamOutputMode::Validated
         );
     }
