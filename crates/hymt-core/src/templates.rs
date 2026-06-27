@@ -205,7 +205,8 @@ fn cli_help_prompt_note(source: &str, chinese: bool) -> &'static str {
     }
 }
 
-fn looks_like_cli_help_source(source: &str) -> bool {
+/// Returns true when `source` looks like command-line help text.
+pub fn looks_like_cli_help_source(source: &str) -> bool {
     let lower = source.to_lowercase();
     lower.contains("usage:")
         && (lower.contains("options:")
