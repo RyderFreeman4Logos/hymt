@@ -213,7 +213,6 @@ pub fn looks_like_cli_help_source(source: &str) -> bool {
             || lower.contains("arguments:")
             || lower.contains("commands:")
             || lower.contains("examples:"))
-        && lower.contains("--")
 }
 
 fn build_terminology(

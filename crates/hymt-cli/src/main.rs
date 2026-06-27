@@ -1447,6 +1447,15 @@ Options:\n  --source-id <SOURCE_ID>\n  --context-only\n";
     }
 
     #[test]
+    fn short_option_only_cli_help_uses_validated_streaming() {
+        let help = "Usage: foo [OPTIONS]\n\nOptions:\n  -h Print help\n";
+        assert_eq!(
+            select_stream_output_mode(help, false, false),
+            StreamOutputMode::Validated
+        );
+    }
+
+    #[test]
     fn output_file_disables_default_streaming() {
         let output = PathBuf::from("translated.txt");
         assert!(!should_stream_translation(true, false, Some(&output)));
