@@ -21,8 +21,8 @@ use hymt_translate::docs::{run_info_command, run_man_command, ManInfoOpts};
 use hymt_translate::exec_wrapper::run_exec_command;
 use hymt_translate::precache::run_precache;
 use hymt_translate::{
-    plan_translation, translate_file, translate_text, translate_text_stream_with_mode, StreamEvent,
-    StreamOutputMode, TranslationCtx,
+    plan_translation, translate_file, translate_text, translate_text_stream_with_mode,
+    write_translation_output, StreamEvent, StreamOutputMode, TranslationCtx,
 };
 
 // ── Known subcommand names (for smart routing) ────────────────────────────────
@@ -660,10 +660,7 @@ async fn run_translate_text(
     }
     let translated = translate_text(&text, &effective_lang, template, opts, &tctx).await?;
     if let Some(out) = flags.output_path {
-        if let Some(parent) = out.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        tokio::fs::write(out, &translated).await?;
+        write_translation_output(out, &translated).await?;
         return Ok(());
     }
     print!("{translated}");
@@ -736,10 +733,7 @@ async fn run_translate_stdin(
     }
     let translated = translate_text(&text, &effective_lang, template, opts, &tctx).await?;
     if let Some(out) = flags.output_path {
-        if let Some(parent) = out.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        tokio::fs::write(out, &translated).await?;
+        write_translation_output(out, &translated).await?;
         return Ok(());
     }
     print!("{translated}");
@@ -1304,6 +1298,37 @@ async fn run_translate_doc(
 mod tests {
     use super::*;
 
+    enum CleanupPath {
+        File(PathBuf),
+        Dir(PathBuf),
+    }
+
+    impl Drop for CleanupPath {
+        fn drop(&mut self) {
+            match self {
+                Self::File(path) => {
+                    let _ = std::fs::remove_file(path);
+                }
+                Self::Dir(path) => {
+                    let _ = std::fs::remove_dir_all(path);
+                }
+            }
+        }
+    }
+
+    fn unique_test_name(prefix: &str, suffix: &str) -> String {
+        format!(
+            "{}-{}-{}.{}",
+            prefix,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            suffix
+        )
+    }
+
     #[test]
     fn find_first_positional_no_args() {
         assert_eq!(find_first_positional(&[]), None);
@@ -1435,6 +1460,33 @@ mod tests {
             Some(Cmd::Text(words)) => assert_eq!(words, vec!["hello".to_owned()]),
             _ => panic!("expected text command"),
         }
+    }
+
+    #[tokio::test]
+    async fn writes_single_component_output_path() {
+        let output = PathBuf::from(unique_test_name("translated", "txt"));
+        let _cleanup = CleanupPath::File(output.clone());
+        let _ = std::fs::remove_file(&output);
+
+        write_translation_output(&output, "translated")
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&output).unwrap(), "translated");
+    }
+
+    #[tokio::test]
+    async fn writes_nested_output_path_creating_parent() {
+        let dir = PathBuf::from("target").join(unique_test_name("hymt-cli-output", "dir"));
+        let output = dir.join("nested").join("translated.txt");
+        let _cleanup = CleanupPath::Dir(dir.clone());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        write_translation_output(&output, "translated")
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&output).unwrap(), "translated");
     }
 
     #[test]

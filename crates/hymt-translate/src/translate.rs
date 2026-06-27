@@ -1380,6 +1380,25 @@ pub async fn translate_text_stream_with_mode(
     Ok(translated)
 }
 
+// ── output writing ─────────────────────────────────────────────────────────────
+
+/// Write translated output to `output_path`, creating non-empty parent dirs.
+pub async fn write_translation_output(output_path: &Path, translated: &str) -> Result<()> {
+    if let Some(parent) = non_empty_parent(output_path) {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    tokio::fs::write(output_path, translated)
+        .await
+        .with_context(|| format!("writing {}", output_path.display()))
+}
+
+fn non_empty_parent(path: &Path) -> Option<&Path> {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+}
+
 // ── translate_file ─────────────────────────────────────────────────────────────
 
 /// Read `path`, translate it, and write the result to `output_path` (or stdout if `None`).
@@ -1398,12 +1417,7 @@ pub async fn translate_file(
     let translated = translate_text(&text, target_lang, template, opts, ctx).await?;
 
     if let Some(out) = output_path {
-        if let Some(parent) = out.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        tokio::fs::write(out, &translated)
-            .await
-            .with_context(|| format!("writing {}", out.display()))?;
+        write_translation_output(out, &translated).await?;
     } else {
         print!("{}", translated);
         if !translated.ends_with('\n') {
