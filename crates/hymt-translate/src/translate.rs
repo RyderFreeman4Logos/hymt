@@ -749,19 +749,28 @@ async fn flush_ready_stream_prefix(
 }
 
 /// Advance reconstruction cursor past a segment whose tokens were already streamed.
-fn advance_stream_cursor_past_segment(
+///
+/// Priority / already-streamed segments skip re-emitting their text and
+/// [`StreamEvent::SegmentDone`], but must still emit any reconstruction newline
+/// that `flush_ready_stream_prefix` would have appended so progressive tokens
+/// remain an exact prefix of final [`TranslationPlan::reconstruct`].
+async fn advance_stream_cursor_past_segment(
     plan: &TranslationPlan,
     translations: &[Option<String>],
     segment_index: usize,
     next_section_index: &mut usize,
     next_emit: &mut usize,
-) {
+    event_tx: &mpsc::Sender<StreamEvent>,
+) -> Result<()> {
     if *next_emit != segment_index {
-        return;
+        return Ok(());
     }
     let _ = untranslated_text_before_segment(plan, segment_index, next_section_index);
+    if let Some(newline) = reconstruction_newline_after_segment(plan, translations, segment_index) {
+        send_stream_event(event_tx, StreamEvent::Token(newline)).await?;
+    }
     *next_emit = segment_index + 1;
-    let _ = translations;
+    Ok(())
 }
 
 async fn translate_segment_with_completeness_streaming(
@@ -1419,7 +1428,9 @@ pub async fn translate_text_stream_with_mode(
                     idx,
                     &mut next_section_index,
                     &mut cached_prefix_len,
-                );
+                    &event_tx,
+                )
+                .await?;
                 flush_ready_stream_prefix(
                     &plan,
                     &translations,
@@ -1478,7 +1489,9 @@ pub async fn translate_text_stream_with_mode(
                     idx,
                     &mut next_section_index,
                     &mut cached_prefix_len,
-                );
+                    &event_tx,
+                )
+                .await?;
             }
         } else {
             let mut join_set: JoinSet<Result<(usize, String, bool)>> = JoinSet::new();
@@ -2566,6 +2579,144 @@ max_retries = 1
 
         assert_eq!(translated, expected);
         assert_eq!(stdout, format!("{expected}\n"));
+    }
+
+    #[tokio::test]
+    async fn document_plan_progressive_stream_tokens_are_exact_prefix_of_reconstruct() {
+        // Separate translation groups: paragraph / code / paragraph.
+        // reconstruct() inserts a reconstruction newline after group 0 when the
+        // source ends with \n but the model text does not. Priority streaming of
+        // segment 0 must emit that newline when advancing the ordered cursor,
+        // otherwise progressive tokens are seg0+seg1 while reconstruct is
+        // seg0+\n+seg1 (CLI strip_prefix mismatch / full replay).
+        let text = "Alpha zero text carries enough source material for cache validation and ordering checks.\n\n\
+```\n\
+code fence keeps groups separate\n\
+```\n\n\
+Bravo one text carries enough source material for cache validation and ordering checks.\n";
+        let planning_cfg = make_stream_config("http://127.0.0.1:1/v1");
+        let segmenter = fallback_segmenter();
+        let plan = plan_translation(
+            text,
+            "zh",
+            &planning_cfg,
+            &segmenter,
+            &TemplateType::Default,
+            &PromptOpts::default(),
+        )
+        .unwrap();
+        assert!(
+            plan.document_plan.is_some(),
+            "document-plan path required for reconstruction newlines"
+        );
+        assert!(
+            plan.segment_count() >= 2,
+            "test source must split into multiple segments, got {}",
+            plan.segment_count()
+        );
+        assert!(
+            plan.segment_section_groups.len() >= 2,
+            "expected distinct section groups, groups={:?}",
+            plan.segment_section_groups
+        );
+        assert_ne!(
+            plan.segment_section_groups[0], plan.segment_section_groups[1],
+            "segment 0 and 1 must be different groups so a reconstruction newline is required between them"
+        );
+
+        let translations = planned_complete_translations(&plan);
+        assert!(
+            !translations[0].ends_with('\n'),
+            "fixture translation 0 must not already end with newline"
+        );
+        let expected = plan.reconstruct(&translations);
+        let between = format!("{}{}", translations[0], translations[1]);
+        assert!(
+            !expected.contains(&between) || expected.contains(&format!("{}\n{}", translations[0], translations[1])),
+            "reconstruct must insert a separator newline between priority and later segments; expected={expected:?}"
+        );
+        assert!(
+            expected.starts_with(&format!("{}\n", translations[0])),
+            "reconstruct must place a newline immediately after segment 0; expected={expected:?}"
+        );
+
+        let mut responses = vec![MockResponse::Sse(vec![translations[0].clone()])];
+        responses.extend(translations.iter().skip(1).cloned().map(MockResponse::Json));
+        let server = start_mock_server(responses).await;
+        let cfg = make_stream_config(&server.endpoint_url);
+        let history = HistoryDB::new(temp_path("doc-plan-progressive-prefix-history.db"));
+
+        let client = TranslationClient::new(cfg.clone()).unwrap();
+        let ctx = TranslationCtx {
+            config: &cfg,
+            client: &client,
+            segmenter: &segmenter,
+            history: &history,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let outcome = translate_text_stream_with_mode(
+            text,
+            "zh",
+            &TemplateType::Default,
+            &PromptOpts::default(),
+            &ctx,
+            StreamOutputMode::Validated,
+            tx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.text, expected);
+
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+
+        let mut streamed_prefix = String::new();
+        let mut all_done = None;
+        for event in &events {
+            match event {
+                StreamEvent::Token(token) => {
+                    streamed_prefix.push_str(token);
+                    assert!(
+                        expected.starts_with(&streamed_prefix),
+                        "progressive stream tokens must be an exact prefix of reconstruct(); \
+                         streamed={streamed_prefix:?} expected={expected:?}"
+                    );
+                }
+                StreamEvent::SegmentDone(_) => {}
+                StreamEvent::AllDone(translated) => {
+                    all_done = Some(translated.clone());
+                }
+            }
+        }
+
+        let all_done = all_done.expect("stream must finish with AllDone");
+        assert_eq!(all_done, expected);
+        assert!(
+            expected.starts_with(&streamed_prefix),
+            "Token concatenation before AllDone must be an exact prefix of final text; \
+             streamed={streamed_prefix:?} expected={expected:?}"
+        );
+        assert!(
+            streamed_prefix.starts_with(&translations[0]),
+            "priority segment tokens must appear in the progressive stream"
+        );
+        // After priority segment completes, the reconstruction newline (if any)
+        // must already be present before later segment tokens are appended.
+        assert!(
+            streamed_prefix.starts_with(&format!("{}\n", translations[0]))
+                || streamed_prefix == translations[0]
+                || streamed_prefix.starts_with(&translations[0]),
+            "streamed prefix should include segment 0 (and its reconstruction newline once later content streams)"
+        );
+        if streamed_prefix.len() > translations[0].len() {
+            assert!(
+                streamed_prefix.starts_with(&format!("{}\n", translations[0])),
+                "content after priority segment must be preceded by the reconstruction newline; \
+                 streamed={streamed_prefix:?}"
+            );
+        }
     }
 
     #[tokio::test]
