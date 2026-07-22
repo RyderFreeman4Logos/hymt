@@ -80,6 +80,15 @@ Template-specific options:
 - `hymt config path`
 - `hymt config edit`
 - `hymt tokenizer download [--force]`
+- `hymt telegram` — long-poll CN↔EN Telegram bot until Ctrl+C (default cargo feature; requires `[telegram].enabled = true` and a bot token)
+- `hymt telegram --regenerate-claim-password` — rotate claim password, print once, exit
+
+### Telegram bot
+
+- Config section `[telegram]`: `enabled` (default `false`), `bot_token` or env `HYMT_TELEGRAM_BOT_TOKEN`, `claim_password` (auto-generated once), `owners[]`, `groups[]`, `mode` (`owners`|`groups`).
+- Private chat: send the claim password (or `/claim <password>`) to become an owner; multi-owner is supported.
+- Authorized chats auto-translate Chinese↔English text; unauthorized chats get a short denial.
+- Build without Telegram deps: `just install-no-telegram` / `cargo install --path crates/hymt-cli --no-default-features`.
 
 Related skills cover command/documentation translation:
 
@@ -108,7 +117,7 @@ Related skills cover command/documentation translation:
 - Source segments are bounded by the expansion/context budget and by `[translation].max_source_tokens_per_segment` (default `1024`, `0` disables). Multi-k Markdown therefore splits instead of hanging as one oversized request. Request/timeout failures include segment index and approximate source tokens on stderr.
 - `translate-doc` persists each completed segment immediately, so interrupted runs can resume from the segment cache.
 - After a completed interactive translation, if actual runtime diverges from the estimate by `[timing].divergence_threshold` (default `2.0`), `hymt` can prompt to file a GitHub timing-data issue.
-- Config lives at `~/.config/hymt/config.toml`; `[language].primary` and `[language].secondary` configure default routing, `[translation].max_source_tokens_per_segment` caps per-segment source size, and `[completeness]` configures segment validation thresholds plus `warn_only`.
+- Config lives at `~/.config/hymt/config.toml`; `[language].primary` and `[language].secondary` configure default routing, `[translation].max_source_tokens_per_segment` caps per-segment source size, and `[completeness]` configures segment validation thresholds plus `warn_only`. `[telegram]` configures the optional bot (disabled until `enabled = true`).
 - The tokenizer is cached at `~/.cache/hymt/tokenizer/tokenizer.json`.
 - Translation commands use the cached tokenizer when present; otherwise they use approximate token counting. Run `hymt tokenizer download` to fetch the tokenizer explicitly.
 - On Android/Termux installs, `hymt` uses approximate token counting for segmentation because Rust tokenizer wheels are unavailable.

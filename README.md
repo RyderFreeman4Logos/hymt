@@ -22,8 +22,25 @@ Hy-MT2 as a practical CLI: tokenizer-aware segmentation, per-segment cache reuse
 - Wrap arbitrary shell commands with `hymt exec`, or browse translated `man` and `info` pages.
 - Recall previous outputs and inspect translation history with throughput statistics.
 - Keep bilingual Markdown in sync with `hymt translate-doc`.
+- Optional Telegram bot (`hymt telegram`) for private multi-owner claim and group Chinese↔English translation.
 
 ## Install
+
+### Rust install (recommended)
+
+```bash
+just install
+# or:
+cargo install --path crates/hymt-cli --force
+```
+
+The binary enables the `telegram` cargo feature by default. To build without Telegram Bot API dependencies:
+
+```bash
+just install-no-telegram
+# or:
+cargo install --path crates/hymt-cli --no-default-features --force
+```
 
 ### Quick install with `uv`
 
@@ -87,6 +104,29 @@ divergence_threshold = 2.0
 ```
 
 The config is hot-reloadable. Long-running workflows pick up edits without restarting the process.
+
+### Telegram bot (`[telegram]`)
+
+Default config includes a disabled Telegram section:
+
+```toml
+[telegram]
+enabled = false
+bot_token = ""          # or set HYMT_TELEGRAM_BOT_TOKEN
+claim_password = ""     # auto-generated on first `hymt telegram` if empty
+owners = []             # private chat ids after claim
+groups = []             # group chat ids when mode = "groups"
+mode = "owners"         # "owners" | "groups"
+```
+
+1. Create a bot with [@BotFather](https://t.me/BotFather), set `bot_token` (or `HYMT_TELEGRAM_BOT_TOKEN`).
+2. Set `enabled = true`.
+3. Run `hymt telegram` (long-poll until Ctrl+C). On first run, hymt generates a claim password, stores it in config, and prints it once.
+4. In a private chat with the bot, send the claim password (or `/claim <password>`) to become an owner. Multiple owners are supported.
+5. Authorized owners (and members of groups listed in `groups` when `mode = "groups"`) receive automatic Chinese↔English translation of text messages. Unauthorized chats get a short denial.
+6. Regenerate the claim password with `hymt telegram --regenerate-claim-password` (prints the new value once).
+
+Secrets (`bot_token`, `claim_password`) are not re-printed on every run.
 
 ## Quick start
 
@@ -222,6 +262,16 @@ History powers:
 - median / percentile ETA estimation
 - progress bars that reflect observed token throughput
 
+## Telegram bot
+
+```bash
+# after configuring [telegram] and enabling it
+hymt telegram
+hymt telegram --regenerate-claim-password
+```
+
+See the `[telegram]` config section above for claim ownership and group mode.
+
 ## Timing divergence auto-issue filing
 
 After an interactive translation, `hymt` compares actual runtime with historical estimates. When the run diverges beyond `[timing].divergence_threshold`, it can prompt to file a GitHub issue containing:
@@ -262,6 +312,12 @@ Run the full local quality gate with:
 
 ```bash
 env JUST_TEMPDIR=$PWD/.git/just-tmp just pre-commit
+```
+
+Verify the binary still builds without Telegram deps:
+
+```bash
+just check-no-telegram
 ```
 
 If you want README bilingual sync in automation, see the `doc-translate-sync` recipe and the `post-commit` hook in `lefthook.yml`.

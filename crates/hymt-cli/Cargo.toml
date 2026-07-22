@@ -8,6 +8,12 @@ license.workspace = true
 name = "hymt"
 path = "src/main.rs"
 
+[features]
+default = ["telegram"]
+# Optional Telegram bot long-poll subcommand (`hymt telegram`).
+# Disable with: cargo install --path crates/hymt-cli --no-default-features
+telegram = ["dep:reqwest", "dep:serde", "dep:serde_json"]
+
 [dependencies]
 hymt-core = { path = "../hymt-core" }
 hymt-segment = { path = "../hymt-segment" }
@@ -17,3 +23,6 @@ hymt-translate = { path = "../hymt-translate" }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { version = "1", optional = true }

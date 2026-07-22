@@ -754,6 +754,9 @@ dependencies = [
  "hymt-core",
  "hymt-segment",
  "hymt-translate",
+ "reqwest",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
