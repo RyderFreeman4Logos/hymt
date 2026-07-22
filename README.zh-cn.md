@@ -69,6 +69,8 @@ concurrency = 8
 stream = true
 config_version = 1
 timeout = 600
+# first_chunk_priority = false
+# debug_chunk_timing = false
 
 [completeness]
 zh_to_en_min_ratio = 0.3
@@ -106,6 +108,8 @@ hymt -f report.md -t zh | tee report.zh.preview.md
 ```
 
 如果需要完全缓冲的响应，请使用`--no-stream`。
+
+可用 `--concurrency N` 覆盖本次运行的并发（覆盖 `[translation].concurrency`）。使用 `--debug-chunk-timing`（或 `HYMT_DEBUG_CHUNK_TIMING=1`）在 stderr 打印各 chunk 的 queue/request/first-token/complete 时序，便于诊断多段流式停顿。
 
 ### 混合语言的文档依然可读
 

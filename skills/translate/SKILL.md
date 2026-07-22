@@ -13,6 +13,8 @@ Use `hymt` when an agent should drive the local Hy-MT2 CLI instead of hand-writi
 - File input: `hymt input.txt -l ja`
 - Stdin pipeline: `cat article.txt | hymt -l fr`
 - Force or disable streaming: `hymt input.txt -l ja --stream` / `hymt input.txt -l ja --no-stream`
+- Override concurrency for one run (overrides `[translation].concurrency`): `hymt input.txt -l ja --concurrency 4`
+- Log per-chunk queue/request/first-token/complete timings on stderr: `hymt input.txt -l ja --debug-chunk-timing` (or set `HYMT_DEBUG_CHUNK_TIMING=1` / `[translation].debug_chunk_timing = true`)
 - Show progress indicators: `cat article.txt | hymt -l fr --progress`
 - Skip interactive checks: `hymt input.txt -l ja --yes`
 - If the source text matches a subcommand name, disambiguate with `--`: `hymt -l zh -- "config"`
@@ -97,6 +99,8 @@ Related skills cover command/documentation translation:
 - If all detected paragraphs are already in the target language, interactive runs still ask whether to translate anyway.
 - Fenced code blocks and leading YAML frontmatter are excluded from language detection and translation in every mode.
 - `--stream` is the default for stdout translation. Streaming emits any cached segment-0 prefix immediately; if segment 0 is uncached, it starts only that request first, then starts remaining chunks after segment 0's first non-empty backend token. Normal stdout/stdin translation emits segment 0 tokens optimistically for low TTFT even through pipes; CLI help/usage/options-like input stays validated so completeness checks can retry before stdout is written. `--output <path>` defaults to buffered throughput mode, and `--no-stream` / `--no-streaming` keep buffered stdout behavior.
+- `--concurrency N` overrides `[translation].concurrency` for the process (client semaphore). Higher values improve wall-clock throughput once first-token fan-out begins; `--concurrency 1` is strictly serial and continuous but slower overall. Remaining completed segments are flushed to stdout in document order as soon as the contiguous prefix is ready.
+- `--debug-chunk-timing` (also `translation.debug_chunk_timing` or `HYMT_DEBUG_CHUNK_TIMING=1`) prints per-segment `queue_enter` / `request_start` / `first_token` / `complete` / completeness-retry markers on stderr only.
 - Streaming caches completed segments and emits the final reconstructed remainder after all chunks finish, so stdout remains complete and in segment order.
 - Progress is written to stderr as `[done/total] XX.XX% | elapsed 2m47s | eta 1m23s | NN.NN tok/s`.
 - Identical source segments, target language, template type, and template-specific options reuse cached segment translations.

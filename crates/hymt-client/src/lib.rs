@@ -90,6 +90,7 @@ struct Inner {
     config: HotConfig,
     http: reqwest::Client,
     semaphore: Arc<Semaphore>,
+    concurrency: usize,
 }
 
 // ── TranslationClient ─────────────────────────────────────────────────────────
@@ -109,6 +110,15 @@ impl TranslationClient {
     /// (endpoint URL, model, token limits) are refreshed on each call via `maybe_reload`.
     pub fn new(config: HotConfig) -> Result<Self, ClientError> {
         let concurrency = config.concurrency() as usize;
+        Self::with_concurrency(config, concurrency)
+    }
+
+    /// Creates a new client with an explicit concurrency limit.
+    ///
+    /// Use this when a CLI/runtime override must replace `[translation].concurrency`
+    /// for the lifetime of the client. `concurrency` is clamped to at least 1.
+    pub fn with_concurrency(config: HotConfig, concurrency: usize) -> Result<Self, ClientError> {
+        let concurrency = concurrency.max(1);
         let timeout_secs = config.timeout();
         let timeout = if timeout_secs.is_finite() && timeout_secs > 0.0 {
             Duration::from_secs_f64(timeout_secs.min(86_400.0))
@@ -121,8 +131,14 @@ impl TranslationClient {
                 config,
                 http,
                 semaphore: Arc::new(Semaphore::new(concurrency)),
+                concurrency,
             }),
         })
+    }
+
+    /// Effective request concurrency baked into this client at construction.
+    pub fn concurrency(&self) -> usize {
+        self.inner.concurrency
     }
 
     /// Translates `prompt` to a single string (non-streaming).

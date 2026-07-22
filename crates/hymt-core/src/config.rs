@@ -26,6 +26,7 @@ first_chunk_priority = false
 # hangs when context_window/max_output_tokens alone still leave a multi-k budget.
 # Set to 0 to disable the hard cap (budget is then only expansion/context-limited).
 max_source_tokens_per_segment = 1024
+debug_chunk_timing = false
 
 [language]
 primary = "zh"
@@ -86,6 +87,22 @@ fn expand_tilde(s: &str) -> PathBuf {
         PathBuf::from(home).join(rest)
     } else {
         PathBuf::from(s)
+    }
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return false;
+            }
+            !matches!(
+                trimmed.to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        }
+        Err(_) => false,
     }
 }
 
@@ -214,6 +231,17 @@ impl HotConfig {
     /// `0` disables the hard cap (budget is only expansion/context-limited).
     pub fn max_source_tokens_per_segment(&self) -> u32 {
         self.get_non_negative_u32("translation", "max_source_tokens_per_segment", 1024)
+    }
+
+    /// When true, emit per-chunk pipeline timestamps on stderr.
+    ///
+    /// Also enabled when the environment variable `HYMT_DEBUG_CHUNK_TIMING` is
+    /// set to a non-empty value other than `0`/`false`/`no`/`off` (case-insensitive).
+    pub fn debug_chunk_timing(&self) -> bool {
+        if env_flag_enabled("HYMT_DEBUG_CHUNK_TIMING") {
+            return true;
+        }
+        self.get_bool("translation", "debug_chunk_timing", false)
     }
 
     // ── language ────────────────────────────────────────────────────────────
@@ -592,6 +620,21 @@ url = "http://localhost:8401/v1/""#,
         fs::write(&path, "[translation]\nfirst_chunk_priority = true").unwrap();
         let cfg = HotConfig::from_path(&path).unwrap();
         assert!(cfg.first_chunk_priority());
+    }
+
+    #[test]
+    fn debug_chunk_timing_defaults_false() {
+        let path = temp_config_path("debug_timing_default");
+        let cfg = HotConfig::from_path(&path).unwrap();
+        assert!(!cfg.debug_chunk_timing());
+    }
+
+    #[test]
+    fn debug_chunk_timing_reads_true() {
+        let path = temp_config_path("debug_timing_true");
+        fs::write(&path, "[translation]\ndebug_chunk_timing = true").unwrap();
+        let cfg = HotConfig::from_path(&path).unwrap();
+        assert!(cfg.debug_chunk_timing());
     }
 
     #[test]

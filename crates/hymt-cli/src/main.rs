@@ -81,6 +81,14 @@ struct Cli {
     #[arg(long = "no-stream", alias = "no-streaming", global = true)]
     no_stream: bool,
 
+    /// Override `[translation].concurrency` for this run (minimum 1)
+    #[arg(long, global = true, value_name = "N")]
+    concurrency: Option<u32>,
+
+    /// Log per-chunk pipeline timestamps on stderr
+    #[arg(long = "debug-chunk-timing", global = true)]
+    debug_chunk_timing: bool,
+
     /// Write top-level text/stdin/file translation to this file
     #[arg(short = 'o', long)]
     output: Option<PathBuf>,
@@ -458,6 +466,11 @@ async fn run() -> Result<()> {
     };
 
     let config = HotConfig::new()?;
+    if cli.debug_chunk_timing {
+        // CLI flag forces timing logs for this process; config/env also enable them.
+        std::env::set_var("HYMT_DEBUG_CHUNK_TIMING", "1");
+    }
+    let concurrency_override = cli.concurrency;
     let default_lang = config.primary_lang();
     let target_lang = cli.lang.as_deref().unwrap_or(&default_lang);
     let explicit_target = cli.lang.is_some();
@@ -467,6 +480,7 @@ async fn run() -> Result<()> {
         stream_output: should_stream_translation(cli.stream, cli.no_stream, cli.output.as_ref()),
         output_path: cli.output.as_deref(),
         warn_only_completeness: cli.warn_only_completeness,
+        concurrency_override,
     };
     let terms = parse_terms(&cli.term);
     let prompt_opts = PromptOpts {
@@ -515,17 +529,49 @@ async fn run() -> Result<()> {
         }
         Some(Cmd::Config(args)) => run_config(args, &config),
         Some(Cmd::Man(args)) => {
-            run_man(args, target_lang, explicit_target, &config, &prompt_opts).await
+            run_man(
+                args,
+                target_lang,
+                explicit_target,
+                &config,
+                &prompt_opts,
+                concurrency_override,
+            )
+            .await
         }
         Some(Cmd::Info(args)) => {
-            run_info(args, target_lang, explicit_target, &config, &prompt_opts).await
+            run_info(
+                args,
+                target_lang,
+                explicit_target,
+                &config,
+                &prompt_opts,
+                concurrency_override,
+            )
+            .await
         }
         Some(Cmd::Exec(args)) => {
-            run_exec(args, target_lang, explicit_target, &config, &prompt_opts).await
+            run_exec(
+                args,
+                target_lang,
+                explicit_target,
+                &config,
+                &prompt_opts,
+                concurrency_override,
+            )
+            .await
         }
         Some(Cmd::Tokenizer(args)) => run_tokenizer(args).await,
         Some(Cmd::Estimate(args)) => {
-            run_estimate(args, target_lang, &template, &prompt_opts, &config).await
+            run_estimate(
+                args,
+                target_lang,
+                &template,
+                &prompt_opts,
+                &config,
+                concurrency_override,
+            )
+            .await
         }
         Some(Cmd::Batch(args)) => {
             run_batch(
@@ -536,6 +582,7 @@ async fn run() -> Result<()> {
                 &prompt_opts,
                 cli.plan,
                 &config,
+                concurrency_override,
             )
             .await
         }
@@ -549,6 +596,7 @@ async fn run() -> Result<()> {
                 &template,
                 &prompt_opts,
                 &config,
+                concurrency_override,
             )
             .await
         }
@@ -569,8 +617,15 @@ fn make_segmenter_from_path(tokenizer_path: PathBuf) -> Segmenter {
     }
 }
 
-fn make_client(config: &HotConfig) -> Result<TranslationClient> {
-    TranslationClient::new(config.clone()).map_err(|e| anyhow::anyhow!("{e}"))
+fn make_client_with_concurrency(
+    config: &HotConfig,
+    concurrency_override: Option<u32>,
+) -> Result<TranslationClient> {
+    let concurrency = concurrency_override
+        .unwrap_or_else(|| config.concurrency())
+        .max(1) as usize;
+    TranslationClient::with_concurrency(config.clone(), concurrency)
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 fn piped_stdin_placeholder(words: &[String], stdin_is_terminal: bool) -> bool {
@@ -585,6 +640,7 @@ struct TranslateFlags<'a> {
     stream_output: bool,
     output_path: Option<&'a Path>,
     warn_only_completeness: bool,
+    concurrency_override: Option<u32>,
 }
 
 fn should_stream_translation(
@@ -669,7 +725,7 @@ async fn run_translate_text(
         return Ok(());
     }
 
-    let client = make_client(config)?;
+    let client = make_client_with_concurrency(config, flags.concurrency_override)?;
     let tctx = TranslationCtx {
         config,
         client: &client,
@@ -744,7 +800,7 @@ async fn run_translate_stdin(
         return Ok(());
     }
 
-    let client = make_client(config)?;
+    let client = make_client_with_concurrency(config, flags.concurrency_override)?;
     let tctx = TranslationCtx {
         config,
         client: &client,
@@ -810,7 +866,7 @@ async fn run_translate_path(
         return Ok(());
     }
 
-    let client = make_client(config)?;
+    let client = make_client_with_concurrency(config, flags.concurrency_override)?;
     let tctx = TranslationCtx {
         config,
         client: &client,
@@ -952,13 +1008,14 @@ async fn run_man(
     explicit_target: bool,
     config: &HotConfig,
     _opts: &PromptOpts,
+    concurrency_override: Option<u32>,
 ) -> Result<()> {
     if args.args.is_empty() {
         anyhow::bail!("man page name is required");
     }
     let segmenter = make_segmenter();
     let history = HistoryDB::default();
-    let client = make_client(config)?;
+    let client = make_client_with_concurrency(config, concurrency_override)?;
     let str_args: Vec<&str> = args.args.iter().map(String::as_str).collect();
     let opts = ManInfoOpts {
         target_lang,
@@ -981,13 +1038,14 @@ async fn run_info(
     explicit_target: bool,
     config: &HotConfig,
     _opts: &PromptOpts,
+    concurrency_override: Option<u32>,
 ) -> Result<()> {
     if args.args.is_empty() {
         anyhow::bail!("info topic is required");
     }
     let segmenter = make_segmenter();
     let history = HistoryDB::default();
-    let client = make_client(config)?;
+    let client = make_client_with_concurrency(config, concurrency_override)?;
     let str_args: Vec<&str> = args.args.iter().map(String::as_str).collect();
     let opts = ManInfoOpts {
         target_lang,
@@ -1010,6 +1068,7 @@ async fn run_exec(
     explicit_target: bool,
     config: &HotConfig,
     _opts: &PromptOpts,
+    concurrency_override: Option<u32>,
 ) -> Result<()> {
     match args.action {
         Some(ExecAction::Install(install_args)) => {
@@ -1025,7 +1084,7 @@ async fn run_exec(
         Some(ExecAction::Precache) => {
             let segmenter = make_segmenter();
             let history = HistoryDB::default();
-            let client = make_client(config)?;
+            let client = make_client_with_concurrency(config, concurrency_override)?;
             let summary = run_precache(
                 target_lang,
                 config,
@@ -1058,7 +1117,7 @@ async fn run_exec(
             }
             let segmenter = make_segmenter();
             let history = HistoryDB::default();
-            let client = make_client(config)?;
+            let client = make_client_with_concurrency(config, concurrency_override)?;
             let code = run_exec_command(
                 &command,
                 target_lang,
@@ -1096,6 +1155,7 @@ async fn run_estimate(
     template: &TemplateType,
     opts: &PromptOpts,
     config: &HotConfig,
+    concurrency_override: Option<u32>,
 ) -> Result<()> {
     let segmenter = make_segmenter();
     let plan = plan_translation("sample", target_lang, config, &segmenter, template, opts)?;
@@ -1106,7 +1166,9 @@ async fn run_estimate(
 
     let history = HistoryDB::default();
     let source_chars = args.source_chars;
-    let concurrency = config.concurrency() as i64;
+    let concurrency = concurrency_override
+        .unwrap_or_else(|| config.concurrency())
+        .max(1) as i64;
     let template_name = template.as_str();
 
     eprintln!(
@@ -1202,6 +1264,7 @@ fn estimate_segment_count(source_chars: u64, chars_per_segment: u64) -> Result<i
 
 // ── batch ─────────────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn run_batch(
     args: BatchArgs,
     target_lang: &str,
@@ -1210,6 +1273,7 @@ async fn run_batch(
     opts: &PromptOpts,
     show_plan: bool,
     config: &HotConfig,
+    concurrency_override: Option<u32>,
 ) -> Result<()> {
     let segmenter = make_segmenter();
     let history = HistoryDB::default();
@@ -1228,7 +1292,7 @@ async fn run_batch(
         return Ok(());
     }
 
-    let client = make_client(config)?;
+    let client = make_client_with_concurrency(config, concurrency_override)?;
     run_batch_translation(&plan, config, &client, &segmenter, &history, template, opts).await?;
     eprintln!("Batch translation complete: {} files", plan.files.len());
     Ok(())
@@ -1309,10 +1373,11 @@ async fn run_translate_doc(
     template: &TemplateType,
     opts: &PromptOpts,
     config: &HotConfig,
+    concurrency_override: Option<u32>,
 ) -> Result<()> {
     let segmenter = make_segmenter();
     let history = HistoryDB::default();
-    let client = make_client(config)?;
+    let client = make_client_with_concurrency(config, concurrency_override)?;
     let doc_opts = DocTranslationOpts {
         target_lang,
         config,
@@ -1503,6 +1568,49 @@ Options:\n  --source-id <SOURCE_ID>\n  --context-only\n";
         let cli = Cli::try_parse_from(["hymt", "--no-streaming", "hello"]).unwrap();
         assert!(cli.no_stream);
         assert!(!should_stream_translation(cli.stream, cli.no_stream, None));
+    }
+
+    #[test]
+    fn concurrency_flag_parses_and_overrides_absent_by_default() {
+        let default_cli = Cli::try_parse_from(["hymt", "hello"]).unwrap();
+        assert_eq!(default_cli.concurrency, None);
+        assert!(!default_cli.debug_chunk_timing);
+
+        let cli = Cli::try_parse_from([
+            "hymt",
+            "--concurrency",
+            "4",
+            "--debug-chunk-timing",
+            "hello",
+        ])
+        .unwrap();
+        assert_eq!(cli.concurrency, Some(4));
+        assert!(cli.debug_chunk_timing);
+    }
+
+    #[test]
+    fn make_client_with_concurrency_override_replaces_config_value() {
+        let dir = PathBuf::from("target").join(unique_test_name("hymt-cli-concurrency", "dir"));
+        let _cleanup = CleanupPath::Dir(dir.clone());
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            r#"[endpoint]
+url = "http://127.0.0.1:1/v1"
+
+[translation]
+concurrency = 8
+timeout = 5
+"#,
+        )
+        .unwrap();
+        let cfg = HotConfig::from_path(&path).unwrap();
+        assert_eq!(cfg.concurrency(), 8);
+        let client = make_client_with_concurrency(&cfg, Some(2)).unwrap();
+        assert_eq!(client.concurrency(), 2);
+        let default_client = make_client_with_concurrency(&cfg, None).unwrap();
+        assert_eq!(default_client.concurrency(), 8);
     }
 
     #[test]
