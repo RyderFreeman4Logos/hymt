@@ -505,6 +505,8 @@ impl HotConfig {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&self.path, DEFAULT_CONFIG)?;
+        // Future secrets land in this file; never leave it group/world-readable.
+        restrict_config_permissions(&self.path)?;
         Ok(())
     }
 
@@ -676,37 +678,17 @@ pub struct TelegramClaimBootstrap {
 }
 
 fn generate_claim_password() -> String {
-    // 10 chars from a no-ambiguous alphabet (~51 bits); human-enterable in chat.
+    // 10 chars from a no-ambiguous alphabet of length 32 (~50 bits of entropy).
+    // Alphabet length is a power of two so byte→index mapping has no modulo bias.
     const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    debug_assert_eq!(ALPHABET.len(), 32);
     let mut bytes = [0u8; 10];
-    fill_random_bytes(&mut bytes);
+    // OS CSPRNG — never fall back to a process-seeded PRNG for claim secrets.
+    getrandom::getrandom(&mut bytes).expect("OS CSPRNG unavailable for claim password");
     bytes
         .iter()
         .map(|b| ALPHABET[(*b as usize) % ALPHABET.len()] as char)
         .collect()
-}
-
-fn fill_random_bytes(out: &mut [u8]) {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let mut hasher = DefaultHasher::new();
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
-        .hash(&mut hasher);
-    std::process::id().hash(&mut hasher);
-    std::thread::current().id().hash(&mut hasher);
-    let mut state = hasher.finish();
-    for (i, slot) in out.iter_mut().enumerate() {
-        state = state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(i as u64)
-            .wrapping_add(1);
-        *slot = (state >> 33) as u8;
-    }
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), CoreError> {
@@ -716,6 +698,18 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), CoreError> {
     let tmp = path.with_extension("toml.tmp");
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)?;
+    // Config may hold bot_token / claim_password / owners — keep owner-only.
+    restrict_config_permissions(path)?;
+    Ok(())
+}
+
+/// Best-effort owner-read/write-only mode for secret-bearing config files.
+fn restrict_config_permissions(path: &Path) -> Result<(), CoreError> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::metadata(path)?;
+    let mut perms = meta.permissions();
+    perms.set_mode(0o600);
+    std::fs::set_permissions(path, perms)?;
     Ok(())
 }
 
@@ -959,10 +953,26 @@ mode = "groups"
         let first = cfg.ensure_telegram_claim_password().unwrap();
         assert!(first.newly_generated);
         assert_eq!(first.claim_password.len(), 10);
+        assert!(first
+            .claim_password
+            .bytes()
+            .all(|b| b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789".contains(&b)));
         let second = cfg.ensure_telegram_claim_password().unwrap();
         assert!(!second.newly_generated);
         assert_eq!(second.claim_password, first.claim_password);
         assert_eq!(cfg.telegram_claim_password(), first.claim_password);
+    }
+
+    #[test]
+    fn claim_password_generation_is_unpredictable_across_calls() {
+        // Weak process-seeded PRNGs often emit identical streams in-process;
+        // CSPRNG should almost never collide across independent generations.
+        let a = generate_claim_password();
+        let b = generate_claim_password();
+        let c = generate_claim_password();
+        assert_ne!(a, b);
+        assert_ne!(b, c);
+        assert_ne!(a, c);
     }
 
     #[test]
@@ -983,5 +993,18 @@ mode = "groups"
         let second = cfg.regenerate_telegram_claim_password().unwrap();
         assert_ne!(first, second);
         assert_eq!(cfg.telegram_claim_password(), second);
+    }
+
+    #[test]
+    fn telegram_secret_writes_set_owner_only_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp_config_path("tg_mode_600");
+        let cfg = HotConfig::from_path(&path).unwrap();
+        let _ = cfg.ensure_telegram_claim_password().unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "claim password write must set 0o600");
+        let _ = cfg.add_telegram_owner(1).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "owner write must set 0o600");
     }
 }

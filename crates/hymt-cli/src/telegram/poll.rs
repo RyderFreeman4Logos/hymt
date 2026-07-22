@@ -193,8 +193,10 @@ async fn handle_update(
 }
 
 async fn get_updates(http: &Client, token: &str, offset: i64) -> Result<Vec<Update>> {
+    // Token lives in the URL path (Bot API contract). Never surface that URL
+    // via reqwest's Display/Debug/context chains — they embed the full URL.
     let url = format!("{API_BASE}/bot{token}/getUpdates");
-    let resp = http
+    let resp = match http
         .get(&url)
         .query(&[
             ("offset", offset.to_string()),
@@ -203,19 +205,32 @@ async fn get_updates(http: &Client, token: &str, offset: i64) -> Result<Vec<Upda
         ])
         .send()
         .await
-        .context("getUpdates request")?;
+    {
+        Ok(r) => r,
+        Err(e) => bail!("{}", safe_reqwest_error("getUpdates request", token, &e)),
+    };
     let status = resp.status();
-    let body = resp.text().await.context("getUpdates body")?;
+    let body = match resp.text().await {
+        Ok(b) => b,
+        Err(e) => bail!("{}", safe_reqwest_error("getUpdates body", token, &e)),
+    };
     if !status.is_success() {
-        // Never echo the token; body may still be useful without it.
-        bail!("getUpdates HTTP {status}: {body}");
+        bail!(
+            "getUpdates HTTP {status}: {}",
+            redact_token_in_text(token, &body)
+        );
     }
-    let parsed: ApiResponse<Vec<Update>> =
-        serde_json::from_str(&body).context("parse getUpdates json")?;
+    let parsed: ApiResponse<Vec<Update>> = match serde_json::from_str(&body) {
+        Ok(p) => p,
+        Err(e) => bail!("parse getUpdates json: {e}"),
+    };
     if !parsed.ok {
         bail!(
             "getUpdates not ok: {}",
-            parsed.description.unwrap_or_else(|| "unknown".into())
+            redact_token_in_text(
+                token,
+                &parsed.description.unwrap_or_else(|| "unknown".into())
+            )
         );
     }
     Ok(parsed.result.unwrap_or_default())
@@ -235,22 +250,76 @@ async fn send_message(http: &Client, token: &str, chat_id: i64, text: &str) -> R
         "text": text,
         "disable_web_page_preview": true,
     });
-    let resp = http
-        .post(&url)
-        .json(&payload)
-        .send()
-        .await
-        .context("sendMessage request")?;
+    let resp = match http.post(&url).json(&payload).send().await {
+        Ok(r) => r,
+        Err(e) => bail!("{}", safe_reqwest_error("sendMessage request", token, &e)),
+    };
     let status = resp.status();
-    let body: Value = resp.json().await.context("sendMessage json")?;
+    let body: Value = match resp.json().await {
+        Ok(b) => b,
+        Err(e) => bail!("{}", safe_reqwest_error("sendMessage json", token, &e)),
+    };
     if !status.is_success() || body.get("ok").and_then(|v| v.as_bool()) != Some(true) {
         let desc = body
             .get("description")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
-        bail!("sendMessage failed HTTP {status}: {desc}");
+        bail!(
+            "sendMessage failed HTTP {status}: {}",
+            redact_token_in_text(token, desc)
+        );
     }
     Ok(())
+}
+
+/// Map a reqwest error to a log-safe message that never includes the bot token.
+///
+/// `reqwest::Error` Display often embeds the request URL (`/bot{token}/...`).
+/// Callers must not append `err.to_string()` / `{:?}` — only this helper.
+fn safe_reqwest_error(op: &str, _token: &str, err: &reqwest::Error) -> String {
+    // Prefer structured fields over Display/Debug, which may contain the URL.
+    let kind = if err.is_timeout() {
+        "timeout"
+    } else if err.is_connect() {
+        "connect"
+    } else if err.is_request() {
+        "request"
+    } else if err.is_body() {
+        "body"
+    } else if err.is_decode() {
+        "decode"
+    } else if err.is_redirect() {
+        "redirect"
+    } else {
+        "transport"
+    };
+    let status = err
+        .status()
+        .map(|s| format!(" HTTP {s}"))
+        .unwrap_or_default();
+    format!("{op} failed ({kind}{status})")
+}
+
+fn redact_token_in_text(token: &str, text: &str) -> String {
+    if token.is_empty() {
+        return text.to_owned();
+    }
+    text.replace(token, "<redacted>")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redact_token_in_text_strips_secret() {
+        let token = "123456:ABC-DEF_secret";
+        let raw = format!("error for https://api.telegram.org/bot{token}/getUpdates");
+        let scrubbed = redact_token_in_text(token, &raw);
+        assert!(!scrubbed.contains(token));
+        assert!(scrubbed.contains("<redacted>"));
+        assert!(!scrubbed.contains("ABC-DEF"));
+    }
 }
 
 fn make_segmenter() -> Segmenter {

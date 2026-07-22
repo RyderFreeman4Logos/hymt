@@ -131,13 +131,11 @@ pub fn evaluate_text_message(
         return BotAction::Help;
     }
 
-    // Private-chat ownership claim: exact password (or /claim <password>).
+    // Private-chat ownership claim: exact password (or /claim[@BotName] <password>).
+    // Telegram may append @BotName to the command token, same as /start.
     if msg.chat_kind == ChatKind::Private {
-        let claim_candidate = if let Some(rest) = text
-            .strip_prefix("/claim")
-            .or_else(|| text.strip_prefix("/Claim"))
-        {
-            rest.trim()
+        let claim_candidate = if command_base.eq_ignore_ascii_case("/claim") {
+            text[command.len()..].trim()
         } else {
             text
         };
@@ -344,5 +342,29 @@ mod tests {
         };
         let action = evaluate_text_message(&msg, "x", TelegramMode::Owners, &[], &[], "zh", "en");
         assert_eq!(action, BotAction::Help);
+    }
+
+    #[test]
+    fn claim_with_bot_suffix_accepts_password() {
+        let msg = IncomingTextMessage {
+            chat_id: 11,
+            chat_kind: ChatKind::Private,
+            text: "/claim@MyBot SECRET99".into(),
+        };
+        let action =
+            evaluate_text_message(&msg, "SECRET99", TelegramMode::Owners, &[], &[], "zh", "en");
+        assert_eq!(action, BotAction::Claimed { chat_id: 11 });
+    }
+
+    #[test]
+    fn claim_command_case_insensitive_with_bot_suffix() {
+        let msg = IncomingTextMessage {
+            chat_id: 12,
+            chat_kind: ChatKind::Private,
+            text: "/Claim@OtherBot  SECRET99  ".into(),
+        };
+        let action =
+            evaluate_text_message(&msg, "SECRET99", TelegramMode::Owners, &[], &[], "zh", "en");
+        assert_eq!(action, BotAction::Claimed { chat_id: 12 });
     }
 }

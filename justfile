@@ -71,12 +71,12 @@ install-no-telegram:
     if command -v uv >/dev/null 2>&1; then
         uv tool uninstall hymt 2>/dev/null || true
     fi
-    cargo install --path "{{_repo_root}}/crates/hymt-cli" --no-default-features --force
+    {{_io_prefix}} cargo install --path "{{_repo_root}}/crates/hymt-cli" --no-default-features --force
     echo "hymt (Rust, no telegram) installed from {{_repo_root}}"
 
 # Compile-check CLI with telegram feature disabled.
 check-no-telegram:
-    cargo check -p hymt-cli --no-default-features
+    {{_io_prefix}} cargo check -p hymt-cli --no-default-features
 
 # =============================================================================
 # Misc
