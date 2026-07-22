@@ -278,7 +278,7 @@ pub async fn run_doc_translation(source: &Path, opts: &DocTranslationOpts<'_>) -
             segmenter: opts.segmenter,
             history: opts.history,
         };
-        let translated = translate_text(
+        let outcome = translate_text(
             &text,
             &target.target_lang,
             opts.template,
@@ -286,6 +286,8 @@ pub async fn run_doc_translation(source: &Path, opts: &DocTranslationOpts<'_>) -
             &tctx,
         )
         .await?;
+        outcome.report_completeness_degraded();
+        let translated = outcome.text;
 
         // Atomic write: PID + epoch-ns suffix prevents concurrent temp-file collisions.
         if let Some(parent) = target.output_path.parent() {

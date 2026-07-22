@@ -2,6 +2,9 @@
 # AI AGENT: Do NOT modify this file or use `git commit -n`/`--no-verify` to bypass pre-commit.
 
 set shell := ["bash", "-c"]
+# IO scheduling: run cargo at idle priority to avoid starving interactive processes
+_io_prefix := "ionice -c 3 nice -n 19"
+
 
 _repo_root := `git rev-parse --show-toplevel`
 _timeout := "3000"
@@ -23,16 +26,16 @@ pre-commit:
     '
 
 fmt:
-    cargo fmt --all -- --check
+    {{_io_prefix}} cargo fmt --all -- --check
 
 lint:
-    cargo clippy --workspace -- -D warnings
+    {{_io_prefix}} cargo clippy --workspace -- -D warnings
 
 check:
-    cargo check --workspace
+    {{_io_prefix}} cargo check --workspace
 
 test:
-    cargo test --workspace
+    {{_io_prefix}} cargo test --workspace
 
 # ==============================================================================
 # Individual commands
@@ -57,7 +60,7 @@ install:
     if command -v uv >/dev/null 2>&1; then
         uv tool uninstall hymt 2>/dev/null || true
     fi
-    cargo install --path "{{_repo_root}}/crates/hymt-cli" --force
+    {{_io_prefix}} cargo install --path "{{_repo_root}}/crates/hymt-cli" --force
     echo "hymt (Rust) installed from {{_repo_root}}"
 
 # ==============================================================================

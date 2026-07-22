@@ -342,14 +342,15 @@ pub async fn run_batch_translation(
             segmenter,
             history,
         };
-        let translated = translate_text(&file.text, &file.target_lang, template, opts, &tctx)
+        let outcome = translate_text(&file.text, &file.target_lang, template, opts, &tctx)
             .await
             .with_context(|| format!("translating {}", file.source_path.display()))?;
+        outcome.report_completeness_degraded();
 
         if let Some(parent) = file.output_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        tokio::fs::write(&file.output_path, &translated)
+        tokio::fs::write(&file.output_path, &outcome.text)
             .await
             .with_context(|| format!("writing {}", file.output_path.display()))?;
     }

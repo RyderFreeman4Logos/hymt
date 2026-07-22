@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Branch protection: blocks pushes (and any other lefthook pre-push wiring) on protected branches.
+# Installed by: csa setup review-gate. This script is hooked pre-push only.
+set -euo pipefail
+
+branch=$(git symbolic-ref --short HEAD 2>/dev/null) || exit 0
+[ -z "$branch" ] && exit 0  # detached HEAD
+
+PROTECTED="main dev master"
+
+for pb in $PROTECTED; do
+  if [ "$branch" = "$pb" ]; then
+    echo ""
+    echo "BLOCKED: Cannot commit or push directly to '$branch'."
+    echo ""
+    echo "Create a feature branch first:"
+    echo "  git checkout -b feat/<description>"
+    echo "  git checkout -b fix/<description>"
+    echo ""
+    echo "Branch naming: feat/ fix/ refactor/ chore/ docs/ test/"
+    echo ""
+    exit 1
+  fi
+done

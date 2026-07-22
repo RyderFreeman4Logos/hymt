@@ -22,6 +22,10 @@ stream = true
 config_version = 1
 timeout = 600
 first_chunk_priority = false
+# Hard cap on source tokens submitted per segment. Prevents oversized single-segment
+# hangs when context_window/max_output_tokens alone still leave a multi-k budget.
+# Set to 0 to disable the hard cap (budget is then only expansion/context-limited).
+max_source_tokens_per_segment = 1024
 
 [language]
 primary = "zh"
@@ -41,6 +45,10 @@ zh_to_en_min_ratio = 0.3
 en_to_zh_min_ratio = 0.3
 min_paragraph_ratio = 0.5
 max_retries = 2
+# When false (default), top-level CLI translation exits non-zero after writing best
+# attempt if any segment exhausted completeness retries. Set true (or pass
+# --warn-only-completeness) to keep exit 0 with warnings only.
+warn_only = false
 
 [exec]
 shared_cache_path = "/usr/local/share/hymt/cache.db"
@@ -199,6 +207,15 @@ impl HotConfig {
         self.get_bool("translation", "first_chunk_priority", false)
     }
 
+    /// Hard upper bound on source tokens per translation segment.
+    ///
+    /// Caps the expansion/context-derived budget so multi-k documents always
+    /// split instead of hanging as one oversized request. Defaults to `1024`.
+    /// `0` disables the hard cap (budget is only expansion/context-limited).
+    pub fn max_source_tokens_per_segment(&self) -> u32 {
+        self.get_non_negative_u32("translation", "max_source_tokens_per_segment", 1024)
+    }
+
     // ── language ────────────────────────────────────────────────────────────
 
     pub fn primary_lang(&self) -> String {
@@ -270,6 +287,14 @@ impl HotConfig {
 
     pub fn completeness_max_retries(&self) -> u32 {
         self.get_non_negative_u32("completeness", "max_retries", 2)
+    }
+
+    /// When true, completeness best-attempt fallback only warns (exit 0).
+    ///
+    /// Default is `false`: top-level CLI translation reports non-success after
+    /// writing the best-effort output so scripts can detect degraded results.
+    pub fn completeness_warn_only(&self) -> bool {
+        self.get_bool("completeness", "warn_only", false)
     }
 
     // ── exec ────────────────────────────────────────────────────────────────
@@ -443,10 +468,12 @@ mod tests {
         assert_eq!(cfg.secondary_lang(), "en");
         assert_eq!(cfg.stream(), true);
         assert!((cfg.timeout() - 600.0).abs() < f64::EPSILON);
+        assert_eq!(cfg.max_source_tokens_per_segment(), 1024);
         assert!((cfg.completeness_zh_to_en_min_ratio() - 0.3).abs() < f64::EPSILON);
         assert!((cfg.completeness_en_to_zh_min_ratio() - 0.3).abs() < f64::EPSILON);
         assert!((cfg.completeness_min_paragraph_ratio() - 0.5).abs() < f64::EPSILON);
         assert_eq!(cfg.completeness_max_retries(), 2);
+        assert!(!cfg.completeness_warn_only());
     }
 
     #[test]

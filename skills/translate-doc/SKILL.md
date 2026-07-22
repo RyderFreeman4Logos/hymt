@@ -29,17 +29,20 @@ Use `hymt translate-doc` when you want file-oriented Markdown translation instea
 ```toml
 [translation]
 stream = true
+max_source_tokens_per_segment = 1024
 
 [completeness]
 zh_to_en_min_ratio = 0.3
 en_to_zh_min_ratio = 0.3
 min_paragraph_ratio = 0.5
 max_retries = 2
+warn_only = false
 ```
 
 - `stream` controls streaming requests to the endpoint.
 - Completeness validation checks translated segments for minimum character ratio, paragraph retention, and Markdown heading preservation.
-- Failed segments retry up to `[completeness].max_retries`, the shared completeness retry setting used by normal, streaming, batch, and `translate-doc` segment validation; after retries are exhausted, `hymt` warns and continues with the best attempt.
+- Failed segments retry up to `[completeness].max_retries`, the shared completeness retry setting used by normal, streaming, batch, and `translate-doc` segment validation. After retries are exhausted, `hymt` still writes the best-effort output and emits `completeness_degraded_segments=…` on stderr. Top-level text/file/stdin translation exits non-zero so scripts detect degraded results; pass `--warn-only-completeness` or set `[completeness].warn_only = true` to keep exit 0 with warnings only. `translate-doc`, `batch`, and `exec` report the same stderr marker by default but do not fail the whole job for degraded segments.
+- Source segments are bounded by the expansion/context budget and `[translation].max_source_tokens_per_segment` (default `1024`, `0` disables).
 
 ## Notes
 
