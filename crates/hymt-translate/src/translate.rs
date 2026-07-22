@@ -92,6 +92,51 @@ pub struct TranslationPlan {
     pub segment_section_groups: Vec<Vec<usize>>,
 }
 
+/// Result of a full translation pipeline run.
+///
+/// Completeness retries may exhaust and still produce best-effort text. Callers
+/// that care about script-detectable quality (CLI file/text translation) should
+/// inspect [`Self::completeness_degraded_segments`] and treat a non-empty list as
+/// degraded success.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TranslationOutcome {
+    /// Reconstructed translation text (best-effort when degraded).
+    pub text: String,
+    /// 1-based segment indexes that exhausted completeness retries and fell back
+    /// to the best attempt.
+    pub completeness_degraded_segments: Vec<usize>,
+}
+
+impl TranslationOutcome {
+    pub fn is_completeness_degraded(&self) -> bool {
+        !self.completeness_degraded_segments.is_empty()
+    }
+
+    /// Emit a machine-readable summary on stderr when any segment was degraded.
+    pub fn report_completeness_degraded(&self) {
+        if self.completeness_degraded_segments.is_empty() {
+            return;
+        }
+        let list = self
+            .completeness_degraded_segments
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        eprintln!("completeness_degraded_segments={list}");
+        eprintln!(
+            "Warning: {} segment(s) used best attempt after completeness retries exhausted",
+            self.completeness_degraded_segments.len()
+        );
+    }
+}
+
+/// Single-segment translate result (internal).
+struct SegmentTranslateOutcome {
+    text: String,
+    completeness_degraded: bool,
+}
+
 impl TranslationPlan {
     pub fn segment_count(&self) -> usize {
         self.segments.len()
@@ -352,7 +397,13 @@ pub fn plan_translation(
 
     let ratio = expansion_ratio(target_lang).max(MIN_EXPANSION_FOR_BUDGET);
     let max_safe = ((max_output as f64) / (ratio * OUTPUT_SAFETY_FACTOR)) as usize;
-    let available = base_budget.min(max_safe).max(1);
+    let mut available = base_budget.min(max_safe).max(1);
+    // Hard cap keeps multi-k documents from remaining a single slow segment when
+    // context_window/max_output_tokens still leave a multi-k expansion budget.
+    let hard_cap = config.max_source_tokens_per_segment() as usize;
+    if hard_cap > 0 {
+        available = available.min(hard_cap).max(1);
+    }
 
     if text.is_empty() {
         return Ok(TranslationPlan {
@@ -538,6 +589,27 @@ struct SegmentTranslateRequest<'a> {
     config: &'a HotConfig,
 }
 
+fn approx_source_tokens(segment: &str) -> usize {
+    if segment.is_empty() {
+        0
+    } else {
+        segment.len().div_ceil(4).max(1)
+    }
+}
+
+fn map_segment_http_error(
+    index: usize,
+    segment: &str,
+    err: impl std::fmt::Display,
+) -> anyhow::Error {
+    anyhow!(
+        "HTTP translation failed for segment {} (source_chars={}, approx_source_tokens={}): {err}",
+        index + 1,
+        segment.len(),
+        approx_source_tokens(segment)
+    )
+}
+
 async fn translate_segment_with_completeness(
     index: usize,
     client: &TranslationClient,
@@ -546,9 +618,8 @@ async fn translate_segment_with_completeness(
     template: &TemplateType,
     opts: &PromptOpts,
     config: &HotConfig,
-) -> Result<(String, f64)> {
+) -> Result<SegmentTranslateOutcome> {
     let max_retries = config.completeness_max_retries() as usize;
-    let started = Instant::now();
     let mut best = String::new();
 
     for attempt in 0..=max_retries {
@@ -560,7 +631,7 @@ async fn translate_segment_with_completeness(
         let translated = client
             .translate(&prompt)
             .await
-            .map_err(|e| anyhow!("HTTP translation failed: {e}"))?;
+            .map_err(|e| map_segment_http_error(index, segment, e))?;
 
         let result = check_completeness(segment, &translated, target_lang, config);
         best = translated;
@@ -574,7 +645,10 @@ async fn translate_segment_with_completeness(
         }
 
         if result.is_complete {
-            return Ok((best, started.elapsed().as_secs_f64()));
+            return Ok(SegmentTranslateOutcome {
+                text: best,
+                completeness_degraded: false,
+            });
         }
 
         let action = if attempt < max_retries {
@@ -597,7 +671,10 @@ async fn translate_segment_with_completeness(
         index + 1,
         max_retries
     );
-    Ok((best, started.elapsed().as_secs_f64()))
+    Ok(SegmentTranslateOutcome {
+        text: best,
+        completeness_degraded: true,
+    })
 }
 
 async fn send_stream_event(tx: &mpsc::Sender<StreamEvent>, event: StreamEvent) -> Result<()> {
@@ -607,8 +684,8 @@ async fn send_stream_event(tx: &mpsc::Sender<StreamEvent>, event: StreamEvent) -
 }
 
 fn joined_segment(
-    res: std::result::Result<Result<(usize, String)>, tokio::task::JoinError>,
-) -> Result<(usize, String)> {
+    res: std::result::Result<Result<(usize, String, bool)>, tokio::task::JoinError>,
+) -> Result<(usize, String, bool)> {
     match res {
         Ok(Ok(segment)) => Ok(segment),
         Ok(Err(e)) => Err(e.context("segment translation failed")),
@@ -621,9 +698,8 @@ async fn translate_segment_with_completeness_streaming(
     event_tx: &mpsc::Sender<StreamEvent>,
     first_token_tx: Option<mpsc::Sender<()>>,
     output_mode: StreamOutputMode,
-) -> Result<(String, f64)> {
+) -> Result<SegmentTranslateOutcome> {
     let max_retries = request.config.completeness_max_retries() as usize;
-    let started = Instant::now();
     let mut prompt = build_prompt(
         request.segment,
         request.target_lang,
@@ -634,14 +710,14 @@ async fn translate_segment_with_completeness_streaming(
         .client
         .translate_stream(&prompt)
         .await
-        .map_err(|e| anyhow!("HTTP streaming translation failed: {e}"))?;
+        .map_err(|e| map_segment_http_error(request.index, request.segment, e))?;
     let mut translated = String::new();
     let mut streamed_tokens: Vec<String> = Vec::new();
     let mut first_token_tx = first_token_tx;
     let mut emitted_optimistically = false;
 
     while let Some(item) = stream.next().await {
-        let token = item.map_err(|e| anyhow!("HTTP streaming translation failed: {e}"))?;
+        let token = item.map_err(|e| map_segment_http_error(request.index, request.segment, e))?;
         if token.is_empty() {
             continue;
         }
@@ -674,7 +750,10 @@ async fn translate_segment_with_completeness_streaming(
             }
         }
         send_stream_event(event_tx, StreamEvent::SegmentDone(request.index)).await?;
-        return Ok((best, started.elapsed().as_secs_f64()));
+        return Ok(SegmentTranslateOutcome {
+            text: best,
+            completeness_degraded: false,
+        });
     }
 
     // Optimistic mode: tokens are already on stdout and cannot be retracted.
@@ -688,7 +767,10 @@ async fn translate_segment_with_completeness_streaming(
             result.checks_failed
         );
         send_stream_event(event_tx, StreamEvent::SegmentDone(request.index)).await?;
-        return Ok((best, started.elapsed().as_secs_f64()));
+        return Ok(SegmentTranslateOutcome {
+            text: best,
+            completeness_degraded: true,
+        });
     }
 
     let action = if max_retries > 0 {
@@ -717,7 +799,7 @@ async fn translate_segment_with_completeness_streaming(
             .client
             .translate(&prompt)
             .await
-            .map_err(|e| anyhow!("HTTP translation failed: {e}"))?;
+            .map_err(|e| map_segment_http_error(request.index, request.segment, e))?;
 
         let result = check_completeness(
             request.segment,
@@ -745,7 +827,10 @@ async fn translate_segment_with_completeness_streaming(
                 }
             }
             send_stream_event(event_tx, StreamEvent::SegmentDone(request.index)).await?;
-            return Ok((best, started.elapsed().as_secs_f64()));
+            return Ok(SegmentTranslateOutcome {
+                text: best,
+                completeness_degraded: false,
+            });
         }
 
         let action = if attempt < max_retries {
@@ -775,7 +860,10 @@ async fn translate_segment_with_completeness_streaming(
         }
     }
     send_stream_event(event_tx, StreamEvent::SegmentDone(request.index)).await?;
-    Ok((best, started.elapsed().as_secs_f64()))
+    Ok(SegmentTranslateOutcome {
+        text: best,
+        completeness_degraded: true,
+    })
 }
 
 // ── Pipeline partition helper ─────────────────────────────────────────────────
@@ -813,9 +901,12 @@ pub async fn translate_text(
     template: &TemplateType,
     opts: &PromptOpts,
     ctx: &TranslationCtx<'_>,
-) -> Result<String> {
+) -> Result<TranslationOutcome> {
     if text.is_empty() {
-        return Ok(String::new());
+        return Ok(TranslationOutcome {
+            text: String::new(),
+            completeness_degraded_segments: Vec::new(),
+        });
     }
 
     let template_name = template.as_str();
@@ -873,8 +964,10 @@ pub async fn translate_text(
 
     // ── Phase 2: parallel translate missing segments ───────────────────────────
 
+    let mut degraded_segments: Vec<usize> = Vec::new();
+
     if !missing.is_empty() {
-        let mut join_set: JoinSet<Result<(usize, String)>> = JoinSet::new();
+        let mut join_set: JoinSet<Result<(usize, String, bool)>> = JoinSet::new();
 
         for &idx in &missing {
             let client = ctx.client.clone();
@@ -885,7 +978,7 @@ pub async fn translate_text(
             let cfg = ctx.config.clone();
 
             join_set.spawn(async move {
-                let (translated, _elapsed) = translate_segment_with_completeness(
+                let outcome = translate_segment_with_completeness(
                     idx,
                     &client,
                     &segment,
@@ -895,12 +988,15 @@ pub async fn translate_text(
                     &cfg,
                 )
                 .await?;
-                Ok((idx, translated))
+                Ok((idx, outcome.text, outcome.completeness_degraded))
             });
         }
 
         while let Some(res) = join_set.join_next().await {
-            let (idx, translated) = joined_segment(res)?;
+            let (idx, translated, degraded) = joined_segment(res)?;
+            if degraded {
+                degraded_segments.push(idx + 1);
+            }
             let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
             if let Err(e) = ctx.history.store_segment_cache(
                 &seg_hashes[idx],
@@ -1004,7 +1100,12 @@ pub async fn translate_text(
         }
     }
 
-    Ok(translated)
+    degraded_segments.sort_unstable();
+    degraded_segments.dedup();
+    Ok(TranslationOutcome {
+        text: translated,
+        completeness_degraded_segments: degraded_segments,
+    })
 }
 
 /// Translate `text` and emit incremental output events for the pipeline path.
@@ -1020,7 +1121,7 @@ pub async fn translate_text_stream(
     opts: &PromptOpts,
     ctx: &TranslationCtx<'_>,
     event_tx: mpsc::Sender<StreamEvent>,
-) -> Result<String> {
+) -> Result<TranslationOutcome> {
     translate_text_stream_with_mode(
         text,
         target_lang,
@@ -1042,10 +1143,13 @@ pub async fn translate_text_stream_with_mode(
     ctx: &TranslationCtx<'_>,
     output_mode: StreamOutputMode,
     event_tx: mpsc::Sender<StreamEvent>,
-) -> Result<String> {
+) -> Result<TranslationOutcome> {
     if text.is_empty() {
         send_stream_event(&event_tx, StreamEvent::AllDone(String::new())).await?;
-        return Ok(String::new());
+        return Ok(TranslationOutcome {
+            text: String::new(),
+            completeness_degraded_segments: Vec::new(),
+        });
     }
 
     let template_name = template.as_str();
@@ -1099,6 +1203,7 @@ pub async fn translate_text_stream_with_mode(
         }
     }
 
+    let mut degraded_segments: Vec<usize> = Vec::new();
     let mut next_section_index = 0;
     let mut cached_prefix_len = 0;
     while cached_prefix_len < plan.segment_count() && translations[cached_prefix_len].is_some() {
@@ -1146,7 +1251,7 @@ pub async fn translate_text_stream_with_mode(
             }
 
             let mut priority_task = tokio::spawn(async move {
-                let (translated, _elapsed) = translate_segment_with_completeness_streaming(
+                let outcome = translate_segment_with_completeness_streaming(
                     SegmentTranslateRequest {
                         index: chunk_idx,
                         client: &client,
@@ -1161,10 +1266,10 @@ pub async fn translate_text_stream_with_mode(
                     output_mode,
                 )
                 .await?;
-                Ok((chunk_idx, translated))
+                Ok((chunk_idx, outcome.text, outcome.completeness_degraded))
             });
 
-            let mut priority_done: Option<(usize, String)> = None;
+            let mut priority_done: Option<(usize, String, bool)> = None;
             if !missing.is_empty() {
                 tokio::select! {
                     _ = first_token_rx.recv() => {}
@@ -1173,7 +1278,7 @@ pub async fn translate_text_stream_with_mode(
                     }
                 }
 
-                let mut join_set: JoinSet<Result<(usize, String)>> = JoinSet::new();
+                let mut join_set: JoinSet<Result<(usize, String, bool)>> = JoinSet::new();
                 for &idx in &missing {
                     let client = ctx.client.clone();
                     let segment = plan.segments[idx].clone();
@@ -1183,7 +1288,7 @@ pub async fn translate_text_stream_with_mode(
                     let cfg = ctx.config.clone();
 
                     join_set.spawn(async move {
-                        let (translated, _elapsed) = translate_segment_with_completeness(
+                        let outcome = translate_segment_with_completeness(
                             idx,
                             &client,
                             &segment,
@@ -1193,15 +1298,18 @@ pub async fn translate_text_stream_with_mode(
                             &cfg,
                         )
                         .await?;
-                        Ok((idx, translated))
+                        Ok((idx, outcome.text, outcome.completeness_degraded))
                     });
                 }
 
-                let (idx, translated) = if let Some(done) = priority_done {
+                let (idx, translated, degraded) = if let Some(done) = priority_done {
                     done
                 } else {
                     joined_segment(priority_task.await)?
                 };
+                if degraded {
+                    degraded_segments.push(idx + 1);
+                }
                 let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
                 if let Err(e) = ctx.history.store_segment_cache(
                     &seg_hashes[idx],
@@ -1216,7 +1324,10 @@ pub async fn translate_text_stream_with_mode(
                 translations[idx] = Some(translated);
 
                 while let Some(res) = join_set.join_next().await {
-                    let (idx, translated) = joined_segment(res)?;
+                    let (idx, translated, degraded) = joined_segment(res)?;
+                    if degraded {
+                        degraded_segments.push(idx + 1);
+                    }
                     let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
                     if let Err(e) = ctx.history.store_segment_cache(
                         &seg_hashes[idx],
@@ -1232,7 +1343,10 @@ pub async fn translate_text_stream_with_mode(
                     translations[idx] = Some(translated);
                 }
             } else {
-                let (idx, translated) = joined_segment(priority_task.await)?;
+                let (idx, translated, degraded) = joined_segment(priority_task.await)?;
+                if degraded {
+                    degraded_segments.push(idx + 1);
+                }
                 let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
                 if let Err(e) = ctx.history.store_segment_cache(
                     &seg_hashes[idx],
@@ -1247,7 +1361,7 @@ pub async fn translate_text_stream_with_mode(
                 translations[idx] = Some(translated);
             }
         } else {
-            let mut join_set: JoinSet<Result<(usize, String)>> = JoinSet::new();
+            let mut join_set: JoinSet<Result<(usize, String, bool)>> = JoinSet::new();
 
             for &idx in &missing {
                 let client = ctx.client.clone();
@@ -1258,7 +1372,7 @@ pub async fn translate_text_stream_with_mode(
                 let cfg = ctx.config.clone();
 
                 join_set.spawn(async move {
-                    let (translated, _elapsed) = translate_segment_with_completeness(
+                    let outcome = translate_segment_with_completeness(
                         idx,
                         &client,
                         &segment,
@@ -1268,12 +1382,15 @@ pub async fn translate_text_stream_with_mode(
                         &cfg,
                     )
                     .await?;
-                    Ok((idx, translated))
+                    Ok((idx, outcome.text, outcome.completeness_degraded))
                 });
             }
 
             while let Some(res) = join_set.join_next().await {
-                let (idx, translated) = joined_segment(res)?;
+                let (idx, translated, degraded) = joined_segment(res)?;
+                if degraded {
+                    degraded_segments.push(idx + 1);
+                }
                 let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
                 if let Err(e) = ctx.history.store_segment_cache(
                     &seg_hashes[idx],
@@ -1377,7 +1494,12 @@ pub async fn translate_text_stream_with_mode(
     }
 
     send_stream_event(&event_tx, StreamEvent::AllDone(translated.clone())).await?;
-    Ok(translated)
+    degraded_segments.sort_unstable();
+    degraded_segments.dedup();
+    Ok(TranslationOutcome {
+        text: translated,
+        completeness_degraded_segments: degraded_segments,
+    })
 }
 
 // ── output writing ─────────────────────────────────────────────────────────────
@@ -1409,23 +1531,25 @@ pub async fn translate_file(
     template: &TemplateType,
     opts: &PromptOpts,
     ctx: &TranslationCtx<'_>,
-) -> Result<String> {
+) -> Result<TranslationOutcome> {
     let text = tokio::fs::read_to_string(path)
         .await
         .with_context(|| format!("reading {}", path.display()))?;
 
-    let translated = translate_text(&text, target_lang, template, opts, ctx).await?;
+    let outcome = translate_text(&text, target_lang, template, opts, ctx)
+        .await
+        .with_context(|| format!("translating {}", path.display()))?;
 
     if let Some(out) = output_path {
-        write_translation_output(out, &translated).await?;
+        write_translation_output(out, &outcome.text).await?;
     } else {
-        print!("{}", translated);
-        if !translated.ends_with('\n') {
+        print!("{}", outcome.text);
+        if !outcome.text.ends_with('\n') {
             println!();
         }
     }
 
-    Ok(translated)
+    Ok(outcome)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1911,7 +2035,8 @@ max_retries = 1
             tx,
         );
         let render = render_events_as_stdout(rx);
-        tokio::try_join!(translate, render)
+        let (outcome, stdout) = tokio::try_join!(translate, render)?;
+        Ok((outcome.text, stdout))
     }
 
     // ── Hashing ───────────────────────────────────────────────────────────────
@@ -2036,6 +2161,83 @@ max_retries = 1
         .unwrap();
         // en expansion ratio = 1.8, safety = 1.5 → max_safe = 100 / (1.8 * 1.5) ≈ 37
         assert!(plan.available_source_tokens <= 37);
+    }
+
+    #[test]
+    fn plan_hard_cap_splits_multik_style_markdown() {
+        let seg = fallback_segmenter();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        // Large context/output budget (matches production hang class) but hard cap 512.
+        std::fs::write(
+            &cfg_path,
+            "[translation]\ncontext_window = 8192\nmax_output_tokens = 4096\nmax_source_tokens_per_segment = 512\n",
+        )
+        .unwrap();
+        let cfg = hymt_core::config::HotConfig::from_path(&cfg_path).unwrap();
+        // ~2.5k estimated tokens under fallback (~4 bytes/token).
+        let body = "Paragraph about local stopgaps and maintenance stack. ".repeat(80);
+        let text = format!("# Known local stopgaps\n\n{body}\n\n## Details\n\n{body}");
+        let plan = plan_translation(
+            &text,
+            "zh",
+            &cfg,
+            &seg,
+            &TemplateType::Default,
+            &PromptOpts::default(),
+        )
+        .unwrap();
+        assert!(
+            plan.source_tokens >= 2000,
+            "fixture should be multi-k tokens, got {}",
+            plan.source_tokens
+        );
+        assert!(
+            plan.available_source_tokens <= 512,
+            "hard cap should limit budget, got {}",
+            plan.available_source_tokens
+        );
+        assert!(
+            plan.segment_count() >= 2,
+            "multi-k input must split under hard cap; got {} segments",
+            plan.segment_count()
+        );
+        for (i, segment) in plan.segments.iter().enumerate() {
+            let tokens = seg.count_tokens(segment);
+            // Protected atomic blocks may exceed; normal text must fit.
+            if !segment.trim_start().starts_with("```") && !segment.contains('|') {
+                assert!(
+                    tokens <= plan.available_source_tokens,
+                    "segment {i} has {tokens} tokens over budget {}",
+                    plan.available_source_tokens
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn plan_hard_cap_zero_disables_cap() {
+        let seg = fallback_segmenter();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            "[translation]\ncontext_window = 16384\nmax_output_tokens = 4096\nmax_source_tokens_per_segment = 0\n",
+        )
+        .unwrap();
+        let cfg = hymt_core::config::HotConfig::from_path(&cfg_path).unwrap();
+        let plan = plan_translation(
+            "test",
+            "zh",
+            &cfg,
+            &seg,
+            &TemplateType::Default,
+            &PromptOpts::default(),
+        )
+        .unwrap();
+        // Without hard cap, zh expansion 0.7→1.0 * 1.5 → max_safe = 4096/1.5 ≈ 2730,
+        // base_budget also large → available > 1024.
+        assert!(plan.available_source_tokens > 1024);
     }
 
     // ── reconstruct ───────────────────────────────────────────────────────────
@@ -2280,7 +2482,7 @@ max_retries = 1
             history: &history,
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
-        let translated = translate_text_stream(
+        let outcome = translate_text_stream(
             &text,
             "zh",
             &TemplateType::Default,
@@ -2290,6 +2492,7 @@ max_retries = 1
         )
         .await
         .unwrap();
+        let translated = outcome.text;
 
         let mut events = Vec::new();
         while let Some(event) = rx.recv().await {
@@ -2549,7 +2752,7 @@ max_retries = 1
             history: &history,
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
-        let translated = translate_text_stream_with_mode(
+        let outcome = translate_text_stream_with_mode(
             &text,
             "zh",
             &TemplateType::Default,
@@ -2560,6 +2763,7 @@ max_retries = 1
         )
         .await
         .unwrap();
+        let translated = outcome.text;
 
         let first_event = rx.recv().await.expect("stream must emit cached segment 0");
         assert_eq!(first_event, StreamEvent::Token(translations[0].clone()));
@@ -2606,7 +2810,7 @@ max_retries = 1
             history: &history,
         };
 
-        let translated = translate_text(
+        let outcome = translate_text(
             &text,
             "zh",
             &TemplateType::Default,
@@ -2616,7 +2820,8 @@ max_retries = 1
         .await
         .unwrap();
 
-        assert_eq!(translated, expected);
+        assert_eq!(outcome.text, expected);
+        assert!(!outcome.is_completeness_degraded());
         assert_eq!(server.max_active.load(Ordering::SeqCst), 2);
     }
 
@@ -2719,5 +2924,127 @@ max_retries = 1
             }
         );
         assert!(!stdout.contains("short"));
+    }
+
+    #[tokio::test]
+    async fn completeness_best_attempt_marks_degraded_segments() {
+        let text = "Hello world paragraph one.\n\nHello world paragraph two.";
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        // Force token_ratio failure with absurdly high min ratio and zero retries.
+        std::fs::write(
+            &cfg_path,
+            r#"[endpoint]
+url = "PLACEHOLDER"
+
+[translation]
+context_window = 4096
+max_output_tokens = 512
+concurrency = 1
+timeout = 5
+max_source_tokens_per_segment = 1024
+
+[completeness]
+zh_to_en_min_ratio = 0.3
+en_to_zh_min_ratio = 10.0
+min_paragraph_ratio = 0.5
+max_retries = 0
+"#,
+        )
+        .unwrap();
+        // mock server returns short translation that fails en_to_zh ratio
+        let server = start_mock_server(vec![MockResponse::Json("短".to_owned())]).await;
+        let cfg_toml = std::fs::read_to_string(&cfg_path)
+            .unwrap()
+            .replace("PLACEHOLDER", &server.endpoint_url);
+        std::fs::write(&cfg_path, cfg_toml).unwrap();
+        let cfg = hymt_core::config::HotConfig::from_path(&cfg_path).unwrap();
+        let segmenter = fallback_segmenter();
+        let history = HistoryDB::new(temp_path("completeness-degraded.db"));
+        let client = TranslationClient::new(cfg.clone()).unwrap();
+        let ctx = TranslationCtx {
+            config: &cfg,
+            client: &client,
+            segmenter: &segmenter,
+            history: &history,
+        };
+        let outcome = translate_text(
+            text,
+            "zh",
+            &TemplateType::Default,
+            &PromptOpts::default(),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(
+            outcome.is_completeness_degraded(),
+            "expected degraded segments, got {:?}",
+            outcome.completeness_degraded_segments
+        );
+        assert!(!outcome.text.is_empty());
+        assert_eq!(outcome.completeness_degraded_segments, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn segment_timeout_error_includes_segment_context() {
+        // Bind a listener that never responds so the client times out.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _keep = tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    break;
+                };
+                // Hold connection open without responding.
+                let _ = socket;
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                r#"[endpoint]
+url = "http://{addr}/v1"
+
+[translation]
+context_window = 4096
+max_output_tokens = 512
+concurrency = 1
+timeout = 0.2
+max_source_tokens_per_segment = 1024
+
+[completeness]
+max_retries = 0
+"#
+            ),
+        )
+        .unwrap();
+        let cfg = hymt_core::config::HotConfig::from_path(&cfg_path).unwrap();
+        let segmenter = fallback_segmenter();
+        let history = HistoryDB::new(temp_path("timeout-diag.db"));
+        let client = TranslationClient::new(cfg.clone()).unwrap();
+        let ctx = TranslationCtx {
+            config: &cfg,
+            client: &client,
+            segmenter: &segmenter,
+            history: &history,
+        };
+        let err = translate_text(
+            "Hello timeout diagnostic segment.",
+            "zh",
+            &TemplateType::Default,
+            &PromptOpts::default(),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("segment 1") && msg.contains("approx_source_tokens="),
+            "timeout error should include segment context, got: {msg}"
+        );
     }
 }

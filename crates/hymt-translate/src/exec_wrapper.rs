@@ -133,7 +133,9 @@ pub(crate) async fn translate_cached(
     }
 
     let opts = PromptOpts::default();
-    let translated = translate_text(text, target_lang, &TemplateType::Default, &opts, ctx).await?;
+    let outcome = translate_text(text, target_lang, &TemplateType::Default, &opts, ctx).await?;
+    outcome.report_completeness_degraded();
+    let translated = outcome.text;
 
     if let Err(e) = cache.store_user(command, subcommand, text, target_lang, &translated) {
         eprintln!("Warning: exec cache store failed: {e}");

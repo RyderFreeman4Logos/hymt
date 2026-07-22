@@ -22,7 +22,7 @@ use hymt_translate::exec_wrapper::run_exec_command;
 use hymt_translate::precache::run_precache;
 use hymt_translate::{
     plan_translation, translate_file, translate_text, translate_text_stream_with_mode,
-    write_translation_output, StreamEvent, StreamOutputMode, TranslationCtx,
+    write_translation_output, StreamEvent, StreamOutputMode, TranslationCtx, TranslationOutcome,
 };
 
 // ── Known subcommand names (for smart routing) ────────────────────────────────
@@ -96,6 +96,10 @@ struct Cli {
 
     #[arg(long = "no-progress", global = true, hide = true)]
     no_progress: bool,
+
+    /// Keep exit 0 when completeness falls back to best attempt
+    #[arg(long = "warn-only-completeness", global = true)]
+    warn_only_completeness: bool,
 
     /// Translation template
     #[arg(long, value_enum, default_value_t = TemplateArg::Default, global = true)]
@@ -462,6 +466,7 @@ async fn run() -> Result<()> {
         show_plan: cli.plan,
         stream_output: should_stream_translation(cli.stream, cli.no_stream, cli.output.as_ref()),
         output_path: cli.output.as_deref(),
+        warn_only_completeness: cli.warn_only_completeness,
     };
     let terms = parse_terms(&cli.term);
     let prompt_opts = PromptOpts {
@@ -579,6 +584,7 @@ struct TranslateFlags<'a> {
     show_plan: bool,
     stream_output: bool,
     output_path: Option<&'a Path>,
+    warn_only_completeness: bool,
 }
 
 fn should_stream_translation(
@@ -587,6 +593,29 @@ fn should_stream_translation(
     output_path: Option<&PathBuf>,
 ) -> bool {
     stream_enabled && !no_stream && output_path.is_none()
+}
+
+fn completeness_warn_only(config: &HotConfig, flag: bool) -> bool {
+    flag || config.completeness_warn_only()
+}
+
+fn finalize_top_level_outcome(outcome: &TranslationOutcome, warn_only: bool) -> Result<()> {
+    if !outcome.is_completeness_degraded() {
+        return Ok(());
+    }
+    outcome.report_completeness_degraded();
+    if warn_only {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "completeness degraded (best attempt) for segment(s): {}",
+        outcome
+            .completeness_degraded_segments
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    )
 }
 
 async fn run_translate_text(
@@ -647,6 +676,7 @@ async fn run_translate_text(
         segmenter: &segmenter,
         history: &history,
     };
+    let warn_only = completeness_warn_only(config, flags.warn_only_completeness);
     if flags.stream_output {
         return translate_text_to_stdout_streaming(
             &text,
@@ -655,19 +685,20 @@ async fn run_translate_text(
             opts,
             &tctx,
             true,
+            warn_only,
         )
         .await;
     }
-    let translated = translate_text(&text, &effective_lang, template, opts, &tctx).await?;
+    let outcome = translate_text(&text, &effective_lang, template, opts, &tctx).await?;
     if let Some(out) = flags.output_path {
-        write_translation_output(out, &translated).await?;
-        return Ok(());
+        write_translation_output(out, &outcome.text).await?;
+        return finalize_top_level_outcome(&outcome, warn_only);
     }
-    print!("{translated}");
-    if !translated.ends_with('\n') {
+    print!("{}", outcome.text);
+    if !outcome.text.ends_with('\n') {
         println!();
     }
-    Ok(())
+    finalize_top_level_outcome(&outcome, warn_only)
 }
 
 async fn run_translate_stdin(
@@ -720,6 +751,7 @@ async fn run_translate_stdin(
         segmenter: &segmenter,
         history: &history,
     };
+    let warn_only = completeness_warn_only(config, flags.warn_only_completeness);
     if flags.stream_output {
         return translate_text_to_stdout_streaming(
             &text,
@@ -728,19 +760,20 @@ async fn run_translate_stdin(
             opts,
             &tctx,
             stdin_is_terminal,
+            warn_only,
         )
         .await;
     }
-    let translated = translate_text(&text, &effective_lang, template, opts, &tctx).await?;
+    let outcome = translate_text(&text, &effective_lang, template, opts, &tctx).await?;
     if let Some(out) = flags.output_path {
-        write_translation_output(out, &translated).await?;
-        return Ok(());
+        write_translation_output(out, &outcome.text).await?;
+        return finalize_top_level_outcome(&outcome, warn_only);
     }
-    print!("{translated}");
-    if !translated.ends_with('\n') {
+    print!("{}", outcome.text);
+    if !outcome.text.ends_with('\n') {
         println!();
     }
-    Ok(())
+    finalize_top_level_outcome(&outcome, warn_only)
 }
 
 async fn run_translate_path(
@@ -784,6 +817,7 @@ async fn run_translate_path(
         segmenter: &segmenter,
         history: &history,
     };
+    let warn_only = completeness_warn_only(config, flags.warn_only_completeness);
     if flags.stream_output {
         return translate_text_to_stdout_streaming(
             &text,
@@ -792,10 +826,11 @@ async fn run_translate_path(
             opts,
             &tctx,
             false,
+            warn_only,
         )
         .await;
     }
-    translate_file(
+    let outcome = translate_file(
         path,
         flags.output_path,
         &effective_lang,
@@ -804,7 +839,7 @@ async fn run_translate_path(
         &tctx,
     )
     .await?;
-    Ok(())
+    finalize_top_level_outcome(&outcome, warn_only)
 }
 
 async fn translate_text_to_stdout_streaming(
@@ -814,14 +849,15 @@ async fn translate_text_to_stdout_streaming(
     opts: &PromptOpts,
     tctx: &TranslationCtx<'_>,
     input_is_interactive: bool,
+    warn_only: bool,
 ) -> Result<()> {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
     let output_mode = current_stream_output_mode(text, input_is_interactive);
     let translate =
         translate_text_stream_with_mode(text, target_lang, template, opts, tctx, output_mode, tx);
     let print = print_stream_events(rx);
-    let (_translated, ()) = tokio::try_join!(translate, print)?;
-    Ok(())
+    let (outcome, ()) = tokio::try_join!(translate, print)?;
+    finalize_top_level_outcome(&outcome, warn_only)
 }
 
 fn current_stream_output_mode(input_text: &str, input_is_interactive: bool) -> StreamOutputMode {
