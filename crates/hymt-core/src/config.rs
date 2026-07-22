@@ -64,6 +64,14 @@ blocklist = [
     "gpg", "openssl", "base64", "xxd", "od", "hexdump", "dd",
     "cp", "mv", "rsync", "docker", "podman", "hymt", "ssh", "scp"
 ]
+
+[telegram]
+enabled = false
+bot_token = ""
+claim_password = ""
+owners = []
+groups = []
+mode = "owners"
 "#;
 
 const DEFAULT_BLOCKLIST: &[&str] = &[
@@ -381,6 +389,99 @@ impl HotConfig {
             .unwrap_or_else(|| DEFAULT_BLOCKLIST.iter().map(|s| s.to_string()).collect())
     }
 
+    // ── telegram ────────────────────────────────────────────────────────────
+
+    /// Whether the Telegram bot is enabled (`false` until the user opts in).
+    pub fn telegram_enabled(&self) -> bool {
+        self.get_bool("telegram", "enabled", false)
+    }
+
+    /// Bot token from config, or empty when unset.
+    ///
+    /// Callers should prefer [`Self::telegram_bot_token_resolved`] so the
+    /// `HYMT_TELEGRAM_BOT_TOKEN` environment variable can override config.
+    pub fn telegram_bot_token(&self) -> String {
+        self.get_str("telegram", "bot_token", "")
+    }
+
+    /// Resolve the bot token from `HYMT_TELEGRAM_BOT_TOKEN` or config.
+    pub fn telegram_bot_token_resolved(&self) -> String {
+        if let Ok(env_token) = std::env::var("HYMT_TELEGRAM_BOT_TOKEN") {
+            let trimmed = env_token.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_owned();
+            }
+        }
+        self.telegram_bot_token()
+    }
+
+    /// Human-enterable claim password used for private-chat ownership claims.
+    ///
+    /// Treat as a secret: do not log the plaintext repeatedly.
+    pub fn telegram_claim_password(&self) -> String {
+        self.get_str("telegram", "claim_password", "")
+    }
+
+    /// Authorized private-chat owner ids after successful claim.
+    pub fn telegram_owners(&self) -> Vec<i64> {
+        self.get_i64_vec("telegram", "owners")
+    }
+
+    /// Authorized group chat ids used when mode is `groups`.
+    pub fn telegram_groups(&self) -> Vec<i64> {
+        self.get_i64_vec("telegram", "groups")
+    }
+
+    /// Authorization mode: `owners` (default) or `groups`.
+    pub fn telegram_mode(&self) -> TelegramMode {
+        match self
+            .get_str("telegram", "mode", "owners")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "groups" | "group" => TelegramMode::Groups,
+            _ => TelegramMode::Owners,
+        }
+    }
+
+    /// Ensure `[telegram]` exists and a claim password is present.
+    ///
+    /// When the password is missing/empty, generates one and writes it once.
+    /// Returns whether a new password was generated (caller may print it once).
+    pub fn ensure_telegram_claim_password(&self) -> Result<TelegramClaimBootstrap, CoreError> {
+        self.maybe_reload()?;
+        let existing = self.telegram_claim_password();
+        if !existing.trim().is_empty() {
+            return Ok(TelegramClaimBootstrap {
+                claim_password: existing,
+                newly_generated: false,
+            });
+        }
+        let generated = generate_claim_password();
+        self.set_telegram_string("claim_password", &generated)?;
+        Ok(TelegramClaimBootstrap {
+            claim_password: generated,
+            newly_generated: true,
+        })
+    }
+
+    /// Replace the claim password with a newly generated value and persist it.
+    pub fn regenerate_telegram_claim_password(&self) -> Result<String, CoreError> {
+        let generated = generate_claim_password();
+        self.set_telegram_string("claim_password", &generated)?;
+        Ok(generated)
+    }
+
+    /// Add `chat_id` to `owners` if absent and persist the config.
+    pub fn add_telegram_owner(&self, chat_id: i64) -> Result<bool, CoreError> {
+        self.append_telegram_i64("owners", chat_id)
+    }
+
+    /// Add `chat_id` to `groups` if absent and persist the config.
+    pub fn add_telegram_group(&self, chat_id: i64) -> Result<bool, CoreError> {
+        self.append_telegram_i64("groups", chat_id)
+    }
+
     // ── internals ───────────────────────────────────────────────────────────
 
     fn load_from_disk(&self) -> Result<(), CoreError> {
@@ -404,6 +505,8 @@ impl HotConfig {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&self.path, DEFAULT_CONFIG)?;
+        // Future secrets land in this file; never leave it group/world-readable.
+        restrict_config_permissions(&self.path)?;
         Ok(())
     }
 
@@ -463,6 +566,151 @@ impl HotConfig {
             })
             .unwrap_or_default()
     }
+
+    fn get_i64_vec(&self, section: &str, key: &str) -> Vec<i64> {
+        self.section_value(section, key)
+            .and_then(|v| v.as_array().cloned())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| {
+                        v.as_integer()
+                            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn set_telegram_string(&self, key: &str, value: &str) -> Result<(), CoreError> {
+        self.mutate_telegram(|table| {
+            table.insert(key.to_owned(), toml::Value::String(value.to_owned()));
+        })
+    }
+
+    fn append_telegram_i64(&self, key: &str, value: i64) -> Result<bool, CoreError> {
+        let mut added = false;
+        self.mutate_telegram(|table| {
+            let entry = table
+                .entry(key.to_owned())
+                .or_insert_with(|| toml::Value::Array(Vec::new()));
+            let arr = match entry {
+                toml::Value::Array(a) => a,
+                _ => {
+                    *entry = toml::Value::Array(Vec::new());
+                    entry.as_array_mut().expect("array just inserted")
+                }
+            };
+            let exists = arr.iter().any(|v| {
+                v.as_integer() == Some(value)
+                    || v.as_str().and_then(|s| s.parse::<i64>().ok()) == Some(value)
+            });
+            if !exists {
+                arr.push(toml::Value::Integer(value));
+                added = true;
+            }
+        })?;
+        Ok(added)
+    }
+
+    fn mutate_telegram<F>(&self, f: F) -> Result<(), CoreError>
+    where
+        F: FnOnce(&mut toml::map::Map<String, toml::Value>),
+    {
+        self.maybe_reload()?;
+        let mut root = {
+            let state = self.state.read().unwrap();
+            state.data.clone()
+        };
+        {
+            let telegram = root
+                .entry("telegram".to_owned())
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+            let table = match telegram {
+                toml::Value::Table(t) => t,
+                _ => {
+                    *telegram = toml::Value::Table(toml::map::Map::new());
+                    telegram.as_table_mut().expect("table just inserted")
+                }
+            };
+            // Ensure stable defaults for missing keys so partial writes stay complete.
+            table
+                .entry("enabled".to_owned())
+                .or_insert(toml::Value::Boolean(false));
+            table
+                .entry("bot_token".to_owned())
+                .or_insert_with(|| toml::Value::String(String::new()));
+            table
+                .entry("claim_password".to_owned())
+                .or_insert_with(|| toml::Value::String(String::new()));
+            table
+                .entry("owners".to_owned())
+                .or_insert_with(|| toml::Value::Array(Vec::new()));
+            table
+                .entry("groups".to_owned())
+                .or_insert_with(|| toml::Value::Array(Vec::new()));
+            table
+                .entry("mode".to_owned())
+                .or_insert_with(|| toml::Value::String("owners".to_owned()));
+            f(table);
+        }
+        let rendered = toml::to_string_pretty(&root)
+            .map_err(|e| CoreError::Config(format!("serialize config: {e}")))?;
+        atomic_write(&self.path, rendered.as_bytes())?;
+        self.load_from_disk()?;
+        Ok(())
+    }
+}
+
+/// Telegram bot authorization mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelegramMode {
+    /// Private chats that successfully claimed ownership.
+    Owners,
+    /// Messages inside configured group chat ids.
+    Groups,
+}
+
+/// Result of ensuring a claim password exists on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelegramClaimBootstrap {
+    pub claim_password: String,
+    pub newly_generated: bool,
+}
+
+fn generate_claim_password() -> String {
+    // 10 chars from a no-ambiguous alphabet of length 32 (~50 bits of entropy).
+    // Alphabet length is a power of two so byte→index mapping has no modulo bias.
+    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    debug_assert_eq!(ALPHABET.len(), 32);
+    let mut bytes = [0u8; 10];
+    // OS CSPRNG — never fall back to a process-seeded PRNG for claim secrets.
+    getrandom::getrandom(&mut bytes).expect("OS CSPRNG unavailable for claim password");
+    bytes
+        .iter()
+        .map(|b| ALPHABET[(*b as usize) % ALPHABET.len()] as char)
+        .collect()
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), CoreError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)?;
+    // Config may hold bot_token / claim_password / owners — keep owner-only.
+    restrict_config_permissions(path)?;
+    Ok(())
+}
+
+/// Best-effort owner-read/write-only mode for secret-bearing config files.
+fn restrict_config_permissions(path: &Path) -> Result<(), CoreError> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::metadata(path)?;
+    let mut perms = meta.permissions();
+    perms.set_mode(0o600);
+    std::fs::set_permissions(path, perms)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -659,5 +907,104 @@ blocklist = ["foo", "bar"]"#,
         let cfg = HotConfig::from_path(&path).unwrap();
         let bl = cfg.exec_plugin_blocklist();
         assert_eq!(bl, vec!["foo".to_owned(), "bar".to_owned()]);
+    }
+
+    #[test]
+    fn telegram_defaults_when_absent() {
+        let path = temp_config_path("tg_defaults");
+        let cfg = HotConfig::from_path(&path).unwrap();
+        assert!(!cfg.telegram_enabled());
+        assert!(cfg.telegram_bot_token().is_empty());
+        assert!(cfg.telegram_claim_password().is_empty());
+        assert!(cfg.telegram_owners().is_empty());
+        assert!(cfg.telegram_groups().is_empty());
+        assert_eq!(cfg.telegram_mode(), TelegramMode::Owners);
+    }
+
+    #[test]
+    fn telegram_reads_custom_values() {
+        let path = temp_config_path("tg_custom");
+        fs::write(
+            &path,
+            r#"
+[telegram]
+enabled = true
+bot_token = "token-from-file"
+claim_password = "CLAIM-ME"
+owners = [111, 222]
+groups = [333]
+mode = "groups"
+"#,
+        )
+        .unwrap();
+        let cfg = HotConfig::from_path(&path).unwrap();
+        assert!(cfg.telegram_enabled());
+        assert_eq!(cfg.telegram_bot_token(), "token-from-file");
+        assert_eq!(cfg.telegram_claim_password(), "CLAIM-ME");
+        assert_eq!(cfg.telegram_owners(), vec![111, 222]);
+        assert_eq!(cfg.telegram_groups(), vec![333]);
+        assert_eq!(cfg.telegram_mode(), TelegramMode::Groups);
+    }
+
+    #[test]
+    fn ensure_claim_password_generates_once() {
+        let path = temp_config_path("tg_claim_gen");
+        let cfg = HotConfig::from_path(&path).unwrap();
+        let first = cfg.ensure_telegram_claim_password().unwrap();
+        assert!(first.newly_generated);
+        assert_eq!(first.claim_password.len(), 10);
+        assert!(first
+            .claim_password
+            .bytes()
+            .all(|b| b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789".contains(&b)));
+        let second = cfg.ensure_telegram_claim_password().unwrap();
+        assert!(!second.newly_generated);
+        assert_eq!(second.claim_password, first.claim_password);
+        assert_eq!(cfg.telegram_claim_password(), first.claim_password);
+    }
+
+    #[test]
+    fn claim_password_generation_is_unpredictable_across_calls() {
+        // Weak process-seeded PRNGs often emit identical streams in-process;
+        // CSPRNG should almost never collide across independent generations.
+        let a = generate_claim_password();
+        let b = generate_claim_password();
+        let c = generate_claim_password();
+        assert_ne!(a, b);
+        assert_ne!(b, c);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn add_telegram_owner_is_idempotent_and_multi() {
+        let path = temp_config_path("tg_owners");
+        let cfg = HotConfig::from_path(&path).unwrap();
+        assert!(cfg.add_telegram_owner(42).unwrap());
+        assert!(!cfg.add_telegram_owner(42).unwrap());
+        assert!(cfg.add_telegram_owner(99).unwrap());
+        assert_eq!(cfg.telegram_owners(), vec![42, 99]);
+    }
+
+    #[test]
+    fn regenerate_claim_password_changes_value() {
+        let path = temp_config_path("tg_regen");
+        let cfg = HotConfig::from_path(&path).unwrap();
+        let first = cfg.ensure_telegram_claim_password().unwrap().claim_password;
+        let second = cfg.regenerate_telegram_claim_password().unwrap();
+        assert_ne!(first, second);
+        assert_eq!(cfg.telegram_claim_password(), second);
+    }
+
+    #[test]
+    fn telegram_secret_writes_set_owner_only_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp_config_path("tg_mode_600");
+        let cfg = HotConfig::from_path(&path).unwrap();
+        let _ = cfg.ensure_telegram_claim_password().unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "claim password write must set 0o600");
+        let _ = cfg.add_telegram_owner(1).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "owner write must set 0o600");
     }
 }

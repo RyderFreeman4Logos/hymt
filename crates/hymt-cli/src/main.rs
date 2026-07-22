@@ -1,5 +1,8 @@
 mod zsh_plugin;
 
+#[cfg(feature = "telegram")]
+mod telegram;
+
 use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 
@@ -38,6 +41,7 @@ const KNOWN_SUBCOMMANDS: &[&str] = &[
     "history",
     "recall",
     "translate-doc",
+    "telegram",
     "help",
     "--help",
     "-h",
@@ -189,6 +193,8 @@ enum Cmd {
     /// Translate Markdown documents
     #[command(name = "translate-doc")]
     TranslateDoc(TranslateDocArgs),
+    /// Run the Telegram CN↔EN translation bot (long-poll until Ctrl+C)
+    Telegram(TelegramArgs),
     /// Translate positional text or a file (default command)
     #[command(external_subcommand)]
     Text(Vec<String>),
@@ -354,6 +360,15 @@ struct TranslateDocArgs {
     /// Recursively translate subdirectories
     #[arg(short = 'r', long)]
     recursive: bool,
+}
+
+// ── telegram ──────────────────────────────────────────────────────────────────
+
+#[derive(Args)]
+struct TelegramArgs {
+    /// Regenerate the claim password, print it once, and exit
+    #[arg(long)]
+    regenerate_claim_password: bool,
 }
 
 // ── Smart arg routing ─────────────────────────────────────────────────────────
@@ -600,6 +615,7 @@ async fn run() -> Result<()> {
             )
             .await
         }
+        Some(Cmd::Telegram(args)) => run_telegram(args, &config).await,
     }
 }
 
@@ -998,6 +1014,34 @@ fn run_config(args: ConfigArgs, config: &HotConfig) -> Result<()> {
         }
     }
     Ok(())
+}
+
+// ── telegram ──────────────────────────────────────────────────────────────────
+
+async fn run_telegram(args: TelegramArgs, config: &HotConfig) -> Result<()> {
+    if args.regenerate_claim_password {
+        let password = config.regenerate_telegram_claim_password()?;
+        // Print once to stdout so the user can store it; not re-printed later.
+        println!("{password}");
+        eprintln!(
+            "hymt telegram: wrote new claim password to {}",
+            config.path().display()
+        );
+        return Ok(());
+    }
+
+    #[cfg(feature = "telegram")]
+    {
+        telegram::run_telegram_bot(config).await
+    }
+    #[cfg(not(feature = "telegram"))]
+    {
+        let _ = config;
+        anyhow::bail!(
+            "hymt was built without the `telegram` cargo feature. \
+             Rebuild with default features, or `cargo install --path crates/hymt-cli --features telegram`."
+        )
+    }
 }
 
 // ── man ───────────────────────────────────────────────────────────────────────

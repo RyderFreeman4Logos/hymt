@@ -63,9 +63,24 @@ install:
     {{_io_prefix}} cargo install --path "{{_repo_root}}/crates/hymt-cli" --force
     echo "hymt (Rust) installed from {{_repo_root}}"
 
-# ==============================================================================
+# Install without the default `telegram` feature (drops Bot API deps).
+install-no-telegram:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "{{_repo_root}}"
+    if command -v uv >/dev/null 2>&1; then
+        uv tool uninstall hymt 2>/dev/null || true
+    fi
+    {{_io_prefix}} cargo install --path "{{_repo_root}}/crates/hymt-cli" --no-default-features --force
+    echo "hymt (Rust, no telegram) installed from {{_repo_root}}"
+
+# Compile-check CLI with telegram feature disabled.
+check-no-telegram:
+    {{_io_prefix}} cargo check -p hymt-cli --no-default-features
+
+# =============================================================================
 # Misc
-# ==============================================================================
+# =============================================================================
 
 doc-translate-sync:
     #!/usr/bin/env bash
