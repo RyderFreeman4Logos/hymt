@@ -69,6 +69,8 @@ concurrency = 8
 stream = true
 config_version = 1
 timeout = 600
+# first_chunk_priority = false
+# debug_chunk_timing = false
 
 [completeness]
 zh_to_en_min_ratio = 0.3
@@ -107,6 +109,8 @@ hymt -f report.md -t zh | tee report.zh.preview.md
 ```
 
 Use `--no-stream` if you need a fully buffered response.
+
+Force concurrency for one run with `--concurrency N` (overrides `[translation].concurrency`). Use `--debug-chunk-timing` (or `HYMT_DEBUG_CHUNK_TIMING=1`) to print per-chunk queue/request/first-token/complete timings on stderr while diagnosing multi-segment stalls.
 
 ### Mixed-language docs stay readable
 
