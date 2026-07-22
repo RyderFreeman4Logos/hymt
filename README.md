@@ -64,6 +64,7 @@ model = ""
 [translation]
 context_window = 65536
 max_output_tokens = 4096
+max_source_tokens_per_segment = 1024
 concurrency = 8
 stream = true
 config_version = 1
@@ -74,6 +75,10 @@ zh_to_en_min_ratio = 0.3
 en_to_zh_min_ratio = 0.3
 min_paragraph_ratio = 0.5
 max_retries = 2
+# When false (default), top-level text/file/stdin exits non-zero after writing best
+# attempt if any segment exhausted completeness retries. Set true (or pass
+# --warn-only-completeness) to keep exit 0 with warnings only.
+warn_only = false
 
 [timing]
 divergence_threshold = 2.0
@@ -150,7 +155,8 @@ Behavior:
 - Default target is `zh`, and Markdown outputs normalize to `.zh-cn.md`.
 - Directory mode translates Markdown files and preserves relative paths when `--output-dir` is used.
 - Completeness validation checks translated segments for minimum character ratio, paragraph retention, and Markdown heading preservation.
-- Failed segments retry up to `[completeness].max_retries`; the same value applies to normal, streaming, batch, and `translate-doc` segment validation. After retries are exhausted, `hymt` warns and continues with the best attempt.
+- Failed segments retry up to `[completeness].max_retries`; the same value applies to normal, streaming, batch, and `translate-doc` segment validation. After retries are exhausted, `hymt` still writes the best-effort output and emits `completeness_degraded_segments=…` on stderr. Top-level text/file/stdin translation then exits non-zero so scripts detect degraded results; pass `--warn-only-completeness` or set `[completeness].warn_only = true` to keep exit 0 with warnings only. `batch`, `translate-doc`, and `exec` report the same stderr marker by default but do not fail the whole job for degraded segments.
+- Source segments are also bounded by the expansion/context budget and `[translation].max_source_tokens_per_segment` (default `1024`, `0` disables).
 
 ## Batch translate directory trees
 

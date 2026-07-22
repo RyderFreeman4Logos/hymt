@@ -64,6 +64,7 @@ model = ""
 [translation]
 context_window = 65536
 max_output_tokens = 4096
+max_source_tokens_per_segment = 1024
 concurrency = 8
 stream = true
 config_version = 1
@@ -74,6 +75,9 @@ zh_to_en_min_ratio = 0.3
 en_to_zh_min_ratio = 0.3
 min_paragraph_ratio = 0.5
 max_retries = 2
+# 默认 false：顶层 text/file/stdin 在写出最佳尝试后，若仍有片段耗尽完整性重试则非零退出。
+# 设为 true（或传 --warn-only-completeness）则仅告警并以 0 退出。
+warn_only = false
 
 [timing]
 divergence_threshold = 2.0
@@ -150,7 +154,8 @@ hymt translate-doc docs/ --recursive
 - 默认目标语言为`zh`，Markdown输出文件会自动命名为`.zh-cn.md`。
 - 当使用`--output-dir`参数时，目录模式会翻译Markdown文件并保留相对路径。
 - 完整性校验会检查已翻译片段的最小字符比例、段落保留率和 Markdown 标题保留情况。
-- 失败片段最多按`[completeness].max_retries`重试；普通、流式、批量和`translate-doc`的片段完整性校验都使用同一个值。重试耗尽后，`hymt`会告警并继续使用最佳尝试。
+- 失败片段最多按`[completeness].max_retries`重试；普通、流式、批量和`translate-doc`的片段完整性校验都使用同一个值。重试耗尽后，`hymt`仍会写出最佳尝试结果，并在 stderr 打印`completeness_degraded_segments=…`。顶层 text/file/stdin 翻译随后以非零状态退出，便于脚本检测降级结果；可传`--warn-only-completeness`或设置`[completeness].warn_only = true`以保持仅告警且退出码为 0。`batch`、`translate-doc`与`exec`默认同样报告该 stderr 标记，但不会因降级片段而使整个任务失败。
+- 源片段还会受扩展/上下文预算以及`[translation].max_source_tokens_per_segment`限制（默认`1024`，`0`表示禁用）。
 
 ## 批量翻译目录树
 
