@@ -34,8 +34,8 @@ secondary = "en"
 
 [inference]
 # Sampler values are omitted by default so the configured server selects them.
-# Set `backend` to `openai_compatible` for servers that use transformers-style
-# disabled sampler sentinels instead of llama.cpp's wire conventions.
+# `openai_compatible` accepts only temperature, top_p, and repetition_penalty;
+# it sends the latter as `repetition_penalty`, unlike llama.cpp's repeat_penalty.
 backend = "llama_cpp"
 # Explicit overrides belong under `[inference.override]`; a numeric value is
 # sent as-is and the string `"disabled"` turns off that sampler.
@@ -90,6 +90,45 @@ const GENERATION_SETTING_KEYS: &[&str] = &[
     "repeat_last_n",
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GenerationSettingField {
+    Temperature,
+    TopP,
+    TopK,
+    RepetitionPenalty,
+    MinP,
+    RepeatLastN,
+}
+
+impl GenerationSettingField {
+    const ALL: [Self; 6] = [
+        Self::Temperature,
+        Self::TopP,
+        Self::TopK,
+        Self::RepetitionPenalty,
+        Self::MinP,
+        Self::RepeatLastN,
+    ];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Temperature => "temperature",
+            Self::TopP => "top_p",
+            Self::TopK => "top_k",
+            Self::RepetitionPenalty => "repetition_penalty",
+            Self::MinP => "min_p",
+            Self::RepeatLastN => "repeat_last_n",
+        }
+    }
+}
+
+const LLAMA_CPP_CAPABILITIES: &[GenerationSettingField] = &GenerationSettingField::ALL;
+const OPENAI_COMPATIBLE_CAPABILITIES: &[GenerationSettingField] = &[
+    GenerationSettingField::Temperature,
+    GenerationSettingField::TopP,
+    GenerationSettingField::RepetitionPenalty,
+];
+
 /// Semantic tri-state for a generation parameter.
 ///
 /// `ServerDefault` deliberately differs from a numeric backend sentinel: it
@@ -110,8 +149,40 @@ pub enum Setting<T> {
 pub enum GenerationBackend {
     /// llama.cpp's OpenAI-compatible server.
     LlamaCpp,
-    /// An OpenAI-compatible server using transformers-style sampler sentinels.
+    /// A generic OpenAI-compatible server.
+    ///
+    /// This profile accepts `temperature`, `top_p`, and `repetition_penalty`.
+    /// The repetition penalty is serialized as `repetition_penalty`.
     OpenAiCompatible,
+}
+
+impl GenerationBackend {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::LlamaCpp => "llama_cpp",
+            Self::OpenAiCompatible => "openai_compatible",
+        }
+    }
+
+    fn capabilities(self) -> &'static [GenerationSettingField] {
+        match self {
+            Self::LlamaCpp => LLAMA_CPP_CAPABILITIES,
+            Self::OpenAiCompatible => OPENAI_COMPATIBLE_CAPABILITIES,
+        }
+    }
+
+    fn validate_settings(self, settings: &GenerationSettings) -> Result<(), CoreError> {
+        for field in GenerationSettingField::ALL {
+            if settings.is_explicit(field) && !self.capabilities().contains(&field) {
+                return Err(CoreError::Config(format!(
+                    "inference.backend {} does not support inference.override.{}",
+                    self.name(),
+                    field.name(),
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Backend-neutral generation configuration.
@@ -187,6 +258,23 @@ impl GenerationSettings {
         }
 
         Ok(())
+    }
+
+    fn is_explicit(&self, field: GenerationSettingField) -> bool {
+        match field {
+            GenerationSettingField::Temperature => {
+                !matches!(self.temperature, Setting::ServerDefault)
+            }
+            GenerationSettingField::TopP => !matches!(self.top_p, Setting::ServerDefault),
+            GenerationSettingField::TopK => !matches!(self.top_k, Setting::ServerDefault),
+            GenerationSettingField::RepetitionPenalty => {
+                !matches!(self.repetition_penalty, Setting::ServerDefault)
+            }
+            GenerationSettingField::MinP => !matches!(self.min_p, Setting::ServerDefault),
+            GenerationSettingField::RepeatLastN => {
+                !matches!(self.repeat_last_n, Setting::ServerDefault)
+            }
+        }
     }
 }
 
@@ -484,7 +572,9 @@ impl HotConfig {
     /// Reads and validates the backend-neutral generation overrides.
     pub fn generation_settings(&self) -> Result<GenerationSettings, CoreError> {
         let state = self.state.read().unwrap();
-        GenerationSettings::from_toml(&state.data)
+        let settings = GenerationSettings::from_toml(&state.data)?;
+        generation_backend_from_toml(&state.data)?.validate_settings(&settings)?;
+        Ok(settings)
     }
 
     /// Backend profile used to map [`GenerationSettings`] to request fields.
@@ -706,8 +796,8 @@ impl HotConfig {
         let content = std::fs::read_to_string(&self.path)?;
         let data: toml::Table = toml::from_str(&content)
             .map_err(|e| CoreError::Config(format!("{}: {}", self.path.display(), e)))?;
-        GenerationSettings::from_toml(&data)?;
-        generation_backend_from_toml(&data)?;
+        let settings = GenerationSettings::from_toml(&data)?;
+        generation_backend_from_toml(&data)?.validate_settings(&settings)?;
         let uses_legacy_generation_scalars = uses_legacy_generation_scalars(&data);
         let mtime = std::fs::metadata(&self.path)
             .and_then(|m| m.modified())
@@ -1072,6 +1162,33 @@ repeat_last_n = -1"#,
 
         let error = HotConfig::from_path(&path).unwrap_err();
         assert!(error.to_string().contains("inference.backend"));
+    }
+
+    #[test]
+    fn openai_compatible_rejects_unsupported_explicit_and_disabled_overrides_at_load() {
+        for (tag, override_value, field) in [
+            ("top_k_explicit", "top_k = 20", "top_k"),
+            ("min_p_disabled", "min_p = \"disabled\"", "min_p"),
+            (
+                "repeat_last_n_explicit",
+                "repeat_last_n = -1",
+                "repeat_last_n",
+            ),
+        ] {
+            let path = temp_config_path(tag);
+            fs::write(
+                &path,
+                format!(
+                    "[inference]\nbackend = \"openai_compatible\"\n\n[inference.override]\n{override_value}"
+                ),
+            )
+            .unwrap();
+
+            let error = HotConfig::from_path(&path).unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains("openai_compatible"), "{tag}: {message}");
+            assert!(message.contains(field), "{tag}: {message}");
+        }
     }
 
     #[test]

@@ -66,6 +66,8 @@ struct ChatPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     top_k: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    repeat_penalty: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     repetition_penalty: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     min_p: Option<f64>,
@@ -75,6 +77,39 @@ struct ChatPayload {
     model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+}
+
+impl ChatPayload {
+    fn from_generation_settings(
+        prompt: &str,
+        max_tokens: u32,
+        model: String,
+        stream: bool,
+        generation_settings: &GenerationSettings,
+        backend: GenerationBackend,
+    ) -> Self {
+        let settings = map_generation_settings(generation_settings, backend);
+        let (repeat_penalty, repetition_penalty) = match backend {
+            GenerationBackend::LlamaCpp => (settings.repetition_penalty, None),
+            GenerationBackend::OpenAiCompatible => (None, settings.repetition_penalty),
+        };
+        Self {
+            messages: vec![Message {
+                role: "user",
+                content: prompt.to_owned(),
+            }],
+            max_tokens,
+            temperature: settings.temperature,
+            top_p: settings.top_p,
+            top_k: settings.top_k,
+            repeat_penalty,
+            repetition_penalty,
+            min_p: settings.min_p,
+            repeat_last_n: settings.repeat_last_n,
+            model: if model.is_empty() { None } else { Some(model) },
+            stream: if stream { Some(true) } else { None },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -268,24 +303,14 @@ impl TranslationClient {
 
     fn build_payload(&self, prompt: &str, stream: bool) -> Result<ChatPayload, ClientError> {
         let cfg = &self.inner.config;
-        let model = cfg.model();
-        let settings =
-            map_generation_settings(&cfg.generation_settings()?, cfg.generation_backend()?);
-        Ok(ChatPayload {
-            messages: vec![Message {
-                role: "user",
-                content: prompt.to_owned(),
-            }],
-            max_tokens: cfg.max_output_tokens(),
-            temperature: settings.temperature,
-            top_p: settings.top_p,
-            top_k: settings.top_k,
-            repetition_penalty: settings.repetition_penalty,
-            min_p: settings.min_p,
-            repeat_last_n: settings.repeat_last_n,
-            model: if model.is_empty() { None } else { Some(model) },
-            stream: if stream { Some(true) } else { None },
-        })
+        Ok(ChatPayload::from_generation_settings(
+            prompt,
+            cfg.max_output_tokens(),
+            cfg.model(),
+            stream,
+            &cfg.generation_settings()?,
+            cfg.generation_backend()?,
+        ))
     }
 
     fn build_headers(&self) -> reqwest::header::HeaderMap {
@@ -824,7 +849,7 @@ mod tests {
     // ── Payload serialization ────────────────────────────────────────────────
 
     #[test]
-    fn generation_settings_map_disabled_samplers_per_backend() {
+    fn llama_cpp_maps_disabled_samplers() {
         let settings = GenerationSettings {
             temperature: Setting::Value(0.7),
             top_p: Setting::ServerDefault,
@@ -841,9 +866,52 @@ mod tests {
         assert_eq!(llama.repetition_penalty, Some(1.0));
         assert_eq!(llama.min_p, Some(0.0));
         assert_eq!(llama.repeat_last_n, Some(0));
+    }
 
-        let openai = map_generation_settings(&settings, GenerationBackend::OpenAiCompatible);
-        assert_eq!(openai.top_k, Some(-1));
+    #[test]
+    fn llama_cpp_payload_uses_repeat_penalty_wire_key() {
+        let payload = ChatPayload::from_generation_settings(
+            "test",
+            1,
+            String::new(),
+            false,
+            &GenerationSettings {
+                temperature: Setting::ServerDefault,
+                top_p: Setting::ServerDefault,
+                top_k: Setting::ServerDefault,
+                repetition_penalty: Setting::Value(1.05),
+                min_p: Setting::ServerDefault,
+                repeat_last_n: Setting::ServerDefault,
+            },
+            GenerationBackend::LlamaCpp,
+        );
+
+        let object = serde_json::to_value(payload).unwrap();
+        assert_eq!(object["repeat_penalty"], 1.05);
+        assert!(object.get("repetition_penalty").is_none());
+    }
+
+    #[test]
+    fn openai_compatible_payload_uses_repetition_penalty_wire_key() {
+        let payload = ChatPayload::from_generation_settings(
+            "test",
+            1,
+            String::new(),
+            false,
+            &GenerationSettings {
+                temperature: Setting::ServerDefault,
+                top_p: Setting::ServerDefault,
+                top_k: Setting::ServerDefault,
+                repetition_penalty: Setting::Value(1.05),
+                min_p: Setting::ServerDefault,
+                repeat_last_n: Setting::ServerDefault,
+            },
+            GenerationBackend::OpenAiCompatible,
+        );
+
+        let object = serde_json::to_value(payload).unwrap();
+        assert_eq!(object["repetition_penalty"], 1.05);
+        assert!(object.get("repeat_penalty").is_none());
     }
 
     #[test]
@@ -865,6 +933,7 @@ mod tests {
             temperature: settings.temperature,
             top_p: settings.top_p,
             top_k: settings.top_k,
+            repeat_penalty: None,
             repetition_penalty: settings.repetition_penalty,
             min_p: settings.min_p,
             repeat_last_n: settings.repeat_last_n,
@@ -878,6 +947,7 @@ mod tests {
             "temperature",
             "top_p",
             "top_k",
+            "repeat_penalty",
             "repetition_penalty",
             "min_p",
             "repeat_last_n",
@@ -897,6 +967,7 @@ mod tests {
             temperature: Some(0.7),
             top_p: Some(0.9),
             top_k: Some(40),
+            repeat_penalty: None,
             repetition_penalty: Some(1.0),
             min_p: None,
             repeat_last_n: None,
@@ -917,6 +988,7 @@ mod tests {
             temperature: Some(0.7),
             top_p: Some(0.6),
             top_k: Some(20),
+            repeat_penalty: None,
             repetition_penalty: Some(1.05),
             min_p: None,
             repeat_last_n: None,
@@ -940,6 +1012,7 @@ mod tests {
             temperature: Some(0.7),
             top_p: Some(0.6),
             top_k: Some(20),
+            repeat_penalty: None,
             repetition_penalty: Some(1.05),
             min_p: None,
             repeat_last_n: None,
