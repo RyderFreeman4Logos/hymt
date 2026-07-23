@@ -2,12 +2,11 @@
 
 # 赞歌
 
-![Python](https://img.shields.io/badge/python-3.11%2B-blue)
-![许可证](https://img.shields.io/badge/license-Apache--2.0-green)
+[![许可证：Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 ![模型](https://img.shields.io/badge/model-Hy--MT2-orange)
-![平台](https://img.shields.io/badge/platform-Linux%20%7C%20Termux-lightgrey)
+![平台](https://img.shields.io/badge/platform-Linux-lightgrey)
 
-Hy-MT2是一款实用的命令行工具：具备分词器感知的分段功能、分段级缓存复用机制、管道安全的令牌流处理能力、多语言文档处理功能、批量翻译功能、命令输出翻译功能，以及可热重载的配置系统。
+Hy-MT2 是一款实用的 Rust 命令行工具：具备分词器感知的分段功能、分段级缓存复用机制、管道安全的令牌流处理能力、Markdown 感知的文档翻译功能、批量翻译功能、命令输出翻译功能，以及可热重载的配置系统。
 
 `hymt` 是为那些需要处理真实终端界面及 Markdown 工作流程的翻译任务而设计的，而不仅仅是处理零散的文本字符串。它会将进度信息输出到 `stderr`，翻译内容则输出到 `stdout`，还会记录历史数据以帮助估算完成时间；当模型表现与历史预期相差较大时，它还能自动记录时间偏差问题。
 
@@ -15,9 +14,9 @@ Hy-MT2是一款实用的命令行工具：具备分词器感知的分段功能�
 
 - 通过一个命令即可翻译位置文本、标准输入内容或文件。  
 - 基于Hy-MT2分词器对长文本进行分段，而非盲目分割。  
-- 在段落级别重用缓存翻译结果，从而使重复出现的段落几乎能瞬间完成翻译。  
+- 在片段级别重用缓存翻译结果，从而使重复内容几乎能瞬间完成翻译。
 - 默认以流式方式处理分词结果，确保`| less`、`| bat`和`| tee`等操作保持响应迅速。  
-- 能识别混合语言的Markdown文档，仅翻译非目标语言的段落，同时保留代码块格式。  
+- 以保留结构的方式分割 Markdown；混合语言限制见下文。
 - 可批量处理整个目录树，在写入前预览缓存状态及预计完成时间。  
 - 可用`hymt exec`封装任意shell命令，或查看已翻译的`man`和`info`页面。  
 - 可调出之前的翻译结果，并查看包含处理效率统计信息的翻译历史记录。  
@@ -25,31 +24,19 @@ Hy-MT2是一款实用的命令行工具：具备分词器感知的分段功能�
 
 ## 安装
 
-### 使用 `uv` 快速安装
+### 安装
 
 ```bash
-uv tool install .
+just install
 ```
 
-如果您希望在本地可编辑的安装版本中获得可选的语言检测功能：
+二进制默认启用 `telegram` Cargo feature。若不需要 Telegram Bot API 依赖：
 
 ```bash
-uv pip install --system -e ".[detect]"
-mise reshim
+just install-no-telegram
 ```
 
-这样你就得到了：
-
-- `langdetect`，用于混合语言的局部翻译。
-
-### Termux / 安卓
-
-Android版本会跳过Rust的`tokenizers`依赖，因此`hymt`会自动采用近似的方式计算词元数量。翻译功能依然可用，只是分词精度不如基于Linux词法分析器的方案。
-
-```bash
-uv pip install --system -e ".[detect]"
-mise reshim
-```
+文档化并经过测试的安装路径是 Linux x86_64 上的 Rust workspace。
 
 ## 配置端点
 
@@ -62,15 +49,26 @@ api_key = ""
 model = ""
 
 [translation]
-context_window = 65536
+# `llama-server -c` 是服务总上下文。两个示例服务的每请求上限都约为
+# 8,192 tokens：quality 为 24,576 / 3 槽，throughput 为 65,536 / 8 槽。
+# 此处填写每槽上限，而不是服务级 `-c` 总量。
+context_window = 8192
 max_output_tokens = 4096
 max_source_tokens_per_segment = 1024
-concurrency = 8
+concurrency = 8 # 使用 hy-mt2-quality.service 时设为 3
 stream = true
 config_version = 1
 timeout = 600
 # first_chunk_priority = false
 # debug_chunk_timing = false
+
+[inference]
+# 客户端会发送这些 OpenAI 兼容请求字段。它们与示例服务配置一致；
+# 显式覆盖时请保持客户端和端点配置一致。
+temperature = 0.7
+top_p = 0.6
+top_k = 20
+repetition_penalty = 1.05
 
 [completeness]
 zh_to_en_min_ratio = 0.3
@@ -111,24 +109,20 @@ hymt -f report.md -t zh | tee report.zh.preview.md
 
 可用 `--concurrency N` 覆盖本次运行的并发（覆盖 `[translation].concurrency`）。使用 `--debug-chunk-timing`（或 `HYMT_DEBUG_CHUNK_TIMING=1`）在 stderr 打印各 chunk 的 queue/request/first-token/complete 时序，便于诊断多段流式停顿。
 
-### 混合语言的文档依然可读
+### 混合语言文档：当前限制
 
-当安装了可选的语言检测功能后，`hymt`会保留已为目标语言的段落，翻译其余部分，并始终保留代码块。
-
-这使得它适用于：
-
-- 双语README文件  
-- 包含复制过来的shell输出的设计说明  
-- 混合英文代码与中文注释的API文档
+Rust 主翻译路径尚未使用段落级语言分析来跳过已经是目标语言的段落。对于文本、`batch` 和 `translate-doc`，不要依赖自动保留目标语言段落：可翻译文本片段仍会发送给模型。Markdown 感知分段仍有助于保留结构，但不保证按混合语言过滤。当前没有旧版检测器兼容安装路径，也没有针对这项未完成行为的 CLI 强制/禁用开关。
 
 ## 智能分段与缓存重用
 
-`hymt`会根据Hy-MT2分词器及选定的提示模板来规划每次翻译。每个翻译后的片段都会被缓存：
+`hymt`会根据Hy-MT2分词器及选定的提示模板来规划每次翻译。当前每个翻译后的片段按以下内容缓存：
 
-- 段落内容哈希值
+- 片段内容哈希值
 - 目标语言
 - 模板类型
 - 模板选项
+
+片段缓存键目前**不**包含端点/模型身份、量化或后端构建、分词器版本或推理采样设置。因此，修改这些设置后仍可能复用旧推理配置生成的条目；`config_version`仅记录任务历史，并不参与片段缓存键。要自动隔离这些配置，仍需实现推理指纹。
 
 这可以实现：
 
@@ -157,8 +151,8 @@ hymt translate-doc docs/ --recursive
 
 - 默认目标语言为`zh`，Markdown输出文件会自动命名为`.zh-cn.md`。
 - 当使用`--output-dir`参数时，目录模式会翻译Markdown文件并保留相对路径。
-- 完整性校验会检查已翻译片段的最小字符比例、段落保留率和 Markdown 标题保留情况。
-- 失败片段最多按`[completeness].max_retries`重试；普通、流式、批量和`translate-doc`的片段完整性校验都使用同一个值。重试耗尽后，`hymt`仍会写出最佳尝试结果，并在 stderr 打印`completeness_degraded_segments=…`。顶层 text/file/stdin 翻译随后以非零状态退出，便于脚本检测降级结果；可传`--warn-only-completeness`或设置`[completeness].warn_only = true`以保持仅告警且退出码为 0。`batch`、`translate-doc`与`exec`默认同样报告该 stderr 标记，但不会因降级片段而使整个任务失败。
+- 完整性校验是一组快速的截断/结构启发式检查：最小字符比例、段落保留率和 Markdown 标题保留。它能标记可能的截断或结构丢失，不能证明翻译在语义上正确。
+- 失败片段最多按`[completeness].max_retries`重试；普通、流式、批量和`translate-doc`的片段完整性校验都使用同一个值。重试耗尽后，`hymt`仍会写出最佳尝试结果，并在 stderr 打印`completeness_degraded_segments=…`。顶层 text/file/stdin 命令（包括流式形式）随后以非零状态退出，便于脚本检测降级结果；可传`--warn-only-completeness`或设置`[completeness].warn_only = true`以保持仅告警且退出码为 0。`batch`、`translate-doc`与`exec`默认同样报告该 stderr 标记，但不会因降级片段而使整个任务失败。
 - 源片段还会受扩展/上下文预算以及`[translation].max_source_tokens_per_segment`限制（默认`1024`，`0`表示禁用）。
 
 ## 批量翻译目录树
@@ -235,32 +229,33 @@ hymt estimate 10000 -l zh
 
 ## 通过Tailscale远程使用Hy-MT2
 
-该仓库在[`services/`](services)目录下包含两个systemd用户服务示例：
+该仓库在[`services/`](services)目录下包含两个互斥的 systemd 用户服务示例。`-c` 是服务总上下文池，`--parallel` 会将其分配给并发请求：
 
-- `hy-mt2-quality.service`：Q6_K，单个槽位，Q8 KV，16K上下文容量
-- `hy-mt2-throughput.service`：Q4_K_M，8个槽位，Q4 KV，64K上下文容量
+| 服务 | 模型量化 | KV 缓存 | 总上下文 | 并行槽位 | 每槽约上下文 |
+|---|---|---|---:|---:|---:|
+| `hy-mt2-quality.service` | Q6_K | Q8 (`q8_0`) | 24,576 | 3 | 8,192 |
+| `hy-mt2-throughput.service` | Q4_K_M | Q4 (`q4_0`) | 65,536 | 8 | 8,192 |
 
-两者都仅绑定到Tailscale接口（`100.78.159.38:8401`），而不绑定到`0.0.0.0`。当您希望通过Tailnet使用远程的Hy-MT2主机时，应将`endpoint.url`设置为该地址。
+两者都仅绑定到 Tailscale 接口（`100.78.159.38:8401`），而不绑定到`0.0.0.0`。它们使用 CUDA `llama-server`：quality 单元指向持久化的本地构建，throughput 示例固定使用 mise 的 `llama-cpp/9294-cuda` 构建。绝对可执行文件和模型路径依赖具体主机；替换后端必须支持所示 `llama-server` 的上下文、并行槽位和 KV 缓存参数。
+
+两个服务都设置了 `--temp 0.7`、`--top-k 20`、`--top-p 0.6` 和 `--repeat-penalty 1.05`。两个单元都未显式设置 llama.cpp 的 `min-p` 或重复历史长度，因此采用后端默认值。Rust 客户端目前会发送对应的 `[inference]` 请求字段；修改它们时请明确操作，并让客户端与服务配置保持一致。
 
 ## 架构
 
-- `src/hymt/config.py`：可热重载的TOML配置文件  
-- `src/hymt/segment.py`：基于分词器的字符计数与分词功能  
-- `src/hymt/client.py`：具备重试机制的异步OpenAI兼容翻译客户端  
-- `src/hymt/translate.py`：核心翻译流程，包括缓存查询、流式处理、进度显示及时间记录功能  
-- `src/hymt/history.py`：基于SQLite的任务历史记录、召回率及预计完成时间统计  
-- `src/hymt/batch.py`：目录规划、缓存预览及批量写入功能  
-- `src/hymt/doc_translate.py`：专注于Markdown文档的翻译与预览工作流  
-- `src/hymt/docs.py`：已翻译的`man`和`info`文档  
-- `src/hymt/exec_wrapper.py`：命令封装工具及翻译后的运行结果输出  
-- `src/hymt/cli.py`：基于Click框架的命令行接口入口
+- `crates/hymt-core`：可热重载的 TOML 配置、提示模板、CJK 语言工具和完整性启发式检查。
+- `crates/hymt-segment`：Hy-MT2 分词器集成，以及分层和 Markdown 感知的分段。
+- `crates/hymt-client`：异步 OpenAI 兼容 HTTP 客户端、重试、并发限制和 SSE 流式传输。
+- `crates/hymt-cache`：SQLite 片段/exec 缓存、任务历史、回溯和 ETA 统计。
+- `crates/hymt-translate`：翻译编排、完整性重试、批量/文档工作流和已翻译文档。
+- `crates/hymt-cli`：Clap `hymt` 二进制、命令分发、面向 shell 的行为和可选 Telegram 子命令。
 
 ## 开发
 
-使用以下命令运行完整的本地质量检查：
+先安装仓库钩子，然后运行本地质量检查：
 
 ```bash
-env JUST_TEMPDIR=$PWD/.git/just-tmp just pre-commit
+just install-hooks
+just pre-commit
 ```
 
-如果您希望在自动化过程中实现README的双语同步，请查看`doc-translate-sync`脚本以及`lefthook.yml`中的`post-commit`钩子。
+Lefthook 会在提交前运行 `just pre-commit`，并提供 README 翻译同步。GitHub Actions CI 会在 pull request 和推送到 `main` 时运行，覆盖格式化、Clippy、workspace 测试/检查、无默认 feature 的 CLI 检查、shell 检查、服务单元验证和 TOML 解析。
