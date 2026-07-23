@@ -2,12 +2,11 @@
 
 # hymt
 
-![Python](https://img.shields.io/badge/python-3.11%2B-blue)
-![License](https://img.shields.io/badge/license-Apache--2.0-green)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 ![Model](https://img.shields.io/badge/model-Hy--MT2-orange)
-![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Termux-lightgrey)
+![Platform](https://img.shields.io/badge/platform-Linux-lightgrey)
 
-Hy-MT2 as a practical CLI: tokenizer-aware segmentation, per-segment cache reuse, pipe-safe token streaming, mixed-language document handling, batch translation, command-output translation, and hot-reloadable config.
+Hy-MT2 as a practical Rust CLI: tokenizer-aware segmentation, per-segment cache reuse, pipe-safe token streaming, Markdown-aware document translation, batch translation, command-output translation, and hot-reloadable config.
 
 `hymt` is designed for people who translate real terminal and Markdown workflows, not just one-off strings. It keeps progress on `stderr`, translation payloads on `stdout`, records history for ETA estimation, and can auto-file timing-divergence issues when the model behaves far outside historical expectations.
 
@@ -15,9 +14,9 @@ Hy-MT2 as a practical CLI: tokenizer-aware segmentation, per-segment cache reuse
 
 - Translate positional text, stdin, or files with one command.
 - Segment long inputs against the Hy-MT2 tokenizer instead of splitting blindly.
-- Reuse cached translations at the segment level, so repeated paragraphs become nearly instant.
+- Reuse cached translations at the segment level, so repeated content becomes nearly instant.
 - Stream tokens by default, which keeps `| less`, `| bat`, and `| tee` workflows responsive.
-- Detect mixed-language Markdown and translate only the non-target paragraphs while preserving fenced code blocks.
+- Segment Markdown with structure-aware boundaries; see the mixed-language limitation below.
 - Batch entire directory trees and preview cache status plus ETA before writing.
 - Wrap arbitrary shell commands with `hymt exec`, or browse translated `man` and `info` pages.
 - Recall previous outputs and inspect translation history with throughput statistics.
@@ -26,47 +25,19 @@ Hy-MT2 as a practical CLI: tokenizer-aware segmentation, per-segment cache reuse
 
 ## Install
 
-### Rust install (recommended)
+### Install
 
 ```bash
 just install
-# or:
-cargo install --path crates/hymt-cli --force
 ```
 
 The binary enables the `telegram` cargo feature by default. To build without Telegram Bot API dependencies:
 
 ```bash
 just install-no-telegram
-# or:
-cargo install --path crates/hymt-cli --no-default-features --force
 ```
 
-### Quick install with `uv`
-
-```bash
-uv tool install .
-```
-
-If you want optional language detection support in a local editable install:
-
-```bash
-uv pip install --system -e ".[detect]"
-mise reshim
-```
-
-That gives you:
-
-- `langdetect` for mixed-language partial translation.
-
-### Termux / Android
-
-Android builds skip the Rust `tokenizers` dependency, so `hymt` automatically falls back to approximate token counting. Translation still works; segmentation is just less precise than the Linux tokenizer-backed path.
-
-```bash
-uv pip install --system -e ".[detect]"
-mise reshim
-```
+The documented and tested installation path is the Rust workspace on Linux x86_64.
 
 ## Configure the endpoint
 
@@ -79,15 +50,26 @@ api_key = ""
 model = ""
 
 [translation]
-context_window = 65536
+# `llama-server -c` is service-wide. Both supplied units provide about 8,192
+# tokens per request: quality is 24,576 / 3 slots; throughput is 65,536 / 8.
+# Use the per-slot limit here, not the service-wide `-c` total.
+context_window = 8192
 max_output_tokens = 4096
 max_source_tokens_per_segment = 1024
-concurrency = 8
+concurrency = 8 # use 3 with hy-mt2-quality.service
 stream = true
 config_version = 1
 timeout = 600
 # first_chunk_priority = false
 # debug_chunk_timing = false
+
+[inference]
+# The client sends these OpenAI-compatible request fields. They match the
+# supplied service profiles; keep client overrides aligned with the endpoint.
+temperature = 0.7
+top_p = 0.6
+top_k = 20
+repetition_penalty = 1.05
 
 [completeness]
 zh_to_en_min_ratio = 0.3
@@ -152,24 +134,20 @@ Use `--no-stream` if you need a fully buffered response.
 
 Force concurrency for one run with `--concurrency N` (overrides `[translation].concurrency`). Use `--debug-chunk-timing` (or `HYMT_DEBUG_CHUNK_TIMING=1`) to print per-chunk queue/request/first-token/complete timings on stderr while diagnosing multi-segment stalls.
 
-### Mixed-language docs stay readable
+### Mixed-language documents: current limitation
 
-When optional language detection is installed, `hymt` keeps paragraphs that are already in the target language, translates the rest, and always preserves fenced code blocks.
-
-That makes it practical for:
-
-- bilingual READMEs
-- design notes with copied shell output
-- API docs that mix English code with Chinese commentary
+The Rust main translation paths do **not** yet use paragraph-level language analysis to skip paragraphs already written in the target language. For text, `batch`, and `translate-doc`, do not rely on automatic target-paragraph preservation: translatable text segments are sent to the model. Markdown-aware segmentation remains useful for structure, but it is not a mixed-language filtering guarantee. There is no legacy detector compatibility install path or CLI force/disable switch for that unfinished behavior.
 
 ## Smart segmentation and cache reuse
 
-`hymt` plans each translation against the Hy-MT2 tokenizer and the selected prompt template. Each translated segment is cached by:
+`hymt` plans each translation against the Hy-MT2 tokenizer and the selected prompt template. Each translated segment is currently cached by:
 
 - segment content hash
 - target language
 - template type
 - template options
+
+The segment-cache key does **not** yet include endpoint/model identity, quantization or backend build, tokenizer version, or inference sampling settings. Those changes can therefore reuse entries from an older inference profile; `config_version` is recorded in task history, not the segment-cache key. Inference fingerprinting is required before those profiles are isolated automatically.
 
 That enables:
 
@@ -198,8 +176,8 @@ Behavior:
 
 - Default target is `zh`, and Markdown outputs normalize to `.zh-cn.md`.
 - Directory mode translates Markdown files and preserves relative paths when `--output-dir` is used.
-- Completeness validation checks translated segments for minimum character ratio, paragraph retention, and Markdown heading preservation.
-- Failed segments retry up to `[completeness].max_retries`; the same value applies to normal, streaming, batch, and `translate-doc` segment validation. After retries are exhausted, `hymt` still writes the best-effort output and emits `completeness_degraded_segments=…` on stderr. Top-level text/file/stdin translation then exits non-zero so scripts detect degraded results; pass `--warn-only-completeness` or set `[completeness].warn_only = true` to keep exit 0 with warnings only. `batch`, `translate-doc`, and `exec` report the same stderr marker by default but do not fail the whole job for degraded segments.
+- Completeness validation is a set of fast truncation/structure heuristics: minimum character ratio, paragraph retention, and Markdown heading preservation. It can flag likely truncation or structural loss; it is not proof that a translation is semantically correct.
+- Failed segments retry up to `[completeness].max_retries`; the same value applies to normal, streaming, batch, and `translate-doc` segment validation. After retries are exhausted, `hymt` still writes the best-effort output and emits `completeness_degraded_segments=…` on stderr. Top-level text/file/stdin commands, including their streaming form, then exit non-zero so scripts detect degraded results; pass `--warn-only-completeness` or set `[completeness].warn_only = true` to keep exit 0 with warnings only. `batch`, `translate-doc`, and `exec` report the same stderr marker by default but do not fail the whole job for degraded segments.
 - Source segments are also bounded by the expansion/context budget and `[translation].max_source_tokens_per_segment` (default `1024`, `0` disables).
 
 ## Batch translate directory trees
@@ -286,32 +264,33 @@ That makes it easier to track regressions in server settings, concurrency, or pr
 
 ## Remote Hy-MT2 over Tailscale
 
-This repo includes two sample systemd user services under [`services/`](services):
+This repo includes two mutually exclusive sample systemd user services under [`services/`](services). `-c` is the service-wide context pool; `--parallel` divides it across concurrent requests:
 
-- `hy-mt2-quality.service`: Q6_K, single slot, Q8 KV, 16K context
-- `hy-mt2-throughput.service`: Q4_K_M, 8 slots, Q4 KV, 64K context
+| Service | Model quantization | KV cache | Total context | Parallel slots | Approx. context per slot |
+|---|---|---|---:|---:|---:|
+| `hy-mt2-quality.service` | Q6_K | Q8 (`q8_0`) | 24,576 | 3 | 8,192 |
+| `hy-mt2-throughput.service` | Q4_K_M | Q4 (`q4_0`) | 65,536 | 8 | 8,192 |
 
-Both bind to the Tailscale interface only (`100.78.159.38:8401`), not `0.0.0.0`. Point your `endpoint.url` at that address when you want to use a remote Hy-MT2 host across your tailnet.
+Both bind only to `100.78.159.38:8401` on Tailscale, not `0.0.0.0`. They use CUDA `llama-server`; the quality unit points at a persistent local build, while the throughput example pins a mise `llama-cpp/9294-cuda` build. Those absolute executable and model paths are host-specific, but a replacement backend must support the shown `llama-server` context, parallel-slot, and KV-cache flags.
+
+Both service profiles set `--temp 0.7`, `--top-k 20`, `--top-p 0.6`, and `--repeat-penalty 1.05`. Neither unit explicitly sets llama.cpp `min-p` or repeat-history length, so those use the backend defaults. The Rust client currently sends the matching `[inference]` request fields; change them deliberately and keep client and service profiles aligned.
 
 ## Architecture
 
-- `src/hymt/config.py`: hot-reloadable TOML config
-- `src/hymt/segment.py`: tokenizer-backed token counting and segmentation
-- `src/hymt/client.py`: async OpenAI-compatible translation client with retry logic
-- `src/hymt/translate.py`: core translate pipeline, cache lookup, streaming, progress, timing history
-- `src/hymt/history.py`: SQLite task history, recall, and ETA statistics
-- `src/hymt/batch.py`: directory planning, cache preview, and batch writes
-- `src/hymt/doc_translate.py`: Markdown-focused translation workflow
-- `src/hymt/docs.py`: translated `man` and `info`
-- `src/hymt/exec_wrapper.py`: command wrapper and translated post-run output
-- `src/hymt/cli.py`: Click CLI entry point
+- `crates/hymt-core`: hot-reloadable TOML configuration, prompt templates, CJK language utilities, and completeness heuristics.
+- `crates/hymt-segment`: Hy-MT2 tokenizer integration plus hierarchical and Markdown-aware segmentation.
+- `crates/hymt-client`: asynchronous OpenAI-compatible HTTP client, retry handling, concurrency limiting, and SSE streaming.
+- `crates/hymt-cache`: SQLite segment and exec caches, task history, recall, and ETA statistics.
+- `crates/hymt-translate`: translation orchestration, completeness retries, batch/document workflows, and translated docs.
+- `crates/hymt-cli`: the Clap `hymt` binary, command dispatch, shell-facing behavior, and optional Telegram subcommand.
 
 ## Development
 
-Run the full local quality gate with:
+Install the repository hooks once, then run the local quality gate with:
 
 ```bash
-env JUST_TEMPDIR=$PWD/.git/just-tmp just pre-commit
+just install-hooks
+just pre-commit
 ```
 
 Verify the binary still builds without Telegram deps:
@@ -320,4 +299,4 @@ Verify the binary still builds without Telegram deps:
 just check-no-telegram
 ```
 
-If you want README bilingual sync in automation, see the `doc-translate-sync` recipe and the `post-commit` hook in `lefthook.yml`.
+Lefthook runs `just pre-commit` before commits and provides README translation synchronization. GitHub Actions CI runs on pull requests and pushes to `main`, covering formatting, Clippy, workspace tests/checks, the no-default-features CLI check, shell checks, service-unit validation, and TOML parsing.
