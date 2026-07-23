@@ -33,10 +33,12 @@ primary = "zh"
 secondary = "en"
 
 [inference]
-temperature = 0.7
-top_p = 0.6
-top_k = 20
-repetition_penalty = 1.05
+# Sampler values are omitted by default so the configured server selects them.
+# `openai_compatible` accepts only temperature, top_p, and repetition_penalty;
+# it sends the latter as `repetition_penalty`, unlike llama.cpp's repeat_penalty.
+backend = "llama_cpp"
+# Explicit overrides belong under `[inference.override]`; a numeric value is
+# sent as-is and the string `"disabled"` turns off that sampler.
 
 [timing]
 divergence_threshold = 2.0
@@ -79,6 +81,307 @@ const DEFAULT_BLOCKLIST: &[&str] = &[
     "hexdump", "dd", "cp", "mv", "rsync", "docker", "podman", "hymt", "ssh", "scp",
 ];
 
+const GENERATION_SETTING_KEYS: &[&str] = &[
+    "temperature",
+    "top_p",
+    "top_k",
+    "repetition_penalty",
+    "min_p",
+    "repeat_last_n",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GenerationSettingField {
+    Temperature,
+    TopP,
+    TopK,
+    RepetitionPenalty,
+    MinP,
+    RepeatLastN,
+}
+
+impl GenerationSettingField {
+    const ALL: [Self; 6] = [
+        Self::Temperature,
+        Self::TopP,
+        Self::TopK,
+        Self::RepetitionPenalty,
+        Self::MinP,
+        Self::RepeatLastN,
+    ];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Temperature => "temperature",
+            Self::TopP => "top_p",
+            Self::TopK => "top_k",
+            Self::RepetitionPenalty => "repetition_penalty",
+            Self::MinP => "min_p",
+            Self::RepeatLastN => "repeat_last_n",
+        }
+    }
+}
+
+const LLAMA_CPP_CAPABILITIES: &[GenerationSettingField] = &GenerationSettingField::ALL;
+const OPENAI_COMPATIBLE_CAPABILITIES: &[GenerationSettingField] = &[
+    GenerationSettingField::Temperature,
+    GenerationSettingField::TopP,
+    GenerationSettingField::RepetitionPenalty,
+];
+
+/// Semantic tri-state for a generation parameter.
+///
+/// `ServerDefault` deliberately differs from a numeric backend sentinel: it
+/// means that the request must omit the field entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum Setting<T> {
+    /// Omit the field and inherit the server or service default.
+    #[default]
+    ServerDefault,
+    /// Explicitly disable the sampler through the selected backend adapter.
+    Disabled,
+    /// Send an explicit, backend-neutral value.
+    Value(T),
+}
+
+/// Backend profile used only when converting semantic settings to wire values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenerationBackend {
+    /// llama.cpp's OpenAI-compatible server.
+    LlamaCpp,
+    /// A generic OpenAI-compatible server.
+    ///
+    /// This profile accepts `temperature`, `top_p`, and `repetition_penalty`.
+    /// The repetition penalty is serialized as `repetition_penalty`.
+    OpenAiCompatible,
+}
+
+impl GenerationBackend {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::LlamaCpp => "llama_cpp",
+            Self::OpenAiCompatible => "openai_compatible",
+        }
+    }
+
+    fn capabilities(self) -> &'static [GenerationSettingField] {
+        match self {
+            Self::LlamaCpp => LLAMA_CPP_CAPABILITIES,
+            Self::OpenAiCompatible => OPENAI_COMPATIBLE_CAPABILITIES,
+        }
+    }
+
+    fn validate_settings(self, settings: &GenerationSettings) -> Result<(), CoreError> {
+        for field in GenerationSettingField::ALL {
+            if settings.is_explicit(field) && !self.capabilities().contains(&field) {
+                return Err(CoreError::Config(format!(
+                    "inference.backend {} does not support inference.override.{}",
+                    self.name(),
+                    field.name(),
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Backend-neutral generation configuration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GenerationSettings {
+    pub temperature: Setting<f64>,
+    pub top_p: Setting<f64>,
+    pub top_k: Setting<i32>,
+    pub repetition_penalty: Setting<f64>,
+    pub min_p: Setting<f64>,
+    pub repeat_last_n: Setting<i64>,
+}
+
+impl GenerationSettings {
+    fn from_toml(data: &toml::Table) -> Result<Self, CoreError> {
+        let settings = Self {
+            temperature: parse_f64_setting(data, "temperature")?,
+            top_p: parse_f64_setting(data, "top_p")?,
+            top_k: parse_i32_setting(data, "top_k")?,
+            repetition_penalty: parse_f64_setting(data, "repetition_penalty")?,
+            min_p: parse_f64_setting(data, "min_p")?,
+            repeat_last_n: parse_i64_setting(data, "repeat_last_n")?,
+        };
+        settings.validate()?;
+        Ok(settings)
+    }
+
+    fn validate(&self) -> Result<(), CoreError> {
+        validate_f64_range("temperature", &self.temperature, 0.0, 2.0)?;
+        validate_f64_range("top_p", &self.top_p, 0.0, 1.0)?;
+        validate_f64_range("min_p", &self.min_p, 0.0, 1.0)?;
+
+        if let Setting::Value(value) = self.repetition_penalty {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(CoreError::Config(
+                    "inference.override.repetition_penalty must be finite and greater than 0"
+                        .to_owned(),
+                ));
+            }
+        }
+        if let Setting::Value(value) = self.top_k {
+            if value < -1 {
+                return Err(CoreError::Config(
+                    "inference.override.top_k must be at least -1".to_owned(),
+                ));
+            }
+        }
+        if let Setting::Value(value) = self.repeat_last_n {
+            if value < -1 {
+                return Err(CoreError::Config(
+                    "inference.override.repeat_last_n must be at least -1".to_owned(),
+                ));
+            }
+        }
+
+        if matches!(self.temperature, Setting::Disabled)
+            && (matches!(self.top_p, Setting::Value(_))
+                || matches!(self.top_k, Setting::Value(_))
+                || matches!(self.min_p, Setting::Value(_)))
+        {
+            return Err(CoreError::Config(
+                "inference.override.temperature is disabled, so top_p, top_k, and min_p must not be explicit values"
+                    .to_owned(),
+            ));
+        }
+        if matches!(self.repetition_penalty, Setting::Disabled)
+            && matches!(self.repeat_last_n, Setting::Value(_))
+        {
+            return Err(CoreError::Config(
+                "inference.override.repetition_penalty is disabled, so repeat_last_n must not be an explicit value"
+                    .to_owned(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn is_explicit(&self, field: GenerationSettingField) -> bool {
+        match field {
+            GenerationSettingField::Temperature => {
+                !matches!(self.temperature, Setting::ServerDefault)
+            }
+            GenerationSettingField::TopP => !matches!(self.top_p, Setting::ServerDefault),
+            GenerationSettingField::TopK => !matches!(self.top_k, Setting::ServerDefault),
+            GenerationSettingField::RepetitionPenalty => {
+                !matches!(self.repetition_penalty, Setting::ServerDefault)
+            }
+            GenerationSettingField::MinP => !matches!(self.min_p, Setting::ServerDefault),
+            GenerationSettingField::RepeatLastN => {
+                !matches!(self.repeat_last_n, Setting::ServerDefault)
+            }
+        }
+    }
+}
+
+fn validate_f64_range(
+    field: &str,
+    setting: &Setting<f64>,
+    min: f64,
+    max: f64,
+) -> Result<(), CoreError> {
+    if let Setting::Value(value) = setting {
+        if !value.is_finite() || *value < min || *value > max {
+            return Err(CoreError::Config(format!(
+                "inference.override.{field} must be finite and in [{min}, {max}]"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn inference_value(data: &toml::Table, key: &str) -> Result<Option<toml::Value>, CoreError> {
+    let Some(inference) = data.get("inference") else {
+        return Ok(None);
+    };
+    let table = inference
+        .as_table()
+        .ok_or_else(|| CoreError::Config("inference must be a TOML table".to_owned()))?;
+    if let Some(overrides) = table.get("override") {
+        let overrides = overrides.as_table().ok_or_else(|| {
+            CoreError::Config("inference.override must be a TOML table".to_owned())
+        })?;
+        if let Some(value) = overrides.get(key) {
+            return Ok(Some(value.clone()));
+        }
+    }
+    Ok(table.get(key).cloned())
+}
+
+fn uses_legacy_generation_scalars(data: &toml::Table) -> bool {
+    data.get("inference")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|table| {
+            GENERATION_SETTING_KEYS
+                .iter()
+                .any(|key| table.contains_key(*key))
+        })
+}
+
+fn parse_f64_setting(data: &toml::Table, key: &str) -> Result<Setting<f64>, CoreError> {
+    match inference_value(data, key)? {
+        None => Ok(Setting::ServerDefault),
+        Some(toml::Value::String(value)) if value == "disabled" => Ok(Setting::Disabled),
+        Some(toml::Value::Float(value)) => Ok(Setting::Value(value)),
+        Some(toml::Value::Integer(value)) => Ok(Setting::Value(value as f64)),
+        Some(_) => Err(CoreError::Config(format!(
+            "inference.override.{key} must be a number or \"disabled\""
+        ))),
+    }
+}
+
+fn parse_i32_setting(data: &toml::Table, key: &str) -> Result<Setting<i32>, CoreError> {
+    match inference_value(data, key)? {
+        None => Ok(Setting::ServerDefault),
+        Some(toml::Value::String(value)) if value == "disabled" => Ok(Setting::Disabled),
+        Some(toml::Value::Integer(value)) => {
+            i32::try_from(value).map(Setting::Value).map_err(|_| {
+                CoreError::Config(format!("inference.override.{key} is outside i32 range"))
+            })
+        }
+        Some(_) => Err(CoreError::Config(format!(
+            "inference.override.{key} must be an integer or \"disabled\""
+        ))),
+    }
+}
+
+fn parse_i64_setting(data: &toml::Table, key: &str) -> Result<Setting<i64>, CoreError> {
+    match inference_value(data, key)? {
+        None => Ok(Setting::ServerDefault),
+        Some(toml::Value::String(value)) if value == "disabled" => Ok(Setting::Disabled),
+        Some(toml::Value::Integer(value)) => Ok(Setting::Value(value)),
+        Some(_) => Err(CoreError::Config(format!(
+            "inference.override.{key} must be an integer or \"disabled\""
+        ))),
+    }
+}
+
+fn generation_backend_from_toml(data: &toml::Table) -> Result<GenerationBackend, CoreError> {
+    let Some(inference) = data.get("inference") else {
+        return Ok(GenerationBackend::LlamaCpp);
+    };
+    let table = inference
+        .as_table()
+        .ok_or_else(|| CoreError::Config("inference must be a TOML table".to_owned()))?;
+    match table.get("backend") {
+        None => Ok(GenerationBackend::LlamaCpp),
+        Some(toml::Value::String(value)) => match value.as_str() {
+            "llama_cpp" | "llama.cpp" => Ok(GenerationBackend::LlamaCpp),
+            "openai_compatible" | "transformers" => Ok(GenerationBackend::OpenAiCompatible),
+            _ => Err(CoreError::Config(format!(
+                "inference.backend must be llama_cpp or openai_compatible, got {value:?}"
+            ))),
+        },
+        Some(value) => Err(CoreError::Config(format!(
+            "inference.backend must be llama_cpp or openai_compatible, got {value:?}"
+        ))),
+    }
+}
+
 fn default_config_path() -> PathBuf {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
@@ -118,6 +421,7 @@ fn env_flag_enabled(name: &str) -> bool {
 struct ConfigState {
     data: toml::Table,
     mtime: Option<SystemTime>,
+    uses_legacy_generation_scalars: bool,
 }
 
 impl ConfigState {
@@ -125,6 +429,7 @@ impl ConfigState {
         Self {
             data: toml::Table::new(),
             mtime: None,
+            uses_legacy_generation_scalars: false,
         }
     }
 }
@@ -264,20 +569,23 @@ impl HotConfig {
 
     // ── inference ───────────────────────────────────────────────────────────
 
-    pub fn temperature(&self) -> f64 {
-        self.get_number_as_f64("inference", "temperature", 0.7)
+    /// Reads and validates the backend-neutral generation overrides.
+    pub fn generation_settings(&self) -> Result<GenerationSettings, CoreError> {
+        let state = self.state.read().unwrap();
+        let settings = GenerationSettings::from_toml(&state.data)?;
+        generation_backend_from_toml(&state.data)?.validate_settings(&settings)?;
+        Ok(settings)
     }
 
-    pub fn top_p(&self) -> f64 {
-        self.get_number_as_f64("inference", "top_p", 0.6)
+    /// Backend profile used to map [`GenerationSettings`] to request fields.
+    pub fn generation_backend(&self) -> Result<GenerationBackend, CoreError> {
+        let state = self.state.read().unwrap();
+        generation_backend_from_toml(&state.data)
     }
 
-    pub fn top_k(&self) -> u32 {
-        self.get_positive_u32("inference", "top_k", 20)
-    }
-
-    pub fn repetition_penalty(&self) -> f64 {
-        self.get_number_as_f64("inference", "repetition_penalty", 1.05)
+    /// Whether this config uses deprecated scalar sampler keys in `[inference]`.
+    pub fn uses_legacy_generation_scalars(&self) -> bool {
+        self.state.read().unwrap().uses_legacy_generation_scalars
     }
 
     // ── timing ──────────────────────────────────────────────────────────────
@@ -488,12 +796,16 @@ impl HotConfig {
         let content = std::fs::read_to_string(&self.path)?;
         let data: toml::Table = toml::from_str(&content)
             .map_err(|e| CoreError::Config(format!("{}: {}", self.path.display(), e)))?;
+        let settings = GenerationSettings::from_toml(&data)?;
+        generation_backend_from_toml(&data)?.validate_settings(&settings)?;
+        let uses_legacy_generation_scalars = uses_legacy_generation_scalars(&data);
         let mtime = std::fs::metadata(&self.path)
             .and_then(|m| m.modified())
             .ok();
         let mut state = self.state.write().unwrap();
         state.data = data;
         state.mtime = mtime;
+        state.uses_legacy_generation_scalars = uses_legacy_generation_scalars;
         Ok(())
     }
 
@@ -760,6 +1072,123 @@ mod tests {
         assert!(path.exists());
         let contents = fs::read_to_string(&path).unwrap();
         assert!(contents.contains("[endpoint]"));
+    }
+
+    #[test]
+    fn generation_settings_parse_semantic_override_states() {
+        let path = temp_config_path("generation_states");
+        fs::write(
+            &path,
+            r#"[inference.override]
+temperature = 0.7
+top_k = "disabled"
+repeat_last_n = -1"#,
+        )
+        .unwrap();
+
+        let settings = HotConfig::from_path(&path)
+            .unwrap()
+            .generation_settings()
+            .unwrap();
+        assert_eq!(settings.temperature, Setting::Value(0.7));
+        assert_eq!(settings.top_p, Setting::ServerDefault);
+        assert_eq!(settings.top_k, Setting::Disabled);
+        assert_eq!(settings.repeat_last_n, Setting::Value(-1));
+    }
+
+    #[test]
+    fn legacy_generation_scalars_remain_explicit_values() {
+        let path = temp_config_path("legacy_generation");
+        fs::write(
+            &path,
+            r#"[inference]
+temperature = 0.7
+top_p = 0.6
+top_k = -1
+repetition_penalty = 1.05
+min_p = 0.2
+repeat_last_n = -1"#,
+        )
+        .unwrap();
+
+        let config = HotConfig::from_path(&path).unwrap();
+        assert!(config.uses_legacy_generation_scalars());
+        let settings = config.generation_settings().unwrap();
+        assert_eq!(settings.temperature, Setting::Value(0.7));
+        assert_eq!(settings.top_p, Setting::Value(0.6));
+        assert_eq!(settings.top_k, Setting::Value(-1));
+        assert_eq!(settings.repetition_penalty, Setting::Value(1.05));
+        assert_eq!(settings.min_p, Setting::Value(0.2));
+        assert_eq!(settings.repeat_last_n, Setting::Value(-1));
+    }
+
+    #[test]
+    fn invalid_generation_overrides_name_the_invalid_field() {
+        for (tag, value, field) in [
+            ("temperature", "temperature = nan", "temperature"),
+            ("top_p", "top_p = 1.1", "top_p"),
+            ("min_p", "min_p = -0.1", "min_p"),
+            ("repetition", "repetition_penalty = 0", "repetition_penalty"),
+            ("top_k", "top_k = -2", "top_k"),
+            ("repeat", "repeat_last_n = -2", "repeat_last_n"),
+        ] {
+            let path = temp_config_path(tag);
+            fs::write(&path, format!("[inference.override]\n{value}")).unwrap();
+            let error = HotConfig::from_path(&path).unwrap_err();
+            assert!(error.to_string().contains(field), "{tag}: {error}");
+        }
+    }
+
+    #[test]
+    fn contradictory_disabled_generation_settings_are_rejected() {
+        let path = temp_config_path("contradictory_generation");
+        fs::write(
+            &path,
+            r#"[inference.override]
+repetition_penalty = "disabled"
+repeat_last_n = -1"#,
+        )
+        .unwrap();
+
+        let error = HotConfig::from_path(&path).unwrap_err();
+        assert!(error.to_string().contains("repetition_penalty"));
+        assert!(error.to_string().contains("repeat_last_n"));
+    }
+
+    #[test]
+    fn invalid_generation_backend_is_rejected() {
+        let path = temp_config_path("invalid_generation_backend");
+        fs::write(&path, "[inference]\nbackend = 7").unwrap();
+
+        let error = HotConfig::from_path(&path).unwrap_err();
+        assert!(error.to_string().contains("inference.backend"));
+    }
+
+    #[test]
+    fn openai_compatible_rejects_unsupported_explicit_and_disabled_overrides_at_load() {
+        for (tag, override_value, field) in [
+            ("top_k_explicit", "top_k = 20", "top_k"),
+            ("min_p_disabled", "min_p = \"disabled\"", "min_p"),
+            (
+                "repeat_last_n_explicit",
+                "repeat_last_n = -1",
+                "repeat_last_n",
+            ),
+        ] {
+            let path = temp_config_path(tag);
+            fs::write(
+                &path,
+                format!(
+                    "[inference]\nbackend = \"openai_compatible\"\n\n[inference.override]\n{override_value}"
+                ),
+            )
+            .unwrap();
+
+            let error = HotConfig::from_path(&path).unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains("openai_compatible"), "{tag}: {message}");
+            assert!(message.contains(field), "{tag}: {message}");
+        }
     }
 
     #[test]

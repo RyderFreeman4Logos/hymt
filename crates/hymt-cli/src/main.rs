@@ -481,6 +481,11 @@ async fn run() -> Result<()> {
     };
 
     let config = HotConfig::new()?;
+    if config.uses_legacy_generation_scalars() {
+        eprintln!(
+            "Warning: legacy [inference] sampler scalars are deprecated; move them under [inference.override]."
+        );
+    }
     if cli.debug_chunk_timing {
         // CLI flag forces timing logs for this process; config/env also enable them.
         std::env::set_var("HYMT_DEBUG_CHUNK_TIMING", "1");
