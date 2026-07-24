@@ -219,8 +219,12 @@ pub fn validate_completeness_with_context(
     if !preserves_all(&urls(input_text), &urls(output_text)) {
         checks_failed.push("url_preservation".to_owned());
     }
-    if is_json_document(input_text) && !is_json_document(output_text) {
-        checks_failed.push("json_validity".to_owned());
+    if let Some(input_json) = parse_json_document(input_text) {
+        match serde_json::from_str::<serde_json::Value>(output_text.trim()) {
+            Ok(output_json) if preserves_json_object_keys(&input_json, &output_json) => {}
+            Ok(_) => checks_failed.push("json_key_preservation".to_owned()),
+            Err(_) => checks_failed.push("json_validity".to_owned()),
+        }
     }
     if generic_refusal(output_text) {
         checks_failed.push("generic_refusal".to_owned());
@@ -305,6 +309,7 @@ fn classify_status(checks_failed: &[String], advisory_warnings: &[String]) -> Co
                 | "placeholder_preservation"
                 | "url_preservation"
                 | "json_validity"
+                | "json_key_preservation"
         )
     }) {
         CompletenessStatus::StructurallyInvalid
@@ -411,10 +416,36 @@ fn preserves_all(input: &HashSet<String>, output: &HashSet<String>) -> bool {
     input.iter().all(|token| output.contains(token))
 }
 
-fn is_json_document(text: &str) -> bool {
+fn parse_json_document(text: &str) -> Option<serde_json::Value> {
     let trimmed = text.trim();
     (trimmed.starts_with('{') || trimmed.starts_with('['))
-        && serde_json::from_str::<serde_json::Value>(trimmed).is_ok()
+        .then(|| serde_json::from_str::<serde_json::Value>(trimmed).ok())
+        .flatten()
+}
+
+fn preserves_json_object_keys(input: &serde_json::Value, output: &serde_json::Value) -> bool {
+    match input {
+        serde_json::Value::Object(input) => {
+            let serde_json::Value::Object(output) = output else {
+                return false;
+            };
+            input.iter().all(|(key, input_value)| {
+                output.get(key).is_some_and(|output_value| {
+                    preserves_json_object_keys(input_value, output_value)
+                })
+            })
+        }
+        serde_json::Value::Array(input) => {
+            let serde_json::Value::Array(output) = output else {
+                return false;
+            };
+            input.len() <= output.len()
+                && input.iter().zip(output).all(|(input_value, output_value)| {
+                    preserves_json_object_keys(input_value, output_value)
+                })
+        }
+        _ => true,
+    }
 }
 
 fn count_paragraphs(text: &str) -> usize {
@@ -932,6 +963,51 @@ verbatim ask --no-generate --format json \"哪些证据是相关的？\"";
 
         assert_eq!(result.status, CompletenessStatus::StructurallyInvalid);
         assert!(result.checks_failed.contains(&"json_validity".to_owned()));
+    }
+
+    #[test]
+    fn missing_json_object_key_is_a_structural_failure() {
+        let result = validate_completeness(
+            r#"{"required_key":"value","retained_key":"value"}"#,
+            r#"{"retained_key":"valeur"}"#,
+            "fr",
+            None,
+        );
+
+        assert_eq!(result.status, CompletenessStatus::StructurallyInvalid);
+        assert!(result
+            .checks_failed
+            .contains(&"json_key_preservation".to_owned()));
+    }
+
+    #[test]
+    fn replaced_json_object_key_is_a_structural_failure() {
+        let result = validate_completeness(
+            r#"{"required_key":{"nested_key":"value"}}"#,
+            r#"{"different_key":{"nested_key":"valeur"}}"#,
+            "fr",
+            None,
+        );
+
+        assert_eq!(result.status, CompletenessStatus::StructurallyInvalid);
+        assert!(result
+            .checks_failed
+            .contains(&"json_key_preservation".to_owned()));
+    }
+
+    #[test]
+    fn missing_nested_json_object_key_is_a_structural_failure() {
+        let result = validate_completeness(
+            r#"{"required_key":{"nested_key":"value"}}"#,
+            r#"{"required_key":{}}"#,
+            "fr",
+            None,
+        );
+
+        assert_eq!(result.status, CompletenessStatus::StructurallyInvalid);
+        assert!(result
+            .checks_failed
+            .contains(&"json_key_preservation".to_owned()));
     }
 
     #[test]

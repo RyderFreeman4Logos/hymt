@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_core::Stream;
+use hymt_core::completeness::CompletionTermination;
 use hymt_core::config::{GenerationBackend, GenerationSettings, HotConfig, Setting};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -45,6 +46,20 @@ pub enum ClientError {
 
     #[error("semaphore closed")]
     SemaphoreClosed,
+}
+
+/// A completed non-streaming translation with its provider termination signal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranslationCompletion {
+    pub text: String,
+    pub termination: CompletionTermination,
+}
+
+/// An item emitted by a termination-aware translation stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranslationStreamEvent {
+    Token(String),
+    Finished(CompletionTermination),
 }
 
 // ── Serde types ───────────────────────────────────────────────────────────────
@@ -241,8 +256,23 @@ impl TranslationClient {
     /// Translates `prompt` to a single string (non-streaming).
     ///
     /// Acquires one concurrency slot for the duration of the request.
-    /// Retries on transient errors and guards against `finish_reason == "length"`.
+    /// Retries on transient errors and returns an error for `finish_reason == "length"`.
+    ///
+    /// Call [`Self::translate_with_completion`] when the caller needs the partial
+    /// output and termination signal for completeness handling.
     pub async fn translate(&self, prompt: &str) -> Result<String, ClientError> {
+        let completion = self.translate_with_completion(prompt).await?;
+        if completion.termination == CompletionTermination::Length {
+            return Err(ClientError::Truncated);
+        }
+        Ok(completion.text)
+    }
+
+    /// Translates `prompt`, preserving partial output and the provider termination signal.
+    pub async fn translate_with_completion(
+        &self,
+        prompt: &str,
+    ) -> Result<TranslationCompletion, ClientError> {
         // Continue with cached config on reload failure (e.g. transient I/O)
         let _ = self.inner.config.maybe_reload();
 
@@ -305,6 +335,68 @@ impl TranslationClient {
         Ok(ReceiverStream::new(rx))
     }
 
+    /// Translates `prompt` with SSE streaming while preserving termination events.
+    ///
+    /// A `finish_reason == "length"` response emits [`TranslationStreamEvent::Finished`]
+    /// with [`CompletionTermination::Length`] after all available partial tokens.
+    pub async fn translate_stream_with_completion(
+        &self,
+        prompt: &str,
+    ) -> Result<impl Stream<Item = Result<TranslationStreamEvent, ClientError>>, ClientError> {
+        let _ = self.inner.config.maybe_reload();
+
+        let permit = Arc::clone(&self.inner.semaphore)
+            .acquire_owned()
+            .await
+            .map_err(|_| ClientError::SemaphoreClosed)?;
+
+        let payload = self.build_payload(prompt, true)?;
+        let headers = self.build_headers();
+        let url = self.chat_url();
+
+        let response = self
+            .connect_stream_with_retry(&url, &payload, &headers)
+            .await?;
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<Result<TranslationStreamEvent, ClientError>>(64);
+
+        let is_sse = is_event_stream(&response);
+        tokio::spawn(async move {
+            let _permit = permit; // held for the entire stream duration
+            if is_sse {
+                parse_sse_with_completion(response, tx).await;
+            } else {
+                // Non-SSE fallback: emit its text before the terminal signal.
+                let result = async {
+                    let body = response.bytes().await?;
+                    let resp: ChatResponse = serde_json::from_slice(&body)?;
+                    extract_completion_from_response(resp)
+                }
+                .await;
+                match result {
+                    Ok(completion) => {
+                        if !completion.text.is_empty()
+                            && tx
+                                .send(Ok(TranslationStreamEvent::Token(completion.text)))
+                                .await
+                                .is_err()
+                        {
+                            return;
+                        }
+                        let _ = tx
+                            .send(Ok(TranslationStreamEvent::Finished(completion.termination)))
+                            .await;
+                    }
+                    Err(error) => {
+                        let _ = tx.send(Err(error)).await;
+                    }
+                }
+            }
+        });
+
+        Ok(ReceiverStream::new(rx))
+    }
+
     // ── Private helpers ────────────────────────────────────────────────────────
 
     fn build_payload(&self, prompt: &str, stream: bool) -> Result<ChatPayload, ClientError> {
@@ -343,7 +435,7 @@ impl TranslationClient {
         url: &str,
         payload: &ChatPayload,
         headers: &reqwest::header::HeaderMap,
-    ) -> Result<String, ClientError> {
+    ) -> Result<TranslationCompletion, ClientError> {
         let mut last: Option<ClientError> = None;
         for attempt in 0..=MAX_RETRIES {
             match self
@@ -360,7 +452,7 @@ impl TranslationClient {
                     if status < 400 {
                         let body = resp.bytes().await?;
                         let chat: ChatResponse = serde_json::from_slice(&body)?;
-                        return extract_from_response(chat);
+                        return extract_completion_from_response(chat);
                     }
                     let body = resp.bytes().await.unwrap_or_default();
                     let err = http_error(status, &body);
@@ -489,6 +581,107 @@ async fn parse_sse(
     }
 }
 
+async fn parse_sse_with_completion(
+    response: reqwest::Response,
+    tx: tokio::sync::mpsc::Sender<Result<TranslationStreamEvent, ClientError>>,
+) {
+    use tokio_stream::StreamExt as _;
+
+    let mut byte_stream = response.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut data_lines: Vec<String> = Vec::new();
+    let mut saw_terminal = false;
+
+    loop {
+        match byte_stream.next().await {
+            Some(Ok(chunk)) => {
+                buf.extend_from_slice(&chunk);
+                while let Some(pos) = buf.iter().position(|&byte| byte == b'\n') {
+                    let raw: Vec<u8> = buf.drain(..=pos).collect();
+                    let line = String::from_utf8_lossy(&raw)
+                        .trim_end_matches(['\r', '\n'])
+                        .to_owned();
+                    if line.is_empty() {
+                        if !flush_completion_sse_data(&mut data_lines, &tx, &mut saw_terminal).await
+                        {
+                            return;
+                        }
+                    } else if !line.starts_with(':') {
+                        if let Some(data) = line.strip_prefix("data:") {
+                            data_lines.push(data.trim_start().to_owned());
+                        }
+                    }
+                }
+            }
+            Some(Err(error)) => {
+                let _ = tx.send(Err(ClientError::Request(error))).await;
+                return;
+            }
+            None => break,
+        }
+    }
+
+    if !buf.is_empty() {
+        let line = String::from_utf8_lossy(&buf)
+            .trim_end_matches(['\r', '\n'])
+            .to_owned();
+        if let Some(data) = line.strip_prefix("data:") {
+            data_lines.push(data.trim_start().to_owned());
+        }
+    }
+    if !flush_completion_sse_data(&mut data_lines, &tx, &mut saw_terminal).await {
+        return;
+    }
+    if !saw_terminal {
+        let _ = tx
+            .send(Ok(TranslationStreamEvent::Finished(
+                CompletionTermination::Unknown,
+            )))
+            .await;
+    }
+}
+
+async fn flush_completion_sse_data(
+    data_lines: &mut Vec<String>,
+    tx: &tokio::sync::mpsc::Sender<Result<TranslationStreamEvent, ClientError>>,
+    saw_terminal: &mut bool,
+) -> bool {
+    if data_lines.is_empty() {
+        return true;
+    }
+    let data = data_lines.join("\n");
+    data_lines.clear();
+    if data == "[DONE]" {
+        if !*saw_terminal {
+            *saw_terminal = true;
+            return tx
+                .send(Ok(TranslationStreamEvent::Finished(
+                    CompletionTermination::Stop,
+                )))
+                .await
+                .is_ok();
+        }
+        return true;
+    }
+
+    let events = match serde_json::from_str::<ChatResponse>(&data) {
+        Ok(response) => match extract_stream_completion_events(response) {
+            Ok(events) => events,
+            Err(error) => return tx.send(Err(error)).await.is_ok(),
+        },
+        Err(error) => return tx.send(Err(ClientError::Json(error))).await.is_ok(),
+    };
+    for event in events {
+        if matches!(event, TranslationStreamEvent::Finished(_)) {
+            *saw_terminal = true;
+        }
+        if tx.send(Ok(event)).await.is_err() {
+            return false;
+        }
+    }
+    true
+}
+
 /// Processes one SSE text line, mutating the `data_lines` accumulator.
 ///
 /// Returns `Some(result)` only when an event boundary (empty line) is reached
@@ -531,27 +724,45 @@ pub fn tokens_from_sse_data(data_lines: &[String]) -> Option<Result<String, Clie
 
 // ── Response extraction ───────────────────────────────────────────────────────
 
-fn extract_from_response(resp: ChatResponse) -> Result<String, ClientError> {
+fn termination_from_finish_reason(finish_reason: Option<&str>) -> CompletionTermination {
+    match finish_reason {
+        Some("stop") => CompletionTermination::Stop,
+        Some("length") => CompletionTermination::Length,
+        Some(_) | None => CompletionTermination::Unknown,
+    }
+}
+
+fn extract_completion_from_response(
+    resp: ChatResponse,
+) -> Result<TranslationCompletion, ClientError> {
     let choices = resp.choices.unwrap_or_default();
     let first = choices
         .into_iter()
         .next()
         .ok_or(ClientError::MissingChoices)?;
-
-    if first.finish_reason.as_deref() == Some("length") {
-        return Err(ClientError::Truncated);
-    }
+    let termination = termination_from_finish_reason(first.finish_reason.as_deref());
 
     if let Some(msg) = first.message {
         if let Some(content) = msg.content {
-            return Ok(content);
+            return Ok(TranslationCompletion {
+                text: content,
+                termination,
+            });
         }
     }
     if let Some(text) = first.text {
-        return Ok(text);
+        return Ok(TranslationCompletion { text, termination });
     }
 
     Err(ClientError::MissingContent)
+}
+
+fn extract_from_response(resp: ChatResponse) -> Result<String, ClientError> {
+    let completion = extract_completion_from_response(resp)?;
+    if completion.termination == CompletionTermination::Length {
+        return Err(ClientError::Truncated);
+    }
+    Ok(completion.text)
 }
 
 fn extract_stream_token(resp: ChatResponse) -> Result<String, ClientError> {
@@ -574,6 +785,32 @@ fn extract_stream_token(resp: ChatResponse) -> Result<String, ClientError> {
         return Ok(text);
     }
     Ok(String::new())
+}
+
+fn extract_stream_completion_events(
+    resp: ChatResponse,
+) -> Result<Vec<TranslationStreamEvent>, ClientError> {
+    let choices = resp.choices.unwrap_or_default();
+    let Some(first) = choices.into_iter().next() else {
+        return Ok(Vec::new());
+    };
+    let termination = first
+        .finish_reason
+        .as_deref()
+        .map(|finish_reason| termination_from_finish_reason(Some(finish_reason)));
+    let content = first
+        .delta
+        .and_then(|delta| delta.content)
+        .or(first.text)
+        .unwrap_or_default();
+    let mut events = Vec::new();
+    if !content.is_empty() {
+        events.push(TranslationStreamEvent::Token(content));
+    }
+    if let Some(termination) = termination {
+        events.push(TranslationStreamEvent::Finished(termination));
+    }
+    Ok(events)
 }
 
 // ── Retry helpers ─────────────────────────────────────────────────────────────

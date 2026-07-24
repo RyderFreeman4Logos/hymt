@@ -18,9 +18,12 @@ use tokio::task::JoinSet;
 use tokio_stream::StreamExt as _;
 
 use hymt_cache::history::{format_duration, HistoryDB, SegmentCacheScope, TaskRecord};
-use hymt_client::TranslationClient;
+use hymt_client::{TranslationClient, TranslationStreamEvent};
+#[cfg(test)]
+use hymt_core::completeness::validate_completeness;
 use hymt_core::completeness::{
-    validate_completeness, CompletenessResult, CompletenessStatus, CompletenessThresholds,
+    validate_completeness_with_context, CompletenessContext, CompletenessResult,
+    CompletenessStatus, CompletenessThresholds, CompletionTermination,
 };
 use hymt_core::config::HotConfig;
 use hymt_core::language::{
@@ -670,9 +673,10 @@ fn check_completeness(
     translated: &str,
     target_lang: &str,
     config: &HotConfig,
+    context: &CompletenessContext,
 ) -> CompletenessResult {
     let thresholds = completeness_thresholds(config);
-    validate_completeness(segment, translated, target_lang, Some(&thresholds))
+    validate_completeness_with_context(segment, translated, target_lang, Some(&thresholds), context)
 }
 
 fn cached_segment_is_complete(
@@ -682,7 +686,13 @@ fn cached_segment_is_complete(
     target_lang: &str,
     config: &HotConfig,
 ) -> bool {
-    let result = check_completeness(segment, cached, target_lang, config);
+    let result = check_completeness(
+        segment,
+        cached,
+        target_lang,
+        config,
+        &CompletenessContext::default(),
+    );
     if !result.advisory_warnings.is_empty() {
         eprintln!(
             "Note: cached segment {} has advisory warnings: {:?}",
@@ -752,12 +762,20 @@ async fn translate_segment_with_completeness(
             prompt.push_str("\n\nTranslate the COMPLETE input. Do not stop early.");
         }
 
-        let translated = client
-            .translate(&prompt)
+        let completion = client
+            .translate_with_completion(&prompt)
             .await
             .map_err(|e| map_segment_http_error(index, segment, e))?;
-        let validation = check_completeness(segment, &translated, target_lang, config);
-        let candidate = ScoredAttempt::new(attempt, translated, validation);
+        let validation = check_completeness(
+            segment,
+            &completion.text,
+            target_lang,
+            config,
+            &CompletenessContext {
+                termination: completion.termination,
+            },
+        );
+        let candidate = ScoredAttempt::new(attempt, completion.text, validation);
 
         if !candidate.validation.advisory_warnings.is_empty() {
             eprintln!(
@@ -896,30 +914,35 @@ async fn translate_segment_with_completeness_streaming(
     timing.log(request.index, "request_start");
     let mut stream = request
         .client
-        .translate_stream(&prompt)
+        .translate_stream_with_completion(&prompt)
         .await
         .map_err(|e| map_segment_http_error(request.index, request.segment, e))?;
     let mut translated = String::new();
     let mut streamed_tokens: Vec<String> = Vec::new();
     let mut first_token_tx = first_token_tx;
     let mut emitted_optimistically = false;
+    let mut termination = CompletionTermination::Unknown;
 
     while let Some(item) = stream.next().await {
-        let token = item.map_err(|e| map_segment_http_error(request.index, request.segment, e))?;
-        if token.is_empty() {
-            continue;
-        }
-        if let Some(tx) = first_token_tx.take() {
-            timing.log(request.index, "first_token");
-            let _ = tx.try_send(());
-        }
-        translated.push_str(&token);
-        match output_mode {
-            StreamOutputMode::Validated => streamed_tokens.push(token),
-            StreamOutputMode::Optimistic => {
-                emitted_optimistically = true;
-                send_stream_event(event_tx, StreamEvent::Token(token)).await?;
+        match item.map_err(|e| map_segment_http_error(request.index, request.segment, e))? {
+            TranslationStreamEvent::Token(token) => {
+                if token.is_empty() {
+                    continue;
+                }
+                if let Some(tx) = first_token_tx.take() {
+                    timing.log(request.index, "first_token");
+                    let _ = tx.try_send(());
+                }
+                translated.push_str(&token);
+                match output_mode {
+                    StreamOutputMode::Validated => streamed_tokens.push(token),
+                    StreamOutputMode::Optimistic => {
+                        emitted_optimistically = true;
+                        send_stream_event(event_tx, StreamEvent::Token(token)).await?;
+                    }
+                }
             }
+            TranslationStreamEvent::Finished(next_termination) => termination = next_termination,
         }
     }
 
@@ -928,6 +951,7 @@ async fn translate_segment_with_completeness_streaming(
         &translated,
         request.target_lang,
         request.config,
+        &CompletenessContext { termination },
     );
     let mut best = ScoredAttempt::new(0, translated, validation);
     if !best.validation.advisory_warnings.is_empty() {
@@ -992,19 +1016,22 @@ async fn translate_segment_with_completeness_streaming(
         )?;
         prompt.push_str("\n\nTranslate the COMPLETE input. Do not stop early.");
 
-        let translated = request
+        let completion = request
             .client
-            .translate(&prompt)
+            .translate_with_completion(&prompt)
             .await
             .map_err(|e| map_segment_http_error(request.index, request.segment, e))?;
 
         let validation = check_completeness(
             request.segment,
-            &translated,
+            &completion.text,
             request.target_lang,
             request.config,
+            &CompletenessContext {
+                termination: completion.termination,
+            },
         );
-        let candidate = ScoredAttempt::new(attempt, translated, validation);
+        let candidate = ScoredAttempt::new(attempt, completion.text, validation);
         timing.log(request.index, "completeness_retry_end");
 
         if !candidate.validation.advisory_warnings.is_empty() {
@@ -1884,7 +1911,15 @@ mod tests {
 
     enum MockResponse {
         Json(String),
+        JsonWithFinishReason {
+            content: String,
+            finish_reason: String,
+        },
         Sse(Vec<String>),
+        SseWithFinishReason {
+            tokens: Vec<String>,
+            finish_reason: String,
+        },
     }
 
     struct MockServer {
@@ -2182,6 +2217,15 @@ mod tests {
                     r#"{{"choices":[{{"finish_reason":"stop","message":{{"content":"{content}"}}}}]}}"#
                 ),
             ),
+            MockResponse::JsonWithFinishReason {
+                content,
+                finish_reason,
+            } => (
+                "application/json",
+                format!(
+                    r#"{{"choices":[{{"finish_reason":"{finish_reason}","message":{{"content":"{content}"}}}}]}}"#
+                ),
+            ),
             MockResponse::Sse(tokens) => {
                 let mut body = String::new();
                 for token in tokens {
@@ -2191,6 +2235,23 @@ mod tests {
                     body.push_str("\n\n");
                 }
                 body.push_str("data: [DONE]\n\n");
+                ("text/event-stream", body)
+            }
+            MockResponse::SseWithFinishReason {
+                tokens,
+                finish_reason,
+            } => {
+                let mut body = String::new();
+                for token in tokens {
+                    body.push_str(&format!(
+                        r#"data: {{"choices":[{{"finish_reason":null,"delta":{{"content":"{token}"}}}}]}}"#
+                    ));
+                    body.push_str("\n\n");
+                }
+                body.push_str(&format!(
+                    r#"data: {{"choices":[{{"finish_reason":"{finish_reason}","delta":{{"content":""}}}}]}}"#
+                ));
+                body.push_str("\n\ndata: [DONE]\n\n");
                 ("text/event-stream", body)
             }
         }
@@ -3699,7 +3760,7 @@ Bravo one text carries enough source material for cache validation and ordering 
     }
 
     #[tokio::test]
-    async fn validated_streaming_retries_single_uncached_segment_before_stdout() {
+    async fn validated_streaming_retries_finish_reason_length_before_stdout() {
         let text = "Usage: ask [OPTIONS]\n\nOptions:\n  -h, --help Print help.\n";
         let planning_cfg = make_stream_config_with_fcp("http://127.0.0.1:1/v1", false);
         let segmenter = fallback_segmenter();
@@ -3721,7 +3782,10 @@ Bravo one text carries enough source material for cache validation and ordering 
         let retry_segment = complete_translation("RETRY", &plan.segments[0]);
         let expected = plan.reconstruct(std::slice::from_ref(&retry_segment));
         let server = start_mock_server(vec![
-            MockResponse::Sse(vec!["short".to_owned()]),
+            MockResponse::SseWithFinishReason {
+                tokens: vec![complete_translation("PARTIAL", &plan.segments[0])],
+                finish_reason: "length".to_owned(),
+            },
             MockResponse::Json(retry_segment),
         ])
         .await;
@@ -3747,7 +3811,7 @@ Bravo one text carries enough source material for cache validation and ordering 
                 format!("{expected}\n")
             }
         );
-        assert!(!stdout.contains("short"));
+        assert!(!stdout.contains("PARTIAL"));
     }
 
     #[tokio::test]
@@ -3980,11 +4044,10 @@ Bravo one text carries enough source material for cache validation and ordering 
     }
 
     #[tokio::test]
-    async fn completeness_best_attempt_marks_degraded_segments() {
+    async fn finish_reason_length_retries_selects_best_attempt_and_marks_degraded() {
         let text = "Hello world paragraph one.\n\nHello world paragraph two.";
         let dir = tempfile::tempdir().unwrap();
         let cfg_path = dir.path().join("config.toml");
-        // Force token_ratio failure with absurdly high min ratio and zero retries.
         std::fs::write(
             &cfg_path,
             r#"[endpoint]
@@ -4001,12 +4064,22 @@ max_source_tokens_per_segment = 1024
 zh_to_en_min_ratio = 0.3
 en_to_zh_min_ratio = 10.0
 min_paragraph_ratio = 0.5
-max_retries = 0
+max_retries = 1
 "#,
         )
         .unwrap();
-        // mock server returns short translation that fails en_to_zh ratio
-        let server = start_mock_server(vec![MockResponse::Json("短".to_owned())]).await;
+        let best_partial = complete_translation("BEST_TRUNCATED", text);
+        let server = start_mock_server(vec![
+            MockResponse::JsonWithFinishReason {
+                content: best_partial.clone(),
+                finish_reason: "length".to_owned(),
+            },
+            MockResponse::JsonWithFinishReason {
+                content: "短".to_owned(),
+                finish_reason: "length".to_owned(),
+            },
+        ])
+        .await;
         let cfg_toml = std::fs::read_to_string(&cfg_path)
             .unwrap()
             .replace("PLACEHOLDER", &server.endpoint_url);
@@ -4035,7 +4108,7 @@ max_retries = 0
             "expected degraded segments, got {:?}",
             outcome.completeness_degraded_segments
         );
-        assert!(!outcome.text.is_empty());
+        assert_eq!(outcome.text, best_partial);
         assert_eq!(outcome.completeness_degraded_segments, vec![1]);
         assert_eq!(
             outcome.completeness_status(),
