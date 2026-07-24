@@ -161,8 +161,9 @@ The Rust main translation paths do **not** yet use paragraph-level language anal
 - target language
 - template type
 - template options
+- `profile_id` (canonical profile ID)
 
-The segment-cache key does **not** yet include endpoint/model identity, quantization or backend build, tokenizer version, or inference sampling settings. Those changes can therefore reuse entries from an older inference profile; `config_version` is recorded in task history, not the segment-cache key. Inference fingerprinting is required before those profiles are isolated automatically.
+Profile isolation is therefore provided. The segment-cache key does **not** yet include endpoint/model identity, tokenizer revision, quantization or backend build, or inference sampling settings (see #115). Changes to those settings can therefore reuse entries from an older inference profile; `config_version` is recorded in task history, not the segment-cache key. Inference fingerprinting is required before those settings are isolated automatically.
 
 That enables:
 
