@@ -19,7 +19,9 @@ use tokio_stream::StreamExt as _;
 
 use hymt_cache::history::{format_duration, HistoryDB, SegmentCacheScope, TaskRecord};
 use hymt_client::TranslationClient;
-use hymt_core::completeness::{validate_completeness, CompletenessResult, CompletenessThresholds};
+use hymt_core::completeness::{
+    validate_completeness, CompletenessResult, CompletenessStatus, CompletenessThresholds,
+};
 use hymt_core::config::HotConfig;
 use hymt_core::language::{
     plan_document_translation, DocumentLanguagePlan, DocumentTranslationPolicy, SectionKind,
@@ -140,6 +142,15 @@ pub struct TranslationOutcome {
 }
 
 impl TranslationOutcome {
+    /// Machine-readable final completeness state for scripts and integrations.
+    pub fn completeness_status(&self) -> CompletenessStatus {
+        if self.is_completeness_degraded() {
+            CompletenessStatus::DegradedBestEffort
+        } else {
+            CompletenessStatus::Valid
+        }
+    }
+
     pub fn is_completeness_degraded(&self) -> bool {
         !self.completeness_degraded_segments.is_empty()
     }
@@ -155,6 +166,7 @@ impl TranslationOutcome {
             .map(|i| i.to_string())
             .collect::<Vec<_>>()
             .join(",");
+        eprintln!("completeness_status=degraded_best_effort");
         eprintln!("completeness_degraded_segments={list}");
         eprintln!(
             "Warning: {} segment(s) used best attempt after completeness retries exhausted",
@@ -167,6 +179,37 @@ impl TranslationOutcome {
 struct SegmentTranslateOutcome {
     text: String,
     completeness_degraded: bool,
+}
+
+/// One failed candidate retained only long enough to select the safest available
+/// fallback. Its score ranks observable validation signals, not translation QE.
+#[derive(Debug)]
+struct ScoredAttempt {
+    attempt: usize,
+    text: String,
+    validation: CompletenessResult,
+}
+
+impl ScoredAttempt {
+    fn new(attempt: usize, text: impl Into<String>, validation: CompletenessResult) -> Self {
+        Self {
+            attempt,
+            text: text.into(),
+            validation,
+        }
+    }
+
+    fn selection_reason(&self) -> &'static str {
+        "highest_validation_score"
+    }
+}
+
+/// Retain the earliest attempt that has the highest validation score.
+fn select_best_attempt(current: Option<ScoredAttempt>, candidate: ScoredAttempt) -> ScoredAttempt {
+    match current {
+        Some(current) if current.validation.score >= candidate.validation.score => current,
+        _ => candidate,
+    }
 }
 
 impl TranslationPlan {
@@ -674,7 +717,7 @@ fn approx_source_tokens(segment: &str) -> usize {
     if segment.is_empty() {
         0
     } else {
-        segment.len().div_ceil(4).max(1)
+        segment.chars().count().div_ceil(4).max(1)
     }
 }
 
@@ -684,9 +727,9 @@ fn map_segment_http_error(
     err: impl std::fmt::Display,
 ) -> anyhow::Error {
     anyhow!(
-        "HTTP translation failed for segment {} (source_chars={}, approx_source_tokens={}): {err}",
+        "HTTP translation failed for segment {} (source_unicode_scalars={}, approx_source_tokens={}): {err}",
         index + 1,
-        segment.len(),
+        segment.chars().count(),
         approx_source_tokens(segment)
     )
 }
@@ -701,7 +744,7 @@ async fn translate_segment_with_completeness(
     config: &HotConfig,
 ) -> Result<SegmentTranslateOutcome> {
     let max_retries = config.completeness_max_retries() as usize;
-    let mut best = String::new();
+    let mut best = None;
 
     for attempt in 0..=max_retries {
         let mut prompt = build_prompt(segment, target_lang, template, opts)?;
@@ -713,21 +756,19 @@ async fn translate_segment_with_completeness(
             .translate(&prompt)
             .await
             .map_err(|e| map_segment_http_error(index, segment, e))?;
+        let validation = check_completeness(segment, &translated, target_lang, config);
+        let candidate = ScoredAttempt::new(attempt, translated, validation);
 
-        let result = check_completeness(segment, &translated, target_lang, config);
-        best = translated;
-
-        if !result.advisory_warnings.is_empty() {
+        if !candidate.validation.advisory_warnings.is_empty() {
             eprintln!(
                 "Note: segment {} has advisory warnings: {:?}",
                 index + 1,
-                result.advisory_warnings
+                candidate.validation.advisory_warnings
             );
         }
-
-        if result.is_complete {
+        if candidate.validation.is_complete {
             return Ok(SegmentTranslateOutcome {
-                text: best,
+                text: candidate.text,
                 completeness_degraded: false,
             });
         }
@@ -743,17 +784,24 @@ async fn translate_segment_with_completeness(
             attempt + 1,
             max_retries + 1,
             action,
-            result.checks_failed
+            candidate.validation.checks_failed
         );
+        best = Some(select_best_attempt(best, candidate));
     }
 
+    let best = best.expect("a retry loop always has at least one attempt");
     eprintln!(
-        "Warning: segment {} exceeded {} retries, using best attempt",
+        "Warning: segment {} exceeded {} retries, selected attempt {}/{} \
+         (score={}, reason={})",
         index + 1,
-        max_retries
+        max_retries,
+        best.attempt + 1,
+        max_retries + 1,
+        best.validation.score,
+        best.selection_reason(),
     );
     Ok(SegmentTranslateOutcome {
-        text: best,
+        text: best.text,
         completeness_degraded: true,
     })
 }
@@ -875,16 +923,21 @@ async fn translate_segment_with_completeness_streaming(
         }
     }
 
-    let mut best = translated;
-    let result = check_completeness(request.segment, &best, request.target_lang, request.config);
-    if !result.advisory_warnings.is_empty() {
+    let validation = check_completeness(
+        request.segment,
+        &translated,
+        request.target_lang,
+        request.config,
+    );
+    let mut best = ScoredAttempt::new(0, translated, validation);
+    if !best.validation.advisory_warnings.is_empty() {
         eprintln!(
             "Note: segment {} has advisory warnings: {:?}",
             request.index + 1,
-            result.advisory_warnings
+            best.validation.advisory_warnings
         );
     }
-    if result.is_complete {
+    if best.validation.is_complete {
         if output_mode == StreamOutputMode::Validated {
             for token in streamed_tokens {
                 send_stream_event(event_tx, StreamEvent::Token(token)).await?;
@@ -893,7 +946,7 @@ async fn translate_segment_with_completeness_streaming(
         send_stream_event(event_tx, StreamEvent::SegmentDone(request.index)).await?;
         timing.log(request.index, "complete");
         return Ok(SegmentTranslateOutcome {
-            text: best,
+            text: best.text,
             completeness_degraded: false,
         });
     }
@@ -906,12 +959,12 @@ async fn translate_segment_with_completeness_streaming(
             "Warning: segment {} failed completeness, using streamed attempt (retry skipped \
              — tokens already emitted): {:?}",
             request.index + 1,
-            result.checks_failed
+            best.validation.checks_failed
         );
         send_stream_event(event_tx, StreamEvent::SegmentDone(request.index)).await?;
         timing.log(request.index, "complete");
         return Ok(SegmentTranslateOutcome {
-            text: best,
+            text: best.text,
             completeness_degraded: true,
         });
     }
@@ -926,7 +979,7 @@ async fn translate_segment_with_completeness_streaming(
         request.index + 1,
         max_retries + 1,
         action,
-        result.checks_failed
+        best.validation.checks_failed
     );
 
     for attempt in 1..=max_retries {
@@ -945,28 +998,28 @@ async fn translate_segment_with_completeness_streaming(
             .await
             .map_err(|e| map_segment_http_error(request.index, request.segment, e))?;
 
-        let result = check_completeness(
+        let validation = check_completeness(
             request.segment,
             &translated,
             request.target_lang,
             request.config,
         );
-        best = translated;
+        let candidate = ScoredAttempt::new(attempt, translated, validation);
         timing.log(request.index, "completeness_retry_end");
 
-        if !result.advisory_warnings.is_empty() {
+        if !candidate.validation.advisory_warnings.is_empty() {
             eprintln!(
                 "Note: segment {} has advisory warnings: {:?}",
                 request.index + 1,
-                result.advisory_warnings
+                candidate.validation.advisory_warnings
             );
         }
 
-        if result.is_complete {
-            if !best.is_empty()
+        if candidate.validation.is_complete {
+            if !candidate.text.is_empty()
                 && (output_mode == StreamOutputMode::Validated || !emitted_optimistically)
             {
-                send_stream_event(event_tx, StreamEvent::Token(best.clone())).await?;
+                send_stream_event(event_tx, StreamEvent::Token(candidate.text.clone())).await?;
                 if let Some(tx) = first_token_tx.take() {
                     timing.log(request.index, "first_token");
                     let _ = tx.try_send(());
@@ -975,7 +1028,7 @@ async fn translate_segment_with_completeness_streaming(
             send_stream_event(event_tx, StreamEvent::SegmentDone(request.index)).await?;
             timing.log(request.index, "complete");
             return Ok(SegmentTranslateOutcome {
-                text: best,
+                text: candidate.text,
                 completeness_degraded: false,
             });
         }
@@ -991,17 +1044,25 @@ async fn translate_segment_with_completeness_streaming(
             attempt + 1,
             max_retries + 1,
             action,
-            result.checks_failed
+            candidate.validation.checks_failed
         );
+        best = select_best_attempt(Some(best), candidate);
     }
 
     eprintln!(
-        "Warning: segment {} exceeded {} retries, using best attempt",
+        "Warning: segment {} exceeded {} retries, selected attempt {}/{} \
+         (score={}, reason={})",
         request.index + 1,
-        max_retries
+        max_retries,
+        best.attempt + 1,
+        max_retries + 1,
+        best.validation.score,
+        best.selection_reason(),
     );
-    if !best.is_empty() && (output_mode == StreamOutputMode::Validated || !emitted_optimistically) {
-        send_stream_event(event_tx, StreamEvent::Token(best.clone())).await?;
+    if !best.text.is_empty()
+        && (output_mode == StreamOutputMode::Validated || !emitted_optimistically)
+    {
+        send_stream_event(event_tx, StreamEvent::Token(best.text.clone())).await?;
         if let Some(tx) = first_token_tx.take() {
             timing.log(request.index, "first_token");
             let _ = tx.try_send(());
@@ -1010,7 +1071,7 @@ async fn translate_segment_with_completeness_streaming(
     send_stream_event(event_tx, StreamEvent::SegmentDone(request.index)).await?;
     timing.log(request.index, "complete");
     Ok(SegmentTranslateOutcome {
-        text: best,
+        text: best.text,
         completeness_degraded: true,
     })
 }
@@ -1219,8 +1280,8 @@ pub async fn translate_text(
         profile_id: profile_id.to_owned(),
         inference_fingerprint: inference_fingerprint.hash().to_owned(),
         tokens_per_second: tps,
-        input_chars: text.len() as i64,
-        output_chars: translated.len() as i64,
+        input_chars: text.chars().count() as i64,
+        output_chars: translated.chars().count() as i64,
         output_text: Some(translated.clone()),
         input_hash: None,
         config_version: ctx.config.config_version() as i64,
@@ -1688,8 +1749,8 @@ pub async fn translate_text_stream_with_mode(
         profile_id: profile_id.to_owned(),
         inference_fingerprint: inference_fingerprint.hash().to_owned(),
         tokens_per_second: tps,
-        input_chars: text.len() as i64,
-        output_chars: translated.len() as i64,
+        input_chars: text.chars().count() as i64,
+        output_chars: translated.chars().count() as i64,
         output_text: Some(translated.clone()),
         input_hash: None,
         config_version: ctx.config.config_version() as i64,
@@ -3976,6 +4037,10 @@ max_retries = 0
         );
         assert!(!outcome.text.is_empty());
         assert_eq!(outcome.completeness_degraded_segments, vec![1]);
+        assert_eq!(
+            outcome.completeness_status(),
+            CompletenessStatus::DegradedBestEffort
+        );
         let records = history.fetch_recent(None).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(
@@ -4204,5 +4269,32 @@ max_retries = 1
         assert!(stderr.contains("event=request_start"));
         assert!(stderr.contains("event=first_token"));
         assert!(stderr.contains("event=complete"));
+    }
+
+    #[test]
+    fn best_attempt_selection_prefers_higher_validation_score_over_last_attempt() {
+        let source = "This source paragraph has enough text to discriminate incomplete attempts.";
+        let first = ScoredAttempt::new(
+            0,
+            "A substantially longer translated paragraph that preserves the whole source idea.",
+            validate_completeness(
+                source,
+                "A substantially longer translated paragraph that preserves the whole source idea.",
+                "en",
+                None,
+            ),
+        );
+        let last = ScoredAttempt::new(
+            1,
+            "Short.",
+            validate_completeness(source, "Short.", "en", None),
+        );
+
+        let selected = select_best_attempt(None, first);
+        let selected = select_best_attempt(Some(selected), last);
+
+        assert_eq!(selected.attempt, 0);
+        assert!(selected.validation.score > 0);
+        assert_eq!(selected.selection_reason(), "highest_validation_score");
     }
 }
