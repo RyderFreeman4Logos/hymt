@@ -642,30 +642,60 @@ fn migrate_tasks_columns(conn: &Connection) -> Result<(), CacheError> {
 }
 
 fn migrate_segment_cache_columns(conn: &Connection) -> Result<(), CacheError> {
+    let transaction = conn.unchecked_transaction()?;
+    let result = migrate_segment_cache_columns_in_transaction(&transaction);
+    match result {
+        Ok(()) => {
+            transaction.commit()?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = transaction.rollback();
+            Err(error)
+        }
+    }
+}
+
+fn migrate_segment_cache_columns_in_transaction(conn: &Connection) -> Result<(), CacheError> {
     let cols = table_column_names(conn, "segment_cache")?;
-    let mut rebuild_primary_key = false;
     if !cols.contains("options_hash") {
         conn.execute_batch(
             "ALTER TABLE segment_cache ADD COLUMN options_hash TEXT NOT NULL DEFAULT ''",
         )?;
-        rebuild_primary_key = true;
     }
     if !cols.contains("profile_id") {
         conn.execute_batch(
             "ALTER TABLE segment_cache ADD COLUMN profile_id TEXT NOT NULL DEFAULT ''",
         )?;
-        rebuild_primary_key = true;
     }
     if !cols.contains("inference_fingerprint") {
         conn.execute_batch(
             "ALTER TABLE segment_cache ADD COLUMN inference_fingerprint TEXT NOT NULL DEFAULT ''",
         )?;
-        rebuild_primary_key = true;
     }
-    if rebuild_primary_key {
+    if !segment_cache_has_current_primary_key(conn)? {
         rebuild_segment_cache_pk(conn)?;
     }
     Ok(())
+}
+
+fn segment_cache_has_current_primary_key(conn: &Connection) -> Result<bool, CacheError> {
+    let mut stmt = conn.prepare("PRAGMA table_info(segment_cache)")?;
+    let mut columns = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    columns.retain(|(_, ordinal)| *ordinal > 0);
+    columns.sort_by_key(|(_, ordinal)| *ordinal);
+    Ok(columns.into_iter().map(|(name, _)| name).eq([
+        "content_hash".to_owned(),
+        "target_lang".to_owned(),
+        "template_type".to_owned(),
+        "options_hash".to_owned(),
+        "profile_id".to_owned(),
+        "inference_fingerprint".to_owned(),
+    ]))
 }
 
 fn rebuild_segment_cache_pk(conn: &Connection) -> Result<(), CacheError> {
@@ -1036,6 +1066,79 @@ mod tests {
             )
             .unwrap();
         assert_eq!(legacy_sentinel, "");
+    }
+
+    #[test]
+    fn test_segment_cache_migration_rebuilds_old_pk_when_fingerprint_column_exists() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("resumed-history.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE segment_cache (
+                 content_hash TEXT NOT NULL,
+                 target_lang TEXT NOT NULL,
+                 template_type TEXT NOT NULL,
+                 options_hash TEXT NOT NULL DEFAULT '',
+                 profile_id TEXT NOT NULL DEFAULT '',
+                 inference_fingerprint TEXT NOT NULL DEFAULT '',
+                 translated_text TEXT NOT NULL,
+                 created_at TEXT NOT NULL,
+                 PRIMARY KEY (content_hash, target_lang, template_type, options_hash, profile_id)
+             );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = HistoryDB::new(&path);
+        let q4 = SegmentCacheScope {
+            target_lang: "en",
+            template_type: "default",
+            options_hash: "",
+            profile_id: "hy_mt2_7b",
+            inference_fingerprint: "sha256:q4",
+        };
+        let q6 = SegmentCacheScope {
+            inference_fingerprint: "sha256:q6",
+            ..q4
+        };
+
+        db.store_segment_cache("hash1", q4, "q4 translation", "2024-01-01T00:00:00Z")
+            .unwrap();
+        db.store_segment_cache("hash1", q6, "q6 translation", "2024-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!(
+            db.find_segment_cached("hash1", q4).unwrap().as_deref(),
+            Some("q4 translation")
+        );
+        assert_eq!(
+            db.find_segment_cached("hash1", q6).unwrap().as_deref(),
+            Some("q6 translation")
+        );
+
+        let conn = Connection::open(&path).unwrap();
+        let primary_key = conn
+            .prepare("PRAGMA table_info(segment_cache)")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            primary_key
+                .into_iter()
+                .filter(|(_, ordinal)| *ordinal > 0)
+                .collect::<Vec<_>>(),
+            vec![
+                ("content_hash".to_owned(), 1),
+                ("target_lang".to_owned(), 2),
+                ("template_type".to_owned(), 3),
+                ("options_hash".to_owned(), 4),
+                ("profile_id".to_owned(), 5),
+                ("inference_fingerprint".to_owned(), 6),
+            ]
+        );
     }
 
     #[test]

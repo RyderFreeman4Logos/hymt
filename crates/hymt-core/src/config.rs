@@ -130,6 +130,7 @@ const PROMPT_SCHEMA_VERSION: u32 = 1;
 pub struct InferenceFingerprint {
     canonical_json: String,
     hash: String,
+    cache_verified: bool,
 }
 
 impl InferenceFingerprint {
@@ -141,6 +142,12 @@ impl InferenceFingerprint {
     /// Lowercase hexadecimal SHA-256 digest of [`Self::canonical_json`].
     pub fn hash(&self) -> &str {
         &self.hash
+    }
+
+    /// Whether the served model and effective sampler identity are complete
+    /// enough to safely reuse a segment-cache entry.
+    pub fn is_cache_verified(&self) -> bool {
+        self.cache_verified
     }
 }
 
@@ -261,6 +268,20 @@ impl GenerationSettings {
             min_p: Setting::ServerDefault,
             repeat_last_n: Setting::ServerDefault,
         }
+    }
+
+    fn uses_only_server_defaults(&self) -> bool {
+        matches!(
+            self,
+            Self {
+                temperature: Setting::ServerDefault,
+                top_p: Setting::ServerDefault,
+                top_k: Setting::ServerDefault,
+                repetition_penalty: Setting::ServerDefault,
+                min_p: Setting::ServerDefault,
+                repeat_last_n: Setting::ServerDefault,
+            }
+        )
     }
 
     /// Overlay explicit user overrides on top of a model profile's defaults.
@@ -944,6 +965,11 @@ impl HotConfig {
         let profile = self.model_profile()?;
         let settings = self.generation_settings()?;
         let backend = self.generation_backend()?;
+        let model = self.model();
+        // A Generic profile without an explicit served model, or a request that
+        // delegates every sampler to the server, has no stable cache namespace.
+        let cache_verified =
+            !(settings.uses_only_server_defaults() || (profile.is_generic() && model.is_empty()));
 
         let mut fields = BTreeMap::new();
         fields.insert(
@@ -982,7 +1008,7 @@ impl HotConfig {
         fields.insert(
             "model".to_owned(),
             canonical_object([
-                ("configured_alias".to_owned(), string_or_null(self.model())),
+                ("configured_alias".to_owned(), string_or_null(model)),
                 (
                     "upstream_source".to_owned(),
                     source_fingerprint_value(profile.model()),
@@ -1034,6 +1060,7 @@ impl HotConfig {
         Ok(InferenceFingerprint {
             canonical_json,
             hash,
+            cache_verified,
         })
     }
 
@@ -1869,6 +1896,51 @@ temperature = 0.7"#,
         assert_eq!(q4.hash().len(), 64);
         assert!(q4.canonical_json().contains("\"quantization\":null"));
         assert!(q4.canonical_json().contains("\"schema_version\":1"));
+    }
+
+    #[test]
+    fn incomplete_inference_identity_is_not_cache_verified() {
+        fn fingerprint(config: &str) -> InferenceFingerprint {
+            let path = temp_config_path("inference_fingerprint_verification");
+            fs::write(&path, config).unwrap();
+            HotConfig::from_path(&path)
+                .unwrap()
+                .inference_fingerprint("default", "")
+                .unwrap()
+        }
+
+        let incomplete = fingerprint(
+            r#"[endpoint]
+url = "http://localhost:8401/v1""#,
+        );
+        let profiled = fingerprint(
+            r#"[endpoint]
+url = "http://localhost:8401/v1"
+profile = "hy_mt2_7b""#,
+        );
+        let explicit_generic = fingerprint(
+            r#"[endpoint]
+url = "http://localhost:8401/v1"
+model = "stable-served-model"
+
+[inference.override]
+temperature = 0.7
+top_p = 0.6
+top_k = 20
+repetition_penalty = 1.05
+min_p = 0.1
+repeat_last_n = 64"#,
+        );
+
+        assert!(
+            !incomplete.is_cache_verified(),
+            "generic model identity plus server-default sampling cannot safely reuse cache"
+        );
+        assert!(profiled.is_cache_verified());
+        assert!(
+            explicit_generic.is_cache_verified(),
+            "a configured served model and explicit sampling establish a usable identity"
+        );
     }
 
     #[test]
