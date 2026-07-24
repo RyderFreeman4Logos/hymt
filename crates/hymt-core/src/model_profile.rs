@@ -139,7 +139,7 @@ impl ModelProfile {
             )),
             Self::HyMt2_7b => Some(format!("<|startoftext|>{prompt}<|extra_0|>")),
             Self::HyMt2_30bA3b => Some(format!(
-                "<｜hy_begin▁of▁sentence｜><｜hy_User｜>{prompt}<｜hy_Assistant｜><think></think>"
+                "<｜hy_begin▁of▁sentence｜><｜reasoning_mode｜>reasoning_effort:no_think<｜hy_User｜>{prompt}<｜hy_Assistant｜>"
             )),
             Self::Generic => None,
         }
@@ -211,5 +211,27 @@ impl ModelProfile {
     /// Whether this profile is deliberately operating without tested assumptions.
     pub const fn is_generic(self) -> bool {
         matches!(self, Self::Generic)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ModelProfile;
+
+    #[test]
+    fn renders_pinned_single_user_chat_templates() {
+        for (profile, expected) in [
+            (
+                ModelProfile::HyMt2_1_8b,
+                "<｜hy_begin▁of▁sentence｜><｜hy_User｜>P<｜hy_Assistant｜>",
+            ),
+            (ModelProfile::HyMt2_7b, "<|startoftext|>P<|extra_0|>"),
+            (
+                ModelProfile::HyMt2_30bA3b,
+                "<｜hy_begin▁of▁sentence｜><｜reasoning_mode｜>reasoning_effort:no_think<｜hy_User｜>P<｜hy_Assistant｜>",
+            ),
+        ] {
+            assert_eq!(profile.render_chat_user_prompt("P").as_deref(), Some(expected));
+        }
     }
 }

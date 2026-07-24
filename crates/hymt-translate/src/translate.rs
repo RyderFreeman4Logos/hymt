@@ -573,17 +573,17 @@ pub fn plan_translation_with_policy(
     }
 
     if text.is_empty() {
-        let token_budget = make_token_budget(
+        let token_budget = make_token_budget(TokenBudgetOptions {
             profile,
-            overhead.source,
-            per_request_context,
-            input_capacity,
-            max_output,
-            overhead.tokens,
-            overhead.safety_margin_tokens,
-            0,
-            Vec::new(),
-        );
+            counting_source: overhead.source,
+            per_slot_context: per_request_context,
+            input_capacity_tokens: input_capacity,
+            output_reservation_tokens: max_output,
+            template_tokens: overhead.tokens,
+            safety_margin_tokens: overhead.safety_margin_tokens,
+            revisions: 0,
+            segment_input_tokens: Vec::new(),
+        });
         emit_approximate_budget_warning(&token_budget);
         return Ok(TranslationPlan {
             source_tokens: 0,
@@ -603,13 +603,15 @@ pub fn plan_translation_with_policy(
         segments,
         indexes,
         groups,
-        target_lang,
-        template,
-        opts,
-        config,
-        segmenter,
-        profile,
-        input_capacity,
+        FinalRequestBudgetOptions {
+            target_lang,
+            template,
+            prompt_opts: opts,
+            config,
+            segmenter,
+            profile,
+            input_capacity,
+        },
     )?;
     let counting_source =
         if overhead.source == TokenCountingSource::Approximate || fitted.used_approximate {
@@ -618,19 +620,19 @@ pub fn plan_translation_with_policy(
             TokenCountingSource::Local
         };
     reject_approximate_budget_if_strict(counting_source, config)?;
-    let token_budget = make_token_budget(
+    let token_budget = make_token_budget(TokenBudgetOptions {
         profile,
         counting_source,
-        per_request_context,
-        input_capacity,
-        max_output,
-        overhead.tokens,
-        overhead
+        per_slot_context: per_request_context,
+        input_capacity_tokens: input_capacity,
+        output_reservation_tokens: max_output,
+        template_tokens: overhead.tokens,
+        safety_margin_tokens: overhead
             .safety_margin_tokens
             .max(fitted.safety_margin_tokens),
-        fitted.revisions,
-        fitted.segment_input_tokens,
-    );
+        revisions: fitted.revisions,
+        segment_input_tokens: fitted.segment_input_tokens,
+    });
     emit_approximate_budget_warning(&token_budget);
 
     Ok(TranslationPlan {
@@ -659,6 +661,30 @@ struct FittedSegments {
     safety_margin_tokens: usize,
     revisions: usize,
     used_approximate: bool,
+}
+
+/// Inputs needed to record the final request budget in a translation plan.
+struct TokenBudgetOptions {
+    profile: ModelProfile,
+    counting_source: TokenCountingSource,
+    per_slot_context: usize,
+    input_capacity_tokens: usize,
+    output_reservation_tokens: usize,
+    template_tokens: usize,
+    safety_margin_tokens: usize,
+    revisions: usize,
+    segment_input_tokens: Vec<usize>,
+}
+
+/// Immutable dependencies for fitting segments to their final rendered request.
+struct FinalRequestBudgetOptions<'a> {
+    target_lang: &'a str,
+    template: &'a TemplateType,
+    prompt_opts: &'a PromptOpts,
+    config: &'a HotConfig,
+    segmenter: &'a Segmenter,
+    profile: ModelProfile,
+    input_capacity: usize,
 }
 
 fn prompt_for_budget(
@@ -734,18 +760,18 @@ fn token_budget_warning(profile: ModelProfile) -> String {
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn make_token_budget(
-    profile: ModelProfile,
-    counting_source: TokenCountingSource,
-    per_slot_context: usize,
-    input_capacity_tokens: usize,
-    output_reservation_tokens: usize,
-    template_tokens: usize,
-    safety_margin_tokens: usize,
-    revisions: usize,
-    segment_input_tokens: Vec<usize>,
-) -> TokenBudget {
+fn make_token_budget(options: TokenBudgetOptions) -> TokenBudget {
+    let TokenBudgetOptions {
+        profile,
+        counting_source,
+        per_slot_context,
+        input_capacity_tokens,
+        output_reservation_tokens,
+        template_tokens,
+        safety_margin_tokens,
+        revisions,
+        segment_input_tokens,
+    } = options;
     TokenBudget {
         counting_source,
         profile_id: profile.id().to_owned(),
@@ -771,18 +797,11 @@ fn emit_approximate_budget_warning(token_budget: &TokenBudget) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn fit_segments_to_final_request_budget(
     segments: Vec<String>,
     indexes: Vec<usize>,
     groups: Vec<Vec<usize>>,
-    target_lang: &str,
-    template: &TemplateType,
-    opts: &PromptOpts,
-    config: &HotConfig,
-    segmenter: &Segmenter,
-    profile: ModelProfile,
-    input_capacity: usize,
+    options: FinalRequestBudgetOptions<'_>,
 ) -> Result<FittedSegments> {
     let mut fitted = FittedSegments {
         segments: Vec::new(),
@@ -797,15 +816,21 @@ fn fit_segments_to_final_request_budget(
     for ((segment, index), group) in segments.into_iter().zip(indexes).zip(groups) {
         let mut pending = vec![segment];
         while let Some(segment) = pending.pop() {
-            let prompt = prompt_for_budget(&segment, target_lang, template, opts, config)?;
-            let final_request = count_final_request(profile, segmenter, &prompt);
-            reject_approximate_budget_if_strict(final_request.source, config)?;
+            let prompt = prompt_for_budget(
+                &segment,
+                options.target_lang,
+                options.template,
+                options.prompt_opts,
+                options.config,
+            )?;
+            let final_request = count_final_request(options.profile, options.segmenter, &prompt);
+            reject_approximate_budget_if_strict(final_request.source, options.config)?;
             fitted.used_approximate |= final_request.source == TokenCountingSource::Approximate;
             fitted.safety_margin_tokens = fitted
                 .safety_margin_tokens
                 .max(final_request.safety_margin_tokens);
 
-            if final_request.tokens <= input_capacity {
+            if final_request.tokens <= options.input_capacity {
                 fitted.segment_input_tokens.push(final_request.tokens);
                 fitted.indexes.push(index);
                 fitted.groups.push(group.clone());
@@ -813,8 +838,8 @@ fn fit_segments_to_final_request_budget(
                 continue;
             }
 
-            let source_tokens = segmenter.count_tokens(&segment);
-            let excess = final_request.tokens.saturating_sub(input_capacity);
+            let source_tokens = options.segmenter.count_tokens(&segment);
+            let excess = final_request.tokens.saturating_sub(options.input_capacity);
             let split_limit = source_tokens
                 .saturating_sub(excess)
                 .min(source_tokens.saturating_sub(1));
@@ -822,17 +847,20 @@ fn fit_segments_to_final_request_budget(
                 anyhow::bail!(
                     "final request for a segment is {}/{} input tokens after chat-template framing; it cannot be split further",
                     final_request.tokens,
-                    input_capacity
+                    options.input_capacity
                 );
             }
-            let pieces = segmenter.segment(&segment, split_limit).map_err(|error| {
-                anyhow!("segmentation error while fitting final request: {error}")
-            })?;
+            let pieces = options
+                .segmenter
+                .segment(&segment, split_limit)
+                .map_err(|error| {
+                    anyhow!("segmentation error while fitting final request: {error}")
+                })?;
             if pieces.len() <= 1 {
                 anyhow::bail!(
                     "final request for a segment is {}/{} input tokens after chat-template framing; it cannot be split further",
                     final_request.tokens,
-                    input_capacity
+                    options.input_capacity
                 );
             }
             fitted.revisions += 1;
