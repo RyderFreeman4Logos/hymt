@@ -8,6 +8,11 @@ pub enum SegmentError {
     #[error("max_tokens is too small for the tokenizer output")]
     MaxTokensTooSmall,
 
+    #[error(
+        "ProtectedBlockTooLarge: protected block too large: {tokens} tokens exceeds segment limit {max_tokens}; split it or preserve it outside the model"
+    )]
+    ProtectedBlockTooLarge { tokens: usize, max_tokens: usize },
+
     #[error("internal segmentation error: unit exceeds max_tokens")]
     UnitExceedsMaxTokens,
 

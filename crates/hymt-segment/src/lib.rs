@@ -147,6 +147,37 @@ impl Segmenter {
         estimate_token_count(text)
     }
 
+    /// Whether this segmenter can use the selected local tokenizer rather than
+    /// the byte-based estimate.
+    pub fn has_exact_tokenizer(&self) -> bool {
+        #[cfg(feature = "tokenizer")]
+        {
+            self.tokenizer.is_some()
+        }
+        #[cfg(not(feature = "tokenizer"))]
+        {
+            false
+        }
+    }
+
+    /// Count a fully rendered request with the local tokenizer. `None` means
+    /// that no tokenizer is loaded or it rejected the text; callers must not
+    /// present that result as an exact count.
+    pub fn count_tokens_exact(&self, text: &str) -> Option<usize> {
+        #[cfg(feature = "tokenizer")]
+        {
+            self.tokenizer
+                .as_ref()
+                .and_then(|tokenizer| tokenizer.encode(text, false).ok())
+                .map(|encoding| encoding.get_ids().len())
+        }
+        #[cfg(not(feature = "tokenizer"))]
+        {
+            let _ = text;
+            None
+        }
+    }
+
     pub fn segment(&self, text: &str, max_tokens: usize) -> Result<Vec<String>, SegmentError> {
         if max_tokens == 0 {
             return Err(SegmentError::InvalidMaxTokens);
@@ -162,8 +193,14 @@ impl Segmenter {
 
         for block in split::split_markdown_blocks(text) {
             match block {
-                // Fenced code and tables are atomic even when oversized.
+                // Fenced code and tables are atomic. Do not emit an oversized
+                // atomic unit: a caller cannot safely submit it to a bounded
+                // context window without an explicit split/placeholder policy.
                 split::MarkdownBlock::FencedCode(s) | split::MarkdownBlock::Table(s) => {
+                    let tokens = self.count_tokens(&s);
+                    if tokens > max_tokens {
+                        return Err(SegmentError::ProtectedBlockTooLarge { tokens, max_tokens });
+                    }
                     units.push(s);
                 }
                 // Blockquotes are split at line boundaries when oversized,
@@ -303,14 +340,8 @@ impl Segmenter {
             if unit.is_empty() {
                 continue;
             }
-            // Protected blocks (fenced code, tables) may be legitimately oversized.
-            // Emit them as their own segment rather than erroring.
             if self.count_tokens(&unit) > max_tokens {
-                if !current.is_empty() {
-                    segments.push(std::mem::take(&mut current));
-                }
-                segments.push(unit);
-                continue;
+                return Err(SegmentError::UnitExceedsMaxTokens);
             }
             let candidate = format!("{current}{unit}");
             if !current.is_empty() && self.count_tokens(&candidate) > max_tokens {

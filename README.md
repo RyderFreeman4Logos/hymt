@@ -71,6 +71,9 @@ config_version = 1
 timeout = 600
 # first_chunk_priority = false
 # debug_chunk_timing = false
+# Refuse planning when the final chat template cannot be tokenized locally.
+# Otherwise hymt emits a warning and uses a conservative approximate budget.
+strict_token_budget = false
 # For Chinese-family targets, preserve confidently target-language paragraphs.
 language_detection = true
 # Override detection and submit every non-code paragraph.
@@ -251,7 +254,9 @@ Behavior:
 - Directory mode translates Markdown files and preserves relative paths when `--output-dir` is used.
 - Completeness validation is a fast, layered truncation/structure guard — **not** translation quality estimation (QE) or proof of semantic correctness. It uses Unicode-scalar density bounds for calibrated English/Chinese targets; other targets explicitly report `unverified_density` rather than silently claiming density has passed. It also checks empty/terminated responses when supplied by a caller, paragraphs, Markdown headings and fenced blocks, placeholders, URLs, and valid JSON templates. Cached segments are revalidated with the current guard before reuse.
 - Failed segments retry up to `[completeness].max_retries`; the same value applies to normal, streaming, batch, and `translate-doc` segment validation. Exhausted retries retain the highest validation-scored attempt (a ranking of observable guard signals, never a QE score) and record `reason=highest_validation_score`. `hymt` writes this degraded best effort and emits `completeness_status=degraded_best_effort` plus `completeness_degraded_segments=…` on stderr. Top-level text/file/stdin commands, including their streaming form, then exit non-zero so scripts detect degraded results; pass `--warn-only-completeness` or set `[completeness].warn_only = true` to keep exit 0 with warnings only. `batch`, `translate-doc`, and `exec` report the same stderr marker by default but do not fail the whole job for degraded segments. Validated streaming buffers a segment until it passes; optimistic streaming cannot retract emitted invalid tokens and therefore reports degraded best effort rather than retrying.
-- Source segments are also bounded by the expansion/context budget and `[translation].max_source_tokens_per_segment` (default `1024`, `0` disables).
+- Source segments are bounded by the expansion/context budget and `[translation].max_source_tokens_per_segment` (default `1024`, `0` disables). For a pinned Hy-MT2 profile with its tokenizer downloaded, the planner renders and counts the complete chat request (role framing, prompt/context, assistant marker, and the completeness-retry reservation) before reserving output tokens. `--plan` reports the counting source, profile/tokenizer/template identity, per-slot capacity, input/output breakdown, and any segment revisions.
+- If the active profile/template or tokenizer is unavailable, hymt prints an explicit stderr warning and applies a conservative `2x` input estimate plus a `64`-token chat-framing allowance. Set `[translation].strict_token_budget = true` to reject that approximate path instead; configure `[endpoint].profile` and run `hymt tokenizer download` for local budgeting.
+- Oversized fenced-code and Markdown-table protected blocks fail closed with `ProtectedBlockTooLarge` before any HTTP request is submitted; split them or preserve them outside the model.
 
 ## Batch translate directory trees
 

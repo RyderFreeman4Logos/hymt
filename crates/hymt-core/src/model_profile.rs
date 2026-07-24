@@ -107,6 +107,44 @@ impl ModelProfile {
         self.model()
     }
 
+    /// Identity of the pinned upstream chat template used for local request
+    /// budgeting. Generic profiles deliberately return no identity because the
+    /// endpoint's template is not known to hymt.
+    pub const fn chat_template_identity(self) -> Option<&'static str> {
+        match self {
+            Self::HyMt2_1_8b => Some(
+                "tencent/Hy-MT2-1.8B@9a341cd1b679d3efd23b46e847b01745a71ed792/chat_template.jinja",
+            ),
+            Self::HyMt2_7b => Some(
+                "tencent/Hy-MT2-7B@9b0eb4e8f001def3e5ff6469a0ac96fdb39ec223/chat_template.jinja",
+            ),
+            Self::HyMt2_30bA3b => Some(
+                "tencent/Hy-MT2-30B-A3B@d3ead4dba61c09aac60a261a96ad1df3e705febb/chat_template.jinja",
+            ),
+            Self::Generic => None,
+        }
+    }
+
+    /// Render the exact one-user-message chat prompt emitted by hymt's
+    /// OpenAI-compatible client, including the generation marker.
+    ///
+    /// These compact renderings are derived from the `chat_template.jinja`
+    /// files pinned by [`Self::chat_template_identity`]. They intentionally do
+    /// not try to discover arbitrary server templates: an unknown profile must
+    /// use the explicit approximate budgeting path instead.
+    pub fn render_chat_user_prompt(self, prompt: &str) -> Option<String> {
+        match self {
+            Self::HyMt2_1_8b => Some(format!(
+                "<｜hy_begin▁of▁sentence｜><｜hy_User｜>{prompt}<｜hy_Assistant｜>"
+            )),
+            Self::HyMt2_7b => Some(format!("<|startoftext|>{prompt}<|extra_0|>")),
+            Self::HyMt2_30bA3b => Some(format!(
+                "<｜hy_begin▁of▁sentence｜><｜reasoning_mode｜>reasoning_effort:no_think<｜hy_User｜>{prompt}<｜hy_Assistant｜><think></think>"
+            )),
+            Self::Generic => None,
+        }
+    }
+
     /// Architecture family, when known.
     pub const fn architecture(self) -> ArchitectureVariant {
         match self {
@@ -173,5 +211,27 @@ impl ModelProfile {
     /// Whether this profile is deliberately operating without tested assumptions.
     pub const fn is_generic(self) -> bool {
         matches!(self, Self::Generic)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ModelProfile;
+
+    #[test]
+    fn renders_pinned_single_user_chat_templates() {
+        for (profile, expected) in [
+            (
+                ModelProfile::HyMt2_1_8b,
+                "<｜hy_begin▁of▁sentence｜><｜hy_User｜>P<｜hy_Assistant｜>",
+            ),
+            (ModelProfile::HyMt2_7b, "<|startoftext|>P<|extra_0|>"),
+            (
+                ModelProfile::HyMt2_30bA3b,
+                "<｜hy_begin▁of▁sentence｜><｜reasoning_mode｜>reasoning_effort:no_think<｜hy_User｜>P<｜hy_Assistant｜><think></think>",
+            ),
+        ] {
+            assert_eq!(profile.render_chat_user_prompt("P").as_deref(), Some(expected));
+        }
     }
 }

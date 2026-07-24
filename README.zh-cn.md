@@ -71,6 +71,8 @@ config_version = 1
 timeout = 600
 # first_chunk_priority = false
 # debug_chunk_timing = false
+# 当最终聊天模板无法在本地分词时拒绝规划；否则 hymt 会发出警告并使用保守的近似预算。
+strict_token_budget = false
 # For Chinese-family targets, preserve confidently target-language paragraphs.
 language_detection = true
 # Override detection and submit every non-code paragraph.
@@ -248,7 +250,9 @@ hymt translate-doc docs/ --recursive
 - 当使用`--output-dir`参数时，目录模式会翻译Markdown文件并保留相对路径。
 - 完整性验证是一项快速的分层截断/结构防护机制，**不是**翻译质量估计（QE），也不能证明语义正确性。它对已校准的英语/中文目标使用 Unicode 标量密度上下限；其他目标会显式报告 `unverified_density`，而不会默默声称密度已通过。它还会检查由调用方提供的空响应/终止信息、段落、Markdown 标题和围栏代码块、占位符、URL 以及 JSON 模板是否有效。缓存片段在复用前会由当前防护机制重新验证。
 - 失败的翻译片段会最多重试`[completeness].max_retries`次；普通模式、流式处理、批量处理以及`translate-doc`模式的片段验证都适用此阈值。重试耗尽后，`hymt`会保留验证得分最高的尝试（仅根据可观察的防护信号排序，绝非 QE 得分），并记录 `reason=highest_validation_score`。`hymt`会写入这一降级的尽力结果，并在标准错误流中输出`completeness_status=degraded_best_effort`和`completeness_degraded_segments=…`信息。顶层文本/文件/标准输入命令（包括其流式处理形式）会以非零状态退出，以便脚本能够检测到降级结果；若希望仅显示警告而不改变退出码，可传递`--warn-only-completeness`参数或设置`[completeness].warn_only = true`。默认情况下，`batch`、`translate-doc`和`exec`模式也会输出相同的标准错误信息，但不会因部分片段降级而使整个任务失败。验证式流处理会缓冲一个片段直到其通过；乐观流处理无法收回已发出的无效令牌，因此会报告降级的尽力结果，而不是重试。
-- 源文本片段的长度也受到扩展量/上下文限制以及`[translation].max_source_tokens_per_segment`参数的约束（默认值为`1024`，设置为`0`则取消该限制）。
+- 源文本片段的长度也受到扩展量/上下文限制以及`[translation].max_source_tokens_per_segment`参数的约束（默认值为`1024`，设置为`0`则取消该限制）。对于已固定的 Hy-MT2 配置文件且已下载分词器，规划器会在预留输出令牌前渲染并计数完整聊天请求（角色框架、提示词/上下文、助手标记以及完整性重试预留）。`--plan` 会报告计数来源、配置文件/分词器/模板标识、每槽容量、输入/输出拆分和任何片段重分割。
+- 如果活动配置文件/模板或分词器不可用，hymt 会在标准错误流中显示明确警告，并采用保守的`2x`输入估算加上`64`令牌的聊天框架预留。设置`[translation].strict_token_budget = true`可拒绝该近似路径；请配置`[endpoint].profile`并运行`hymt tokenizer download`以使用本地预算。
+- 过大的围栏代码块和 Markdown 表格受保护块会在任何 HTTP 请求提交前以`ProtectedBlockTooLarge`失败关闭；请将其拆分或在模型外保留。
 
 ## 批量翻译目录树
 
