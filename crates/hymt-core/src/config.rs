@@ -98,6 +98,7 @@ blocklist = [
 
 [telegram]
 enabled = false
+stream = true
 bot_token = ""
 claim_password = ""
 owners = []
@@ -1377,6 +1378,13 @@ impl HotConfig {
         self.get_bool("telegram", "enabled", false)
     }
 
+    /// Whether Telegram sends progressive translations by editing one message.
+    ///
+    /// Defaults to `true`; set `[telegram].stream = false` for one final message.
+    pub fn telegram_streaming_enabled(&self) -> bool {
+        self.get_bool("telegram", "stream", true)
+    }
+
     /// Bot token from config, or empty when unset.
     ///
     /// Callers should prefer [`Self::telegram_bot_token_resolved`] so the
@@ -2527,6 +2535,7 @@ blocklist = ["foo", "bar"]"#,
         let path = temp_config_path("tg_defaults");
         let cfg = HotConfig::from_path(&path).unwrap();
         assert!(!cfg.telegram_enabled());
+        assert!(cfg.telegram_streaming_enabled());
         assert!(cfg.telegram_bot_token().is_empty());
         assert!(cfg.telegram_claim_password().is_empty());
         assert!(cfg.telegram_owners().is_empty());
@@ -2542,6 +2551,7 @@ blocklist = ["foo", "bar"]"#,
             r#"
 [telegram]
 enabled = true
+stream = false
 bot_token = "token-from-file"
 claim_password = "CLAIM-ME"
 owners = [111, 222]
@@ -2552,6 +2562,7 @@ mode = "groups"
         .unwrap();
         let cfg = HotConfig::from_path(&path).unwrap();
         assert!(cfg.telegram_enabled());
+        assert!(!cfg.telegram_streaming_enabled());
         assert_eq!(cfg.telegram_bot_token(), "token-from-file");
         assert_eq!(cfg.telegram_claim_password(), "CLAIM-ME");
         assert_eq!(cfg.telegram_owners(), vec![111, 222]);
