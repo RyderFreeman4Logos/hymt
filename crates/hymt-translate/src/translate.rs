@@ -2320,6 +2320,57 @@ mod tests {
         }
     }
 
+    async fn start_segment_identifying_mock_server(
+        base_reply: String,
+        segment_markers: Vec<(String, String)>,
+    ) -> MockServer {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let segment_markers = Arc::new(
+            segment_markers
+                .into_iter()
+                .map(|(segment, marker)| {
+                    let escaped_segment = serde_json::to_string(&segment)
+                        .expect("serialize segment for request matching");
+                    (
+                        escaped_segment
+                            .strip_prefix('"')
+                            .and_then(|value| value.strip_suffix('"'))
+                            .expect("quoted serialized segment")
+                            .to_owned(),
+                        marker,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        let first_response = Arc::new(AtomicBool::new(true));
+        let handle = tokio::spawn({
+            let segment_markers = Arc::clone(&segment_markers);
+            let first_response = Arc::clone(&first_response);
+            async move {
+                while let Ok((socket, _)) = listener.accept().await {
+                    let segment_markers = Arc::clone(&segment_markers);
+                    let first_response = Arc::clone(&first_response);
+                    let base_reply = base_reply.clone();
+                    tokio::spawn(async move {
+                        let _ = serve_segment_identifying_connection(
+                            socket,
+                            base_reply,
+                            segment_markers,
+                            first_response,
+                        )
+                        .await;
+                    });
+                }
+            }
+        });
+
+        MockServer {
+            endpoint_url: format!("http://{addr}/v1"),
+            handle,
+        }
+    }
+
     async fn start_preflight_counting_server(
         props_responses: Vec<String>,
     ) -> (
@@ -2434,6 +2485,33 @@ mod tests {
                 .expect("mock response queue exhausted")
         };
         write_mock_response(socket, response).await
+    }
+
+    async fn serve_segment_identifying_connection(
+        mut socket: TcpStream,
+        base_reply: String,
+        segment_markers: Arc<Vec<(String, String)>>,
+        first_response: Arc<AtomicBool>,
+    ) -> std::io::Result<()> {
+        let request = read_http_request(&mut socket).await?;
+        if first_response.swap(false, Ordering::SeqCst) {
+            return write_mock_response(socket, MockResponse::Json("too short".to_owned())).await;
+        }
+
+        let request = std::str::from_utf8(&request)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let marker = segment_markers
+            .iter()
+            .filter(|(segment, _)| request.contains(segment))
+            .max_by_key(|(segment, _)| segment.len())
+            .map(|(_, marker)| marker)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "request did not contain a planned segment",
+                )
+            })?;
+        write_mock_response(socket, MockResponse::Json(format!("{base_reply} {marker}"))).await
     }
 
     async fn start_counted_mock_server(
@@ -2576,6 +2654,48 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    async fn read_http_request(socket: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        let header_end = loop {
+            let count = socket.read(&mut chunk).await?;
+            if count == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed before HTTP headers",
+                ));
+            }
+            request.extend_from_slice(&chunk[..count]);
+            if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break index + 4;
+            }
+        };
+        let headers = std::str::from_utf8(&request[..header_end])
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "missing content-length")
+            })?;
+        while request.len() - header_end < content_length {
+            let count = socket.read(&mut chunk).await?;
+            if count == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed before HTTP request body",
+                ));
+            }
+            request.extend_from_slice(&chunk[..count]);
+        }
+        Ok(request)
     }
 
     async fn write_mock_response(
@@ -3032,16 +3152,30 @@ max_retries = 1
         );
 
         let complete = planned_complete_zh_translations(&plan);
-        let valid_reply = complete.first().expect("planned translation").clone();
-        let mut replies = Vec::with_capacity(33);
-        replies.push(MockResponse::Json("too short".to_owned()));
-        replies.extend((0..32).map(|_| MockResponse::Json(valid_reply.clone())));
-        let server = start_mock_server(replies).await;
+        let base_reply = complete.first().expect("planned translation").clone();
+        let segment_markers: Vec<_> = (0..plan.segment_count())
+            .map(|index| format!("[SEG-{index}]"))
+            .collect();
+        let server = start_segment_identifying_mock_server(
+            base_reply,
+            plan.segments
+                .iter()
+                .cloned()
+                .zip(segment_markers.iter().cloned())
+                .collect(),
+        )
+        .await;
         let config = make_stream_config(&server.endpoint_url);
         let client = TranslationClient::new(config.clone()).expect("client");
         let dir = tempfile::tempdir().expect("temporary document directory");
         let input = dir.path().join("guide.md");
         let output = dir.path().join("guide.zh-cn.md");
+        let previous_output = dir.path().join("previous-guide.zh-cn.md");
+        let previous_output_contents = "previous complete document";
+        std::fs::write(&previous_output, previous_output_contents)
+            .expect("write previous document");
+        std::fs::hard_link(&previous_output, &output)
+            .expect("make output path a hard link to the previous document");
         std::fs::write(&input, source).expect("write source document");
         let history = HistoryDB::new(dir.path().join("history.db"));
         let doc_opts = crate::doc_translate::DocTranslationOpts {
@@ -3063,6 +3197,25 @@ max_retries = 1
             .expect("complete Markdown pipeline");
 
         let written = std::fs::read_to_string(&output).expect("translated output");
+        let marker_positions: Vec<_> = segment_markers
+            .iter()
+            .map(|marker| {
+                assert_eq!(
+                    written.match_indices(marker).count(),
+                    1,
+                    "translated segment marker {marker} must appear exactly once"
+                );
+                written
+                    .find(marker)
+                    .expect("unique translated segment marker position")
+            })
+            .collect();
+        assert!(
+            marker_positions
+                .windows(2)
+                .all(|positions| positions[0] < positions[1]),
+            "translated segment markers must retain document order"
+        );
         assert!(written.contains("title: Preserve this front matter"));
         assert!(written.contains("中文段落必须保持原样，不能发送给模型。"));
         assert!(written.contains("let preserved = \"code fence must remain verbatim\";"));
@@ -3071,12 +3224,10 @@ max_retries = 1
             !written.contains("too short"),
             "the incomplete first attempt must be retried rather than reconstructed"
         );
-        assert!(
-            std::fs::read_dir(dir.path())
-                .expect("output directory")
-                .filter_map(Result::ok)
-                .all(|entry| !entry.file_name().to_string_lossy().contains(".tmp.")),
-            "atomic output write must leave no temporary document behind"
+        assert_eq!(
+            std::fs::read_to_string(&previous_output).expect("previous output through hard link"),
+            previous_output_contents,
+            "atomic rename must not mutate the old output inode; direct fs::write would corrupt it"
         );
     }
 
