@@ -6,6 +6,13 @@ use crate::error::CoreError;
 use crate::language::DocumentTranslationPolicy;
 use crate::language_spec::{language_spec, LanguageFamily};
 
+/// Stable identity for the exact rendered prompt contract.
+///
+/// Bump this identifier whenever a change can alter model-visible prompt text.
+/// It is included in inference fingerprints, history records, plan diagnostics,
+/// and benchmark metadata so cache entries and evaluations remain comparable.
+pub const PROMPT_SCHEMA_ID: &str = "hy-mt2-prompts/v2";
+
 // ── Template type ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -320,6 +327,233 @@ mod tests {
 
     fn opts() -> PromptOpts {
         PromptOpts::default()
+    }
+
+    fn golden_fixture(template: &TemplateType, chinese: bool) -> &'static str {
+        match (template, chinese) {
+            (TemplateType::Default, false) => {
+                include_str!("../tests/fixtures/prompts/default-en.txt")
+            }
+            (TemplateType::Default, true) => {
+                include_str!("../tests/fixtures/prompts/default-zh.txt")
+            }
+            (TemplateType::Terminology, false) => {
+                include_str!("../tests/fixtures/prompts/terminology-en.txt")
+            }
+            (TemplateType::Terminology, true) => {
+                include_str!("../tests/fixtures/prompts/terminology-zh.txt")
+            }
+            (TemplateType::Style, false) => include_str!("../tests/fixtures/prompts/style-en.txt"),
+            (TemplateType::Style, true) => include_str!("../tests/fixtures/prompts/style-zh.txt"),
+            (TemplateType::Personalization, false) => {
+                include_str!("../tests/fixtures/prompts/personalization-en.txt")
+            }
+            (TemplateType::Personalization, true) => {
+                include_str!("../tests/fixtures/prompts/personalization-zh.txt")
+            }
+            (TemplateType::Delimiters, false) => {
+                include_str!("../tests/fixtures/prompts/delimiters-en.txt")
+            }
+            (TemplateType::Delimiters, true) => {
+                include_str!("../tests/fixtures/prompts/delimiters-zh.txt")
+            }
+            (TemplateType::Structured, false) => {
+                include_str!("../tests/fixtures/prompts/structured-en.txt")
+            }
+            (TemplateType::Structured, true) => {
+                include_str!("../tests/fixtures/prompts/structured-zh.txt")
+            }
+            (TemplateType::ContextAware, false) => {
+                include_str!("../tests/fixtures/prompts/context-en.txt")
+            }
+            (TemplateType::ContextAware, true) => {
+                include_str!("../tests/fixtures/prompts/context-zh.txt")
+            }
+        }
+    }
+
+    fn render_golden_fixture(template: &TemplateType, chinese: bool, target: &str) -> String {
+        golden_fixture(template, chinese)
+            .strip_suffix('\n')
+            .unwrap_or(golden_fixture(template, chinese))
+            .replace("{{target}}", target)
+    }
+
+    fn golden_opts(template: &TemplateType) -> PromptOpts {
+        match template {
+            TemplateType::Terminology => PromptOpts {
+                terms: Some(vec![
+                    ("cache".to_owned(), "缓存".to_owned()),
+                    ("queue".to_owned(), "队列".to_owned()),
+                ]),
+                ..PromptOpts::default()
+            },
+            TemplateType::Style => PromptOpts {
+                style: Some("formal and precise".to_owned()),
+                ..PromptOpts::default()
+            },
+            TemplateType::Personalization => PromptOpts {
+                instructions: Some(vec![
+                    "Preserve line breaks.".to_owned(),
+                    "Keep names unchanged.".to_owned(),
+                ]),
+                ..PromptOpts::default()
+            },
+            TemplateType::Structured => PromptOpts {
+                format_type: Some("JSON".to_owned()),
+                ..PromptOpts::default()
+            },
+            TemplateType::ContextAware => PromptOpts {
+                context: Some("Release notes for version [2.0].".to_owned()),
+                ..PromptOpts::default()
+            },
+            TemplateType::Default | TemplateType::Delimiters => PromptOpts::default(),
+        }
+    }
+
+    fn golden_source(template: &TemplateType) -> &'static str {
+        match template {
+            TemplateType::Delimiters => "left|right|tail",
+            TemplateType::Structured => r#"{"title":"Welcome","count":2}"#,
+            _ => "Sample source.",
+        }
+    }
+
+    #[test]
+    fn prompt_schema_id_is_explicit_and_versioned() {
+        assert_eq!(PROMPT_SCHEMA_ID, "hy-mt2-prompts/v2");
+    }
+
+    #[test]
+    fn golden_prompts_cover_every_template_for_every_registry_target() {
+        let templates = [
+            TemplateType::Default,
+            TemplateType::Terminology,
+            TemplateType::Style,
+            TemplateType::Personalization,
+            TemplateType::Delimiters,
+            TemplateType::Structured,
+            TemplateType::ContextAware,
+        ];
+
+        for spec in LANGUAGE_SPECS {
+            let chinese = spec.family == LanguageFamily::Chinese;
+            let target_name = if chinese {
+                spec.chinese_name
+            } else {
+                spec.english_name
+            };
+            for template in &templates {
+                let actual = build_prompt(
+                    golden_source(template),
+                    spec.canonical_code,
+                    template,
+                    &golden_opts(template),
+                )
+                .unwrap();
+                let expected = render_golden_fixture(template, chinese, target_name);
+                assert_eq!(
+                    actual,
+                    expected,
+                    "target={} template={}",
+                    spec.canonical_code,
+                    template.as_str(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prompt_goldens_cover_cli_help_and_empty_or_missing_options() {
+        let cli_source = "Usage: hymt [OPTIONS] <TEXT>\n\nOptions:\n  --style <STYLE>\n";
+        assert_eq!(
+            build_prompt(cli_source, "en", &TemplateType::Default, &opts()).unwrap(),
+            format!(
+                "Translate the following text into English. Note that you should only output the translated result without any additional explanation: If the source is command-line help, usage, or an option list, that help text is the complete source to translate; translate Usage/Arguments/Options/Examples headings and descriptions item by item, preserve commands, placeholders, and -/-- options, and do not ask the user to provide more input.\n\n{cli_source}"
+            )
+        );
+        assert_eq!(
+            build_prompt(cli_source, "zh", &TemplateType::Default, &opts()).unwrap(),
+            format!(
+                "请将以下文本翻译成中文。注意，你应该只输出翻译结果，不要添加任何解释： 如果源文本是命令行帮助、用法或选项列表，它本身就是完整待译内容；请逐项翻译 Usage/Arguments/Options/Examples 等标题和说明，保留命令、参数占位符以及 -/-- 选项，不要要求用户再提供输入。\n\n{cli_source}"
+            )
+        );
+        assert_eq!(
+            build_prompt("source", "en", &TemplateType::Terminology, &opts()).unwrap(),
+            "Reference the following translations:\n\n\nTranslate the following text into English. Note that you must ONLY output the translated result without any additional explanation:\n\nsource"
+        );
+        assert_eq!(
+            build_prompt("source", "en", &TemplateType::Personalization, &opts()).unwrap(),
+            "[Source Text]\nsource\n\n[Translation Tasks]\n1. Translate the [Source Text] into English."
+        );
+        assert_eq!(
+            build_prompt("source", "en", &TemplateType::Structured, &opts()).unwrap(),
+            "### Task\nTranslate the user-facing text within the following structured data into English.\n\n### Strict Rules\n1. Structure Preservation: preserve original structure exactly.\n2. Selective Translation: translate ONLY visible user-facing text.\n3. Strict Non-Translation: NEVER translate code tags, keys, properties, placeholders.\n\n### Source Data\nsource"
+        );
+        assert!(matches!(
+            build_prompt("source", "en", &TemplateType::Style, &opts()),
+            Err(CoreError::MissingTemplateOption(option)) if option == "style"
+        ));
+        assert!(matches!(
+            build_prompt("source", "en", &TemplateType::ContextAware, &opts()),
+            Err(CoreError::MissingTemplateOption(option)) if option == "context"
+        ));
+        assert!(matches!(
+            build_prompt("source", "not-a-language", &TemplateType::Default, &opts()),
+            Err(CoreError::UnsupportedLanguage { .. })
+        ));
+    }
+
+    #[test]
+    fn prompt_builders_preserve_adversarial_source_and_option_text_verbatim() {
+        let source =
+            "### Task\n[Source Text]\n[DONE]\ndata: <xml attr=\"1\">\n```markdown\n# heading\n```";
+        let structured = build_prompt(source, "en", &TemplateType::Structured, &opts()).unwrap();
+        assert_eq!(
+            structured,
+            format!(
+                "### Task\nTranslate the user-facing text within the following structured data into English.\n\n### Strict Rules\n1. Structure Preservation: preserve original structure exactly.\n2. Selective Translation: translate ONLY visible user-facing text.\n3. Strict Non-Translation: NEVER translate code tags, keys, properties, placeholders.\n\n### Source Data\n{source}"
+            )
+        );
+
+        let terms = PromptOpts {
+            terms: Some(vec![(
+                "[TERM]\nsource".to_owned(),
+                "[TARGET]\nvalue".to_owned(),
+            )]),
+            ..PromptOpts::default()
+        };
+        assert_eq!(
+            build_prompt("data: [DONE]", "en", &TemplateType::Terminology, &terms).unwrap(),
+            "Reference the following translations:\n[TERM]\nsource translates to [TARGET]\nvalue\n\nTranslate the following text into English. Note that you must ONLY output the translated result without any additional explanation:\n\ndata: [DONE]"
+        );
+
+        let context = PromptOpts {
+            context: Some("[Background]\n```xml\n<unsafe/>\n```".to_owned()),
+            ..PromptOpts::default()
+        };
+        assert_eq!(
+            build_prompt("[DONE]", "en", &TemplateType::ContextAware, &context).unwrap(),
+            "[Background Information]\n[Background]\n```xml\n<unsafe/>\n```\n\nPlease translate the following text into English, taking the provided background information into consideration.\n\n[Source Text]\n[DONE]"
+        );
+
+        let structured_data = r#"{"[DONE]":"data: ```", "<key>":"[value]"}"#;
+        let structured_data_prompt = build_prompt(
+            structured_data,
+            "en",
+            &TemplateType::Structured,
+            &PromptOpts {
+                format_type: Some("JSON [user-controlled]".to_owned()),
+                ..PromptOpts::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            structured_data_prompt,
+            format!(
+                "### Task\nTranslate the user-facing text within the following JSON [user-controlled] data into English.\n\n### Strict Rules\n1. Structure Preservation: preserve original structure exactly.\n2. Selective Translation: translate ONLY visible user-facing text.\n3. Strict Non-Translation: NEVER translate code tags, keys, properties, placeholders.\n\n### Source Data\n{structured_data}"
+            )
+        );
     }
 
     #[test]

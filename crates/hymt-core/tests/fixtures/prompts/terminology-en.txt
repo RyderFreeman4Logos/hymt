@@ -1,0 +1,7 @@
+Reference the following translations:
+cache translates to 缓存
+queue translates to 队列
+
+Translate the following text into {{target}}. Note that you must ONLY output the translated result without any additional explanation:
+
+Sample source.

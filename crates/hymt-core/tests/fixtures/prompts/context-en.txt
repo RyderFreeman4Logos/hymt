@@ -1,0 +1,7 @@
+[Background Information]
+Release notes for version [2.0].
+
+Please translate the following text into {{target}}, taking the provided background information into consideration.
+
+[Source Text]
+Sample source.

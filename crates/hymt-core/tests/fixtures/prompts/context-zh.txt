@@ -1,0 +1,7 @@
+[背景信息]
+Release notes for version [2.0].
+
+请结合所提供的背景信息，将以下文本翻译成{{target}}。
+
+[源文本]
+Sample source.

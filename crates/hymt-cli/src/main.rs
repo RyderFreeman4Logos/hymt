@@ -912,7 +912,8 @@ fn print_translation_plan(plan: &TranslationPlan) {
     );
     let budget = &plan.token_budget;
     eprintln!(
-        "  token budget: source={} profile={} per_slot_context={} input_capacity={} output_reservation={} template_tokens={} safety_margin={} revisions={}",
+        "  token budget: prompt_schema={} source={} profile={} per_slot_context={} input_capacity={} output_reservation={} template_tokens={} safety_margin={} revisions={}",
+        budget.prompt_schema,
         budget.counting_source.as_str(),
         budget.profile_id,
         budget.per_slot_context,

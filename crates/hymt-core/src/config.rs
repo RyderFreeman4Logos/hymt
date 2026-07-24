@@ -14,6 +14,7 @@ use crate::error::CoreError;
 use crate::language::DocumentTranslationPolicy;
 use crate::model_profile::{ModelProfile, UpstreamSource};
 use crate::runtime::{BackendRuntimeInfo, BackendVerificationStatus};
+use crate::templates::PROMPT_SCHEMA_ID;
 
 pub const DEFAULT_CONFIG: &str = r#"[endpoint]
 url = "http://127.0.0.1:8401/v1"
@@ -122,13 +123,12 @@ const BACKEND_CONTEXT_KEYS: &[&str] = &["total_context", "parallel_slots", "per_
 
 /// Canonical inference fingerprint schema. Increment this when its semantics change.
 ///
-/// Version 1 writes `null` for quantization because the current configuration has
+/// Version 2 writes `null` for quantization because the current configuration has
 /// no quantization field; it never guesses an endpoint's loaded quant. Model and
 /// tokenizer source identities are likewise `null` when generic mode cannot
-/// provide them.
-pub const INFERENCE_FINGERPRINT_SCHEMA_VERSION: u32 = 1;
-
-const PROMPT_SCHEMA_VERSION: u32 = 1;
+/// provide them. It also records the versioned prompt contract instead of a
+/// local numeric prompt counter.
+pub const INFERENCE_FINGERPRINT_SCHEMA_VERSION: u32 = 2;
 
 /// Stable inference identity used to isolate cache and history entries.
 ///
@@ -1112,7 +1112,7 @@ impl HotConfig {
     /// limit, completeness retry/validation policy, and prompt template/options.
     /// API keys are deliberately excluded.
     /// Fields unavailable to the current configuration are represented as JSON
-    /// `null` in schema version 1 rather than guessed.
+    /// `null` in the inference-fingerprint schema rather than guessed.
     pub fn inference_fingerprint(
         &self,
         template_type: &str,
@@ -1212,8 +1212,8 @@ impl HotConfig {
                     serde_json::Value::String(options_hash.to_owned()),
                 ),
                 (
-                    "schema_version".to_owned(),
-                    serde_json::Value::from(PROMPT_SCHEMA_VERSION),
+                    "schema".to_owned(),
+                    serde_json::Value::String(PROMPT_SCHEMA_ID.to_owned()),
                 ),
                 (
                     "template_type".to_owned(),
@@ -2101,7 +2101,10 @@ temperature = 0.7"#,
         assert_ne!(q4, prompted, "prompt identity must scope the cache");
         assert_eq!(q4.hash().len(), 64);
         assert!(q4.canonical_json().contains("\"quantization\":null"));
-        assert!(q4.canonical_json().contains("\"schema_version\":1"));
+        assert!(q4
+            .canonical_json()
+            .contains("\"prompt\":{\"options_hash\":\"\",\"schema\":\"hy-mt2-prompts/v2\",\"template_type\":\"default\"}"));
+        assert!(q4.canonical_json().contains("\"schema_version\":2"));
     }
 
     #[test]

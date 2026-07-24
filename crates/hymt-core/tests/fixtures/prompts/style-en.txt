@@ -1,0 +1,3 @@
+Please translate the following text into {{target}}. Note that the translation style must strictly conform to [formal and precise]:
+
+Sample source.

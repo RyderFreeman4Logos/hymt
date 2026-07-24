@@ -1727,6 +1727,42 @@ mod tests {
     }
 
     #[test]
+    fn translation_chat_contract_has_one_user_message_and_generation_prefix() {
+        let prompt = hymt_core::templates::build_prompt(
+            "contract source",
+            "zh",
+            &hymt_core::templates::TemplateType::Default,
+            &hymt_core::templates::PromptOpts::default(),
+        )
+        .unwrap();
+        let payload = ChatPayload::from_generation_settings(
+            &prompt,
+            4096,
+            "hy-mt2".into(),
+            false,
+            &GenerationSettings::server_defaults(),
+            GenerationBackend::LlamaCpp,
+        );
+        let json = serde_json::to_value(&payload).unwrap();
+
+        assert_eq!(
+            json["messages"],
+            serde_json::json!([{ "role": "user", "content": prompt }]),
+            "translation must not add a default system message or mutate the prompt"
+        );
+
+        let rendered = hymt_core::model_profile::ModelProfile::HyMt2_7b
+            .render_chat_user_prompt(json["messages"][0]["content"].as_str().unwrap())
+            .expect("the Hy-MT2 7B chat template is pinned");
+        assert_eq!(
+            rendered,
+            format!("<|startoftext|>{prompt}<|extra_0|>"),
+            "the rendered request must retain both special tokens and the assistant generation prefix"
+        );
+        assert_eq!(rendered.matches("<|").count(), 2);
+    }
+
+    #[test]
     fn llama_cpp_props_diagnostics_use_the_server_root_and_report_literal_defaults() {
         assert_eq!(
             TranslationClient::llama_cpp_props_url("http://127.0.0.1:8401/v1/"),
