@@ -79,6 +79,7 @@ Template-specific options:
 - `hymt config show`
 - `hymt config path`
 - `hymt config edit`
+- `hymt backend inspect` — query the selected service without printing credentials; compare configured and resolved backend state
 - `hymt tokenizer download [--force]`
 - `hymt telegram` — long-poll CN↔EN Telegram bot until Ctrl+C (default cargo feature; requires `[telegram].enabled = true` and a bot token)
 - `hymt telegram --regenerate-claim-password` — rotate claim password, print once, exit

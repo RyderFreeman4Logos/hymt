@@ -546,8 +546,8 @@ pub fn plan_translation_with_policy(
     document_policy: DocumentTranslationPolicy,
 ) -> Result<TranslationPlan> {
     let profile = config.model_profile().map_err(|error| anyhow!(error))?;
-    let per_request_context = config.per_request_context() as usize;
-    let max_output = config.max_output_tokens() as usize;
+    let per_request_context = config.resolved_per_request_context() as usize;
+    let max_output = config.resolved_max_output_tokens() as usize;
     let input_capacity = per_request_context.saturating_sub(max_output);
     let overhead_prompt = prompt_for_budget("", target_lang, template, opts, config)?;
     let overhead = count_final_request(profile, segmenter, &overhead_prompt);

@@ -3,12 +3,13 @@
 //! Provides concurrency limiting, exponential-backoff retry on transient errors,
 //! `finish_reason == "length"` truncation detection, and SSE streaming support.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_core::Stream;
 use hymt_core::completeness::CompletionTermination;
 use hymt_core::config::{GenerationBackend, GenerationSettings, HotConfig, Setting};
+use hymt_core::runtime::{BackendRuntimeInfo, BackendVerificationStatus};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::Semaphore;
@@ -46,6 +47,9 @@ pub enum ClientError {
 
     #[error("semaphore closed")]
     SemaphoreClosed,
+
+    #[error("strict backend preflight refused translation: {0}")]
+    BackendPreflight(String),
 }
 
 /// A completed non-streaming translation with its provider termination signal.
@@ -60,6 +64,28 @@ pub struct TranslationCompletion {
 pub enum TranslationStreamEvent {
     Token(String),
     Finished(CompletionTermination),
+}
+
+/// Configured values shown beside service-discovered values by `hymt backend inspect`.
+/// API keys and endpoint credentials are deliberately absent.
+#[derive(Debug, Clone)]
+pub struct ConfiguredBackendInfo {
+    pub backend: GenerationBackend,
+    pub model: Option<String>,
+    pub profile: String,
+    pub total_context: u32,
+    pub parallel_slots: u32,
+    pub per_request_context: u32,
+    pub max_output_tokens: u32,
+    pub sampler_overrides: GenerationSettings,
+}
+
+/// Result of one cached or fresh backend preflight.
+#[derive(Debug, Clone)]
+pub struct BackendPreflight {
+    pub configured: ConfiguredBackendInfo,
+    pub runtime: BackendRuntimeInfo,
+    pub warnings: Vec<String>,
 }
 
 // ── Serde types ───────────────────────────────────────────────────────────────
@@ -260,11 +286,29 @@ struct ChoiceContent {
 
 // ── Inner shared state ────────────────────────────────────────────────────────
 
+const BACKEND_PREFLIGHT_TTL: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeCacheKey {
+    endpoint_url: String,
+    backend: GenerationBackend,
+    profile: String,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeCacheEntry {
+    key: RuntimeCacheKey,
+    checked_at: Instant,
+    runtime: BackendRuntimeInfo,
+    warnings: Vec<String>,
+}
+
 struct Inner {
     config: HotConfig,
     http: reqwest::Client,
     semaphore: Arc<Semaphore>,
     concurrency: usize,
+    runtime_cache: Mutex<Option<RuntimeCacheEntry>>,
 }
 
 // ── TranslationClient ─────────────────────────────────────────────────────────
@@ -308,6 +352,7 @@ impl TranslationClient {
                 http,
                 semaphore: Arc::new(Semaphore::new(concurrency)),
                 concurrency,
+                runtime_cache: Mutex::new(None),
             }),
         })
     }
@@ -315,6 +360,274 @@ impl TranslationClient {
     /// Effective request concurrency baked into this client at construction.
     pub fn concurrency(&self) -> usize {
         self.inner.concurrency
+    }
+
+    /// Discover runtime state once per endpoint/backend/profile TTL.
+    ///
+    /// Normal mode always returns a report: an unavailable or malformed endpoint
+    /// becomes explicitly unverified and callers plan conservatively. Strict mode
+    /// refuses before its caller can reach cache lookup or model invocation.
+    pub async fn preflight_backend(&self) -> Result<BackendPreflight, ClientError> {
+        self.preflight_backend_inner(false, true).await
+    }
+
+    /// Bypass the preflight TTL, for inspection and restart/profile-change checks.
+    pub async fn refresh_backend_preflight(&self) -> Result<BackendPreflight, ClientError> {
+        self.preflight_backend_inner(true, true).await
+    }
+
+    /// Return a fresh resolved-state report even when strict translation policy
+    /// would refuse work. This keeps `hymt backend inspect` actionable.
+    pub async fn inspect_backend(&self) -> Result<BackendPreflight, ClientError> {
+        self.preflight_backend_inner(true, false).await
+    }
+
+    async fn preflight_backend_inner(
+        &self,
+        force_refresh: bool,
+        enforce_strict: bool,
+    ) -> Result<BackendPreflight, ClientError> {
+        let _ = self.inner.config.maybe_reload();
+        let key = self.runtime_cache_key()?;
+        if !force_refresh {
+            if let Some(entry) = self.cached_runtime(&key) {
+                self.inner
+                    .config
+                    .set_backend_runtime_info(entry.runtime.clone());
+                return self.backend_preflight_report(
+                    entry.runtime,
+                    entry.warnings,
+                    enforce_strict,
+                );
+            }
+        }
+
+        // A changed endpoint/backend/profile must never continue planning against
+        // a previous server's runtime state while this request is in flight.
+        self.inner.config.clear_backend_runtime_info();
+        let observed_at = unix_timestamp_secs();
+        let runtime = self.fetch_backend_runtime(key.backend, observed_at).await;
+        let warnings = self.preflight_warnings(&runtime)?;
+        self.inner.config.set_backend_runtime_info(runtime.clone());
+        if let Ok(mut cache) = self.inner.runtime_cache.lock() {
+            *cache = Some(RuntimeCacheEntry {
+                key,
+                checked_at: Instant::now(),
+                runtime: runtime.clone(),
+                warnings: warnings.clone(),
+            });
+        }
+        self.backend_preflight_report(runtime, warnings, enforce_strict)
+    }
+
+    fn runtime_cache_key(&self) -> Result<RuntimeCacheKey, ClientError> {
+        Ok(RuntimeCacheKey {
+            endpoint_url: self.inner.config.endpoint_url(),
+            backend: self.inner.config.generation_backend()?,
+            profile: self.inner.config.model_profile()?.id().to_owned(),
+        })
+    }
+
+    fn cached_runtime(&self, key: &RuntimeCacheKey) -> Option<RuntimeCacheEntry> {
+        let cache = self.inner.runtime_cache.lock().ok()?;
+        let entry = cache.as_ref()?;
+        (entry.key == *key && entry.checked_at.elapsed() < BACKEND_PREFLIGHT_TTL)
+            .then(|| entry.clone())
+    }
+
+    async fn fetch_backend_runtime(
+        &self,
+        backend: GenerationBackend,
+        observed_at_unix_secs: u64,
+    ) -> BackendRuntimeInfo {
+        let url = match backend {
+            GenerationBackend::LlamaCpp => {
+                Self::llama_cpp_props_url(&self.inner.config.endpoint_url())
+            }
+            GenerationBackend::Vllm | GenerationBackend::OpenAiCompatible => {
+                Self::models_url(&self.inner.config.endpoint_url())
+            }
+        };
+
+        match self
+            .inner
+            .http
+            .get(&url)
+            .headers(self.build_headers())
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => match response.json().await {
+                Ok(body) => {
+                    let parsed = match backend {
+                        GenerationBackend::LlamaCpp => {
+                            BackendRuntimeInfo::from_llama_cpp_props(&body, observed_at_unix_secs)
+                        }
+                        GenerationBackend::Vllm | GenerationBackend::OpenAiCompatible => {
+                            BackendRuntimeInfo::from_openai_models(
+                                backend,
+                                &body,
+                                observed_at_unix_secs,
+                            )
+                        }
+                    };
+                    match parsed {
+                        Ok(runtime) => runtime,
+                        Err(error) => BackendRuntimeInfo::unverified(
+                            backend,
+                            observed_at_unix_secs,
+                            format!("malformed backend response: {error}"),
+                        ),
+                    }
+                }
+                Err(_) => BackendRuntimeInfo::unverified(
+                    backend,
+                    observed_at_unix_secs,
+                    "backend returned invalid JSON",
+                ),
+            },
+            Ok(response) => BackendRuntimeInfo::unverified(
+                backend,
+                observed_at_unix_secs,
+                format!("backend endpoint returned HTTP {}", response.status()),
+            ),
+            Err(_) => BackendRuntimeInfo::unverified(
+                backend,
+                observed_at_unix_secs,
+                "backend endpoint is unavailable",
+            ),
+        }
+    }
+
+    fn backend_preflight_report(
+        &self,
+        runtime: BackendRuntimeInfo,
+        warnings: Vec<String>,
+        enforce_strict: bool,
+    ) -> Result<BackendPreflight, ClientError> {
+        let configured = self.configured_backend_info()?;
+        let identity_verified = runtime.is_verified() && runtime.served_model.is_some();
+        if enforce_strict
+            && self.inner.config.strict_backend_preflight()
+            && (!identity_verified || !warnings.is_empty())
+        {
+            let reasons = if warnings.is_empty() {
+                "runtime model identity is unavailable".to_owned()
+            } else {
+                warnings.join("; ")
+            };
+            return Err(ClientError::BackendPreflight(reasons));
+        }
+        Ok(BackendPreflight {
+            configured,
+            runtime,
+            warnings,
+        })
+    }
+
+    fn configured_backend_info(&self) -> Result<ConfiguredBackendInfo, ClientError> {
+        let model = self.inner.config.model();
+        Ok(ConfiguredBackendInfo {
+            backend: self.inner.config.generation_backend()?,
+            model: (!model.is_empty()).then_some(model),
+            profile: self.inner.config.model_profile()?.id().to_owned(),
+            total_context: self.inner.config.total_context(),
+            parallel_slots: self.inner.config.parallel_slots(),
+            per_request_context: self.inner.config.per_request_context(),
+            max_output_tokens: self.inner.config.max_output_tokens(),
+            sampler_overrides: self.inner.config.generation_settings()?,
+        })
+    }
+
+    fn preflight_warnings(&self, runtime: &BackendRuntimeInfo) -> Result<Vec<String>, ClientError> {
+        let configured = self.configured_backend_info()?;
+        let mut warnings = Vec::new();
+        if runtime.verification_status == BackendVerificationStatus::Unverified {
+            warnings.push(format!(
+                "runtime preflight is unverified: {}",
+                runtime
+                    .verification_message
+                    .as_deref()
+                    .unwrap_or("backend did not provide verifiable metadata")
+            ));
+            return Ok(warnings);
+        }
+        if let Some(total_context) = runtime.total_context {
+            if total_context != configured.total_context {
+                warnings.push(format!(
+                    "context mismatch: configured total_context={} but service reports {}",
+                    configured.total_context, total_context
+                ));
+            }
+        }
+        if let Some(per_slot_context) = runtime.per_slot_context {
+            if per_slot_context != configured.per_request_context {
+                warnings.push(format!(
+                    "context mismatch: configured per_request_context={} but service reports {}",
+                    configured.per_request_context, per_slot_context
+                ));
+            }
+        }
+        if let (Some(configured_model), Some(served_model)) =
+            (configured.model.as_deref(), runtime.served_model.as_deref())
+        {
+            if configured_model != served_model {
+                warnings.push(format!(
+                    "profile/model mismatch: configured model {configured_model:?} but service reports {served_model:?}"
+                ));
+            }
+        }
+        let profile = self.inner.config.model_profile()?;
+        if configured.model.is_none() && !profile.is_generic() {
+            if let Some(served_model) = runtime.served_model.as_deref() {
+                let normalized_served = served_model.to_ascii_lowercase();
+                let recognized = profile
+                    .gguf_aliases()
+                    .iter()
+                    .any(|alias| normalized_served == alias.to_ascii_lowercase())
+                    || profile.model().is_some_and(|source| {
+                        source
+                            .repo
+                            .rsplit('/')
+                            .next()
+                            .is_some_and(|name| normalized_served == name.to_ascii_lowercase())
+                    });
+                if !recognized {
+                    warnings.push(format!(
+                        "profile/model mismatch: profile {} does not recognize service model {served_model:?}",
+                        profile.id()
+                    ));
+                }
+            }
+        }
+        if let Some(discovered_wire_key) = runtime
+            .sampler_defaults
+            .repetition_penalty_wire_key
+            .as_deref()
+        {
+            let expected_wire_key = match configured.backend {
+                GenerationBackend::LlamaCpp => Some("repeat_penalty"),
+                GenerationBackend::Vllm => Some("repetition_penalty"),
+                GenerationBackend::OpenAiCompatible => None,
+            };
+            if let Some(expected_wire_key) = expected_wire_key {
+                if discovered_wire_key != expected_wire_key {
+                    warnings.push(format!(
+                        "sampler wire-key mismatch: configured backend expects {expected_wire_key}, service advertises {discovered_wire_key}"
+                    ));
+                }
+            }
+        }
+        if configured.sampler_overrides.uses_any_server_defaults()
+            && !runtime.sampler_defaults.is_complete()
+        {
+            warnings.push(
+                "unexpected sampler state: service-owned sampler defaults are incomplete in runtime metadata"
+                    .to_owned(),
+            );
+        }
+        Ok(warnings)
     }
 
     /// Query llama.cpp's `/props` endpoint for its service-owned sampler defaults.
@@ -514,7 +827,7 @@ impl TranslationClient {
         let cfg = &self.inner.config;
         Ok(ChatPayload::from_generation_settings(
             prompt,
-            cfg.max_output_tokens(),
+            cfg.resolved_max_output_tokens(),
             cfg.model(),
             stream,
             &cfg.generation_settings()?,
@@ -545,6 +858,10 @@ impl TranslationClient {
         let endpoint_url = endpoint_url.trim_end_matches('/');
         let server_url = endpoint_url.strip_suffix("/v1").unwrap_or(endpoint_url);
         format!("{server_url}/props")
+    }
+
+    fn models_url(endpoint_url: &str) -> String {
+        format!("{}/models", endpoint_url.trim_end_matches('/'))
     }
 
     async fn post_with_retry(
@@ -636,6 +953,13 @@ impl TranslationClient {
             body: "max retries exceeded".into(),
         }))
     }
+}
+
+fn unix_timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 // ── SSE streaming ─────────────────────────────────────────────────────────────
@@ -976,6 +1300,10 @@ fn llama_cpp_props_default_message(url: &str, props: &serde_json::Value) -> Stri
 #[cfg(test)]
 #[path = "backend_payload_tests.rs"]
 mod backend_payload_tests;
+
+#[cfg(test)]
+#[path = "backend_preflight_tests.rs"]
+mod backend_preflight_tests;
 
 #[cfg(test)]
 mod tests {

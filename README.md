@@ -74,6 +74,9 @@ timeout = 600
 # Refuse planning when the final chat template cannot be tokenized locally.
 # Otherwise hymt emits a warning and uses a conservative approximate budget.
 strict_token_budget = false
+# Refuse translation before cache lookup if the backend runtime cannot be verified
+# or differs materially from this configuration.
+strict_backend_preflight = false
 # For Chinese-family targets, preserve confidently target-language paragraphs.
 language_detection = true
 # Override detection and submit every non-code paragraph.
@@ -123,6 +126,14 @@ Choose `backend` explicitly from the server implementation; hymt never infers it
 An omitted `[inference.override]` key is always `Setting::ServerDefault`, so it is absent from the JSON request and the service applies its own configured value. This is also true for every Hy-MT2 profile: profile sampling values are service-deployment guidance and are never automatically injected into a request payload. Set a numeric override only when the client must deliberately replace the service default; `"disabled"` and numeric values are semantic configuration states, and adapters choose documented wire values rather than converting `0` and `-1` indiscriminately. Explicit overrides are included in diagnostics and the inference/cache fingerprint. Legacy scalar sampler values directly under `[inference]` remain accepted as explicit overrides for one release and emit the startup migration warning; move them under `[inference.override]`. Validation errors name the semantic value and say when no backend wire representation exists. Streaming and non-streaming requests use the same adapter policy.
 
 The supported extension names above are limited to the documented llama.cpp server controls and vLLM OpenAI-server sampling parameters: [llama.cpp server API](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md) and [vLLM OpenAI-compatible server](https://docs.vllm.ai/en/latest/serving/openai_compatible_server/). An old `[inference].backend` key is rejected; move it to `[endpoint].backend`.
+
+### Runtime backend preflight and inspection
+
+Translation paths preflight the configured backend before planning or cache lookup. llama.cpp uses `GET /props`; vLLM and other OpenAI-compatible services use `GET /v1/models` when available. The normalized runtime state includes service build/model identity, context and slot limits, sampler defaults, and only explicitly advertised capabilities. Missing fields remain unknown rather than being inferred.
+
+Run `hymt backend inspect` to print configured and service-resolved values side by side. It never prints API keys, endpoint credentials, or request headers. Warnings identify context/model/profile mismatches, unexpected service sampler state, and a llama.cpp/vLLM repeat-penalty wire-key mismatch.
+
+Normal preflight is fail-open: it warns, marks the inference fingerprint/cache identity unverified, and plans with conservative context/output limits. Set `[translation].strict_backend_preflight = true` to refuse before cache lookup or model invocation when identity cannot be verified or a material mismatch is found. Runtime state is TTL-cached for 60 seconds and refreshed when the endpoint/backend/profile changes; a changed service identity replaces the old resolved state and fingerprint.
 
 ## Model profile (`[endpoint].profile`)
 
