@@ -529,11 +529,12 @@ fn generation_fingerprint_value(settings: &GenerationSettings) -> serde_json::Va
     canonical_object(fields)
 }
 
-/// Runtime identity excludes probe-local timing and transport diagnostics: neither
-/// changes a model response, while version/build/model/capability changes do.
+/// Runtime identity excludes probe-local diagnostics and load: neither changes a
+/// model response, while version/build/model/capability changes do.
 fn runtime_fingerprint_value(info: &BackendRuntimeInfo) -> serde_json::Value {
     match serde_json::to_value(info) {
         Ok(serde_json::Value::Object(mut fields)) => {
+            fields.remove("active_slots");
             fields.remove("observed_at_unix_secs");
             fields.remove("verification_message");
             serde_json::Value::Object(fields)
@@ -1132,6 +1133,12 @@ impl HotConfig {
                     .as_deref()
                     .is_none_or(|served| served == model)
         });
+        // A parsed response without a served-model value cannot attest which
+        // model produced cached output. Keep pre-preflight explicit-override
+        // callers compatible, but never trust an identity-incomplete runtime.
+        let runtime_identity_is_attested = runtime
+            .as_ref()
+            .is_none_or(|info| info.is_verified() && info.served_model.is_some());
         let service_defaults_are_known = !effective_settings.uses_any_server_defaults()
             || runtime
                 .as_ref()
@@ -1140,10 +1147,8 @@ impl HotConfig {
         // explicit-override callers retain their pre-preflight deterministic
         // namespace, while translation paths run preflight before cache lookup.
         let cache_verified = configured_model_matches_runtime
+            && runtime_identity_is_attested
             && service_defaults_are_known
-            && !runtime.as_ref().is_some_and(|info| {
-                info.verification_status == BackendVerificationStatus::Unverified
-            })
             && !(profile.is_generic()
                 && model.is_empty()
                 && runtime
@@ -1483,6 +1488,9 @@ impl HotConfig {
         if state.profile.is_none() {
             state.profile = Some(profile);
         }
+        // Runtime facts belong to the config snapshot that was probed. A reload
+        // must force strict callers to preflight again before planning or reuse.
+        state.backend_runtime_info = None;
         state.data = data;
         state.mtime = mtime;
         state.uses_legacy_generation_scalars = uses_legacy_generation_scalars;

@@ -45,6 +45,30 @@ fn complete_llama_props() -> serde_json::Value {
     })
 }
 
+fn cacheable_llama_config() -> &'static str {
+    r#"
+[endpoint]
+url = "http://127.0.0.1:8401/v1"
+model = "served-hy-mt2"
+backend = "llama_cpp"
+
+[backend]
+total_context = 24576
+parallel_slots = 3
+
+[translation]
+max_output_tokens = 4096
+
+[inference.override]
+temperature = 0.7
+top_p = 0.6
+top_k = 20
+repetition_penalty = 1.05
+min_p = 0.1
+repeat_last_n = 64
+"#
+}
+
 #[test]
 fn parses_llama_props_into_normalized_runtime_info() {
     let info = BackendRuntimeInfo::from_llama_cpp_props(&complete_llama_props(), 42)
@@ -87,6 +111,88 @@ fn older_llama_props_leave_unknown_values_unknown() {
     assert_eq!(info.sampler_defaults.temperature, None);
     assert_eq!(info.supports_templates, None);
     assert_eq!(info.default_max_generation_tokens, None);
+}
+
+#[test]
+fn hot_reload_clears_stale_backend_runtime_state() {
+    with_config("runtime-reload", cacheable_llama_config(), |config| {
+        config.set_backend_runtime_info(
+            BackendRuntimeInfo::from_llama_cpp_props(&complete_llama_props(), 42)
+                .expect("verified runtime"),
+        );
+        assert!(config.backend_runtime_info().is_some());
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(
+            config.path(),
+            cacheable_llama_config().replace("8401", "8402"),
+        )
+        .expect("rewrite config fixture");
+
+        assert!(config.maybe_reload().expect("reload changed config"));
+        assert!(
+            config.backend_runtime_info().is_none(),
+            "a runtime probe must not survive an endpoint/config snapshot change"
+        );
+    });
+}
+
+#[test]
+fn verified_runtime_without_served_model_bypasses_cache() {
+    with_config("identity-incomplete", cacheable_llama_config(), |config| {
+        let runtime = BackendRuntimeInfo::from_llama_cpp_props(
+            &serde_json::json!({
+                "build_info": "old-server",
+                "n_ctx": 24576,
+                "n_ctx_per_seq": 8192,
+                "default_generation_settings": {
+                    "temperature": 0.7,
+                    "top_p": 0.6,
+                    "top_k": 20,
+                    "min_p": 0.1,
+                    "repeat_penalty": 1.05,
+                    "repeat_last_n": 64
+                }
+            }),
+            42,
+        )
+        .expect("older props remain parseable");
+        assert!(runtime.is_verified());
+        assert_eq!(runtime.served_model, None);
+        config.set_backend_runtime_info(runtime);
+
+        assert!(
+            !config
+                .inference_fingerprint("default", "")
+                .expect("fingerprint")
+                .is_cache_verified(),
+            "a verified response without model identity cannot attest a cache namespace"
+        );
+    });
+}
+
+#[test]
+fn runtime_fingerprint_excludes_active_slots() {
+    with_config("active-slots", cacheable_llama_config(), |config| {
+        let busy_runtime = BackendRuntimeInfo::from_llama_cpp_props(&complete_llama_props(), 42)
+            .expect("verified runtime");
+        let mut idle_runtime = busy_runtime.clone();
+        idle_runtime.active_slots = Some(0);
+
+        config.set_backend_runtime_info(busy_runtime);
+        let busy = config
+            .inference_fingerprint("default", "")
+            .expect("busy fingerprint");
+        config.set_backend_runtime_info(idle_runtime);
+        let idle = config
+            .inference_fingerprint("default", "")
+            .expect("idle fingerprint");
+
+        assert_eq!(busy.hash(), idle.hash());
+        let canonical: serde_json::Value =
+            serde_json::from_str(busy.canonical_json()).expect("canonical JSON");
+        assert!(canonical["runtime"].get("active_slots").is_none());
+    });
 }
 
 #[test]

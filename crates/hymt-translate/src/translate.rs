@@ -1449,6 +1449,18 @@ fn partition_pipeline(
 
 // ── translate_text ─────────────────────────────────────────────────────────────
 
+/// Reload configuration before planning and enforce strict backend preflight for
+/// the same snapshot before a cache lookup or model request can proceed.
+async fn reload_config_and_preflight_strict(ctx: &TranslationCtx<'_>) -> Result<()> {
+    let reloaded = ctx.config.maybe_reload()?;
+    if ctx.config.strict_backend_preflight()
+        && (reloaded || ctx.config.backend_runtime_info().is_none())
+    {
+        ctx.client.preflight_backend().await?;
+    }
+    Ok(())
+}
+
 /// Translate `text` to `target_lang`, caching and translating segments in parallel.
 ///
 /// Segments are checked against the cache only when the inference identity is
@@ -1469,7 +1481,7 @@ pub async fn translate_text(
         });
     }
 
-    ctx.config.maybe_reload()?;
+    reload_config_and_preflight_strict(ctx).await?;
     let template_name = template.as_str();
     let plan = plan_translation(text, target_lang, ctx.config, ctx.segmenter, template, opts)?;
 
@@ -1731,7 +1743,7 @@ pub async fn translate_text_stream_with_mode(
         });
     }
 
-    ctx.config.maybe_reload()?;
+    reload_config_and_preflight_strict(ctx).await?;
     let template_name = template.as_str();
     let plan = plan_translation(text, target_lang, ctx.config, ctx.segmenter, template, opts)?;
 
@@ -4487,6 +4499,45 @@ Bravo one text carries enough source material for cache validation and ordering 
                 .as_deref(),
             Some(fresh.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn strict_hot_reload_preflights_before_normal_planning() {
+        let source = "Strict hot reload must preflight before cache lookup or translation.";
+        let server = start_mock_server(vec![MockResponse::Json("ignored".to_owned())]).await;
+        let cfg = make_stream_config(&server.endpoint_url);
+        cfg.set_backend_runtime_info(hymt_core::runtime::BackendRuntimeInfo::unverified(
+            hymt_core::config::GenerationBackend::LlamaCpp,
+            0,
+            "stale initial preflight",
+        ));
+        let client = TranslationClient::new(cfg.clone()).unwrap();
+        let updated = std::fs::read_to_string(cfg.path()).unwrap().replace(
+            "timeout = 5",
+            "timeout = 5\nstrict_backend_preflight = true",
+        );
+        std::thread::sleep(Duration::from_millis(10));
+        std::fs::write(cfg.path(), updated).unwrap();
+        let segmenter = fallback_segmenter();
+        let history = HistoryDB::new(temp_path("strict-hot-reload-history.db"));
+        let ctx = TranslationCtx {
+            config: &cfg,
+            client: &client,
+            segmenter: &segmenter,
+            history: &history,
+        };
+
+        let error = translate_text(
+            source,
+            "zh",
+            &TemplateType::Default,
+            &PromptOpts::default(),
+            &ctx,
+        )
+        .await
+        .expect_err("strict reload must reject identity-incomplete preflight before planning");
+
+        assert!(error.to_string().contains("strict backend preflight"));
     }
 
     #[tokio::test]
