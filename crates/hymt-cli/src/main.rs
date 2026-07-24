@@ -14,6 +14,7 @@ use hymt_cache::history::HistoryDB;
 use hymt_client::TranslationClient;
 use hymt_core::config::HotConfig;
 use hymt_core::language::resolve_target_language;
+use hymt_core::model_profile::ModelProfile;
 use hymt_core::templates::{looks_like_cli_help_source, PromptOpts, TemplateType};
 use hymt_segment::Segmenter;
 use hymt_translate::batch::{
@@ -481,6 +482,7 @@ async fn run() -> Result<()> {
     };
 
     let config = HotConfig::new()?;
+    eprintln!("{}", profile_startup_diagnostic(config.model_profile()?));
     if config.uses_legacy_generation_scalars() {
         eprintln!(
             "Warning: legacy [inference] sampler scalars are deprecated; move them under [inference.override]."
@@ -581,7 +583,7 @@ async fn run() -> Result<()> {
             )
             .await
         }
-        Some(Cmd::Tokenizer(args)) => run_tokenizer(args).await,
+        Some(Cmd::Tokenizer(args)) => run_tokenizer(args, &config).await,
         Some(Cmd::Estimate(args)) => {
             run_estimate(
                 args,
@@ -626,15 +628,30 @@ async fn run() -> Result<()> {
 
 // ── Shared init helpers ───────────────────────────────────────────────────────
 
-fn make_segmenter() -> Segmenter {
-    make_segmenter_from_path(hymt_segment::tokenizer_path())
+fn make_segmenter(config: &HotConfig) -> Result<Segmenter> {
+    let profile = config.model_profile()?;
+    hymt_segment::create_segmenter(profile).map_err(|error| anyhow::anyhow!("{error}"))
 }
 
+#[cfg(test)]
 fn make_segmenter_from_path(tokenizer_path: PathBuf) -> Segmenter {
     if hymt_segment::has_tokenizer_support() && tokenizer_path.exists() {
         Segmenter::new(Some(tokenizer_path)).unwrap_or_else(|_| Segmenter::fallback())
     } else {
         Segmenter::fallback()
+    }
+}
+
+fn profile_startup_diagnostic(profile: ModelProfile) -> String {
+    match profile.tokenizer() {
+        Some(source) => format!(
+            "Model profile: {} ({}; tokenizer {} @ {})",
+            profile.id(),
+            profile.architecture().name(),
+            source.repo,
+            source.revision,
+        ),
+        None => "Warning: no [endpoint].profile configured; using generic mode without a tested tokenizer or generation defaults.".to_owned(),
     }
 }
 
@@ -722,7 +739,7 @@ async fn run_translate_text(
     }
 
     let text = words.join(" ");
-    let segmenter = make_segmenter();
+    let segmenter = make_segmenter(config)?;
     let history = HistoryDB::default();
     let effective_lang = if explicit_target {
         target_lang.to_owned()
@@ -797,7 +814,7 @@ async fn run_translate_stdin(
         return Ok(());
     }
     // Stdin content is always text; never interpret as a file path.
-    let segmenter = make_segmenter();
+    let segmenter = make_segmenter(config)?;
     let history = HistoryDB::default();
     let effective_lang = if explicit_target {
         target_lang.to_owned()
@@ -863,7 +880,7 @@ async fn run_translate_path(
     config: &HotConfig,
 ) -> Result<()> {
     let text = std::fs::read_to_string(path)?;
-    let segmenter = make_segmenter();
+    let segmenter = make_segmenter(config)?;
     let history = HistoryDB::default();
     let effective_lang = if explicit_target {
         target_lang.to_owned()
@@ -1062,7 +1079,7 @@ async fn run_man(
     if args.args.is_empty() {
         anyhow::bail!("man page name is required");
     }
-    let segmenter = make_segmenter();
+    let segmenter = make_segmenter(config)?;
     let history = HistoryDB::default();
     let client = make_client_with_concurrency(config, concurrency_override)?;
     let str_args: Vec<&str> = args.args.iter().map(String::as_str).collect();
@@ -1092,7 +1109,7 @@ async fn run_info(
     if args.args.is_empty() {
         anyhow::bail!("info topic is required");
     }
-    let segmenter = make_segmenter();
+    let segmenter = make_segmenter(config)?;
     let history = HistoryDB::default();
     let client = make_client_with_concurrency(config, concurrency_override)?;
     let str_args: Vec<&str> = args.args.iter().map(String::as_str).collect();
@@ -1131,7 +1148,7 @@ async fn run_exec(
             }
         }
         Some(ExecAction::Precache) => {
-            let segmenter = make_segmenter();
+            let segmenter = make_segmenter(config)?;
             let history = HistoryDB::default();
             let client = make_client_with_concurrency(config, concurrency_override)?;
             let summary = run_precache(
@@ -1164,7 +1181,7 @@ async fn run_exec(
             if command.is_empty() {
                 anyhow::bail!("exec: command is required after --");
             }
-            let segmenter = make_segmenter();
+            let segmenter = make_segmenter(config)?;
             let history = HistoryDB::default();
             let client = make_client_with_concurrency(config, concurrency_override)?;
             let code = run_exec_command(
@@ -1185,11 +1202,13 @@ async fn run_exec(
 
 // ── tokenizer ─────────────────────────────────────────────────────────────────
 
-async fn run_tokenizer(args: TokenizerArgs) -> Result<()> {
+async fn run_tokenizer(args: TokenizerArgs, config: &HotConfig) -> Result<()> {
     match args.action {
         TokenizerAction::Download { force } => {
-            eprintln!("Downloading tokenizer...");
-            let path = hymt_segment::ensure_tokenizer(force).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let profile = config.model_profile()?;
+            eprintln!("Downloading tokenizer for {}...", profile.id());
+            let path = hymt_segment::ensure_tokenizer(profile, force)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
             eprintln!("Tokenizer ready at: {}", path.display());
         }
     }
@@ -1206,7 +1225,7 @@ async fn run_estimate(
     config: &HotConfig,
     concurrency_override: Option<u32>,
 ) -> Result<()> {
-    let segmenter = make_segmenter();
+    let segmenter = make_segmenter(config)?;
     let plan = plan_translation("sample", target_lang, config, &segmenter, template, opts)?;
     let source_lang = estimate_source_lang(target_lang, config);
     let chars_per_segment =
@@ -1324,7 +1343,7 @@ async fn run_batch(
     config: &HotConfig,
     concurrency_override: Option<u32>,
 ) -> Result<()> {
-    let segmenter = make_segmenter();
+    let segmenter = make_segmenter(config)?;
     let history = HistoryDB::default();
     let plan_opts = BatchPlanOpts {
         output_dir: args.output_dir.as_deref(),
@@ -1424,7 +1443,7 @@ async fn run_translate_doc(
     config: &HotConfig,
     concurrency_override: Option<u32>,
 ) -> Result<()> {
-    let segmenter = make_segmenter();
+    let segmenter = make_segmenter(config)?;
     let history = HistoryDB::default();
     let client = make_client_with_concurrency(config, concurrency_override)?;
     let doc_opts = DocTranslationOpts {
@@ -1610,6 +1629,14 @@ Options:\n  --source-id <SOURCE_ID>\n  --context-only\n";
         let output = PathBuf::from("translated.txt");
         assert!(!should_stream_translation(true, false, Some(&output)));
         assert!(should_stream_translation(true, false, None));
+    }
+
+    #[test]
+    fn startup_diagnostics_name_the_selected_or_generic_profile() {
+        use hymt_core::model_profile::ModelProfile;
+
+        assert!(profile_startup_diagnostic(ModelProfile::HyMt2_30bA3b).contains("hy_mt2_30b_a3b"));
+        assert!(profile_startup_diagnostic(ModelProfile::Generic).contains("generic mode"));
     }
 
     #[test]

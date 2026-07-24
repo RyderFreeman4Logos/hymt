@@ -129,20 +129,26 @@ fn map_generation_settings(
     WireGenerationSettings {
         temperature: map_f64_setting(settings.temperature, 0.0),
         top_p: map_f64_setting(settings.top_p, 1.0),
-        top_k: match settings.top_k {
-            Setting::ServerDefault => None,
-            Setting::Disabled => Some(match backend {
-                GenerationBackend::LlamaCpp => 0,
-                GenerationBackend::OpenAiCompatible => -1,
-            }),
-            Setting::Value(value) => Some(value),
+        top_k: match backend {
+            GenerationBackend::LlamaCpp => match settings.top_k {
+                Setting::ServerDefault => None,
+                Setting::Disabled => Some(0),
+                Setting::Value(value) => Some(value),
+            },
+            GenerationBackend::OpenAiCompatible => None,
         },
         repetition_penalty: map_f64_setting(settings.repetition_penalty, 1.0),
-        min_p: map_f64_setting(settings.min_p, 0.0),
-        repeat_last_n: match settings.repeat_last_n {
-            Setting::ServerDefault => None,
-            Setting::Disabled => Some(0),
-            Setting::Value(value) => Some(value),
+        min_p: match backend {
+            GenerationBackend::LlamaCpp => map_f64_setting(settings.min_p, 0.0),
+            GenerationBackend::OpenAiCompatible => None,
+        },
+        repeat_last_n: match backend {
+            GenerationBackend::LlamaCpp => match settings.repeat_last_n {
+                Setting::ServerDefault => None,
+                Setting::Disabled => Some(0),
+                Setting::Value(value) => Some(value),
+            },
+            GenerationBackend::OpenAiCompatible => None,
         },
     }
 }
@@ -866,6 +872,19 @@ mod tests {
         assert_eq!(llama.repetition_penalty, Some(1.0));
         assert_eq!(llama.min_p, Some(0.0));
         assert_eq!(llama.repeat_last_n, Some(0));
+    }
+
+    #[test]
+    fn openai_compatible_omits_unsupported_profile_sampler_fields() {
+        let settings = hymt_core::model_profile::ModelProfile::HyMt2_30bA3b.generation_defaults();
+        let openai = map_generation_settings(&settings, GenerationBackend::OpenAiCompatible);
+
+        assert_eq!(openai.temperature, Some(0.7));
+        assert_eq!(openai.top_p, Some(1.0));
+        assert_eq!(openai.top_k, None);
+        assert_eq!(openai.repetition_penalty, Some(1.0));
+        assert_eq!(openai.min_p, None);
+        assert_eq!(openai.repeat_last_n, None);
     }
 
     #[test]

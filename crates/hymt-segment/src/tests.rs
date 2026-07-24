@@ -5,6 +5,7 @@ use crate::{
     },
     Segmenter,
 };
+use hymt_core::model_profile::ModelProfile;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -27,6 +28,20 @@ fn four_ascii_chars_is_one_token() {
 #[test]
 fn single_char_is_one_token() {
     assert_eq!(seg().count_tokens("a"), 1);
+}
+
+#[test]
+fn tokenizer_cache_is_scoped_to_the_selected_model_profile() {
+    let small = crate::tokenizer_path(ModelProfile::HyMt2_1_8b).unwrap();
+    let medium = crate::tokenizer_path(ModelProfile::HyMt2_7b).unwrap();
+    let large = crate::tokenizer_path(ModelProfile::HyMt2_30bA3b).unwrap();
+
+    assert!(small.ends_with("hy_mt2_1_8b/tokenizer.json"));
+    assert!(medium.ends_with("hy_mt2_7b/tokenizer.json"));
+    assert!(large.ends_with("hy_mt2_30b_a3b/tokenizer.json"));
+    assert_ne!(small, medium);
+    assert_ne!(medium, large);
+    assert_eq!(crate::tokenizer_path(ModelProfile::Generic), None);
 }
 
 // ── paragraph splitting ───────────────────────────────────────────────────────

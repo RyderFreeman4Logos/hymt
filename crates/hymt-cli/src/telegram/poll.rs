@@ -82,7 +82,7 @@ pub async fn run_telegram_bot(config: &HotConfig) -> Result<()> {
         .timeout(Duration::from_secs(LONG_POLL_TIMEOUT_SECS + 15))
         .build()
         .context("build reqwest client")?;
-    let segmenter = make_segmenter();
+    let segmenter = make_segmenter(config)?;
     let history = HistoryDB::default();
     let client = TranslationClient::new(config.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut offset: i64 = 0;
@@ -322,11 +322,7 @@ mod tests {
     }
 }
 
-fn make_segmenter() -> Segmenter {
-    let tokenizer_path = hymt_segment::tokenizer_path();
-    if hymt_segment::has_tokenizer_support() && tokenizer_path.exists() {
-        Segmenter::new(Some(tokenizer_path)).unwrap_or_else(|_| Segmenter::fallback())
-    } else {
-        Segmenter::fallback()
-    }
+fn make_segmenter(config: &HotConfig) -> Result<Segmenter> {
+    let profile = config.model_profile()?;
+    hymt_segment::create_segmenter(profile).map_err(|error| anyhow::anyhow!("{error}"))
 }

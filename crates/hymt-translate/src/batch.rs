@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use walkdir::WalkDir;
 
-use hymt_cache::history::HistoryDB;
+use hymt_cache::history::{HistoryDB, SegmentCacheScope};
 use hymt_client::TranslationClient;
 use hymt_core::config::HotConfig;
 use hymt_core::language::resolve_target_language;
@@ -134,6 +134,7 @@ pub fn build_batch_plan(
 
     let template_name = template.as_str();
     let options_hash = template_options_hash(prompt_opts);
+    let profile_id = config.model_profile()?.id();
     let mut files = Vec::new();
     let mut skipped = Vec::new();
 
@@ -171,6 +172,13 @@ pub fn build_batch_plan(
                 &config.secondary_lang(),
                 false,
             )
+        };
+
+        let cache_scope = SegmentCacheScope {
+            target_lang: &effective_lang,
+            template_type: template_name,
+            options_hash: &options_hash,
+            profile_id,
         };
 
         let suffix = target_lang_path_suffix(&effective_lang);
@@ -220,7 +228,7 @@ pub fn build_batch_plan(
             .collect();
         let hash_refs: Vec<&str> = seg_hashes.iter().map(|s| s.as_str()).collect();
         let cached_set = history
-            .find_cached_segment_hashes(&hash_refs, &effective_lang, template_name, &options_hash)
+            .find_cached_segment_hashes(&hash_refs, cache_scope)
             .unwrap_or_default();
         let cached_segments = seg_hashes
             .iter()

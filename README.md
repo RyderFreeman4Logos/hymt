@@ -48,6 +48,8 @@ On first use, `hymt` creates `~/.config/hymt/config.toml`. A typical setup looks
 url = "http://100.78.159.38:8401/v1"
 api_key = ""
 model = ""
+# Select one supported, tested Hy-MT2 profile, or use "generic" for an unprofiled endpoint.
+profile = "hy_mt2_7b"
 
 [translation]
 # `llama-server -c` is service-wide. Both supplied units provide about 8,192
@@ -85,7 +87,20 @@ warn_only = false
 divergence_threshold = 2.0
 ```
 
-The config is hot-reloadable. Long-running workflows pick up edits without restarting the process.
+The config is hot-reloadable except for `[endpoint].profile`, which is pinned at startup (see [Model profile](#model-profile-endpointprofile)). Long-running workflows pick up other edits without restarting the process.
+
+## Model profile (`[endpoint].profile`)
+
+Set `[endpoint].profile` explicitly for a Hy-MT2 endpoint. The recognized values and their coverage are:
+
+| Value | Coverage |
+|---|---|
+| `hy_mt2_1_8b` | Tested Hy-MT2 1.8B profile with a pinned upstream tokenizer source and profile generation defaults. |
+| `hy_mt2_7b` | Tested Hy-MT2 7B profile with a pinned upstream tokenizer source and profile generation defaults. |
+| `hy_mt2_30b_a3b` | Tested Hy-MT2 30B-A3B profile with a pinned upstream tokenizer source and profile generation defaults. |
+| `generic` (or omitted) | Unprofiled mode: no tested Hy-MT2 tokenizer or generation-default coverage. |
+
+The profile is read and **pinned at process startup**. Other config values remain hot-reloadable, but changing `[endpoint].profile` on disk is ignored by the running session; restart `hymt` to use a different profile. Segment-cache keys and translation-history records retain the canonical profile ID, so results are not shared between profiles.
 
 ### Telegram bot (`[telegram]`)
 
@@ -146,8 +161,9 @@ The Rust main translation paths do **not** yet use paragraph-level language anal
 - target language
 - template type
 - template options
+- `profile_id` (canonical profile ID)
 
-The segment-cache key does **not** yet include endpoint/model identity, quantization or backend build, tokenizer version, or inference sampling settings. Those changes can therefore reuse entries from an older inference profile; `config_version` is recorded in task history, not the segment-cache key. Inference fingerprinting is required before those profiles are isolated automatically.
+Profile isolation is therefore provided. The segment-cache key does **not** yet include endpoint/model identity, tokenizer revision, quantization or backend build, or inference sampling settings (see #115). Changes to those settings can therefore reuse entries from an older inference profile; `config_version` is recorded in task history, not the segment-cache key. Inference fingerprinting is required before those settings are isolated automatically.
 
 That enables:
 
