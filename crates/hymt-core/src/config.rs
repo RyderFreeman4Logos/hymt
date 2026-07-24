@@ -45,6 +45,9 @@ first_chunk_priority = false
 # Set to 0 to disable the hard cap (budget is then only expansion/context-limited).
 max_source_tokens_per_segment = 1024
 debug_chunk_timing = false
+# Refuse planning when the active profile/tokenizer cannot count the final chat
+# request locally. Default false keeps an explicitly warned conservative fallback.
+strict_token_budget = false
 # Preserve high-confidence target-language paragraphs for Chinese-family targets.
 language_detection = true
 # Submit every non-code paragraph, including already-target-language paragraphs.
@@ -971,6 +974,13 @@ impl HotConfig {
         self.get_bool("translation", "debug_chunk_timing", false)
     }
 
+    /// Refuse request plans that cannot count the profiled chat template with a
+    /// local tokenizer. This makes unknown/generic endpoints fail closed rather
+    /// than use the explicitly warned conservative approximation.
+    pub fn strict_token_budget(&self) -> bool {
+        self.get_bool("translation", "strict_token_budget", false)
+    }
+
     /// Selects whether document planning detects and preserves already-target text.
     pub fn document_translation_policy(&self) -> DocumentTranslationPolicy {
         if self.get_bool("translation", "force_translate_all", false)
@@ -1629,6 +1639,15 @@ mod tests {
         assert!((cfg.completeness_min_paragraph_ratio() - 0.5).abs() < f64::EPSILON);
         assert_eq!(cfg.completeness_max_retries(), 2);
         assert!(!cfg.completeness_warn_only());
+        assert!(!cfg.strict_token_budget());
+    }
+
+    #[test]
+    fn strict_token_budget_reads_translation_setting() {
+        let path = temp_config_path("strict_token_budget");
+        fs::write(&path, "[translation]\nstrict_token_budget = true\n").unwrap();
+        let cfg = HotConfig::from_path(&path).unwrap();
+        assert!(cfg.strict_token_budget());
     }
 
     #[test]

@@ -30,6 +30,7 @@ use hymt_core::language::{
     plan_document_translation, DocumentLanguagePlan, DocumentTranslationPolicy, SectionKind,
 };
 use hymt_core::language_spec::{language_spec_or_none, LanguageFamily};
+use hymt_core::model_profile::ModelProfile;
 use hymt_core::templates::{build_prompt, PromptOpts, TemplateType};
 use hymt_segment::Segmenter;
 
@@ -93,6 +94,9 @@ impl ChunkTiming {
 
 const OUTPUT_SAFETY_FACTOR: f64 = 1.5;
 const MIN_EXPANSION_FOR_BUDGET: f64 = 1.0;
+const APPROXIMATE_CHAT_FRAMING_TOKENS: usize = 64;
+const APPROXIMATE_SAFETY_FACTOR: usize = 2;
+const COMPLETENESS_RETRY_INSTRUCTION: &str = "\n\nTranslate the COMPLETE input. Do not stop early.";
 
 fn expansion_ratio(target_lang: &str) -> f64 {
     let Some(spec) = language_spec_or_none(target_lang) else {
@@ -113,6 +117,56 @@ fn expansion_ratio(target_lang: &str) -> f64 {
 
 // ── TranslationPlan ───────────────────────────────────────────────────────────
 
+/// Origin of the token count used to bound an outbound chat request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TokenCountingSource {
+    /// The active profile's pinned chat template was rendered and counted with
+    /// a local tokenizer.
+    Local,
+    /// The endpoint/template is not locally known. The planner used a visible,
+    /// conservative byte estimate plus chat-framing and safety reservations.
+    Approximate,
+}
+
+impl TokenCountingSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Approximate => "approximate",
+        }
+    }
+}
+
+/// Diagnostics for the complete chat request budget used by a translation plan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TokenBudget {
+    /// Whether the final request was counted locally or conservatively estimated.
+    pub counting_source: TokenCountingSource,
+    /// Active model profile used to choose the tokenizer/chat template.
+    pub profile_id: String,
+    /// Pinned tokenizer source and revision, when the profile supplies one.
+    pub tokenizer_revision: Option<String>,
+    /// Pinned chat-template identity, when locally known.
+    pub chat_template_identity: Option<String>,
+    /// Context available to one backend request slot.
+    pub per_slot_context: usize,
+    /// Input capacity after reserving output tokens.
+    pub input_capacity_tokens: usize,
+    /// Reserved generation tokens passed to the backend.
+    pub output_reservation_tokens: usize,
+    /// Complete empty-source request: prompt template, chat framing, and
+    /// assistant generation marker (and retry instruction when configured).
+    pub template_tokens: usize,
+    /// Conservative tokens added beyond the raw byte estimate, if approximate.
+    pub safety_margin_tokens: usize,
+    /// Number of segment revisions needed after measuring complete requests.
+    pub revisions: usize,
+    /// Complete input token count for every emitted segment.
+    pub segment_input_tokens: Vec<usize>,
+    /// Non-empty only when the conservative fallback was used.
+    pub warning: Option<String>,
+}
+
 /// Segmentation plan for a single translation task.
 pub struct TranslationPlan {
     /// Total token count of the original source text.
@@ -121,6 +175,8 @@ pub struct TranslationPlan {
     pub segments: Vec<String>,
     /// Maximum tokens that can be submitted per segment.
     pub available_source_tokens: usize,
+    /// Counting source and complete-request capacity diagnostics.
+    pub token_budget: TokenBudget,
     /// Document language plan used to build the segments.
     pub document_plan: Option<DocumentLanguagePlan>,
     /// For each segment: the first section index of its group.
@@ -489,17 +545,20 @@ pub fn plan_translation_with_policy(
     opts: &PromptOpts,
     document_policy: DocumentTranslationPolicy,
 ) -> Result<TranslationPlan> {
-    let overhead_prompt = build_prompt("", target_lang, template, opts)?;
-    let overhead_tokens = segmenter.count_tokens(&overhead_prompt);
+    let profile = config.model_profile().map_err(|error| anyhow!(error))?;
     let per_request_context = config.per_request_context() as usize;
     let max_output = config.max_output_tokens() as usize;
+    let input_capacity = per_request_context.saturating_sub(max_output);
+    let overhead_prompt = prompt_for_budget("", target_lang, template, opts, config)?;
+    let overhead = count_final_request(profile, segmenter, &overhead_prompt);
+    reject_approximate_budget_if_strict(overhead.source, config)?;
 
-    let reserved_tokens = overhead_tokens + max_output;
-    let base_budget = per_request_context.saturating_sub(reserved_tokens);
+    let base_budget = input_capacity.saturating_sub(overhead.tokens);
     if base_budget == 0 {
         anyhow::bail!(
-            "per_request_context ({per_request_context}) too small for template overhead \
-             ({overhead_tokens}) + max_output_tokens ({max_output})"
+            "per_request_context ({per_request_context}) too small for complete final request \
+             template ({}) + max_output_tokens ({max_output})",
+            overhead.tokens
         );
     }
 
@@ -514,10 +573,23 @@ pub fn plan_translation_with_policy(
     }
 
     if text.is_empty() {
+        let token_budget = make_token_budget(
+            profile,
+            overhead.source,
+            per_request_context,
+            input_capacity,
+            max_output,
+            overhead.tokens,
+            overhead.safety_margin_tokens,
+            0,
+            Vec::new(),
+        );
+        emit_approximate_budget_warning(&token_budget);
         return Ok(TranslationPlan {
             source_tokens: 0,
             segments: Vec::new(),
             available_source_tokens: available,
+            token_budget,
             document_plan: None,
             segment_section_indexes: Vec::new(),
             segment_section_groups: Vec::new(),
@@ -527,25 +599,247 @@ pub fn plan_translation_with_policy(
     let doc_plan = plan_document_translation(text, target_lang, document_policy);
     let source_tokens = segmenter.count_tokens(text);
     let (segments, indexes, groups) = segment_document_plan(&doc_plan, segmenter, available)?;
-    for (index, segment) in segments.iter().enumerate() {
-        let segment_tokens = segmenter.count_tokens(segment);
-        if segment_tokens > available {
-            anyhow::bail!(
-                "segment {index} exceeds per-request source budget: {segment_tokens} tokens > \
-                 {available} after reserving template overhead ({overhead_tokens}) and \
-                 max_output_tokens ({max_output}) from per_request_context ({per_request_context})"
-            );
-        }
-    }
+    let fitted = fit_segments_to_final_request_budget(
+        segments,
+        indexes,
+        groups,
+        target_lang,
+        template,
+        opts,
+        config,
+        segmenter,
+        profile,
+        input_capacity,
+    )?;
+    let counting_source =
+        if overhead.source == TokenCountingSource::Approximate || fitted.used_approximate {
+            TokenCountingSource::Approximate
+        } else {
+            TokenCountingSource::Local
+        };
+    reject_approximate_budget_if_strict(counting_source, config)?;
+    let token_budget = make_token_budget(
+        profile,
+        counting_source,
+        per_request_context,
+        input_capacity,
+        max_output,
+        overhead.tokens,
+        overhead
+            .safety_margin_tokens
+            .max(fitted.safety_margin_tokens),
+        fitted.revisions,
+        fitted.segment_input_tokens,
+    );
+    emit_approximate_budget_warning(&token_budget);
 
     Ok(TranslationPlan {
         source_tokens,
-        segments,
+        segments: fitted.segments,
         available_source_tokens: available,
+        token_budget,
         document_plan: Some(doc_plan),
-        segment_section_indexes: indexes,
-        segment_section_groups: groups,
+        segment_section_indexes: fitted.indexes,
+        segment_section_groups: fitted.groups,
     })
+}
+
+#[derive(Clone, Copy)]
+struct FinalRequestTokens {
+    tokens: usize,
+    source: TokenCountingSource,
+    safety_margin_tokens: usize,
+}
+
+struct FittedSegments {
+    segments: Vec<String>,
+    indexes: Vec<usize>,
+    groups: Vec<Vec<usize>>,
+    segment_input_tokens: Vec<usize>,
+    safety_margin_tokens: usize,
+    revisions: usize,
+    used_approximate: bool,
+}
+
+fn prompt_for_budget(
+    segment: &str,
+    target_lang: &str,
+    template: &TemplateType,
+    opts: &PromptOpts,
+    config: &HotConfig,
+) -> Result<String> {
+    let mut prompt = build_prompt(segment, target_lang, template, opts)?;
+    // Completeness retries append this exact instruction. Reserve it up front so
+    // a retry cannot turn an otherwise valid plan into an over-context request.
+    if config.completeness_max_retries() > 0 {
+        prompt.push_str(COMPLETENESS_RETRY_INSTRUCTION);
+    }
+    Ok(prompt)
+}
+
+fn count_final_request(
+    profile: ModelProfile,
+    segmenter: &Segmenter,
+    prompt: &str,
+) -> FinalRequestTokens {
+    if segmenter.has_exact_tokenizer() {
+        if let Some(rendered) = profile.render_chat_user_prompt(prompt) {
+            if let Some(tokens) = segmenter.count_tokens_exact(&rendered) {
+                return FinalRequestTokens {
+                    tokens,
+                    source: TokenCountingSource::Local,
+                    safety_margin_tokens: 0,
+                };
+            }
+        }
+    }
+
+    // The approximate path deliberately avoids treating a tokenizer alone as
+    // exact when the endpoint's chat template is unknown. It includes a fixed
+    // role/generation framing allowance and doubles the text estimate,
+    // which is conservative for the prior 4-byte-only fallback (especially CJK).
+    let raw_prompt_tokens = if prompt.is_empty() {
+        0
+    } else {
+        prompt.len().div_ceil(4).max(1)
+    };
+    let tokens = raw_prompt_tokens
+        .saturating_mul(APPROXIMATE_SAFETY_FACTOR)
+        .saturating_add(APPROXIMATE_CHAT_FRAMING_TOKENS);
+    FinalRequestTokens {
+        tokens,
+        source: TokenCountingSource::Approximate,
+        safety_margin_tokens: tokens.saturating_sub(raw_prompt_tokens),
+    }
+}
+
+fn reject_approximate_budget_if_strict(
+    source: TokenCountingSource,
+    config: &HotConfig,
+) -> Result<()> {
+    if source == TokenCountingSource::Approximate && config.strict_token_budget() {
+        anyhow::bail!(
+            "translation.strict_token_budget=true refuses approximate token budgeting; configure a profiled endpoint and download its tokenizer"
+        );
+    }
+    Ok(())
+}
+
+fn token_budget_warning(profile: ModelProfile) -> String {
+    format!(
+        "Warning: approximate token budgeting is active for profile {}; the final chat template/tokenizer is unavailable. Applying {}x input safety factor plus {} chat-framing tokens. Run `hymt tokenizer download` with a profiled endpoint, or set translation.strict_token_budget = true to refuse this fallback.",
+        profile.id(),
+        APPROXIMATE_SAFETY_FACTOR,
+        APPROXIMATE_CHAT_FRAMING_TOKENS,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn make_token_budget(
+    profile: ModelProfile,
+    counting_source: TokenCountingSource,
+    per_slot_context: usize,
+    input_capacity_tokens: usize,
+    output_reservation_tokens: usize,
+    template_tokens: usize,
+    safety_margin_tokens: usize,
+    revisions: usize,
+    segment_input_tokens: Vec<usize>,
+) -> TokenBudget {
+    TokenBudget {
+        counting_source,
+        profile_id: profile.id().to_owned(),
+        tokenizer_revision: profile
+            .tokenizer()
+            .map(|source| format!("{}@{}", source.repo, source.revision)),
+        chat_template_identity: profile.chat_template_identity().map(str::to_owned),
+        per_slot_context,
+        input_capacity_tokens,
+        output_reservation_tokens,
+        template_tokens,
+        safety_margin_tokens,
+        revisions,
+        segment_input_tokens,
+        warning: (counting_source == TokenCountingSource::Approximate)
+            .then(|| token_budget_warning(profile)),
+    }
+}
+
+fn emit_approximate_budget_warning(token_budget: &TokenBudget) {
+    if let Some(warning) = &token_budget.warning {
+        eprintln!("{warning}");
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fit_segments_to_final_request_budget(
+    segments: Vec<String>,
+    indexes: Vec<usize>,
+    groups: Vec<Vec<usize>>,
+    target_lang: &str,
+    template: &TemplateType,
+    opts: &PromptOpts,
+    config: &HotConfig,
+    segmenter: &Segmenter,
+    profile: ModelProfile,
+    input_capacity: usize,
+) -> Result<FittedSegments> {
+    let mut fitted = FittedSegments {
+        segments: Vec::new(),
+        indexes: Vec::new(),
+        groups: Vec::new(),
+        segment_input_tokens: Vec::new(),
+        safety_margin_tokens: 0,
+        revisions: 0,
+        used_approximate: false,
+    };
+
+    for ((segment, index), group) in segments.into_iter().zip(indexes).zip(groups) {
+        let mut pending = vec![segment];
+        while let Some(segment) = pending.pop() {
+            let prompt = prompt_for_budget(&segment, target_lang, template, opts, config)?;
+            let final_request = count_final_request(profile, segmenter, &prompt);
+            reject_approximate_budget_if_strict(final_request.source, config)?;
+            fitted.used_approximate |= final_request.source == TokenCountingSource::Approximate;
+            fitted.safety_margin_tokens = fitted
+                .safety_margin_tokens
+                .max(final_request.safety_margin_tokens);
+
+            if final_request.tokens <= input_capacity {
+                fitted.segment_input_tokens.push(final_request.tokens);
+                fitted.indexes.push(index);
+                fitted.groups.push(group.clone());
+                fitted.segments.push(segment);
+                continue;
+            }
+
+            let source_tokens = segmenter.count_tokens(&segment);
+            let excess = final_request.tokens.saturating_sub(input_capacity);
+            let split_limit = source_tokens
+                .saturating_sub(excess)
+                .min(source_tokens.saturating_sub(1));
+            if split_limit == 0 {
+                anyhow::bail!(
+                    "final request for a segment is {}/{} input tokens after chat-template framing; it cannot be split further",
+                    final_request.tokens,
+                    input_capacity
+                );
+            }
+            let pieces = segmenter.segment(&segment, split_limit).map_err(|error| {
+                anyhow!("segmentation error while fitting final request: {error}")
+            })?;
+            if pieces.len() <= 1 {
+                anyhow::bail!(
+                    "final request for a segment is {}/{} input tokens after chat-template framing; it cannot be split further",
+                    final_request.tokens,
+                    input_capacity
+                );
+            }
+            fitted.revisions += 1;
+            pending.extend(pieces.into_iter().rev());
+        }
+    }
+    Ok(fitted)
 }
 
 type SegmentPlanResult = (Vec<String>, Vec<usize>, Vec<Vec<usize>>);
@@ -759,7 +1053,7 @@ async fn translate_segment_with_completeness(
     for attempt in 0..=max_retries {
         let mut prompt = build_prompt(segment, target_lang, template, opts)?;
         if attempt > 0 {
-            prompt.push_str("\n\nTranslate the COMPLETE input. Do not stop early.");
+            prompt.push_str(COMPLETENESS_RETRY_INSTRUCTION);
         }
 
         let completion = client
@@ -1014,7 +1308,7 @@ async fn translate_segment_with_completeness_streaming(
             request.template,
             request.opts,
         )?;
-        prompt.push_str("\n\nTranslate the COMPLETE input. Do not stop early.");
+        prompt.push_str(COMPLETENESS_RETRY_INSTRUCTION);
 
         let completion = request
             .client
@@ -2910,8 +3204,12 @@ max_retries = 1
             context: Some("preserve the heading hierarchy".to_owned()),
             ..PromptOpts::default()
         };
-        let overhead =
-            seg.count_tokens(&build_prompt("", "zh", &TemplateType::Default, &opts).unwrap());
+        let overhead = count_final_request(
+            ModelProfile::Generic,
+            &seg,
+            &build_prompt("", "zh", &TemplateType::Default, &opts).unwrap(),
+        )
+        .tokens;
         let max_output_tokens = 512;
         let expected_available = 64;
         let dir = tempfile::tempdir().unwrap();
@@ -2919,7 +3217,7 @@ max_retries = 1
         std::fs::write(
             &cfg_path,
             format!(
-                "[backend]\ntotal_context = 65536\nparallel_slots = 8\nper_request_context = {}\n\n[translation]\nmax_output_tokens = {max_output_tokens}\nmax_source_tokens_per_segment = 0\n",
+                "[backend]\ntotal_context = 65536\nparallel_slots = 8\nper_request_context = {}\n\n[translation]\nmax_output_tokens = {max_output_tokens}\nmax_source_tokens_per_segment = 0\n\n[completeness]\nmax_retries = 0\n",
                 overhead + max_output_tokens + expected_available,
             ),
         )
@@ -2929,6 +3227,183 @@ max_retries = 1
         let plan =
             plan_translation("source", "zh", &cfg, &seg, &TemplateType::Default, &opts).unwrap();
         assert_eq!(plan.available_source_tokens, expected_available);
+    }
+
+    #[test]
+    fn approximate_budgeting_is_explicit_and_has_a_safety_margin() {
+        let seg = fallback_segmenter();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            "[translation]\ncontext_window = 4096\nmax_output_tokens = 512\n",
+        )
+        .unwrap();
+        let cfg = hymt_core::config::HotConfig::from_path(&cfg_path).unwrap();
+
+        for source in [
+            "English prose that needs a conservative translation budget.",
+            "这是需要保守翻译预算的中文段落。",
+            "Mixed CJK/ASCII prose with https://example.example/path?--option=value&lang=中文",
+        ] {
+            let plan = plan_translation(
+                source,
+                "zh",
+                &cfg,
+                &seg,
+                &TemplateType::Default,
+                &PromptOpts::default(),
+            )
+            .unwrap();
+
+            assert_eq!(
+                plan.token_budget.counting_source,
+                TokenCountingSource::Approximate
+            );
+            assert!(plan.token_budget.warning.is_some());
+            assert!(plan.token_budget.safety_margin_tokens > 0);
+            assert!(plan
+                .token_budget
+                .segment_input_tokens
+                .iter()
+                .all(|tokens| *tokens <= plan.token_budget.input_capacity_tokens));
+        }
+
+        let context_aware = plan_translation(
+            "term source",
+            "zh",
+            &cfg,
+            &seg,
+            &TemplateType::ContextAware,
+            &PromptOpts {
+                context: Some("Translate this release note for a technical audience.".to_owned()),
+                ..PromptOpts::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            context_aware.token_budget.counting_source,
+            TokenCountingSource::Approximate
+        );
+    }
+
+    #[test]
+    fn strict_token_budget_refuses_approximate_counting() {
+        let seg = fallback_segmenter();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            "[translation]\ncontext_window = 4096\nmax_output_tokens = 512\nstrict_token_budget = true\n",
+        )
+        .unwrap();
+        let cfg = hymt_core::config::HotConfig::from_path(&cfg_path).unwrap();
+
+        let error = plan_translation(
+            "a source that must not be planned with an unknown tokenizer",
+            "zh",
+            &cfg,
+            &seg,
+            &TemplateType::Default,
+            &PromptOpts::default(),
+        )
+        .err()
+        .expect("strict mode must reject an approximate budget");
+
+        assert!(error.to_string().contains("strict_token_budget"));
+    }
+
+    #[test]
+    fn local_budget_counts_the_complete_chat_template_at_the_context_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let tokenizer_path = dir.path().join("tokenizer.json");
+        std::fs::write(
+            &tokenizer_path,
+            r#"{
+  "version":"1.0",
+  "truncation":null,
+  "padding":null,
+  "added_tokens":[
+    {"id":1,"content":"<|startoftext|>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true},
+    {"id":2,"content":"<|extra_0|>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}
+  ],
+  "normalizer":null,
+  "pre_tokenizer":{"type":"Whitespace"},
+  "post_processor":null,
+  "decoder":null,
+  "model":{"type":"WordLevel","vocab":{"[UNK]":0,"<|startoftext|>":1,"<|extra_0|>":2},"unk_token":"[UNK]"}
+}"#,
+        )
+        .unwrap();
+        let segmenter = Segmenter::new(Some(tokenizer_path)).unwrap();
+        let source = "hello";
+        let opts = PromptOpts::default();
+        let rendered_prompt = hymt_core::model_profile::ModelProfile::HyMt2_7b
+            .render_chat_user_prompt(
+                &build_prompt(source, "zh", &TemplateType::Default, &opts).unwrap(),
+            )
+            .expect("the profiled chat template is known");
+        let rendered_tokens = segmenter
+            .count_tokens_exact(&rendered_prompt)
+            .expect("test tokenizer must count the rendered request");
+        let output_reservation = 8;
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "[endpoint]\nprofile = \"hy_mt2_7b\"\n\n[backend]\ntotal_context = {}\nparallel_slots = 1\n\n[translation]\nmax_output_tokens = {output_reservation}\nmax_source_tokens_per_segment = 0\n\n[completeness]\nmax_retries = 0\n",
+                rendered_tokens + output_reservation
+            ),
+        )
+        .unwrap();
+        let cfg = hymt_core::config::HotConfig::from_path(&cfg_path).unwrap();
+
+        let plan = plan_translation(
+            source,
+            "zh",
+            &cfg,
+            &segmenter,
+            &TemplateType::Default,
+            &opts,
+        )
+        .expect("the exact final request must fit exactly");
+        assert_eq!(
+            plan.token_budget.counting_source,
+            TokenCountingSource::Local
+        );
+        assert_eq!(
+            plan.token_budget.segment_input_tokens,
+            vec![rendered_tokens]
+        );
+        assert_eq!(
+            plan.token_budget.per_slot_context,
+            rendered_tokens + output_reservation
+        );
+        assert!(plan.token_budget.chat_template_identity.is_some());
+
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "[endpoint]\nprofile = \"hy_mt2_7b\"\n\n[backend]\ntotal_context = {}\nparallel_slots = 1\n\n[translation]\nmax_output_tokens = {output_reservation}\nmax_source_tokens_per_segment = 0\n\n[completeness]\nmax_retries = 0\n",
+                rendered_tokens + output_reservation - 1
+            ),
+        )
+        .unwrap();
+        let one_token_short = hymt_core::config::HotConfig::from_path(&cfg_path).unwrap();
+        let error = plan_translation(
+            source,
+            "zh",
+            &one_token_short,
+            &segmenter,
+            &TemplateType::Default,
+            &opts,
+        )
+        .err()
+        .expect("a one-token-over final request must not be planned");
+        assert!(
+            error.to_string().contains("final request") || error.to_string().contains("too small"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[tokio::test]
@@ -2969,9 +3444,7 @@ max_retries = 1
         .unwrap_err();
 
         assert!(
-            error
-                .to_string()
-                .contains("exceeds per-request source budget"),
+            error.to_string().contains("protected block too large"),
             "unexpected error: {error:#}"
         );
         assert_eq!(request_count.load(Ordering::SeqCst), 0);
@@ -2986,6 +3459,20 @@ max_retries = 1
             source_tokens: 0,
             segments: vec!["a".to_owned(), "b".to_owned(), "c".to_owned()],
             available_source_tokens: 100,
+            token_budget: TokenBudget {
+                counting_source: TokenCountingSource::Local,
+                profile_id: "test".to_owned(),
+                tokenizer_revision: None,
+                chat_template_identity: None,
+                per_slot_context: 100,
+                input_capacity_tokens: 90,
+                output_reservation_tokens: 10,
+                template_tokens: 0,
+                safety_margin_tokens: 0,
+                revisions: 0,
+                segment_input_tokens: vec![1, 1, 1],
+                warning: None,
+            },
             document_plan: None,
             segment_section_indexes: vec![],
             segment_section_groups: vec![],

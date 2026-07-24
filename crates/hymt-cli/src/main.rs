@@ -785,6 +785,37 @@ fn print_translation_plan(plan: &TranslationPlan) {
         plan.segments.len(),
         plan.source_tokens
     );
+    let budget = &plan.token_budget;
+    eprintln!(
+        "  token budget: source={} profile={} per_slot_context={} input_capacity={} output_reservation={} template_tokens={} safety_margin={} revisions={}",
+        budget.counting_source.as_str(),
+        budget.profile_id,
+        budget.per_slot_context,
+        budget.input_capacity_tokens,
+        budget.output_reservation_tokens,
+        budget.template_tokens,
+        budget.safety_margin_tokens,
+        budget.revisions,
+    );
+    eprintln!(
+        "  token identity: tokenizer={} chat_template={}",
+        budget
+            .tokenizer_revision
+            .as_deref()
+            .unwrap_or("unavailable"),
+        budget
+            .chat_template_identity
+            .as_deref()
+            .unwrap_or("unavailable"),
+    );
+    if !budget.segment_input_tokens.is_empty() {
+        eprintln!(
+            "  token inputs: min={} max={} available_source_tokens={}",
+            budget.segment_input_tokens.iter().min().unwrap_or(&0),
+            budget.segment_input_tokens.iter().max().unwrap_or(&0),
+            plan.available_source_tokens,
+        );
+    }
     if let Some(document_plan) = &plan.document_plan {
         for section in document_plan
             .sections

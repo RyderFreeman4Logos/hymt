@@ -306,20 +306,25 @@ fn split_list_items_basic() {
 // ── segment() with markdown blocks ───────────────────────────────────────────
 
 #[test]
-fn segment_fenced_code_not_split_when_oversized() {
-    // A code block with many lines exceeding a tiny token budget.
+fn segment_fenced_code_fails_closed_when_oversized() {
+    // A code block with many lines exceeding a tiny token budget must never be
+    // emitted as an over-budget atomic request.
     let code = "```\n".to_owned() + &"x = 1;\n".repeat(20) + "```\n";
-    let result = seg().segment(&code, 5).unwrap();
-    assert_eq!(result.len(), 1, "code block must not be split: {result:?}");
-    assert_eq!(result[0], code);
+    let error = seg().segment(&code, 5).unwrap_err();
+    assert!(matches!(
+        error,
+        crate::SegmentError::ProtectedBlockTooLarge { .. }
+    ));
 }
 
 #[test]
-fn segment_table_not_split_when_oversized() {
+fn segment_table_fails_closed_when_oversized() {
     let table = "| A | B |\n|---|---|\n".to_owned() + &"| x | y |\n".repeat(10);
-    let result = seg().segment(&table, 5).unwrap();
-    assert_eq!(result.len(), 1, "table must not be split: {result:?}");
-    assert_eq!(result[0], table);
+    let error = seg().segment(&table, 5).unwrap_err();
+    assert!(matches!(
+        error,
+        crate::SegmentError::ProtectedBlockTooLarge { .. }
+    ));
 }
 
 #[test]
