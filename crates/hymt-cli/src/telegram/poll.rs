@@ -139,7 +139,6 @@ impl EditRateLimiter {
         if let Some(delay) = self.remaining_delay(Instant::now()) {
             tokio::time::sleep(delay).await;
         }
-        self.record_edit(Instant::now());
     }
 }
 
@@ -176,6 +175,7 @@ async fn publish_stream_batch<A: TelegramMessageApi>(
     edit_rate_limiter.wait_before_edit().await;
     match api.edit_message(chat_id, message_id, &rendered_text).await {
         Ok(()) => {
+            edit_rate_limiter.record_edit(Instant::now());
             if let Some((_, rendered_prefix)) = sent_message.as_mut() {
                 *rendered_prefix = rendered_text;
             }
@@ -687,6 +687,60 @@ mod tests {
         }
     }
 
+    struct RetryingEditMockTelegramApi {
+        retry_after: Duration,
+        edit_count: std::sync::Mutex<usize>,
+        retry_succeeded_at: std::sync::Mutex<Option<Instant>>,
+        next_edit_started_at: std::sync::Mutex<Option<Instant>>,
+    }
+
+    impl RetryingEditMockTelegramApi {
+        fn new(retry_after: Duration) -> Self {
+            Self {
+                retry_after,
+                edit_count: std::sync::Mutex::new(0),
+                retry_succeeded_at: std::sync::Mutex::new(None),
+                next_edit_started_at: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn retry_succeeded_at(&self) -> Instant {
+            self.retry_succeeded_at
+                .lock()
+                .unwrap()
+                .expect("first edit should retry successfully")
+        }
+
+        fn next_edit_started_at(&self) -> Instant {
+            self.next_edit_started_at
+                .lock()
+                .unwrap()
+                .expect("next batch should edit the message")
+        }
+    }
+
+    impl TelegramMessageApi for RetryingEditMockTelegramApi {
+        async fn send_message(&self, _chat_id: i64, _text: &str) -> Result<i64> {
+            Ok(777)
+        }
+
+        async fn edit_message(&self, _chat_id: i64, _message_id: i64, _text: &str) -> Result<()> {
+            let edit_count = {
+                let mut edit_count = self.edit_count.lock().unwrap();
+                *edit_count += 1;
+                *edit_count
+            };
+
+            if edit_count == 1 {
+                tokio::time::sleep(self.retry_after).await;
+                *self.retry_succeeded_at.lock().unwrap() = Some(Instant::now());
+            } else {
+                *self.next_edit_started_at.lock().unwrap() = Some(Instant::now());
+            }
+            Ok(())
+        }
+    }
+
     async fn deliver_mock_events(api: &MockTelegramApi, events: Vec<StreamEvent>) -> Result<()> {
         let (tx, rx) = tokio::sync::mpsc::channel(events.len());
         for event in events {
@@ -750,6 +804,36 @@ mod tests {
                 .filter(|call| matches!(call, TelegramCall::Edit { .. }))
                 .count(),
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_delivery_throttles_after_a_retrying_edit_succeeds() {
+        let retry_after = Duration::from_millis(75);
+        let edit_interval = Duration::from_millis(100);
+        let api = RetryingEditMockTelegramApi::new(retry_after);
+        let (tx, rx) = tokio::sync::mpsc::channel(5);
+        for event in [
+            StreamEvent::Token("first".into()),
+            StreamEvent::SegmentDone(0),
+            StreamEvent::Token(" second".into()),
+            StreamEvent::SegmentDone(1),
+            StreamEvent::AllDone("first second final".into()),
+        ] {
+            tx.send(event).await.unwrap();
+        }
+        drop(tx);
+
+        deliver_stream_events(&api, 42, rx, edit_interval)
+            .await
+            .unwrap();
+
+        let elapsed_since_retry_success = api
+            .next_edit_started_at()
+            .saturating_duration_since(api.retry_succeeded_at());
+        assert!(
+            elapsed_since_retry_success >= Duration::from_millis(80),
+            "next edit started only {elapsed_since_retry_success:?} after the retried edit succeeded"
         );
     }
 }
