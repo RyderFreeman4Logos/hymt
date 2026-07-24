@@ -74,6 +74,30 @@ fn fingerprint_omits_profile_sampling_when_server_owns_defaults() {
 }
 
 #[test]
+fn partial_sampler_override_does_not_verify_the_cache_identity() {
+    with_config(
+        "fingerprint-partial-sampling",
+        "[endpoint]\nmodel = \"served-model\"\nbackend = \"llama_cpp\"\n\n[inference.override]\ntemperature = 0.7\n",
+        |config| {
+            let fingerprint = config
+                .inference_fingerprint("default", "")
+                .expect("fingerprint");
+            let canonical: serde_json::Value =
+                serde_json::from_str(fingerprint.canonical_json()).expect("canonical JSON");
+            let generation = canonical["generation"]
+                .as_object()
+                .expect("generation object");
+
+            assert_eq!(generation["temperature"], 0.7);
+            assert!(
+                !fingerprint.is_cache_verified(),
+                "any service-owned sampler makes the cache identity unverifiable"
+            );
+        },
+    );
+}
+
+#[test]
 fn supplied_llama_cpp_services_pin_the_documented_sampling_profile() {
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     for service in ["hy-mt2-quality.service", "hy-mt2-throughput.service"] {

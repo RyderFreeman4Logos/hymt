@@ -300,6 +300,16 @@ impl GenerationSettings {
         )
     }
 
+    /// Whether any sampler remains omitted from the request payload.
+    fn uses_any_server_defaults(&self) -> bool {
+        matches!(self.temperature, Setting::ServerDefault)
+            || matches!(self.top_p, Setting::ServerDefault)
+            || matches!(self.top_k, Setting::ServerDefault)
+            || matches!(self.repetition_penalty, Setting::ServerDefault)
+            || matches!(self.min_p, Setting::ServerDefault)
+            || matches!(self.repeat_last_n, Setting::ServerDefault)
+    }
+
     /// Remove explicit sampler settings which the selected adapter cannot put
     /// on the wire. Explicit unsupported overrides are rejected before this
     /// normalization, so this keeps the fingerprint aligned with serialized
@@ -1022,8 +1032,8 @@ impl HotConfig {
         let effective_settings = settings.normalized_for_backend(backend);
         let model = self.model();
         // A Generic profile without an explicit served model, or a request that
-        // delegates every sampler to the server, has no stable cache namespace.
-        let cache_verified = !(effective_settings.uses_only_server_defaults()
+        // delegates any sampler to the server, has no stable cache namespace.
+        let cache_verified = !(effective_settings.uses_any_server_defaults()
             || (profile.is_generic() && model.is_empty()));
 
         let mut fields = BTreeMap::new();

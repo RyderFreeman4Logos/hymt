@@ -340,6 +340,7 @@ impl TranslationClient {
             .inner
             .http
             .get(&url)
+            .headers(self.build_headers())
             .timeout(Duration::from_secs(3))
             .send()
             .await
@@ -1443,6 +1444,12 @@ mod tests {
             let count = socket.read(&mut request).await.unwrap();
             let request = std::str::from_utf8(&request[..count]).unwrap();
             assert!(request.starts_with("GET /props HTTP/1.1"));
+            assert!(request
+                .lines()
+                .any(|line| { line.eq_ignore_ascii_case("authorization: Bearer props-test-key") }));
+            assert!(request
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("content-type: application/json")));
 
             let body = r#"{"default_generation_settings":{"temperature":0.7,"top_p":0.6,"top_k":20,"repeat_penalty":1.05}}"#;
             socket
@@ -1464,7 +1471,9 @@ mod tests {
         ));
         std::fs::write(
             &path,
-            format!("[endpoint]\nurl = \"http://{address}/v1\"\nbackend = \"llama_cpp\"\n"),
+            format!(
+                "[endpoint]\nurl = \"http://{address}/v1\"\nbackend = \"llama_cpp\"\napi_key = \"props-test-key\"\n"
+            ),
         )
         .unwrap();
         let config = HotConfig::from_path(&path).unwrap();

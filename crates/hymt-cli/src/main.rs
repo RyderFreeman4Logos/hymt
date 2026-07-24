@@ -506,11 +506,13 @@ async fn run() -> Result<()> {
              total_context, parallel_slots, and optional per_request_context instead."
         );
     }
-    if let Some(diagnostic) = TranslationClient::new(config.clone())?
-        .llama_cpp_props_diagnostic()
-        .await
-    {
-        eprintln!("{diagnostic}");
+    if should_run_llama_cpp_props_diagnostic(cli.cmd.as_ref()) {
+        if let Some(diagnostic) = TranslationClient::new(config.clone())?
+            .llama_cpp_props_diagnostic()
+            .await
+        {
+            eprintln!("{diagnostic}");
+        }
     }
     if cli.debug_chunk_timing {
         // CLI flag forces timing logs for this process; config/env also enable them.
@@ -684,6 +686,41 @@ fn profile_startup_diagnostic(profile: ModelProfile) -> String {
 
 fn legacy_generation_scalars_migration_warning() -> &'static str {
     "Warning: legacy [inference] sampler scalars are deprecated; move them under [inference.override]."
+}
+
+/// Whether this command will make use of the translation service.
+///
+/// `/props` is an observability preflight, so offline management commands must
+/// not pay its timeout or emit authentication diagnostics.
+fn should_run_llama_cpp_props_diagnostic(command: Option<&Cmd>) -> bool {
+    match command {
+        None
+        | Some(Cmd::Text(_))
+        | Some(Cmd::Man(_))
+        | Some(Cmd::Info(_))
+        | Some(Cmd::Batch(_))
+        | Some(Cmd::TranslateDoc(_))
+        | Some(Cmd::Exec(ExecArgs { action: None, .. }))
+        | Some(Cmd::Exec(ExecArgs {
+            action: Some(ExecAction::Precache),
+            ..
+        }))
+        | Some(Cmd::Telegram(TelegramArgs {
+            regenerate_claim_password: false,
+        })) => true,
+        Some(Cmd::Config(_))
+        | Some(Cmd::Tokenizer(_))
+        | Some(Cmd::Estimate(_))
+        | Some(Cmd::History(_))
+        | Some(Cmd::Recall(_))
+        | Some(Cmd::Exec(ExecArgs {
+            action: Some(ExecAction::Install(_)),
+            ..
+        }))
+        | Some(Cmd::Telegram(TelegramArgs {
+            regenerate_claim_password: true,
+        })) => false,
+    }
 }
 
 fn make_client_with_concurrency(
@@ -1707,6 +1744,45 @@ Options:\n  --source-id <SOURCE_ID>\n  --context-only\n";
         let warning = legacy_generation_scalars_migration_warning();
         assert!(warning.contains("legacy [inference] sampler scalars"));
         assert!(warning.contains("[inference.override]"));
+    }
+
+    #[test]
+    fn llama_cpp_props_diagnostic_only_preflights_translation_paths() {
+        let runs_props_diagnostic = |args: &[&str]| {
+            let cli = Cli::try_parse_from(args).expect("parse CLI arguments");
+            should_run_llama_cpp_props_diagnostic(cli.cmd.as_ref())
+        };
+
+        for args in [
+            &["hymt", "text to translate"][..],
+            &["hymt", "man", "ls"][..],
+            &["hymt", "info", "coreutils"][..],
+            &["hymt", "exec", "printf", "hello"][..],
+            &["hymt", "exec", "precache"][..],
+            &["hymt", "batch", "."][..],
+            &["hymt", "translate-doc", "document.md"][..],
+            &["hymt", "telegram"][..],
+        ] {
+            assert!(
+                runs_props_diagnostic(args),
+                "translation command must run the diagnostic: {args:?}"
+            );
+        }
+
+        for args in [
+            &["hymt", "config", "path"][..],
+            &["hymt", "tokenizer", "download"][..],
+            &["hymt", "estimate", "1"][..],
+            &["hymt", "history"][..],
+            &["hymt", "recall"][..],
+            &["hymt", "exec", "install"][..],
+            &["hymt", "telegram", "--regenerate-claim-password"][..],
+        ] {
+            assert!(
+                !runs_props_diagnostic(args),
+                "offline command must not run the diagnostic: {args:?}"
+            );
+        }
     }
 
     #[test]

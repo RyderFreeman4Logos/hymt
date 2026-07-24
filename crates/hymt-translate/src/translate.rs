@@ -2310,6 +2310,8 @@ temperature = 0.7
 top_p = 0.6
 top_k = 20
 repetition_penalty = 1.05
+min_p = 0.0
+repeat_last_n = 64
 
 [translation]
 context_window = 512
@@ -2353,13 +2355,19 @@ max_retries = 1
             .collect()
     }
 
-    fn make_unverified_stream_config(endpoint_url: &str) -> hymt_core::config::HotConfig {
-        let path = temp_path("unverified-config.toml");
+    fn make_partially_overridden_stream_config(endpoint_url: &str) -> hymt_core::config::HotConfig {
+        let path = temp_path("partial-sampling-config.toml");
         std::fs::write(
             &path,
             format!(
                 r#"[endpoint]
 url = "{endpoint_url}"
+profile = "hy_mt2_7b"
+model = "test-model"
+backend = "llama_cpp"
+
+[inference.override]
+temperature = 0.7
 
 [translation]
 context_window = 512
@@ -3822,11 +3830,11 @@ Bravo one text carries enough source material for cache validation and ordering 
     }
 
     #[tokio::test]
-    async fn unverified_inference_identity_bypasses_segment_cache() {
-        let source = "This generic-server source must not reuse a cached translation.";
+    async fn partial_sampler_override_bypasses_segment_cache() {
+        let source = "This partial sampler override must not reuse a cached translation.";
         let fresh = "fresh translation ".repeat(16);
         let server = start_mock_server(vec![MockResponse::Json(fresh.clone())]).await;
-        let cfg = make_unverified_stream_config(&server.endpoint_url);
+        let cfg = make_partially_overridden_stream_config(&server.endpoint_url);
         assert!(!cfg
             .inference_fingerprint(TemplateType::Default.as_str(), "")
             .unwrap()
@@ -3858,7 +3866,7 @@ Bravo one text carries enough source material for cache validation and ordering 
             inference_fingerprint: fingerprint.hash(),
         };
         let stale = complete_translation("STALE", &plan.segments[0]);
-        let history = HistoryDB::new(temp_path("unverified-cache-history.db"));
+        let history = HistoryDB::new(temp_path("partial-sampler-cache-history.db"));
         history
             .store_segment_cache(
                 &segment_cache_hash(&plan.segments[0]),
