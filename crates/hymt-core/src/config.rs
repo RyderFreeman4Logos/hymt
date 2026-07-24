@@ -411,9 +411,49 @@ fn validate_backend_context(data: &toml::Table) -> Result<(), CoreError> {
         }
     }
 
+    let total_context = backend
+        .get("total_context")
+        .and_then(toml::Value::as_integer)
+        .map(|value| value as u32)
+        .or_else(|| {
+            data.get("translation")
+                .and_then(toml::Value::as_table)
+                .and_then(|translation| translation.get("context_window"))
+                .and_then(toml::Value::as_integer)
+                .filter(|&value| value > 0)
+                .and_then(|value| u32::try_from(value).ok())
+        })
+        .unwrap_or(16_384);
+    let parallel_slots = backend
+        .get("parallel_slots")
+        .and_then(toml::Value::as_integer)
+        .map(|value| value as u32)
+        .unwrap_or(1);
+    let slot_capacity = total_context / parallel_slots;
+
+    if parallel_slots > total_context {
+        return Err(CoreError::Config(format!(
+            "backend.parallel_slots ({parallel_slots}) must not exceed backend.total_context \
+             ({total_context}); computed per-slot capacity is {slot_capacity}"
+        )));
+    }
+
+    if let Some(per_request_context) = backend
+        .get("per_request_context")
+        .and_then(toml::Value::as_integer)
+        .map(|value| value as u32)
+    {
+        if per_request_context > slot_capacity {
+            return Err(CoreError::Config(format!(
+                "backend.per_request_context ({per_request_context}) must not exceed computed \
+                 per-slot capacity ({slot_capacity}) from backend.total_context ({total_context}) \
+                 / backend.parallel_slots ({parallel_slots})"
+            )));
+        }
+    }
+
     Ok(())
 }
-
 fn parse_f64_setting(data: &toml::Table, key: &str) -> Result<Setting<f64>, CoreError> {
     match inference_value(data, key)? {
         None => Ok(Setting::ServerDefault),
@@ -1316,6 +1356,34 @@ mod tests {
         assert_eq!(cfg.total_context(), 65_536);
         assert_eq!(cfg.parallel_slots(), 8);
         assert_eq!(cfg.per_request_context(), 7_000);
+    }
+
+    #[test]
+    fn rejects_inconsistent_backend_context_at_load() {
+        for (tag, backend, expected_message) in [
+            (
+                "parallel_slots_exceed_total_context",
+                "total_context = 1\nparallel_slots = 2",
+                "backend.parallel_slots (2) must not exceed backend.total_context (1); computed per-slot capacity is 0",
+            ),
+            (
+                "per_request_context_exceeds_slot_capacity",
+                "total_context = 24576\nparallel_slots = 3\nper_request_context = 24576",
+                "backend.per_request_context (24576) must not exceed computed per-slot capacity (8192)",
+            ),
+        ] {
+            let path = temp_config_path(tag);
+            fs::write(&path, format!("[backend]\n{backend}\n")).unwrap();
+
+            let error = HotConfig::from_path(&path)
+                .err()
+                .expect("inconsistent backend context must fail at load");
+            let message = match error {
+                CoreError::Config(message) => message,
+                error => panic!("{tag}: expected a configuration error, got {error}"),
+            };
+            assert!(message.contains(expected_message), "{tag}: {message}");
+        }
     }
 
     #[test]
