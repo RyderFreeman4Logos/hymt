@@ -21,7 +21,7 @@ Hy-MT2是一款实用的Rust命令行工具：具备分词器感知的文本分�
 - 可用`hymt exec`封装任意Shell命令，或查看已翻译的`man`和`info`文档页面。
 - 可调出之前的输出结果，并查看带有处理效率统计信息的翻译历史。
 - 使用`hymt translate-doc`可保持双语Markdown文档的同步。
-- 还提供可选的Telegram机器人（`hymt telegram`），用于实现私有多用户权限管理以及群组内的中英互译功能。
+- 还提供可选的Telegram机器人（`hymt telegram`），用于实现私有多用户权限管理以及群组内的中英互译，并支持`.txt`和`.md`文档。
 
 ## 安装
 
@@ -152,6 +152,9 @@ divergence_threshold = 2.0
 ```toml
 [telegram]
 enabled = false
+stream = true              # 为多分段文本译文渐进编辑同一条回复
+accept_documents = true      # 接受 .txt/.md 文档
+max_document_size = 1048576  # 字节；默认 1 MiB
 bot_token = ""          # or set HYMT_TELEGRAM_BOT_TOKEN
 claim_password = ""     # auto-generated on first `hymt telegram` if empty
 owners = []             # private chat ids after claim
@@ -163,8 +166,9 @@ mode = "owners"         # "owners" | "groups"
 2. 将`enabled`设置为`true`。
 3. 运行`hymt telegram`（会持续轮询直到按下Ctrl+C）。首次运行时，hymt会生成一个申请密码，将其存储在配置文件中，并显示一次。
 4. 在与机器人的私聊中，发送该申请密码（或输入`/claim <password>`）即可成为所有者。支持多个所有者。
-5. 经过授权的所有者（以及当`mode = "groups"`时`groups`字段中列出的群组成员）能够自动实现文本消息的中文与英文互译；未经授权的聊天会收到简短的拒绝回复。
-6. 可使用`hymt telegram --regenerate-claim-password`命令重新生成申请密码（新密码仅显示一次）。
+5. 经过授权的所有者（以及当`mode = "groups"`时`groups`字段中列出的群组成员）能够自动翻译文本消息和UTF-8 `.txt`/`.md`文档；超过`max_document_size`的文档或非文本文件会被拒绝。短译文以内联消息回复，较长译文则以保留原扩展名的文档返回。
+6. 如需停用文档处理，请设置`accept_documents = false`。
+7. 可使用`hymt telegram --regenerate-claim-password`命令重新生成申请密码（新密码仅显示一次）。
 
 `bot_token`和`claim_password`这些敏感信息不会在每次运行时都再次显示。
 

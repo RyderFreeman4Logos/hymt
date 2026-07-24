@@ -21,7 +21,7 @@ Hy-MT2 as a practical Rust CLI: tokenizer-aware segmentation, per-segment cache 
 - Wrap arbitrary shell commands with `hymt exec`, or browse translated `man` and `info` pages.
 - Recall previous outputs and inspect translation history with throughput statistics.
 - Keep bilingual Markdown in sync with `hymt translate-doc`.
-- Optional Telegram bot (`hymt telegram`) for private multi-owner claim and group Chinese↔English translation.
+- Optional Telegram bot (`hymt telegram`) for private multi-owner claim and group Chinese↔English translation, including `.txt` and `.md` documents.
 
 ## Install
 
@@ -155,7 +155,9 @@ Default config includes a disabled Telegram section:
 ```toml
 [telegram]
 enabled = false
-stream = true          # progressively edit one response for multi-segment translations
+stream = true              # progressively edit one response for multi-segment text translations
+accept_documents = true      # accept .txt/.md documents
+max_document_size = 1048576  # bytes; default 1 MiB
 bot_token = ""          # or set HYMT_TELEGRAM_BOT_TOKEN
 claim_password = ""     # auto-generated on first `hymt telegram` if empty
 owners = []             # private chat ids after claim
@@ -167,8 +169,9 @@ mode = "owners"         # "owners" | "groups"
 2. Set `enabled = true`.
 3. Run `hymt telegram` (long-poll until Ctrl+C). On first run, hymt generates a claim password, stores it in config, and prints it once.
 4. In a private chat with the bot, send the claim password (or `/claim <password>`) to become an owner. Multiple owners are supported.
-5. Authorized owners (and members of groups listed in `groups` when `mode = "groups"`) receive automatic Chinese↔English translation of text messages. Multi-segment translations progressively edit one response by default; set `stream = false` to wait and send one final response instead. Unauthorized chats get a short denial.
-6. Regenerate the claim password with `hymt telegram --regenerate-claim-password` (prints the new value once).
+5. Authorized owners (and configured groups when `mode = "groups"`) get automatic Chinese↔English translation for text messages and UTF-8 `.txt`/`.md` documents. Documents over `max_document_size` or non-text documents are rejected; short translations are replied inline and longer translations are returned as a document with the original extension.
+6. Set `accept_documents = false` to opt out of document handling.
+7. Regenerate the claim password with `hymt telegram --regenerate-claim-password` (prints the new value once).
 
 Secrets (`bot_token`, `claim_password`) are not re-printed on every run.
 
