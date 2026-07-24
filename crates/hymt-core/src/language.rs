@@ -1,9 +1,11 @@
 //! Document language analysis and section-level translation planning.
 //!
 //! Language detection uses CJK character ratio counting, which is reliable for
-//! zh/yue targets and returns `None` for all other targets.
+//! Chinese-family targets and returns `None` for all other targets.
 
 use serde::{Deserialize, Serialize};
+
+use crate::language_spec::{language_spec_or_none, normalize_language_code, LanguageFamily};
 
 /// CJK Unified Ideographs block (U+4E00–U+9FFF).
 fn is_cjk_char(c: char) -> bool {
@@ -105,22 +107,22 @@ pub fn resolve_target_language(
     explicit_target: bool,
 ) -> String {
     if explicit_target {
-        return requested_target_lang.to_owned();
+        return canonical_or_requested(requested_target_lang);
     }
     let detection = detect_target_language(text, primary_lang);
     if let Some(d) = detection {
         if d.target_ratio > TARGET_PARAGRAPH_RATIO {
-            return secondary_lang.to_owned();
+            return canonical_or_requested(secondary_lang);
         }
     }
-    primary_lang.to_owned()
+    canonical_or_requested(primary_lang)
 }
 
 /// Splits `text` into sections and annotates each paragraph with language
 /// detection results. Paragraphs already in `target_lang` are flagged
 /// `is_target_language = true` and `should_translate = false`.
 pub fn analyze_document_language(text: &str, target_lang: &str) -> DocumentLanguagePlan {
-    let aliases = target_aliases(target_lang);
+    let detects_chinese = is_chinese_family(target_lang);
     let raw_sections = split_document_sections(text);
     let sections = raw_sections
         .into_iter()
@@ -128,7 +130,7 @@ pub fn analyze_document_language(text: &str, target_lang: &str) -> DocumentLangu
             if section.kind != SectionKind::Paragraph {
                 return section;
             }
-            let detection = detect_chunk_sequence(&[section.text.clone()], &aliases);
+            let detection = detect_chunk_sequence(&[section.text.clone()], detects_chinese);
             let is_target = detection
                 .as_ref()
                 .map(|d| d.target_ratio > TARGET_PARAGRAPH_RATIO)
@@ -144,7 +146,7 @@ pub fn analyze_document_language(text: &str, target_lang: &str) -> DocumentLangu
 
     DocumentLanguagePlan {
         sections,
-        target_lang: target_lang.to_owned(),
+        target_lang: canonical_or_requested(target_lang),
     }
 }
 
@@ -162,43 +164,41 @@ pub fn build_document_translation_plan(text: &str, target_lang: &str) -> Documen
         .collect();
     DocumentLanguagePlan {
         sections,
-        target_lang: target_lang.to_owned(),
+        target_lang: canonical_or_requested(target_lang),
     }
 }
 
 // ── Internals ─────────────────────────────────────────────────────────────────
 
-fn target_aliases(target_lang: &str) -> Vec<String> {
-    let normalized = target_lang.trim().to_lowercase();
-    match normalized.as_str() {
-        "zh" => vec!["zh".into(), "zh-cn".into(), "zh-tw".into()],
-        "zh-cn" => vec!["zh".into(), "zh-cn".into()],
-        "zh-tw" => vec!["zh".into(), "zh-tw".into()],
-        "cn" => vec!["zh".into(), "zh-cn".into(), "zh-tw".into()],
-        _ => vec![normalized],
-    }
+fn canonical_or_requested(code: &str) -> String {
+    normalize_language_code(code)
+        .map(str::to_owned)
+        .unwrap_or_else(|_| code.trim().to_owned())
+}
+
+fn is_chinese_family(target_lang: &str) -> bool {
+    language_spec_or_none(target_lang).is_some_and(|spec| spec.family == LanguageFamily::Chinese)
 }
 
 fn detect_without_detector(text: &str, target_lang: &str) -> Option<LanguageDetectionResult> {
-    let aliases = target_aliases(target_lang);
-    // CJK detection only applies to Chinese-family targets.
-    if !aliases.iter().any(|a| a == "zh" || a.starts_with("zh-")) {
+    if !is_chinese_family(target_lang) {
         return None;
     }
     let chunks = detection_chunks(text);
     if chunks.is_empty() {
         return None;
     }
-    detect_chunk_sequence(&chunks, &aliases)
+    detect_chunk_sequence(&chunks, true)
 }
 
 /// Runs CJK-based detection over a slice of text chunks.
-fn detect_chunk_sequence(chunks: &[String], aliases: &[String]) -> Option<LanguageDetectionResult> {
-    if chunks.is_empty() {
+fn detect_chunk_sequence(
+    chunks: &[String],
+    detects_chinese: bool,
+) -> Option<LanguageDetectionResult> {
+    if chunks.is_empty() || !detects_chinese {
         return None;
     }
-
-    let zh_aliases: bool = aliases.iter().any(|a| a == "zh" || a.starts_with("zh-"));
 
     let mut analyzed_chars = 0usize;
     let mut target_chars = 0usize;
@@ -210,7 +210,7 @@ fn detect_chunk_sequence(chunks: &[String], aliases: &[String]) -> Option<Langua
                 continue;
             }
             analyzed_chars += 1;
-            if zh_aliases && is_cjk_char(c) {
+            if is_cjk_char(c) {
                 target_chars += 1;
                 has_cjk = true;
             }
@@ -421,6 +421,20 @@ mod tests {
         assert!(detect_target_language("   \n  ", "zh").is_none());
     }
 
+    #[test]
+    fn chinese_family_aliases_support_detection() {
+        let text = "这是一段中文文本，包含大量汉字，占据了主要字符。";
+        for target in ["zh-Hant", "ZH_tw", "YUE"] {
+            let result = detect_target_language(text, target)
+                .unwrap_or_else(|| panic!("expected detection support for {target}"));
+            assert!(
+                result.target_ratio > 0.5,
+                "target={target}, ratio={}",
+                result.target_ratio
+            );
+        }
+    }
+
     // ── resolve_target_language ───────────────────────────────────────────────
 
     #[test]
@@ -579,18 +593,11 @@ mod tests {
             .all(|s| s.should_translate));
     }
 
-    // ── target_aliases ────────────────────────────────────────────────────────
-
     #[test]
-    fn zh_aliases_include_variants() {
-        let aliases = target_aliases("zh");
-        assert!(aliases.contains(&"zh".to_owned()));
-        assert!(aliases.contains(&"zh-cn".to_owned()));
-    }
-
-    #[test]
-    fn unknown_lang_maps_to_itself() {
-        let aliases = target_aliases("fr");
-        assert_eq!(aliases, vec!["fr".to_owned()]);
+    fn document_plans_preserve_canonical_target_codes() {
+        assert_eq!(
+            analyze_document_language("text", "zh_tw").target_lang,
+            "zh-Hant"
+        );
     }
 }

@@ -14,6 +14,7 @@ use hymt_cache::history::HistoryDB;
 use hymt_client::TranslationClient;
 use hymt_core::config::HotConfig;
 use hymt_core::language::resolve_target_language;
+use hymt_core::language_spec::{language_spec_or_none, LanguageFamily};
 use hymt_core::model_profile::ModelProfile;
 use hymt_core::templates::{looks_like_cli_help_source, PromptOpts, TemplateType};
 use hymt_segment::Segmenter;
@@ -1276,21 +1277,20 @@ async fn run_estimate(
 fn estimate_source_lang(target_lang: &str, config: &HotConfig) -> String {
     let primary = config.primary_lang();
     let secondary = config.secondary_lang();
-    let norm_target = normalize_lang(target_lang);
-    let norm_primary = normalize_lang(&primary);
-    if base_lang(&norm_target) == base_lang(&norm_primary) {
+    if same_language_or_chinese_family(target_lang, &primary) {
         secondary
     } else {
         primary
     }
 }
 
-fn normalize_lang(lang: &str) -> String {
-    lang.trim().to_ascii_lowercase()
-}
-
-fn base_lang(lang: &str) -> &str {
-    lang.split(['-', '_']).next().unwrap_or("")
+fn same_language_or_chinese_family(left: &str, right: &str) -> bool {
+    let (Some(left), Some(right)) = (language_spec_or_none(left), language_spec_or_none(right))
+    else {
+        return false;
+    };
+    left.canonical_code == right.canonical_code
+        || (left.family == LanguageFamily::Chinese && right.family == LanguageFamily::Chinese)
 }
 
 fn estimate_chars_per_segment(
@@ -1322,9 +1322,13 @@ fn build_source_sample(source_lang: &str, min_chars: usize) -> String {
 }
 
 fn representative_source_text(source_lang: &str) -> &'static str {
-    let norm = normalize_lang(source_lang);
-    match base_lang(&norm) {
-        "zh" => "天地玄黄宇宙洪荒日月盈昃辰宿列张",
+    let Some(spec) = language_spec_or_none(source_lang) else {
+        return "This is sample source text used to estimate translation segment size. ";
+    };
+    if spec.family == LanguageFamily::Chinese {
+        return "天地玄黄宇宙洪荒日月盈昃辰宿列张";
+    }
+    match spec.canonical_code {
         "ja" => "これは日本語の文章です。翻訳の見積もりに使います。",
         "ko" => "이것은 한국어 문장입니다. 번역 추정에 사용합니다.",
         _ => "This is sample source text used to estimate translation segment size. ",
