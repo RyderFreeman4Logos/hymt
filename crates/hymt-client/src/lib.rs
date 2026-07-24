@@ -70,10 +70,72 @@ struct Message {
     content: String,
 }
 
+/// The standard chat-completions fields shared by every endpoint adapter.
 #[derive(Debug, Clone, Serialize)]
-struct ChatPayload {
+struct ChatPayloadCore {
     messages: Vec<Message>,
     max_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
+}
+
+/// A backend-specific request body. Each variant owns only the extensions that
+/// its endpoint documents, rather than exposing one pseudo-OpenAI sampler schema.
+#[derive(Debug, Clone)]
+enum ChatPayload {
+    LlamaCpp(LlamaCppPayload),
+    Vllm(VllmPayload),
+    OpenAiCompatible(OpenAiCompatiblePayload),
+}
+
+impl Serialize for ChatPayload {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::LlamaCpp(payload) => payload.serialize(serializer),
+            Self::Vllm(payload) => payload.serialize(serializer),
+            Self::OpenAiCompatible(payload) => payload.serialize(serializer),
+        }
+    }
+}
+
+impl ChatPayload {
+    fn from_generation_settings(
+        prompt: &str,
+        max_tokens: u32,
+        model: String,
+        stream: bool,
+        settings: &GenerationSettings,
+        backend: GenerationBackend,
+    ) -> Self {
+        let core = ChatPayloadCore {
+            messages: vec![Message {
+                role: "user",
+                content: prompt.to_owned(),
+            }],
+            max_tokens,
+            model: (!model.is_empty()).then_some(model),
+            stream: stream.then_some(true),
+        };
+        match backend {
+            GenerationBackend::LlamaCpp => Self::LlamaCpp(LlamaCppPayload::new(core, settings)),
+            GenerationBackend::Vllm => Self::Vllm(VllmPayload::new(core, settings)),
+            GenerationBackend::OpenAiCompatible => {
+                Self::OpenAiCompatible(OpenAiCompatiblePayload::new(core, settings))
+            }
+        }
+    }
+}
+
+/// llama.cpp's documented native sampler extensions.
+#[derive(Debug, Clone, Serialize)]
+struct LlamaCppPayload {
+    #[serde(flatten)]
+    core: ChatPayloadCore,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -83,92 +145,94 @@ struct ChatPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     repeat_penalty: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    repetition_penalty: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     min_p: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     repeat_last_n: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stream: Option<bool>,
 }
 
-impl ChatPayload {
-    fn from_generation_settings(
-        prompt: &str,
-        max_tokens: u32,
-        model: String,
-        stream: bool,
-        generation_settings: &GenerationSettings,
-        backend: GenerationBackend,
-    ) -> Self {
-        let settings = map_generation_settings(generation_settings, backend);
-        let (repeat_penalty, repetition_penalty) = match backend {
-            GenerationBackend::LlamaCpp => (settings.repetition_penalty, None),
-            GenerationBackend::OpenAiCompatible => (None, settings.repetition_penalty),
-        };
+impl LlamaCppPayload {
+    fn new(core: ChatPayloadCore, settings: &GenerationSettings) -> Self {
         Self {
-            messages: vec![Message {
-                role: "user",
-                content: prompt.to_owned(),
-            }],
-            max_tokens,
-            temperature: settings.temperature,
-            top_p: settings.top_p,
-            top_k: settings.top_k,
-            repeat_penalty,
-            repetition_penalty,
-            min_p: settings.min_p,
-            repeat_last_n: settings.repeat_last_n,
-            model: if model.is_empty() { None } else { Some(model) },
-            stream: if stream { Some(true) } else { None },
+            core,
+            temperature: map_f64_setting(settings.temperature, 0.0),
+            top_p: map_f64_setting(settings.top_p, 1.0),
+            top_k: map_i32_setting(settings.top_k, 0),
+            repeat_penalty: map_f64_setting(settings.repetition_penalty, 1.0),
+            min_p: map_f64_setting(settings.min_p, 0.0),
+            repeat_last_n: map_i64_setting(settings.repeat_last_n, 0),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-struct WireGenerationSettings {
+/// vLLM's documented OpenAI-server sampler extensions.
+#[derive(Debug, Clone, Serialize)]
+struct VllmPayload {
+    #[serde(flatten)]
+    core: ChatPayloadCore,
+    #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     top_k: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     repetition_penalty: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     min_p: Option<f64>,
-    repeat_last_n: Option<i64>,
 }
 
-fn map_generation_settings(
-    settings: &GenerationSettings,
-    backend: GenerationBackend,
-) -> WireGenerationSettings {
-    WireGenerationSettings {
-        temperature: map_f64_setting(settings.temperature, 0.0),
-        top_p: map_f64_setting(settings.top_p, 1.0),
-        top_k: match backend {
-            GenerationBackend::LlamaCpp => match settings.top_k {
-                Setting::ServerDefault => None,
-                Setting::Disabled => Some(0),
-                Setting::Value(value) => Some(value),
-            },
-            GenerationBackend::OpenAiCompatible => None,
-        },
-        repetition_penalty: map_f64_setting(settings.repetition_penalty, 1.0),
-        min_p: match backend {
-            GenerationBackend::LlamaCpp => map_f64_setting(settings.min_p, 0.0),
-            GenerationBackend::OpenAiCompatible => None,
-        },
-        repeat_last_n: match backend {
-            GenerationBackend::LlamaCpp => match settings.repeat_last_n {
-                Setting::ServerDefault => None,
-                Setting::Disabled => Some(0),
-                Setting::Value(value) => Some(value),
-            },
-            GenerationBackend::OpenAiCompatible => None,
-        },
+impl VllmPayload {
+    fn new(core: ChatPayloadCore, settings: &GenerationSettings) -> Self {
+        Self {
+            core,
+            temperature: map_f64_setting(settings.temperature, 0.0),
+            top_p: map_f64_setting(settings.top_p, 1.0),
+            // vLLM uses -1 for disabled top-k, unlike llama.cpp's 0.
+            top_k: map_i32_setting(settings.top_k, -1),
+            repetition_penalty: map_f64_setting(settings.repetition_penalty, 1.0),
+            min_p: map_f64_setting(settings.min_p, 0.0),
+        }
+    }
+}
+
+/// Strict generic mode sends only common chat-completions sampling fields.
+#[derive(Debug, Clone, Serialize)]
+struct OpenAiCompatiblePayload {
+    #[serde(flatten)]
+    core: ChatPayloadCore,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f64>,
+}
+
+impl OpenAiCompatiblePayload {
+    fn new(core: ChatPayloadCore, settings: &GenerationSettings) -> Self {
+        Self {
+            core,
+            temperature: map_f64_setting(settings.temperature, 0.0),
+            top_p: map_f64_setting(settings.top_p, 1.0),
+        }
     }
 }
 
 fn map_f64_setting(setting: Setting<f64>, disabled_value: f64) -> Option<f64> {
+    match setting {
+        Setting::ServerDefault => None,
+        Setting::Disabled => Some(disabled_value),
+        Setting::Value(value) => Some(value),
+    }
+}
+
+fn map_i32_setting(setting: Setting<i32>, disabled_value: i32) -> Option<i32> {
+    match setting {
+        Setting::ServerDefault => None,
+        Setting::Disabled => Some(disabled_value),
+        Setting::Value(value) => Some(value),
+    }
+}
+
+fn map_i64_setting(setting: Setting<i64>, disabled_value: i64) -> Option<i64> {
     match setting {
         Setting::ServerDefault => None,
         Setting::Disabled => Some(disabled_value),
@@ -845,6 +909,10 @@ fn http_error(status: u16, body: &[u8]) -> ClientError {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[path = "backend_payload_tests.rs"]
+mod backend_payload_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use hymt_core::config::{GenerationBackend, GenerationSettings, Setting};
@@ -1093,35 +1161,55 @@ mod tests {
 
     #[test]
     fn llama_cpp_maps_disabled_samplers() {
-        let settings = GenerationSettings {
-            temperature: Setting::Value(0.7),
-            top_p: Setting::ServerDefault,
-            top_k: Setting::Disabled,
-            repetition_penalty: Setting::Disabled,
-            min_p: Setting::Disabled,
-            repeat_last_n: Setting::Disabled,
-        };
+        let payload = ChatPayload::from_generation_settings(
+            "test",
+            1,
+            String::new(),
+            false,
+            &GenerationSettings {
+                temperature: Setting::Value(0.7),
+                top_p: Setting::ServerDefault,
+                top_k: Setting::Disabled,
+                repetition_penalty: Setting::Disabled,
+                min_p: Setting::Disabled,
+                repeat_last_n: Setting::Disabled,
+            },
+            GenerationBackend::LlamaCpp,
+        );
+        let object = serde_json::to_value(payload).unwrap();
 
-        let llama = map_generation_settings(&settings, GenerationBackend::LlamaCpp);
-        assert_eq!(llama.temperature, Some(0.7));
-        assert_eq!(llama.top_p, None);
-        assert_eq!(llama.top_k, Some(0));
-        assert_eq!(llama.repetition_penalty, Some(1.0));
-        assert_eq!(llama.min_p, Some(0.0));
-        assert_eq!(llama.repeat_last_n, Some(0));
+        assert_eq!(object["temperature"], 0.7);
+        assert!(object.get("top_p").is_none());
+        assert_eq!(object["top_k"], 0);
+        assert_eq!(object["repeat_penalty"], 1.0);
+        assert_eq!(object["min_p"], 0.0);
+        assert_eq!(object["repeat_last_n"], 0);
     }
 
     #[test]
     fn openai_compatible_omits_unsupported_profile_sampler_fields() {
         let settings = hymt_core::model_profile::ModelProfile::HyMt2_30bA3b.generation_defaults();
-        let openai = map_generation_settings(&settings, GenerationBackend::OpenAiCompatible);
+        let payload = ChatPayload::from_generation_settings(
+            "test",
+            1,
+            String::new(),
+            false,
+            &settings,
+            GenerationBackend::OpenAiCompatible,
+        );
+        let object = serde_json::to_value(payload).unwrap();
 
-        assert_eq!(openai.temperature, Some(0.7));
-        assert_eq!(openai.top_p, Some(1.0));
-        assert_eq!(openai.top_k, None);
-        assert_eq!(openai.repetition_penalty, Some(1.0));
-        assert_eq!(openai.min_p, None);
-        assert_eq!(openai.repeat_last_n, None);
+        assert_eq!(object["temperature"], 0.7);
+        assert_eq!(object["top_p"], 1.0);
+        for field in [
+            "top_k",
+            "repeat_penalty",
+            "repetition_penalty",
+            "min_p",
+            "repeat_last_n",
+        ] {
+            assert!(object.get(field).is_none(), "{field} should be omitted");
+        }
     }
 
     #[test]
@@ -1148,7 +1236,7 @@ mod tests {
     }
 
     #[test]
-    fn openai_compatible_payload_uses_repetition_penalty_wire_key() {
+    fn vllm_payload_uses_repetition_penalty_wire_key() {
         let payload = ChatPayload::from_generation_settings(
             "test",
             1,
@@ -1162,7 +1250,7 @@ mod tests {
                 min_p: Setting::ServerDefault,
                 repeat_last_n: Setting::ServerDefault,
             },
-            GenerationBackend::OpenAiCompatible,
+            GenerationBackend::Vllm,
         );
 
         let object = serde_json::to_value(payload).unwrap();
@@ -1172,30 +1260,14 @@ mod tests {
 
     #[test]
     fn server_default_generation_settings_are_omitted_from_payload_json() {
-        let settings = map_generation_settings(
-            &GenerationSettings {
-                temperature: Setting::ServerDefault,
-                top_p: Setting::ServerDefault,
-                top_k: Setting::ServerDefault,
-                repetition_penalty: Setting::ServerDefault,
-                min_p: Setting::ServerDefault,
-                repeat_last_n: Setting::ServerDefault,
-            },
+        let payload = ChatPayload::from_generation_settings(
+            "test",
+            1,
+            String::new(),
+            false,
+            &GenerationSettings::server_defaults(),
             GenerationBackend::LlamaCpp,
         );
-        let payload = ChatPayload {
-            messages: vec![],
-            max_tokens: 1,
-            temperature: settings.temperature,
-            top_p: settings.top_p,
-            top_k: settings.top_k,
-            repeat_penalty: None,
-            repetition_penalty: settings.repetition_penalty,
-            min_p: settings.min_p,
-            repeat_last_n: settings.repeat_last_n,
-            model: None,
-            stream: None,
-        };
 
         let json = serde_json::to_value(payload).unwrap();
         let object = json.as_object().unwrap();
@@ -1214,22 +1286,14 @@ mod tests {
 
     #[test]
     fn payload_omits_model_and_stream_when_none() {
-        let payload = ChatPayload {
-            messages: vec![Message {
-                role: "user",
-                content: "test".into(),
-            }],
-            max_tokens: 100,
-            temperature: Some(0.7),
-            top_p: Some(0.9),
-            top_k: Some(40),
-            repeat_penalty: None,
-            repetition_penalty: Some(1.0),
-            min_p: None,
-            repeat_last_n: None,
-            model: None,
-            stream: None,
-        };
+        let payload = ChatPayload::from_generation_settings(
+            "test",
+            100,
+            String::new(),
+            false,
+            &GenerationSettings::server_defaults(),
+            GenerationBackend::LlamaCpp,
+        );
         let json = serde_json::to_value(&payload).unwrap();
         let obj = json.as_object().unwrap();
         assert!(!obj.contains_key("model"), "model should be absent");
@@ -1238,19 +1302,14 @@ mod tests {
 
     #[test]
     fn payload_includes_model_and_stream_when_set() {
-        let payload = ChatPayload {
-            messages: vec![],
-            max_tokens: 4096,
-            temperature: Some(0.7),
-            top_p: Some(0.6),
-            top_k: Some(20),
-            repeat_penalty: None,
-            repetition_penalty: Some(1.05),
-            min_p: None,
-            repeat_last_n: None,
-            model: Some("hy-mt2".into()),
-            stream: Some(true),
-        };
+        let payload = ChatPayload::from_generation_settings(
+            "test",
+            4096,
+            "hy-mt2".into(),
+            true,
+            &GenerationSettings::server_defaults(),
+            GenerationBackend::LlamaCpp,
+        );
         let json = serde_json::to_value(&payload).unwrap();
         let obj = json.as_object().unwrap();
         assert_eq!(obj["model"].as_str().unwrap(), "hy-mt2");
@@ -1259,22 +1318,14 @@ mod tests {
 
     #[test]
     fn payload_message_structure() {
-        let payload = ChatPayload {
-            messages: vec![Message {
-                role: "user",
-                content: "translate this".into(),
-            }],
-            max_tokens: 4096,
-            temperature: Some(0.7),
-            top_p: Some(0.6),
-            top_k: Some(20),
-            repeat_penalty: None,
-            repetition_penalty: Some(1.05),
-            min_p: None,
-            repeat_last_n: None,
-            model: None,
-            stream: None,
-        };
+        let payload = ChatPayload::from_generation_settings(
+            "translate this",
+            4096,
+            String::new(),
+            false,
+            &GenerationSettings::server_defaults(),
+            GenerationBackend::LlamaCpp,
+        );
         let json = serde_json::to_value(&payload).unwrap();
         let messages = json["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 1);

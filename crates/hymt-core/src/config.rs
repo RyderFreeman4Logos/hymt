@@ -21,6 +21,9 @@ model = ""
 # Set this explicitly for a tested Hy-MT2 family member. When omitted, hymt
 # uses generic mode and does not assume a tokenizer or sampler profile.
 # profile = "hy_mt2_7b"
+# Select the endpoint-specific sampler adapter. An omitted value is the strict
+# openai_compatible adapter, which sends only common chat-completions fields.
+backend = "llama_cpp"
 
 [backend]
 # `total_context` is the server-wide allocation (`llama-server -c`), while
@@ -53,11 +56,9 @@ secondary = "en"
 
 [inference]
 # Sampler values are omitted by default so the configured server selects them.
-# `openai_compatible` accepts only temperature, top_p, and repetition_penalty;
-# it sends the latter as `repetition_penalty`, unlike llama.cpp's repeat_penalty.
-backend = "llama_cpp"
 # Explicit overrides belong under `[inference.override]`; a numeric value is
-# sent as-is and the string `"disabled"` turns off that sampler.
+# sent through the selected endpoint adapter and the string `"disabled"` turns
+# off that sampler using the adapter's documented wire value.
 
 [timing]
 divergence_threshold = 2.0
@@ -184,10 +185,16 @@ impl GenerationSettingField {
 }
 
 const LLAMA_CPP_CAPABILITIES: &[GenerationSettingField] = &GenerationSettingField::ALL;
+const VLLM_CAPABILITIES: &[GenerationSettingField] = &[
+    GenerationSettingField::Temperature,
+    GenerationSettingField::TopP,
+    GenerationSettingField::TopK,
+    GenerationSettingField::RepetitionPenalty,
+    GenerationSettingField::MinP,
+];
 const OPENAI_COMPATIBLE_CAPABILITIES: &[GenerationSettingField] = &[
     GenerationSettingField::Temperature,
     GenerationSettingField::TopP,
-    GenerationSettingField::RepetitionPenalty,
 ];
 
 /// Semantic tri-state for a generation parameter.
@@ -210,17 +217,21 @@ pub enum Setting<T> {
 pub enum GenerationBackend {
     /// llama.cpp's OpenAI-compatible server.
     LlamaCpp,
+    /// vLLM's OpenAI-compatible server and documented sampler extensions.
+    Vllm,
     /// A generic OpenAI-compatible server.
     ///
-    /// This profile accepts `temperature`, `top_p`, and `repetition_penalty`.
-    /// The repetition penalty is serialized as `repetition_penalty`.
+    /// This conservative profile accepts only common `temperature` and `top_p`
+    /// fields; it does not guess nonstandard extension names.
     OpenAiCompatible,
 }
 
 impl GenerationBackend {
-    const fn name(self) -> &'static str {
+    /// Stable configuration identifier for this endpoint adapter.
+    pub const fn name(self) -> &'static str {
         match self {
             Self::LlamaCpp => "llama_cpp",
+            Self::Vllm => "vllm",
             Self::OpenAiCompatible => "openai_compatible",
         }
     }
@@ -228,6 +239,7 @@ impl GenerationBackend {
     fn capabilities(self) -> &'static [GenerationSettingField] {
         match self {
             Self::LlamaCpp => LLAMA_CPP_CAPABILITIES,
+            Self::Vllm => VLLM_CAPABILITIES,
             Self::OpenAiCompatible => OPENAI_COMPATIBLE_CAPABILITIES,
         }
     }
@@ -236,9 +248,11 @@ impl GenerationBackend {
         for field in GenerationSettingField::ALL {
             if settings.is_explicit(field) && !self.capabilities().contains(&field) {
                 return Err(CoreError::Config(format!(
-                    "inference.backend {} does not support inference.override.{}",
+                    "endpoint.backend {} cannot represent inference.override.{}; \
+                     configured semantic value is {}; wire representation is unsupported",
                     self.name(),
                     field.name(),
+                    settings.setting_description(field),
                 )));
             }
         }
@@ -296,6 +310,44 @@ impl GenerationSettings {
             ),
             min_p: setting_or_default(self.min_p, overrides.min_p),
             repeat_last_n: setting_or_default(self.repeat_last_n, overrides.repeat_last_n),
+        }
+    }
+
+    /// Remove semantic sampler defaults which the selected adapter cannot put
+    /// on the wire. Explicit unsupported overrides are rejected before this
+    /// normalization; this only prevents profile defaults from polluting a
+    /// request fingerprint when strict generic mode omits them.
+    fn normalized_for_backend(&self, backend: GenerationBackend) -> Self {
+        let supports = |field| backend.capabilities().contains(&field);
+        Self {
+            temperature: setting_if_supported(
+                supports(GenerationSettingField::Temperature),
+                self.temperature,
+            ),
+            top_p: setting_if_supported(supports(GenerationSettingField::TopP), self.top_p),
+            top_k: setting_if_supported(supports(GenerationSettingField::TopK), self.top_k),
+            repetition_penalty: setting_if_supported(
+                supports(GenerationSettingField::RepetitionPenalty),
+                self.repetition_penalty,
+            ),
+            min_p: setting_if_supported(supports(GenerationSettingField::MinP), self.min_p),
+            repeat_last_n: setting_if_supported(
+                supports(GenerationSettingField::RepeatLastN),
+                self.repeat_last_n,
+            ),
+        }
+    }
+
+    fn setting_description(&self, field: GenerationSettingField) -> String {
+        match field {
+            GenerationSettingField::Temperature => format!("{:?}", self.temperature),
+            GenerationSettingField::TopP => format!("{:?}", self.top_p),
+            GenerationSettingField::TopK => format!("{:?}", self.top_k),
+            GenerationSettingField::RepetitionPenalty => {
+                format!("{:?}", self.repetition_penalty)
+            }
+            GenerationSettingField::MinP => format!("{:?}", self.min_p),
+            GenerationSettingField::RepeatLastN => format!("{:?}", self.repeat_last_n),
         }
     }
 
@@ -377,6 +429,14 @@ impl GenerationSettings {
                 !matches!(self.repeat_last_n, Setting::ServerDefault)
             }
         }
+    }
+}
+
+fn setting_if_supported<T>(supported: bool, setting: Setting<T>) -> Setting<T> {
+    if supported {
+        setting
+    } else {
+        Setting::ServerDefault
     }
 }
 
@@ -639,23 +699,36 @@ fn parse_i64_setting(data: &toml::Table, key: &str) -> Result<Setting<i64>, Core
 }
 
 fn generation_backend_from_toml(data: &toml::Table) -> Result<GenerationBackend, CoreError> {
-    let Some(inference) = data.get("inference") else {
-        return Ok(GenerationBackend::LlamaCpp);
+    if data
+        .get("inference")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|table| table.contains_key("backend"))
+    {
+        return Err(CoreError::Config(
+            "inference.backend is no longer accepted; set endpoint.backend to \
+             llama_cpp, vllm, or openai_compatible"
+                .to_owned(),
+        ));
+    }
+
+    let Some(endpoint) = data.get("endpoint") else {
+        return Ok(GenerationBackend::OpenAiCompatible);
     };
-    let table = inference
+    let table = endpoint
         .as_table()
-        .ok_or_else(|| CoreError::Config("inference must be a TOML table".to_owned()))?;
+        .ok_or_else(|| CoreError::Config("endpoint must be a TOML table".to_owned()))?;
     match table.get("backend") {
-        None => Ok(GenerationBackend::LlamaCpp),
+        None => Ok(GenerationBackend::OpenAiCompatible),
         Some(toml::Value::String(value)) => match value.as_str() {
-            "llama_cpp" | "llama.cpp" => Ok(GenerationBackend::LlamaCpp),
-            "openai_compatible" | "transformers" => Ok(GenerationBackend::OpenAiCompatible),
+            "llama_cpp" => Ok(GenerationBackend::LlamaCpp),
+            "vllm" => Ok(GenerationBackend::Vllm),
+            "openai_compatible" => Ok(GenerationBackend::OpenAiCompatible),
             _ => Err(CoreError::Config(format!(
-                "inference.backend must be llama_cpp or openai_compatible, got {value:?}"
+                "endpoint.backend must be llama_cpp, vllm, or openai_compatible, got {value:?}"
             ))),
         },
         Some(value) => Err(CoreError::Config(format!(
-            "inference.backend must be llama_cpp or openai_compatible, got {value:?}"
+            "endpoint.backend must be llama_cpp, vllm, or openai_compatible, got {value:?}"
         ))),
     }
 }
@@ -965,11 +1038,12 @@ impl HotConfig {
         let profile = self.model_profile()?;
         let settings = self.generation_settings()?;
         let backend = self.generation_backend()?;
+        let effective_settings = settings.normalized_for_backend(backend);
         let model = self.model();
         // A Generic profile without an explicit served model, or a request that
         // delegates every sampler to the server, has no stable cache namespace.
-        let cache_verified =
-            !(settings.uses_only_server_defaults() || (profile.is_generic() && model.is_empty()));
+        let cache_verified = !(effective_settings.uses_only_server_defaults()
+            || (profile.is_generic() && model.is_empty()));
 
         let mut fields = BTreeMap::new();
         fields.insert(
@@ -1003,7 +1077,7 @@ impl HotConfig {
         );
         fields.insert(
             "generation".to_owned(),
-            generation_fingerprint_value(&settings),
+            generation_fingerprint_value(&effective_settings),
         );
         fields.insert(
             "model".to_owned(),
@@ -1522,6 +1596,10 @@ fn restrict_config_permissions(path: &Path) -> Result<(), CoreError> {
 }
 
 #[cfg(test)]
+#[path = "config_backend_tests.rs"]
+mod config_backend_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
@@ -1783,9 +1861,9 @@ mod tests {
             r#"[endpoint]
 url = "http://localhost:8401/v1"
 model = "hy-mt2-7b-q4_k_m.gguf"
+backend = "llama_cpp"
 
 [inference]
-backend = "llama_cpp"
 
 [inference.override]
 temperature = 0.7"#,
@@ -1803,9 +1881,9 @@ profile = "hy_mt2_7b""#,
             r#"[endpoint]
 url = "http://localhost:8401/v1"
 model = "hy-mt2-7b-q4_k_m.gguf"
+backend = "llama_cpp"
 
 [inference]
-backend = "llama_cpp"
 
 [inference.override]
 temperature = 0.7"#,
@@ -1816,9 +1894,9 @@ temperature = 0.7"#,
             r#"[endpoint]
 url = "http://localhost:8401/v1"
 model = "hy-mt2-7b-q6_k.gguf"
+backend = "llama_cpp"
 
 [inference]
-backend = "llama_cpp"
 
 [inference.override]
 temperature = 0.7"#,
@@ -1829,9 +1907,9 @@ temperature = 0.7"#,
             r#"[endpoint]
 url = "http://localhost:8401/v1"
 model = "hy-mt2-7b-q4_k_m.gguf"
+backend = "openai_compatible"
 
 [inference]
-backend = "openai_compatible"
 
 [inference.override]
 temperature = 0.7"#,
@@ -1842,9 +1920,9 @@ temperature = 0.7"#,
             r#"[endpoint]
 url = "http://localhost:8401/v1"
 model = "hy-mt2-7b-q4_k_m.gguf"
+backend = "llama_cpp"
 
 [inference]
-backend = "llama_cpp"
 
 [inference.override]
 temperature = 0.8"#,
@@ -1855,9 +1933,9 @@ temperature = 0.8"#,
             r#"[endpoint]
 url = "http://localhost:8401/v1"
 model = "hy-mt2-7b-q4_k_m.gguf"
+backend = "llama_cpp"
 
 [inference]
-backend = "llama_cpp"
 
 [inference.override]
 temperature = 0.7
@@ -1871,9 +1949,9 @@ max_retries = 0"#,
             r#"[endpoint]
 url = "http://localhost:8401/v1"
 model = "hy-mt2-7b-q4_k_m.gguf"
+backend = "llama_cpp"
 
 [inference]
-backend = "llama_cpp"
 
 [inference.override]
 temperature = 0.7"#,
@@ -1922,6 +2000,7 @@ profile = "hy_mt2_7b""#,
             r#"[endpoint]
 url = "http://localhost:8401/v1"
 model = "stable-served-model"
+backend = "llama_cpp"
 
 [inference.override]
 temperature = 0.7
@@ -1999,8 +2078,6 @@ top_p = 0.8"#,
             &path,
             r#"[endpoint]
 profile = "hy_mt2_30b_a3b"
-
-[inference]
 backend = "openai_compatible""#,
         )
         .unwrap();
@@ -2017,7 +2094,10 @@ backend = "openai_compatible""#,
         let path = temp_config_path("generation_states");
         fs::write(
             &path,
-            r#"[inference.override]
+            r#"[endpoint]
+backend = "llama_cpp"
+
+[inference.override]
 temperature = 0.7
 top_k = "disabled"
 repeat_last_n = -1"#,
@@ -2039,7 +2119,10 @@ repeat_last_n = -1"#,
         let path = temp_config_path("legacy_generation");
         fs::write(
             &path,
-            r#"[inference]
+            r#"[endpoint]
+backend = "llama_cpp"
+
+[inference]
 temperature = 0.7
 top_p = 0.6
 top_k = -1
@@ -2096,16 +2179,21 @@ repeat_last_n = -1"#,
     #[test]
     fn invalid_generation_backend_is_rejected() {
         let path = temp_config_path("invalid_generation_backend");
-        fs::write(&path, "[inference]\nbackend = 7").unwrap();
+        fs::write(&path, "[endpoint]\nbackend = 7").unwrap();
 
         let error = HotConfig::from_path(&path).unwrap_err();
-        assert!(error.to_string().contains("inference.backend"));
+        assert!(error.to_string().contains("endpoint.backend"));
     }
 
     #[test]
     fn openai_compatible_rejects_unsupported_explicit_and_disabled_overrides_at_load() {
         for (tag, override_value, field) in [
             ("top_k_explicit", "top_k = 20", "top_k"),
+            (
+                "repetition_explicit",
+                "repetition_penalty = 1.05",
+                "repetition_penalty",
+            ),
             ("min_p_disabled", "min_p = \"disabled\"", "min_p"),
             (
                 "repeat_last_n_explicit",
@@ -2117,7 +2205,7 @@ repeat_last_n = -1"#,
             fs::write(
                 &path,
                 format!(
-                    "[inference]\nbackend = \"openai_compatible\"\n\n[inference.override]\n{override_value}"
+                    "[endpoint]\nbackend = \"openai_compatible\"\n\n[inference.override]\n{override_value}"
                 ),
             )
             .unwrap();
@@ -2126,6 +2214,11 @@ repeat_last_n = -1"#,
             let message = error.to_string();
             assert!(message.contains("openai_compatible"), "{tag}: {message}");
             assert!(message.contains(field), "{tag}: {message}");
+            assert!(
+                message.contains("configured semantic value"),
+                "{tag}: {message}"
+            );
+            assert!(message.contains("wire representation"), "{tag}: {message}");
         }
     }
 
