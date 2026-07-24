@@ -1,0 +1,4 @@
+Please accurately translate the following text into {{target}}.
+You must retain the exact same number of delimiters in the translation. Strictly do not omit, escape, or translate these symbols, and pay close attention to their placement.
+
+left|right|tail

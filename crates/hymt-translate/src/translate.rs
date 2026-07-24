@@ -31,7 +31,7 @@ use hymt_core::language::{
 };
 use hymt_core::language_spec::{language_spec_or_none, LanguageFamily};
 use hymt_core::model_profile::ModelProfile;
-use hymt_core::templates::{build_prompt, PromptOpts, TemplateType};
+use hymt_core::templates::{build_prompt, PromptOpts, TemplateType, PROMPT_SCHEMA_ID};
 use hymt_segment::Segmenter;
 
 // ── TranslationCtx ────────────────────────────────────────────────────────────
@@ -140,6 +140,8 @@ impl TokenCountingSource {
 /// Diagnostics for the complete chat request budget used by a translation plan.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TokenBudget {
+    /// Versioned prompt contract used to render every request in this plan.
+    pub prompt_schema: &'static str,
     /// Whether the final request was counted locally or conservatively estimated.
     pub counting_source: TokenCountingSource,
     /// Active model profile used to choose the tokenizer/chat template.
@@ -773,6 +775,7 @@ fn make_token_budget(options: TokenBudgetOptions) -> TokenBudget {
         segment_input_tokens,
     } = options;
     TokenBudget {
+        prompt_schema: PROMPT_SCHEMA_ID,
         counting_source,
         profile_id: profile.id().to_owned(),
         tokenizer_revision: profile
@@ -1644,6 +1647,7 @@ pub async fn translate_text(
         },
         profile_id: profile_id.to_owned(),
         inference_fingerprint: inference_fingerprint.hash().to_owned(),
+        prompt_schema: PROMPT_SCHEMA_ID.to_owned(),
         tokens_per_second: tps,
         input_chars: text.chars().count() as i64,
         output_chars: translated.chars().count() as i64,
@@ -2113,6 +2117,7 @@ pub async fn translate_text_stream_with_mode(
         },
         profile_id: profile_id.to_owned(),
         inference_fingerprint: inference_fingerprint.hash().to_owned(),
+        prompt_schema: PROMPT_SCHEMA_ID.to_owned(),
         tokens_per_second: tps,
         input_chars: text.chars().count() as i64,
         output_chars: translated.chars().count() as i64,
@@ -3537,6 +3542,56 @@ max_retries = 1
         );
     }
 
+    #[test]
+    fn long_context_options_reduce_the_final_request_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            "[backend]\ntotal_context = 1024\nparallel_slots = 1\n\n[translation]\nmax_output_tokens = 600\nmax_source_tokens_per_segment = 0\n\n[completeness]\nmax_retries = 0\n",
+        )
+        .unwrap();
+        let cfg = hymt_core::config::HotConfig::from_path(&cfg_path).unwrap();
+        let segmenter = fallback_segmenter();
+        let brief = PromptOpts {
+            context: Some("brief release-note context".to_owned()),
+            ..PromptOpts::default()
+        };
+        let long = PromptOpts {
+            context: Some("[context]\nrelease detail\n".repeat(16)),
+            ..PromptOpts::default()
+        };
+
+        let brief_plan = plan_translation(
+            "budget source",
+            "zh",
+            &cfg,
+            &segmenter,
+            &TemplateType::ContextAware,
+            &brief,
+        )
+        .unwrap();
+        let long_plan = plan_translation(
+            "budget source",
+            "zh",
+            &cfg,
+            &segmenter,
+            &TemplateType::ContextAware,
+            &long,
+        )
+        .unwrap();
+
+        assert!(
+            long_plan.token_budget.template_tokens > brief_plan.token_budget.template_tokens,
+            "long user-controlled context must be counted as prompt overhead"
+        );
+        assert!(
+            long_plan.available_source_tokens < brief_plan.available_source_tokens,
+            "larger prompt overhead must reduce source capacity"
+        );
+        assert_eq!(long_plan.token_budget.prompt_schema, PROMPT_SCHEMA_ID);
+    }
+
     #[tokio::test]
     async fn oversized_atomic_table_is_rejected_before_http_submission() {
         let (endpoint_url, request_count, server) = start_request_counting_server().await;
@@ -3591,6 +3646,7 @@ max_retries = 1
             segments: vec!["a".to_owned(), "b".to_owned(), "c".to_owned()],
             available_source_tokens: 100,
             token_budget: TokenBudget {
+                prompt_schema: PROMPT_SCHEMA_ID,
                 counting_source: TokenCountingSource::Local,
                 profile_id: "test".to_owned(),
                 tokenizer_revision: None,

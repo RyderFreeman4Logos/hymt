@@ -1,0 +1,7 @@
+[Source Text]
+Sample source.
+
+[Translation Tasks]
+1. Preserve line breaks.
+2. Keep names unchanged.
+3. Translate the [Source Text] into {{target}}.

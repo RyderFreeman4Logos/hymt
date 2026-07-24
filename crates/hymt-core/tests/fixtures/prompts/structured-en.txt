@@ -1,0 +1,10 @@
+### Task
+Translate the user-facing text within the following JSON data into {{target}}.
+
+### Strict Rules
+1. Structure Preservation: preserve original structure exactly.
+2. Selective Translation: translate ONLY visible user-facing text.
+3. Strict Non-Translation: NEVER translate code tags, keys, properties, placeholders.
+
+### Source Data
+{"title":"Welcome","count":2}

@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     input_hash TEXT,
     config_version INTEGER DEFAULT 1,
     profile_id TEXT NOT NULL DEFAULT '',
-    inference_fingerprint TEXT NOT NULL DEFAULT ''
+    inference_fingerprint TEXT NOT NULL DEFAULT '',
+    prompt_schema TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS segment_cache (
@@ -60,6 +61,8 @@ pub struct TaskRecord {
     pub profile_id: String,
     /// SHA-256 inference identity used to scope every cache entry in this task.
     pub inference_fingerprint: String,
+    /// Versioned prompt contract used to render this task's model input.
+    pub prompt_schema: String,
     pub tokens_per_second: f64,
     pub input_chars: i64,
     pub output_chars: i64,
@@ -172,8 +175,9 @@ impl HistoryDB {
                 input_tokens, output_tokens, segments, concurrency,
                 source_lang, target_lang, template_type, model,
                 tokens_per_second, input_chars, output_chars,
-                output_text, input_hash, config_version, profile_id, inference_fingerprint
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+                output_text, input_hash, config_version, profile_id, inference_fingerprint,
+                prompt_schema
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
             rusqlite::params![
                 record.started_at,
                 record.finished_at,
@@ -194,6 +198,7 @@ impl HistoryDB {
                 record.config_version,
                 record.profile_id,
                 record.inference_fingerprint,
+                record.prompt_schema,
             ],
         )?;
         Ok(())
@@ -638,6 +643,9 @@ fn migrate_tasks_columns(conn: &Connection) -> Result<(), CacheError> {
             "ALTER TABLE tasks ADD COLUMN inference_fingerprint TEXT NOT NULL DEFAULT ''",
         )?;
     }
+    if !cols.contains("prompt_schema") {
+        conn.execute_batch("ALTER TABLE tasks ADD COLUMN prompt_schema TEXT NOT NULL DEFAULT ''")?;
+    }
     Ok(())
 }
 
@@ -750,6 +758,9 @@ fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
             .unwrap_or_default(),
         inference_fingerprint: row
             .get::<_, Option<String>>("inference_fingerprint")?
+            .unwrap_or_default(),
+        prompt_schema: row
+            .get::<_, Option<String>>("prompt_schema")?
             .unwrap_or_default(),
         tokens_per_second: row.get("tokens_per_second")?,
         input_chars: row.get("input_chars")?,
@@ -879,6 +890,7 @@ mod tests {
             model: None,
             profile_id: "hy_mt2_7b".to_owned(),
             inference_fingerprint: "sha256:sample".to_owned(),
+            prompt_schema: "hy-mt2-prompts/v2".to_owned(),
             tokens_per_second: tps,
             input_chars: 500,
             output_chars: 400,
@@ -898,6 +910,7 @@ mod tests {
         assert_eq!(records[0].target_lang, "en");
         assert_eq!(records[0].profile_id, "hy_mt2_7b");
         assert_eq!(records[0].inference_fingerprint, "sha256:sample");
+        assert_eq!(records[0].prompt_schema, "hy-mt2-prompts/v2");
         assert!((records[0].tokens_per_second - 50.0).abs() < 1e-9);
     }
 

@@ -1,0 +1,7 @@
+[源文本]
+Sample source.
+
+[翻译任务]
+1. Preserve line breaks.
+2. Keep names unchanged.
+3. 将[源文本]翻译成{{target}}。
