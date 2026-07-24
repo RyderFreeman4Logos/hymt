@@ -494,15 +494,23 @@ async fn run() -> Result<()> {
     let config = HotConfig::new()?;
     eprintln!("{}", profile_startup_diagnostic(config.model_profile()?));
     if config.uses_legacy_generation_scalars() {
-        eprintln!(
-            "Warning: legacy [inference] sampler scalars are deprecated; move them under [inference.override]."
-        );
+        eprintln!("{}", legacy_generation_scalars_migration_warning());
+    }
+    let generation_settings = config.generation_settings()?;
+    if !generation_settings.uses_only_server_defaults() {
+        eprintln!("Client sampling overrides: {generation_settings:?}");
     }
     if config.uses_legacy_context_window() {
         eprintln!(
             "Warning: [translation].context_window is deprecated; configure [backend] \
              total_context, parallel_slots, and optional per_request_context instead."
         );
+    }
+    if let Some(diagnostic) = TranslationClient::new(config.clone())?
+        .llama_cpp_props_diagnostic()
+        .await
+    {
+        eprintln!("{diagnostic}");
     }
     if cli.debug_chunk_timing {
         // CLI flag forces timing logs for this process; config/env also enable them.
@@ -672,6 +680,10 @@ fn profile_startup_diagnostic(profile: ModelProfile) -> String {
         ),
         None => "Warning: no [endpoint].profile configured; using generic mode without a tested tokenizer or generation defaults.".to_owned(),
     }
+}
+
+fn legacy_generation_scalars_migration_warning() -> &'static str {
+    "Warning: legacy [inference] sampler scalars are deprecated; move them under [inference.override]."
 }
 
 fn make_client_with_concurrency(
@@ -1688,6 +1700,13 @@ Options:\n  --source-id <SOURCE_ID>\n  --context-only\n";
 
         assert!(profile_startup_diagnostic(ModelProfile::HyMt2_30bA3b).contains("hy_mt2_30b_a3b"));
         assert!(profile_startup_diagnostic(ModelProfile::Generic).contains("generic mode"));
+    }
+
+    #[test]
+    fn legacy_sampler_migration_diagnostic_names_the_override_table() {
+        let warning = legacy_generation_scalars_migration_warning();
+        assert!(warning.contains("legacy [inference] sampler scalars"));
+        assert!(warning.contains("[inference.override]"));
     }
 
     #[test]

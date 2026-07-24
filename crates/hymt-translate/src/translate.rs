@@ -2303,6 +2303,13 @@ mod tests {
 url = "{endpoint_url}"
 profile = "hy_mt2_7b"
 model = "test-model"
+backend = "llama_cpp"
+
+[inference.override]
+temperature = 0.7
+top_p = 0.6
+top_k = 20
+repetition_penalty = 1.05
 
 [translation]
 context_window = 512

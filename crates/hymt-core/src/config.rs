@@ -56,6 +56,7 @@ secondary = "en"
 
 [inference]
 # Sampler values are omitted by default so the configured server selects them.
+# A model profile is deployment guidance, not a source of request sampler values.
 # Explicit overrides belong under `[inference.override]`; a numeric value is
 # sent through the selected endpoint adapter and the string `"disabled"` turns
 # off that sampler using the adapter's documented wire value.
@@ -284,7 +285,8 @@ impl GenerationSettings {
         }
     }
 
-    fn uses_only_server_defaults(&self) -> bool {
+    /// Whether every sampler is omitted from the request payload.
+    pub fn uses_only_server_defaults(&self) -> bool {
         matches!(
             self,
             Self {
@@ -298,25 +300,10 @@ impl GenerationSettings {
         )
     }
 
-    /// Overlay explicit user overrides on top of a model profile's defaults.
-    pub fn with_overrides(self, overrides: Self) -> Self {
-        Self {
-            temperature: setting_or_default(self.temperature, overrides.temperature),
-            top_p: setting_or_default(self.top_p, overrides.top_p),
-            top_k: setting_or_default(self.top_k, overrides.top_k),
-            repetition_penalty: setting_or_default(
-                self.repetition_penalty,
-                overrides.repetition_penalty,
-            ),
-            min_p: setting_or_default(self.min_p, overrides.min_p),
-            repeat_last_n: setting_or_default(self.repeat_last_n, overrides.repeat_last_n),
-        }
-    }
-
-    /// Remove semantic sampler defaults which the selected adapter cannot put
+    /// Remove explicit sampler settings which the selected adapter cannot put
     /// on the wire. Explicit unsupported overrides are rejected before this
-    /// normalization; this only prevents profile defaults from polluting a
-    /// request fingerprint when strict generic mode omits them.
+    /// normalization, so this keeps the fingerprint aligned with serialized
+    /// request fields without inventing service-owned defaults.
     fn normalized_for_backend(&self, backend: GenerationBackend) -> Self {
         let supports = |field| backend.capabilities().contains(&field);
         Self {
@@ -437,13 +424,6 @@ fn setting_if_supported<T>(supported: bool, setting: Setting<T>) -> Setting<T> {
         setting
     } else {
         Setting::ServerDefault
-    }
-}
-
-fn setting_or_default<T>(default: Setting<T>, override_value: Setting<T>) -> Setting<T> {
-    match override_value {
-        Setting::ServerDefault => default,
-        value => value,
     }
 }
 
@@ -1004,15 +984,16 @@ impl HotConfig {
 
     // ── inference ───────────────────────────────────────────────────────────
 
-    /// Reads and validates the backend-neutral generation overrides.
+    /// Reads and validates explicit backend-neutral generation overrides.
+    ///
+    /// An absent sampler key remains [`Setting::ServerDefault`], so it is not
+    /// serialized and the selected inference service owns its default. Model
+    /// profile sampling guidance is intentionally not overlaid here.
     pub fn generation_settings(&self) -> Result<GenerationSettings, CoreError> {
         let state = self.state.read().unwrap();
-        let profile = state.profile.unwrap_or(ModelProfile::Generic);
         let overrides = GenerationSettings::from_toml(&state.data)?;
         generation_backend_from_toml(&state.data)?.validate_settings(&overrides)?;
-        let settings = profile.generation_defaults().with_overrides(overrides);
-        settings.validate()?;
-        Ok(settings)
+        Ok(overrides)
     }
 
     /// Backend profile used to map [`GenerationSettings`] to request fields.
@@ -1361,8 +1342,6 @@ impl HotConfig {
             .unwrap_or_else(|| model_profile_from_toml(&data))?;
         let overrides = GenerationSettings::from_toml(&data)?;
         generation_backend_from_toml(&data)?.validate_settings(&overrides)?;
-        let settings = profile.generation_defaults().with_overrides(overrides);
-        settings.validate()?;
         let uses_legacy_generation_scalars = uses_legacy_generation_scalars(&data);
         let uses_legacy_context_window = uses_legacy_context_window(&data);
         let mtime = std::fs::metadata(&self.path)
@@ -2015,7 +1994,10 @@ repeat_last_n = 64"#,
             !incomplete.is_cache_verified(),
             "generic model identity plus server-default sampling cannot safely reuse cache"
         );
-        assert!(profiled.is_cache_verified());
+        assert!(
+            !profiled.is_cache_verified(),
+            "a profile alone cannot verify service-owned sampling for cache reuse"
+        );
         assert!(
             explicit_generic.is_cache_verified(),
             "a configured served model and explicit sampling establish a usable identity"
@@ -2023,7 +2005,7 @@ repeat_last_n = 64"#,
     }
 
     #[test]
-    fn endpoint_profile_selects_generation_defaults_and_rejects_unknown_values() {
+    fn endpoint_profile_keeps_sampling_server_owned_without_explicit_overrides() {
         use crate::model_profile::ModelProfile;
 
         let path = temp_config_path("profile_defaults");
@@ -2041,7 +2023,7 @@ top_p = 0.8"#,
         assert_eq!(config.model_profile().unwrap(), ModelProfile::HyMt2_30bA3b);
         assert_eq!(
             config.generation_settings().unwrap().temperature,
-            Setting::Value(0.7)
+            Setting::ServerDefault
         );
         assert_eq!(
             config.generation_settings().unwrap().top_p,
@@ -2049,11 +2031,11 @@ top_p = 0.8"#,
         );
         assert_eq!(
             config.generation_settings().unwrap().top_k,
-            Setting::Disabled
+            Setting::ServerDefault
         );
         assert_eq!(
             config.generation_settings().unwrap().repetition_penalty,
-            Setting::Value(1.0)
+            Setting::ServerDefault
         );
 
         let generic_path = temp_config_path("generic_profile");
@@ -2072,7 +2054,7 @@ top_p = 0.8"#,
     }
 
     #[test]
-    fn profiles_keep_semantic_defaults_when_openai_omits_unsupported_fields() {
+    fn profiles_without_explicit_overrides_keep_openai_sampling_server_owned() {
         let path = temp_config_path("profile_openai_backend");
         fs::write(
             &path,
@@ -2085,7 +2067,7 @@ backend = "openai_compatible""#,
         let config = HotConfig::from_path(&path).unwrap();
         assert_eq!(
             config.generation_settings().unwrap().top_k,
-            Setting::Disabled
+            Setting::ServerDefault
         );
     }
 
