@@ -799,7 +799,7 @@ async fn download_telegram_document(
         ),
     } {
         let chunk_size = chunk.len() as u64;
-        if (bytes.len() as u64) > max_size.saturating_sub(chunk_size) {
+        if chunk_size > max_size.saturating_sub(bytes.len() as u64) {
             bail!(DOCUMENT_TOO_LARGE);
         }
         bytes.extend_from_slice(&chunk);
