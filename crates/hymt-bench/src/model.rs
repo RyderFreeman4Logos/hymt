@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
-use crate::corpus::Example;
+use crate::corpus::{Corpus, Example};
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct SystemsConfig {
@@ -203,7 +203,12 @@ pub struct GateResult {
     pub message: String,
 }
 
-pub fn summarize(records: &[RunRecord]) -> Vec<MetricSummary> {
+pub fn summarize(records: &[RunRecord], corpus: &Corpus) -> Vec<MetricSummary> {
+    let examples_by_id: HashMap<_, _> = corpus
+        .examples
+        .iter()
+        .map(|example| (example.id.as_str(), example))
+        .collect();
     let mut groups: HashMap<(&str, &str), Vec<&RunRecord>> = HashMap::new();
     for record in records.iter().filter(|record| record.error.is_none()) {
         groups
@@ -215,13 +220,22 @@ pub fn summarize(records: &[RunRecord]) -> Vec<MetricSummary> {
         .into_values()
         .map(|records| {
             let first = records[0];
+            let chrf_pairs: Vec<_> = records
+                .iter()
+                .filter_map(|record| {
+                    examples_by_id
+                        .get(record.example_id.as_str())
+                        .and_then(|example| example.reference.as_deref())
+                        .map(|reference| (reference, record.output.as_str()))
+                })
+                .collect();
             MetricSummary {
                 system_id: first.system_id.clone(),
                 backend: first.backend.clone(),
                 quantization: first.quantization.clone(),
                 sampler_id: first.sampler_id.clone(),
                 samples: records.len(),
-                chrf: mean_optional(records.iter().filter_map(|record| record.metrics.chrf)),
+                chrf: (!chrf_pairs.is_empty()).then(|| corpus_chrf(chrf_pairs)),
                 preservation_rate: mean(
                     records
                         .iter()
@@ -339,24 +353,46 @@ pub fn score_example(
 
 /// Character n-gram F-score (n=1..6, beta=2), using character multiset overlap.
 pub fn chrf(reference: &str, hypothesis: &str) -> f64 {
-    let scores: Vec<_> = (1..=6)
-        .filter_map(|n| {
+    corpus_chrf([(reference, hypothesis)])
+}
+
+/// Corpus-level character n-gram F-score (n=1..6, beta=2).
+///
+/// Counts are accumulated by n-gram order across every comparable pair before
+/// computing each order's F-score. This intentionally differs from averaging
+/// per-example chrF values, which would give short and long examples equal
+/// weight.
+pub fn corpus_chrf<'a>(pairs: impl IntoIterator<Item = (&'a str, &'a str)>) -> f64 {
+    let mut matched = [0_usize; 6];
+    let mut reference_total = [0_usize; 6];
+    let mut hypothesis_total = [0_usize; 6];
+    for (reference, hypothesis) in pairs {
+        for n in 1..=6 {
             let reference = char_ngrams(reference, n);
             let hypothesis = char_ngrams(hypothesis, n);
-            if reference.is_empty() || hypothesis.is_empty() {
-                return None;
-            }
-            let overlap: usize = hypothesis
+            let index = n - 1;
+            reference_total[index] += reference.values().sum::<usize>();
+            hypothesis_total[index] += hypothesis.values().sum::<usize>();
+            matched[index] += hypothesis
                 .iter()
                 .map(|(gram, count)| count.min(reference.get(gram).unwrap_or(&0)))
-                .sum();
-            let precision = overlap as f64 / hypothesis.values().sum::<usize>() as f64;
-            let recall = overlap as f64 / reference.values().sum::<usize>() as f64;
-            let beta_squared = 4.0;
-            Some(if precision + recall == 0.0 {
-                0.0
-            } else {
-                (1.0 + beta_squared) * precision * recall / (beta_squared * precision + recall)
+                .sum::<usize>();
+        }
+    }
+
+    let scores: Vec<_> = (0..6)
+        .filter_map(|index| {
+            let reference = reference_total[index];
+            let hypothesis = hypothesis_total[index];
+            (reference != 0 && hypothesis != 0).then(|| {
+                let precision = matched[index] as f64 / hypothesis as f64;
+                let recall = matched[index] as f64 / reference as f64;
+                let beta_squared = 4.0;
+                if precision + recall == 0.0 {
+                    0.0
+                } else {
+                    (1.0 + beta_squared) * precision * recall / (beta_squared * precision + recall)
+                }
             })
         })
         .collect();
@@ -395,4 +431,21 @@ fn source_language_residue(example: &Example, output: &str) -> Option<f64> {
         _ => return None,
     };
     Some(residue as f64 / visible.len() as f64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn corpus_chrf_aggregates_ngram_counts_instead_of_example_scores() {
+        let pairs = [("aaaaaa", "aaaaaa"), ("bbbbbbbbbbbb", "xxxxxxxxxxxx")];
+
+        let score = corpus_chrf(pairs);
+        let per_example_mean =
+            (chrf("aaaaaa", "aaaaaa") + chrf("bbbbbbbbbbbb", "xxxxxxxxxxxx")) / 2.0;
+
+        assert!((score - 0.251_091_269_841_269_84).abs() < 1e-12);
+        assert!((score - per_example_mean).abs() > 0.1);
+    }
 }

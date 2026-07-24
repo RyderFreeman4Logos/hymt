@@ -741,6 +741,7 @@ dependencies = [
  "clap",
  "futures-util",
  "hex",
+ "hymt-core",
  "reqwest",
  "serde",
  "serde_json",

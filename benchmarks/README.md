@@ -32,7 +32,7 @@ just benchmark --dry-run
 
 Live requests are intentionally blocked unless `HYMT_BENCHMARK_LIVE=1`. The runner uses direct OpenAI-compatible `/v1/chat/completions` requests rather than the HyMT cache client, adds `Cache-Control: no-store`, and supplies a unique `X-HyMT-Benchmark-Run` header. This prevents the benchmark from silently measuring HyMT's output cache.
 
-Set the endpoint and model variables for every selected system. Metadata variables are optional but should be set for a comparable run:
+Set the endpoint and all reproducibility metadata variables for every selected system. Live runs reject missing model identity/revision, tokenizer revision, backend version, and (for llama.cpp targets) GGUF SHA-256 values before making requests:
 
 ```bash
 export HYMT_BENCHMARK_LIVE=1
@@ -49,7 +49,7 @@ just benchmark --live --output-dir benchmarks/results/$(date -u +%Y%m%dT%H%M%SZ)
 
 The runner uses streaming responses when the backend serves SSE, so it reports end-to-end latency, first-token latency, and output characters/sec. Non-streaming endpoints still report end-to-end latency and throughput; first-token latency is explicitly `n/a`, never synthesized.
 
-Use a previous JSON result for compatible per-system/per-sampler chrF regression checks:
+Use a previous JSON result for compatible per-system/per-sampler chrF regression checks. The runner rejects baselines with a different result schema, corpus or prompt schema/hash, mode, or selected-system identity metadata:
 
 ```bash
 just benchmark --live --baseline benchmarks/results/baseline/results.json
@@ -85,10 +85,11 @@ COMET/xCOMET is intentionally optional: its model dependencies are not bundled i
 
 Thresholds are versioned in `decision-gates.toml` and evaluated for every system/sampler summary:
 
-1. absolute chrF and optional same-system/sampler baseline regression;
-2. exact preservation, parse success, truncation/completeness, and residue ceilings;
-3. Q4_K_M chrF tradeoff against Q6_K (and Q4 throughput ratio when live measurements exist);
-4. sampler compatibility: max chrF spread, preservation floor, and truncation ceiling for service defaults, min-p on/off, repeat-last-n 64/full, and top-p variants.
+1. complete request coverage for every selected system/sampler; any live backend request error fails the run's quality gates;
+2. absolute chrF and optional same-system/sampler baseline regression;
+3. exact preservation, parse success, truncation/completeness, and residue ceilings;
+4. Q4_K_M chrF tradeoff against Q6_K (and Q4 throughput ratio when live measurements exist);
+5. sampler compatibility: max chrF spread, preservation floor, and truncation ceiling for service defaults, min-p on/off, repeat-last-n 64/full, and top-p variants.
 
 Any threshold change is a reviewable corpus/gate change, not an ad-hoc dashboard setting.
 

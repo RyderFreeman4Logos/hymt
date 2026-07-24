@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -8,6 +8,7 @@ use std::time::Instant;
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use futures_util::StreamExt;
+use hymt_core::templates::{build_prompt, PromptOpts, TemplateType};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
@@ -48,10 +49,17 @@ pub fn load_decision_gates(path: &Path) -> Result<DecisionGates> {
 pub fn run_benchmark(options: &RunOptions) -> Result<BenchmarkReport> {
     let corpus = load_corpus(&options.corpus_path)?;
     validate_corpus(&corpus)?;
+    validate_benchmark_prompts(&corpus)?;
     let systems = load_systems(&options.systems_path)?;
     validate_systems(&systems, &corpus)?;
     let gates = load_decision_gates(&options.gates_path)?;
     let selected = select_systems(&systems, &options.system_ids)?;
+    if options.mode == RunMode::Live {
+        if env::var("HYMT_BENCHMARK_LIVE").as_deref() != Ok("1") {
+            bail!("live benchmark execution requires HYMT_BENCHMARK_LIVE=1; use --mock or --dry-run otherwise");
+        }
+        validate_live_metadata(&selected)?;
+    }
     let mut metadata =
         reproducibility_metadata(&options.mode, &options.corpus_path, &corpus, &selected)?;
 
@@ -59,9 +67,6 @@ pub fn run_benchmark(options: &RunOptions) -> Result<BenchmarkReport> {
         RunMode::DryRun => Vec::new(),
         RunMode::Mock => mock_records(&corpus, &selected),
         RunMode::Live => {
-            if env::var("HYMT_BENCHMARK_LIVE").as_deref() != Ok("1") {
-                bail!("live benchmark execution requires HYMT_BENCHMARK_LIVE=1; use --mock or --dry-run otherwise");
-            }
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
@@ -72,12 +77,15 @@ pub fn run_benchmark(options: &RunOptions) -> Result<BenchmarkReport> {
         }
     };
 
-    let summaries = summarize(&records);
+    let summaries = summarize(&records, &corpus);
     let baseline = options
         .baseline_path
         .as_deref()
         .map(load_baseline)
         .transpose()?;
+    if let Some(baseline) = baseline.as_ref() {
+        validate_baseline_compatibility(baseline, &metadata, &selected)?;
+    }
     let gates = if options.mode == RunMode::DryRun {
         vec![GateResult {
             name: "configuration-valid".into(),
@@ -88,7 +96,14 @@ pub fn run_benchmark(options: &RunOptions) -> Result<BenchmarkReport> {
             message: "corpus, systems, and gate schemas validated; no backend was executed".into(),
         }]
     } else {
-        evaluate_gates(&summaries, &gates, baseline.as_ref(), &selected)
+        evaluate_gates(
+            &records,
+            &corpus,
+            &summaries,
+            &gates,
+            baseline.as_ref(),
+            &selected,
+        )
     };
     let report = BenchmarkReport {
         schema_version: "hymt-benchmark-results/v1".into(),
@@ -204,11 +219,14 @@ async fn live_records(
     for system in systems {
         let endpoint = env::var(&system.endpoint_env)
             .with_context(|| format!("{} is required for live execution", system.endpoint_env))?;
-        let system_metadata = live_system_metadata(&client, system, &endpoint).await;
+        let model =
+            env_value(&system.model_env).expect("live metadata must be validated before execution");
+        let system_metadata = live_system_metadata(&client, system, &endpoint, &model).await;
         for sampler in &system.sampler_variants {
             for example in &corpus.examples {
                 let result =
-                    execute_request(&client, system, sampler, example, &endpoint, run_id).await;
+                    execute_request(&client, system, sampler, example, &endpoint, &model, run_id)
+                        .await;
                 let (output, finish_reason, timing, error) = match result {
                     Ok(response) => (
                         response.output,
@@ -255,13 +273,11 @@ async fn execute_request(
     sampler: &SamplerVariant,
     example: &Example,
     endpoint: &str,
+    model: &str,
     run_id: &str,
 ) -> Result<LiveResponse> {
     let mut body = Map::new();
-    body.insert(
-        "model".into(),
-        Value::String(env::var(&system.model_env).unwrap_or_else(|_| "benchmark-model".into())),
-    );
+    body.insert("model".into(), Value::String(model.to_owned()));
     body.insert("stream".into(), Value::Bool(true));
     body.insert(
         "messages".into(),
@@ -349,12 +365,82 @@ async fn execute_request(
     })
 }
 
+fn validate_benchmark_prompts(corpus: &Corpus) -> Result<()> {
+    for example in &corpus.examples {
+        let (target, template, opts) = benchmark_prompt_parts(example)?;
+        build_prompt(&example.source, target, &template, &opts).with_context(|| {
+            format!(
+                "build production prompt for benchmark example {}",
+                example.id
+            )
+        })?;
+    }
+    Ok(())
+}
+
 fn benchmark_prompt(example: &Example) -> String {
-    let (source, target) = example
+    let (target, template, opts) = benchmark_prompt_parts(example)
+        .expect("benchmark corpus prompt configuration must be validated before execution");
+    build_prompt(&example.source, target, &template, &opts)
+        .expect("benchmark corpus production prompt must be validated before execution")
+}
+
+fn benchmark_prompt_parts(example: &Example) -> Result<(&str, TemplateType, PromptOpts)> {
+    let (_, target) = example
         .language_pair
         .split_once('-')
-        .unwrap_or(("source", "target"));
-    format!("Translate from {source} to {target}. Return only the translation. Preserve these tokens exactly: {}.\n\n{}", example.expected_preserved_tokens.join(", "), example.source)
+        .ok_or_else(|| anyhow!("example {} has invalid language_pair", example.id))?;
+    let (template, opts) = match example.template_type.as_str() {
+        "terminology" => (
+            TemplateType::Terminology,
+            PromptOpts {
+                terms: Some(
+                    example
+                        .expected_preserved_tokens
+                        .iter()
+                        .map(|token| (token.clone(), token.clone()))
+                        .collect(),
+                ),
+                ..PromptOpts::default()
+            },
+        ),
+        "formal" | "casual" | "concise" => (
+            TemplateType::Style,
+            PromptOpts {
+                style: Some(example.template_type.clone()),
+                ..PromptOpts::default()
+            },
+        ),
+        "context" => (
+            TemplateType::ContextAware,
+            PromptOpts {
+                context: Some(example.invariants.join("; ")),
+                ..PromptOpts::default()
+            },
+        ),
+        "json" | "yaml" | "toml" => (
+            TemplateType::Structured,
+            PromptOpts {
+                format_type: Some(
+                    example
+                        .structured_format
+                        .clone()
+                        .unwrap_or_else(|| example.template_type.clone())
+                        .to_uppercase(),
+                ),
+                ..PromptOpts::default()
+            },
+        ),
+        "segments" => (TemplateType::Delimiters, PromptOpts::default()),
+        "prose" | "ui" | "cli-help" | "markdown" | "mixed" | "adversarial" => {
+            (TemplateType::Default, PromptOpts::default())
+        }
+        other => bail!(
+            "example {} uses unsupported benchmark template type {other}",
+            example.id
+        ),
+    };
+    Ok((target, template, opts))
 }
 fn completion_content(value: &Value) -> Option<String> {
     value
@@ -388,6 +474,7 @@ async fn live_system_metadata(
     client: &reqwest::Client,
     system: &SystemDefinition,
     endpoint: &str,
+    effective_model: &str,
 ) -> SystemMetadata {
     let without_completion = endpoint
         .strip_suffix("/chat/completions")
@@ -406,7 +493,9 @@ async fn live_system_metadata(
         Ok(response) if response.status().is_success() => response.json::<Value>().await.ok(),
         _ => None,
     };
-    system_metadata(system, true, resolved_props)
+    let mut metadata = system_metadata(system, true, resolved_props);
+    metadata.model = Some(effective_model.to_owned());
+    metadata
 }
 
 fn system_metadata(
@@ -429,6 +518,46 @@ fn system_metadata(
 }
 fn env_value(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.trim().is_empty())
+}
+
+fn validate_live_metadata(systems: &[&SystemDefinition]) -> Result<()> {
+    validate_live_metadata_with(systems, env_value)
+}
+
+fn validate_live_metadata_with<F>(systems: &[&SystemDefinition], read_env: F) -> Result<()>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    for system in systems {
+        for (field, environment_variable) in [
+            ("model identity", system.model_env.as_str()),
+            ("model revision", system.model_revision_env.as_str()),
+            ("tokenizer revision", system.tokenizer_revision_env.as_str()),
+            ("backend version", system.backend_version_env.as_str()),
+        ] {
+            if read_env(environment_variable).is_none() {
+                bail!(
+                    "{environment_variable} is required for live comparable runs ({field} for system {})",
+                    system.id
+                );
+            }
+        }
+        if let Some(environment_variable) = system.gguf_sha256_env.as_deref() {
+            let hash = read_env(environment_variable).ok_or_else(|| {
+                anyhow!(
+                    "{environment_variable} is required for live comparable runs (GGUF SHA-256 for system {})",
+                    system.id
+                )
+            })?;
+            if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                bail!(
+                    "{environment_variable} must be a 64-character hexadecimal GGUF SHA-256 for system {}",
+                    system.id
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn reproducibility_metadata(
@@ -504,6 +633,8 @@ fn host_metadata() -> HostMetadata {
 }
 
 fn evaluate_gates(
+    records: &[RunRecord],
+    corpus: &Corpus,
     summaries: &[MetricSummary],
     gates: &DecisionGates,
     baseline: Option<&BenchmarkReport>,
@@ -530,6 +661,7 @@ fn evaluate_gates(
         .collect::<Vec<_>>();
     let residue = summary_values(|summary| summary.source_language_residue_rate);
     let mut results = vec![
+        completion_coverage_gate(records, corpus, systems),
         gate(
             "quality-chrf",
             all_at_least(&chrf, gates.quality.min_chrf),
@@ -575,6 +707,47 @@ fn evaluate_gates(
     results.push(quantization_throughput_gate(summaries, systems, gates));
     results.push(sampler_gate(summaries, gates));
     results
+}
+
+fn completion_coverage_gate(
+    records: &[RunRecord],
+    corpus: &Corpus,
+    systems: &[&SystemDefinition],
+) -> GateResult {
+    let expected_examples: HashSet<_> = corpus
+        .examples
+        .iter()
+        .map(|example| example.id.as_str())
+        .collect();
+    let mut coverage = Vec::new();
+    let mut passed = !expected_examples.is_empty() && !systems.is_empty();
+
+    for system in systems {
+        for sampler in &system.sampler_variants {
+            let group = records
+                .iter()
+                .filter(|record| record.system_id == system.id && record.sampler_id == sampler.id);
+            let group_records: Vec<_> = group.collect();
+            let has_error = group_records.iter().any(|record| record.error.is_some());
+            let completed: HashSet<_> = group_records
+                .iter()
+                .filter(|record| record.error.is_none())
+                .map(|record| record.example_id.as_str())
+                .filter(|example_id| expected_examples.contains(example_id))
+                .collect();
+            let fraction = completed.len() as f64 / expected_examples.len() as f64;
+            coverage.push(fraction);
+            passed &= !has_error && completed.len() == expected_examples.len();
+        }
+    }
+
+    gate(
+        "request-completion-coverage",
+        passed,
+        min_value(&coverage),
+        1.0,
+        "per-system/per-sampler request coverage; any backend request error fails this quality gate",
+    )
 }
 
 fn gate(
@@ -768,6 +941,93 @@ fn load_baseline(path: &Path) -> Result<BenchmarkReport> {
         .with_context(|| format!("parse baseline {}", path.display()))
 }
 
+fn validate_baseline_compatibility(
+    baseline: &BenchmarkReport,
+    current: &ReproducibilityMetadata,
+    systems: &[&SystemDefinition],
+) -> Result<()> {
+    if baseline.schema_version != "hymt-benchmark-results/v1" {
+        bail!(
+            "baseline uses unsupported results schema {}; expected hymt-benchmark-results/v1",
+            baseline.schema_version
+        );
+    }
+    for (field, baseline_value, current_value) in [
+        (
+            "benchmark mode",
+            baseline.metadata.mode.as_str(),
+            current.mode.as_str(),
+        ),
+        (
+            "corpus SHA-256",
+            baseline.metadata.corpus_sha256.as_str(),
+            current.corpus_sha256.as_str(),
+        ),
+        (
+            "corpus schema",
+            baseline.metadata.corpus_schema_version.as_str(),
+            current.corpus_schema_version.as_str(),
+        ),
+        (
+            "prompt schema",
+            baseline.metadata.prompt_schema_version.as_str(),
+            current.prompt_schema_version.as_str(),
+        ),
+    ] {
+        if baseline_value != current_value {
+            bail!(
+                "baseline {field} is incompatible (baseline {baseline_value:?}, current {current_value:?})"
+            );
+        }
+    }
+
+    for system in systems {
+        let current_system = current
+            .systems
+            .iter()
+            .find(|metadata| metadata.id == system.id)
+            .ok_or_else(|| anyhow!("current run is missing metadata for system {}", system.id))?;
+        let baseline_system = baseline
+            .metadata
+            .systems
+            .iter()
+            .find(|metadata| metadata.id == system.id)
+            .ok_or_else(|| anyhow!("baseline is missing metadata for system {}", system.id))?;
+        for (field, compatible) in [
+            ("backend", baseline_system.backend == current_system.backend),
+            (
+                "quantization",
+                baseline_system.quantization == current_system.quantization,
+            ),
+            (
+                "model identity",
+                baseline_system.model == current_system.model,
+            ),
+            (
+                "model revision",
+                baseline_system.model_revision == current_system.model_revision,
+            ),
+            (
+                "tokenizer revision",
+                baseline_system.tokenizer_revision == current_system.tokenizer_revision,
+            ),
+            (
+                "GGUF SHA-256",
+                baseline_system.gguf_sha256 == current_system.gguf_sha256,
+            ),
+            (
+                "backend version",
+                baseline_system.backend_version == current_system.backend_version,
+            ),
+        ] {
+            if !compatible {
+                bail!("baseline {field} is incompatible for system {}", system.id);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn write_report(report: &BenchmarkReport, output_dir: &Path) -> Result<()> {
     fs::create_dir_all(output_dir)
         .with_context(|| format!("create output directory {}", output_dir.display()))?;
@@ -828,4 +1088,151 @@ fn opt(value: Option<f64>) -> String {
     value
         .map(|value| format!("{value:.3}"))
         .unwrap_or_else(|| "n/a".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hymt_core::templates::{build_prompt, PromptOpts, TemplateType};
+
+    #[test]
+    fn benchmark_prompt_uses_the_production_style_template() {
+        let example = Example {
+            id: "style".into(),
+            category: "style".into(),
+            language_pair: "en-zh".into(),
+            template_type: "formal".into(),
+            source: "Please submit through {portal}.".into(),
+            reference: None,
+            invariants: vec!["preserve placeholder".into()],
+            expected_preserved_tokens: vec!["{portal}".into()],
+            structured_format: None,
+        };
+
+        let expected = build_prompt(
+            &example.source,
+            "zh",
+            &TemplateType::Style,
+            &PromptOpts {
+                style: Some("formal".into()),
+                ..PromptOpts::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(benchmark_prompt(&example), expected);
+    }
+
+    #[test]
+    fn request_errors_fail_the_per_system_sampler_completion_gate() {
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let corpus = load_corpus(&repo.join("benchmarks/corpus/v1.json")).unwrap();
+        let systems = load_systems(&repo.join("benchmarks/systems.toml")).unwrap();
+        let gates = load_decision_gates(&repo.join("benchmarks/decision-gates.toml")).unwrap();
+        let selected = select_systems(&systems, &[]).unwrap();
+        let mut records = mock_records(&corpus, &selected);
+        records[0].error = Some("connection reset".into());
+        let summaries = summarize(&records, &corpus);
+
+        let coverage = evaluate_gates(&records, &corpus, &summaries, &gates, None, &selected)
+            .into_iter()
+            .find(|gate| gate.name == "request-completion-coverage")
+            .expect("completion coverage gate must be present");
+
+        assert!(!coverage.passed);
+        assert_eq!(coverage.threshold, Some(1.0));
+        assert!(coverage.observed.is_some_and(|value| value < 1.0));
+    }
+
+    #[test]
+    fn live_metadata_requires_identity_revisions_backend_and_valid_gguf_hash() {
+        let system = SystemDefinition {
+            id: "q4".into(),
+            backend: "llama.cpp".into(),
+            quantization: "Q4_K_M".into(),
+            endpoint_env: "ENDPOINT".into(),
+            model_env: "MODEL".into(),
+            model_revision_env: "MODEL_REVISION".into(),
+            tokenizer_revision_env: "TOKENIZER_REVISION".into(),
+            gguf_sha256_env: Some("GGUF_SHA256".into()),
+            backend_version_env: "BACKEND_VERSION".into(),
+            supports_min_p: true,
+            supports_repeat_last_n: true,
+            props_path: "/props".into(),
+            sampler_variants: Vec::new(),
+        };
+        let values = HashMap::from([
+            ("MODEL", "hymt-q4"),
+            ("MODEL_REVISION", "model-revision"),
+            ("TOKENIZER_REVISION", "tokenizer-revision"),
+            ("BACKEND_VERSION", "build-123"),
+            (
+                "GGUF_SHA256",
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            ),
+        ]);
+        let metadata = |name: &str| values.get(name).map(|value| (*value).to_owned());
+
+        validate_live_metadata_with(&[&system], metadata).unwrap();
+
+        let missing_model = |name: &str| {
+            (name != "MODEL")
+                .then(|| values.get(name).map(|value| (*value).to_owned()))
+                .flatten()
+        };
+        assert!(validate_live_metadata_with(&[&system], missing_model)
+            .unwrap_err()
+            .to_string()
+            .contains("MODEL"));
+
+        let invalid_hash = |name: &str| {
+            if name == "GGUF_SHA256" {
+                Some("not-a-sha256".to_owned())
+            } else {
+                values.get(name).map(|value| (*value).to_owned())
+            }
+        };
+        assert!(validate_live_metadata_with(&[&system], invalid_hash)
+            .unwrap_err()
+            .to_string()
+            .contains("GGUF_SHA256"));
+    }
+
+    #[test]
+    fn baseline_compatibility_rejects_schema_corpus_prompt_and_model_identity_mismatches() {
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let corpus_path = repo.join("benchmarks/corpus/v1.json");
+        let corpus = load_corpus(&corpus_path).unwrap();
+        let systems = load_systems(&repo.join("benchmarks/systems.toml")).unwrap();
+        let selected = select_systems(&systems, &[]).unwrap();
+        let current =
+            reproducibility_metadata(&RunMode::Mock, &corpus_path, &corpus, &selected).unwrap();
+        let baseline = BenchmarkReport {
+            schema_version: "hymt-benchmark-results/v1".into(),
+            metadata: current.clone(),
+            records: Vec::new(),
+            summaries: Vec::new(),
+            gates: Vec::new(),
+        };
+
+        let mut wrong_schema = baseline.clone();
+        wrong_schema.schema_version = "hymt-benchmark-results/v0".into();
+        assert!(validate_baseline_compatibility(&wrong_schema, &current, &selected).is_err());
+
+        let mut wrong_corpus = baseline.clone();
+        wrong_corpus.metadata.corpus_sha256 = "different-corpus".into();
+        assert!(validate_baseline_compatibility(&wrong_corpus, &current, &selected).is_err());
+
+        let mut wrong_prompt = baseline.clone();
+        wrong_prompt.metadata.prompt_schema_version = "different-prompt".into();
+        assert!(validate_baseline_compatibility(&wrong_prompt, &current, &selected).is_err());
+
+        let mut wrong_model = baseline;
+        let model = wrong_model.metadata.systems[0]
+            .model
+            .clone()
+            .unwrap_or_default();
+        wrong_model.metadata.systems[0].model = Some(format!("{model}-different"));
+        assert!(validate_baseline_compatibility(&wrong_model, &current, &selected).is_err());
+    }
 }
