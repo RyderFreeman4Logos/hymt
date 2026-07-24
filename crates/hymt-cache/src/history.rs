@@ -25,7 +25,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     output_text TEXT,
     input_hash TEXT,
     config_version INTEGER DEFAULT 1,
-    profile_id TEXT NOT NULL DEFAULT ''
+    profile_id TEXT NOT NULL DEFAULT '',
+    inference_fingerprint TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS segment_cache (
@@ -34,9 +35,10 @@ CREATE TABLE IF NOT EXISTS segment_cache (
     template_type TEXT NOT NULL,
     options_hash TEXT NOT NULL DEFAULT '',
     profile_id TEXT NOT NULL DEFAULT '',
+    inference_fingerprint TEXT NOT NULL DEFAULT '',
     translated_text TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    PRIMARY KEY (content_hash, target_lang, template_type, options_hash, profile_id)
+    PRIMARY KEY (content_hash, target_lang, template_type, options_hash, profile_id, inference_fingerprint)
 );
 ";
 
@@ -56,6 +58,8 @@ pub struct TaskRecord {
     pub model: Option<String>,
     /// Stable endpoint model-profile identifier pinned for this translation.
     pub profile_id: String,
+    /// SHA-256 inference identity used to scope every cache entry in this task.
+    pub inference_fingerprint: String,
     pub tokens_per_second: f64,
     pub input_chars: i64,
     pub output_chars: i64,
@@ -66,14 +70,16 @@ pub struct TaskRecord {
 
 /// Cache-key dimensions shared by every segment in one translation session.
 ///
-/// The profile ID is deliberately part of this scope so results generated with
-/// different tokenizers or generation defaults cannot collide.
+/// The profile ID and inference fingerprint are deliberately part of this scope
+/// so results generated with different tokenizers, backend adapters, prompts, or
+/// generation defaults cannot collide.
 #[derive(Debug, Clone, Copy)]
 pub struct SegmentCacheScope<'a> {
     pub target_lang: &'a str,
     pub template_type: &'a str,
     pub options_hash: &'a str,
     pub profile_id: &'a str,
+    pub inference_fingerprint: &'a str,
 }
 
 #[derive(Debug, Clone)]
@@ -166,8 +172,8 @@ impl HistoryDB {
                 input_tokens, output_tokens, segments, concurrency,
                 source_lang, target_lang, template_type, model,
                 tokens_per_second, input_chars, output_chars,
-                output_text, input_hash, config_version, profile_id
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+                output_text, input_hash, config_version, profile_id, inference_fingerprint
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
             rusqlite::params![
                 record.started_at,
                 record.finished_at,
@@ -187,6 +193,7 @@ impl HistoryDB {
                 record.input_hash,
                 record.config_version,
                 record.profile_id,
+                record.inference_fingerprint,
             ],
         )?;
         Ok(())
@@ -206,13 +213,15 @@ impl HistoryDB {
             "SELECT translated_text FROM segment_cache
              WHERE content_hash = ?1 AND target_lang = ?2
                AND template_type = ?3 AND options_hash = ?4 AND profile_id = ?5
+               AND inference_fingerprint = ?6
              LIMIT 1",
             rusqlite::params![
                 content_hash,
                 scope.target_lang,
                 scope.template_type,
                 scope.options_hash,
-                scope.profile_id
+                scope.profile_id,
+                scope.inference_fingerprint,
             ],
             |row| row.get::<_, String>(0),
         );
@@ -256,13 +265,15 @@ impl HistoryDB {
             let tt_idx = chunk.len() + 2;
             let oh_idx = chunk.len() + 3;
             let profile_idx = chunk.len() + 4;
+            let fingerprint_idx = chunk.len() + 5;
             let sql = format!(
                 "SELECT content_hash FROM segment_cache
                  WHERE content_hash IN ({placeholders})
                    AND target_lang = ?{tl_idx}
                    AND template_type = ?{tt_idx}
                    AND options_hash = ?{oh_idx}
-                   AND profile_id = ?{profile_idx}"
+                   AND profile_id = ?{profile_idx}
+                   AND inference_fingerprint = ?{fingerprint_idx}"
             );
             let mut params: Vec<rusqlite::types::Value> = chunk
                 .iter()
@@ -272,6 +283,9 @@ impl HistoryDB {
             params.push(rusqlite::types::Value::Text(scope.template_type.to_owned()));
             params.push(rusqlite::types::Value::Text(scope.options_hash.to_owned()));
             params.push(rusqlite::types::Value::Text(scope.profile_id.to_owned()));
+            params.push(rusqlite::types::Value::Text(
+                scope.inference_fingerprint.to_owned(),
+            ));
 
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt
@@ -295,9 +309,9 @@ impl HistoryDB {
         ensure_schema(&conn)?;
         conn.execute(
             "INSERT INTO segment_cache
-                 (content_hash, target_lang, template_type, options_hash, profile_id, translated_text, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(content_hash, target_lang, template_type, options_hash, profile_id)
+                 (content_hash, target_lang, template_type, options_hash, profile_id, inference_fingerprint, translated_text, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(content_hash, target_lang, template_type, options_hash, profile_id, inference_fingerprint)
              DO UPDATE SET
                  translated_text = excluded.translated_text,
                  created_at = excluded.created_at",
@@ -307,6 +321,7 @@ impl HistoryDB {
                 scope.template_type,
                 scope.options_hash,
                 scope.profile_id,
+                scope.inference_fingerprint,
                 translated_text,
                 created_at,
             ],
@@ -618,28 +633,69 @@ fn migrate_tasks_columns(conn: &Connection) -> Result<(), CacheError> {
     if !cols.contains("profile_id") {
         conn.execute_batch("ALTER TABLE tasks ADD COLUMN profile_id TEXT NOT NULL DEFAULT ''")?;
     }
+    if !cols.contains("inference_fingerprint") {
+        conn.execute_batch(
+            "ALTER TABLE tasks ADD COLUMN inference_fingerprint TEXT NOT NULL DEFAULT ''",
+        )?;
+    }
     Ok(())
 }
 
 fn migrate_segment_cache_columns(conn: &Connection) -> Result<(), CacheError> {
+    let transaction = conn.unchecked_transaction()?;
+    let result = migrate_segment_cache_columns_in_transaction(&transaction);
+    match result {
+        Ok(()) => {
+            transaction.commit()?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = transaction.rollback();
+            Err(error)
+        }
+    }
+}
+
+fn migrate_segment_cache_columns_in_transaction(conn: &Connection) -> Result<(), CacheError> {
     let cols = table_column_names(conn, "segment_cache")?;
-    let mut rebuild_primary_key = false;
     if !cols.contains("options_hash") {
         conn.execute_batch(
             "ALTER TABLE segment_cache ADD COLUMN options_hash TEXT NOT NULL DEFAULT ''",
         )?;
-        rebuild_primary_key = true;
     }
     if !cols.contains("profile_id") {
         conn.execute_batch(
             "ALTER TABLE segment_cache ADD COLUMN profile_id TEXT NOT NULL DEFAULT ''",
         )?;
-        rebuild_primary_key = true;
     }
-    if rebuild_primary_key {
+    if !cols.contains("inference_fingerprint") {
+        conn.execute_batch(
+            "ALTER TABLE segment_cache ADD COLUMN inference_fingerprint TEXT NOT NULL DEFAULT ''",
+        )?;
+    }
+    if !segment_cache_has_current_primary_key(conn)? {
         rebuild_segment_cache_pk(conn)?;
     }
     Ok(())
+}
+
+fn segment_cache_has_current_primary_key(conn: &Connection) -> Result<bool, CacheError> {
+    let mut stmt = conn.prepare("PRAGMA table_info(segment_cache)")?;
+    let mut columns = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    columns.retain(|(_, ordinal)| *ordinal > 0);
+    columns.sort_by_key(|(_, ordinal)| *ordinal);
+    Ok(columns.into_iter().map(|(name, _)| name).eq([
+        "content_hash".to_owned(),
+        "target_lang".to_owned(),
+        "template_type".to_owned(),
+        "options_hash".to_owned(),
+        "profile_id".to_owned(),
+        "inference_fingerprint".to_owned(),
+    ]))
 }
 
 fn rebuild_segment_cache_pk(conn: &Connection) -> Result<(), CacheError> {
@@ -650,14 +706,16 @@ fn rebuild_segment_cache_pk(conn: &Connection) -> Result<(), CacheError> {
              template_type TEXT NOT NULL,
              options_hash TEXT NOT NULL DEFAULT '',
              profile_id TEXT NOT NULL DEFAULT '',
+             inference_fingerprint TEXT NOT NULL DEFAULT '',
              translated_text TEXT NOT NULL,
              created_at TEXT NOT NULL,
-             PRIMARY KEY (content_hash, target_lang, template_type, options_hash, profile_id)
+             PRIMARY KEY (content_hash, target_lang, template_type, options_hash, profile_id, inference_fingerprint)
          );
          INSERT OR REPLACE INTO segment_cache_new
-             (content_hash, target_lang, template_type, options_hash, profile_id, translated_text, created_at)
+             (content_hash, target_lang, template_type, options_hash, profile_id, inference_fingerprint, translated_text, created_at)
          SELECT content_hash, target_lang, template_type,
-                COALESCE(options_hash, ''), COALESCE(profile_id, ''), translated_text, created_at
+                COALESCE(options_hash, ''), COALESCE(profile_id, ''),
+                COALESCE(inference_fingerprint, ''), translated_text, created_at
          FROM segment_cache;
          DROP TABLE segment_cache;
          ALTER TABLE segment_cache_new RENAME TO segment_cache;",
@@ -689,6 +747,9 @@ fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
         model: row.get("model")?,
         profile_id: row
             .get::<_, Option<String>>("profile_id")?
+            .unwrap_or_default(),
+        inference_fingerprint: row
+            .get::<_, Option<String>>("inference_fingerprint")?
             .unwrap_or_default(),
         tokens_per_second: row.get("tokens_per_second")?,
         input_chars: row.get("input_chars")?,
@@ -817,6 +878,7 @@ mod tests {
             template_type: "default".to_owned(),
             model: None,
             profile_id: "hy_mt2_7b".to_owned(),
+            inference_fingerprint: "sha256:sample".to_owned(),
             tokens_per_second: tps,
             input_chars: 500,
             output_chars: 400,
@@ -835,6 +897,7 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].target_lang, "en");
         assert_eq!(records[0].profile_id, "hy_mt2_7b");
+        assert_eq!(records[0].inference_fingerprint, "sha256:sample");
         assert!((records[0].tokens_per_second - 50.0).abs() < 1e-9);
     }
 
@@ -876,6 +939,7 @@ mod tests {
             template_type: "default",
             options_hash: "",
             profile_id: "hy_mt2_7b",
+            inference_fingerprint: "sha256:q4_k_m",
         };
         let thirty_b = SegmentCacheScope {
             profile_id: "hy_mt2_30b_a3b",
@@ -901,6 +965,7 @@ mod tests {
             template_type: "default",
             options_hash: "",
             profile_id: "hy_mt2_7b",
+            inference_fingerprint: "sha256:sample",
         };
         db.store_segment_cache("aaa", scope, "t1", "2024-01-01T00:00:00Z")
             .unwrap();
@@ -913,6 +978,167 @@ mod tests {
         assert!(found.contains("bbb"));
         assert!(!found.contains("ccc"));
         assert_eq!(found.len(), 2);
+    }
+
+    #[test]
+    fn test_segment_cache_is_scoped_to_inference_fingerprint() {
+        let tmp = TempDir::new().unwrap();
+        let db = HistoryDB::new(tmp.path().join("history.db"));
+        let q4 = SegmentCacheScope {
+            target_lang: "en",
+            template_type: "default",
+            options_hash: "",
+            profile_id: "hy_mt2_7b",
+            inference_fingerprint: "sha256:q4_k_m",
+        };
+        let q6 = SegmentCacheScope {
+            inference_fingerprint: "sha256:q6_k",
+            ..q4
+        };
+
+        db.store_segment_cache("hash1", q4, "q4 translation", "2024-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!(
+            db.find_segment_cached("hash1", q4).unwrap().as_deref(),
+            Some("q4 translation"),
+            "the identical inference fingerprint must hit"
+        );
+        assert!(
+            db.find_segment_cached("hash1", q6).unwrap().is_none(),
+            "a changed inference fingerprint must force a cache miss"
+        );
+    }
+
+    #[test]
+    fn test_legacy_segment_cache_rows_without_fingerprint_do_not_hit() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("legacy-history.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE segment_cache (
+                 content_hash TEXT NOT NULL,
+                 target_lang TEXT NOT NULL,
+                 template_type TEXT NOT NULL,
+                 options_hash TEXT NOT NULL DEFAULT '',
+                 profile_id TEXT NOT NULL DEFAULT '',
+                 translated_text TEXT NOT NULL,
+                 created_at TEXT NOT NULL,
+                 PRIMARY KEY (content_hash, target_lang, template_type, options_hash, profile_id)
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO segment_cache
+                 (content_hash, target_lang, template_type, options_hash, profile_id, translated_text, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                "hash1",
+                "en",
+                "default",
+                "",
+                "hy_mt2_7b",
+                "legacy translation",
+                "2024-01-01T00:00:00Z",
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = HistoryDB::new(&path);
+        let current = SegmentCacheScope {
+            target_lang: "en",
+            template_type: "default",
+            options_hash: "",
+            profile_id: "hy_mt2_7b",
+            inference_fingerprint: "sha256:current",
+        };
+        assert!(
+            db.find_segment_cached("hash1", current).unwrap().is_none(),
+            "a legacy row without a fingerprint must never match a new lookup"
+        );
+
+        let conn = Connection::open(&path).unwrap();
+        let legacy_sentinel: String = conn
+            .query_row(
+                "SELECT inference_fingerprint FROM segment_cache WHERE content_hash = 'hash1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_sentinel, "");
+    }
+
+    #[test]
+    fn test_segment_cache_migration_rebuilds_old_pk_when_fingerprint_column_exists() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("resumed-history.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE segment_cache (
+                 content_hash TEXT NOT NULL,
+                 target_lang TEXT NOT NULL,
+                 template_type TEXT NOT NULL,
+                 options_hash TEXT NOT NULL DEFAULT '',
+                 profile_id TEXT NOT NULL DEFAULT '',
+                 inference_fingerprint TEXT NOT NULL DEFAULT '',
+                 translated_text TEXT NOT NULL,
+                 created_at TEXT NOT NULL,
+                 PRIMARY KEY (content_hash, target_lang, template_type, options_hash, profile_id)
+             );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = HistoryDB::new(&path);
+        let q4 = SegmentCacheScope {
+            target_lang: "en",
+            template_type: "default",
+            options_hash: "",
+            profile_id: "hy_mt2_7b",
+            inference_fingerprint: "sha256:q4",
+        };
+        let q6 = SegmentCacheScope {
+            inference_fingerprint: "sha256:q6",
+            ..q4
+        };
+
+        db.store_segment_cache("hash1", q4, "q4 translation", "2024-01-01T00:00:00Z")
+            .unwrap();
+        db.store_segment_cache("hash1", q6, "q6 translation", "2024-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!(
+            db.find_segment_cached("hash1", q4).unwrap().as_deref(),
+            Some("q4 translation")
+        );
+        assert_eq!(
+            db.find_segment_cached("hash1", q6).unwrap().as_deref(),
+            Some("q6 translation")
+        );
+
+        let conn = Connection::open(&path).unwrap();
+        let primary_key = conn
+            .prepare("PRAGMA table_info(segment_cache)")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            primary_key
+                .into_iter()
+                .filter(|(_, ordinal)| *ordinal > 0)
+                .collect::<Vec<_>>(),
+            vec![
+                ("content_hash".to_owned(), 1),
+                ("target_lang".to_owned(), 2),
+                ("template_type".to_owned(), 3),
+                ("options_hash".to_owned(), 4),
+                ("profile_id".to_owned(), 5),
+                ("inference_fingerprint".to_owned(), 6),
+            ]
+        );
     }
 
     #[test]

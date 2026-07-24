@@ -1041,9 +1041,10 @@ fn partition_pipeline(
 
 /// Translate `text` to `target_lang`, caching and translating segments in parallel.
 ///
-/// All segments are checked against the cache first; only missing or incomplete
-/// cached segments are translated.  Results are stored back to the cache and a
-/// task record is written to the history DB.
+/// Segments are checked against the cache only when the inference identity is
+/// verified; Generic/server-default identities bypass cache reads and writes.
+/// Missing or incomplete segments are translated, and a task record is written to
+/// the history DB.
 pub async fn translate_text(
     text: &str,
     target_lang: &str,
@@ -1058,6 +1059,7 @@ pub async fn translate_text(
         });
     }
 
+    ctx.config.maybe_reload()?;
     let template_name = template.as_str();
     let plan = plan_translation(text, target_lang, ctx.config, ctx.segmenter, template, opts)?;
 
@@ -1072,11 +1074,16 @@ pub async fn translate_text(
         effective_document_translation_policy(opts, ctx.config),
     );
     let profile_id = ctx.config.model_profile()?.id();
+    let inference_fingerprint = ctx
+        .config
+        .inference_fingerprint(template_name, &options_hash)?;
+    let cache_enabled = inference_fingerprint.is_cache_verified();
     let cache_scope = SegmentCacheScope {
         target_lang,
         template_type: template_name,
         options_hash: &options_hash,
         profile_id,
+        inference_fingerprint: inference_fingerprint.hash(),
     };
     let seg_hashes: Vec<String> = plan
         .segments
@@ -1097,25 +1104,29 @@ pub async fn translate_text(
     let mut translations: Vec<Option<String>> = vec![None; plan.segment_count()];
     let mut missing: Vec<usize> = Vec::new();
 
-    for (i, hash) in seg_hashes.iter().enumerate() {
-        match ctx.history.find_segment_cached(hash, cache_scope) {
-            Ok(Some(cached))
-                if cached_segment_is_complete(
-                    i,
-                    &plan.segments[i],
-                    &cached,
-                    target_lang,
-                    ctx.config,
-                ) =>
-            {
-                translations[i] = Some(cached);
-            }
-            Ok(_) => missing.push(i),
-            Err(e) => {
-                eprintln!("Warning: cache lookup error: {e}");
-                missing.push(i);
+    if cache_enabled {
+        for (i, hash) in seg_hashes.iter().enumerate() {
+            match ctx.history.find_segment_cached(hash, cache_scope) {
+                Ok(Some(cached))
+                    if cached_segment_is_complete(
+                        i,
+                        &plan.segments[i],
+                        &cached,
+                        target_lang,
+                        ctx.config,
+                    ) =>
+                {
+                    translations[i] = Some(cached);
+                }
+                Ok(_) => missing.push(i),
+                Err(e) => {
+                    eprintln!("Warning: cache lookup error: {e}");
+                    missing.push(i);
+                }
             }
         }
+    } else {
+        missing.extend(0..plan.segment_count());
     }
 
     // ── Phase 2: parallel translate missing segments ───────────────────────────
@@ -1154,11 +1165,15 @@ pub async fn translate_text(
                 degraded_segments.push(idx + 1);
             }
             let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-            if let Err(e) =
-                ctx.history
-                    .store_segment_cache(&seg_hashes[idx], cache_scope, &translated, &now)
-            {
-                eprintln!("Warning: cache store error: {e}");
+            if cache_enabled {
+                if let Err(e) = ctx.history.store_segment_cache(
+                    &seg_hashes[idx],
+                    cache_scope,
+                    &translated,
+                    &now,
+                ) {
+                    eprintln!("Warning: cache store error: {e}");
+                }
             }
             translations[idx] = Some(translated);
         }
@@ -1202,6 +1217,7 @@ pub async fn translate_text(
             }
         },
         profile_id: profile_id.to_owned(),
+        inference_fingerprint: inference_fingerprint.hash().to_owned(),
         tokens_per_second: tps,
         input_chars: text.len() as i64,
         output_chars: translated.len() as i64,
@@ -1305,6 +1321,7 @@ pub async fn translate_text_stream_with_mode(
         });
     }
 
+    ctx.config.maybe_reload()?;
     let template_name = template.as_str();
     let plan = plan_translation(text, target_lang, ctx.config, ctx.segmenter, template, opts)?;
 
@@ -1319,11 +1336,16 @@ pub async fn translate_text_stream_with_mode(
         effective_document_translation_policy(opts, ctx.config),
     );
     let profile_id = ctx.config.model_profile()?.id();
+    let inference_fingerprint = ctx
+        .config
+        .inference_fingerprint(template_name, &options_hash)?;
+    let cache_enabled = inference_fingerprint.is_cache_verified();
     let cache_scope = SegmentCacheScope {
         target_lang,
         template_type: template_name,
         options_hash: &options_hash,
         profile_id,
+        inference_fingerprint: inference_fingerprint.hash(),
     };
     let seg_hashes: Vec<String> = plan
         .segments
@@ -1342,25 +1364,29 @@ pub async fn translate_text_stream_with_mode(
     let mut translations: Vec<Option<String>> = vec![None; plan.segment_count()];
     let mut missing: Vec<usize> = Vec::new();
 
-    for (i, hash) in seg_hashes.iter().enumerate() {
-        match ctx.history.find_segment_cached(hash, cache_scope) {
-            Ok(Some(cached))
-                if cached_segment_is_complete(
-                    i,
-                    &plan.segments[i],
-                    &cached,
-                    target_lang,
-                    ctx.config,
-                ) =>
-            {
-                translations[i] = Some(cached);
-            }
-            Ok(_) => missing.push(i),
-            Err(e) => {
-                eprintln!("Warning: cache lookup error: {e}");
-                missing.push(i);
+    if cache_enabled {
+        for (i, hash) in seg_hashes.iter().enumerate() {
+            match ctx.history.find_segment_cached(hash, cache_scope) {
+                Ok(Some(cached))
+                    if cached_segment_is_complete(
+                        i,
+                        &plan.segments[i],
+                        &cached,
+                        target_lang,
+                        ctx.config,
+                    ) =>
+                {
+                    translations[i] = Some(cached);
+                }
+                Ok(_) => missing.push(i),
+                Err(e) => {
+                    eprintln!("Warning: cache lookup error: {e}");
+                    missing.push(i);
+                }
             }
         }
+    } else {
+        missing.extend(0..plan.segment_count());
     }
 
     let mut degraded_segments: Vec<usize> = Vec::new();
@@ -1476,13 +1502,15 @@ pub async fn translate_text_stream_with_mode(
                     degraded_segments.push(idx + 1);
                 }
                 let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-                if let Err(e) = ctx.history.store_segment_cache(
-                    &seg_hashes[idx],
-                    cache_scope,
-                    &translated,
-                    &now,
-                ) {
-                    eprintln!("Warning: cache store error: {e}");
+                if cache_enabled {
+                    if let Err(e) = ctx.history.store_segment_cache(
+                        &seg_hashes[idx],
+                        cache_scope,
+                        &translated,
+                        &now,
+                    ) {
+                        eprintln!("Warning: cache store error: {e}");
+                    }
                 }
                 translations[idx] = Some(translated);
                 // Priority segment already streamed its tokens (validated or
@@ -1512,13 +1540,15 @@ pub async fn translate_text_stream_with_mode(
                         degraded_segments.push(idx + 1);
                     }
                     let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-                    if let Err(e) = ctx.history.store_segment_cache(
-                        &seg_hashes[idx],
-                        cache_scope,
-                        &translated,
-                        &now,
-                    ) {
-                        eprintln!("Warning: cache store error: {e}");
+                    if cache_enabled {
+                        if let Err(e) = ctx.history.store_segment_cache(
+                            &seg_hashes[idx],
+                            cache_scope,
+                            &translated,
+                            &now,
+                        ) {
+                            eprintln!("Warning: cache store error: {e}");
+                        }
                     }
                     translations[idx] = Some(translated);
                     flush_ready_stream_prefix(
@@ -1536,13 +1566,15 @@ pub async fn translate_text_stream_with_mode(
                     degraded_segments.push(idx + 1);
                 }
                 let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-                if let Err(e) = ctx.history.store_segment_cache(
-                    &seg_hashes[idx],
-                    cache_scope,
-                    &translated,
-                    &now,
-                ) {
-                    eprintln!("Warning: cache store error: {e}");
+                if cache_enabled {
+                    if let Err(e) = ctx.history.store_segment_cache(
+                        &seg_hashes[idx],
+                        cache_scope,
+                        &translated,
+                        &now,
+                    ) {
+                        eprintln!("Warning: cache store error: {e}");
+                    }
                 }
                 translations[idx] = Some(translated);
                 advance_stream_cursor_past_segment(
@@ -1590,13 +1622,15 @@ pub async fn translate_text_stream_with_mode(
                     degraded_segments.push(idx + 1);
                 }
                 let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-                if let Err(e) = ctx.history.store_segment_cache(
-                    &seg_hashes[idx],
-                    cache_scope,
-                    &translated,
-                    &now,
-                ) {
-                    eprintln!("Warning: cache store error: {e}");
+                if cache_enabled {
+                    if let Err(e) = ctx.history.store_segment_cache(
+                        &seg_hashes[idx],
+                        cache_scope,
+                        &translated,
+                        &now,
+                    ) {
+                        eprintln!("Warning: cache store error: {e}");
+                    }
                 }
                 translations[idx] = Some(translated);
                 flush_ready_stream_prefix(
@@ -1652,6 +1686,7 @@ pub async fn translate_text_stream_with_mode(
             }
         },
         profile_id: profile_id.to_owned(),
+        inference_fingerprint: inference_fingerprint.hash().to_owned(),
         tokens_per_second: tps,
         input_chars: text.len() as i64,
         output_chars: translated.len() as i64,
@@ -1775,7 +1810,7 @@ mod tests {
     use std::time::Duration;
 
     use chrono::{SecondsFormat, Utc};
-    use hymt_cache::history::HistoryDB;
+    use hymt_cache::history::{HistoryDB, SegmentCacheScope};
     use hymt_core::templates::TemplateType;
     use hymt_segment::Segmenter;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2144,6 +2179,8 @@ mod tests {
             format!(
                 r#"[endpoint]
 url = "{endpoint_url}"
+profile = "hy_mt2_7b"
+model = "test-model"
 
 [translation]
 context_window = 512
@@ -2185,6 +2222,33 @@ max_retries = 1
             .enumerate()
             .map(|(i, segment)| complete_translation(&format!("SEGMENT_{i}"), segment))
             .collect()
+    }
+
+    fn make_unverified_stream_config(endpoint_url: &str) -> hymt_core::config::HotConfig {
+        let path = temp_path("unverified-config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"[endpoint]
+url = "{endpoint_url}"
+
+[translation]
+context_window = 512
+max_output_tokens = 40
+concurrency = 1
+first_chunk_priority = true
+timeout = 5
+
+[completeness]
+zh_to_en_min_ratio = 0.3
+en_to_zh_min_ratio = 0.3
+min_paragraph_ratio = 0.5
+max_retries = 1
+"#
+            ),
+        )
+        .unwrap();
+        hymt_core::config::HotConfig::from_path(&path).unwrap()
     }
 
     async fn render_events_as_stdout(
@@ -3145,7 +3209,11 @@ Bravo one text carries enough source material for cache validation and ordering 
                     target_lang: "zh",
                     template_type: TemplateType::Default.as_str(),
                     options_hash: "",
-                    profile_id: "generic",
+                    profile_id: "hy_mt2_7b",
+                    inference_fingerprint: cfg
+                        .inference_fingerprint(TemplateType::Default.as_str(), "")
+                        .unwrap()
+                        .hash(),
                 },
                 &translations[0],
                 &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
@@ -3372,7 +3440,11 @@ Bravo one text carries enough source material for cache validation and ordering 
                     target_lang: "zh",
                     template_type: TemplateType::Default.as_str(),
                     options_hash: "",
-                    profile_id: "generic",
+                    profile_id: "hy_mt2_7b",
+                    inference_fingerprint: cfg
+                        .inference_fingerprint(TemplateType::Default.as_str(), "")
+                        .unwrap()
+                        .hash(),
                 },
                 &translations[0],
                 &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
@@ -3424,7 +3496,11 @@ Bravo one text carries enough source material for cache validation and ordering 
                     target_lang: "zh",
                     template_type: TemplateType::Default.as_str(),
                     options_hash: "",
-                    profile_id: "generic",
+                    profile_id: "hy_mt2_7b",
+                    inference_fingerprint: cfg
+                        .inference_fingerprint(TemplateType::Default.as_str(), "")
+                        .unwrap()
+                        .hash(),
                 },
                 &translations[0],
                 &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
@@ -3614,6 +3690,235 @@ Bravo one text carries enough source material for cache validation and ordering 
     }
 
     #[tokio::test]
+    async fn unverified_inference_identity_bypasses_segment_cache() {
+        let source = "This generic-server source must not reuse a cached translation.";
+        let fresh = "fresh translation ".repeat(16);
+        let server = start_mock_server(vec![MockResponse::Json(fresh.clone())]).await;
+        let cfg = make_unverified_stream_config(&server.endpoint_url);
+        assert!(!cfg
+            .inference_fingerprint(TemplateType::Default.as_str(), "")
+            .unwrap()
+            .is_cache_verified());
+        let segmenter = fallback_segmenter();
+        let prompt_opts = PromptOpts::default();
+        let plan = plan_translation(
+            source,
+            "zh",
+            &cfg,
+            &segmenter,
+            &TemplateType::Default,
+            &prompt_opts,
+        )
+        .unwrap();
+        assert_eq!(plan.segment_count(), 1);
+        let options_hash = template_options_hash(
+            &prompt_opts,
+            effective_document_translation_policy(&prompt_opts, &cfg),
+        );
+        let fingerprint = cfg
+            .inference_fingerprint(TemplateType::Default.as_str(), &options_hash)
+            .unwrap();
+        let scope = SegmentCacheScope {
+            target_lang: "zh",
+            template_type: TemplateType::Default.as_str(),
+            options_hash: &options_hash,
+            profile_id: cfg.model_profile().unwrap().id(),
+            inference_fingerprint: fingerprint.hash(),
+        };
+        let stale = complete_translation("STALE", &plan.segments[0]);
+        let history = HistoryDB::new(temp_path("unverified-cache-history.db"));
+        history
+            .store_segment_cache(
+                &segment_cache_hash(&plan.segments[0]),
+                scope,
+                &stale,
+                "2024-01-01T00:00:00Z",
+            )
+            .unwrap();
+        let client = TranslationClient::new(cfg.clone()).unwrap();
+        let ctx = TranslationCtx {
+            config: &cfg,
+            client: &client,
+            segmenter: &segmenter,
+            history: &history,
+        };
+
+        let outcome = translate_text(source, "zh", &TemplateType::Default, &prompt_opts, &ctx)
+            .await
+            .unwrap();
+
+        assert!(outcome.text.contains("fresh translation"));
+        assert_eq!(
+            history
+                .find_segment_cached(&segment_cache_hash(&plan.segments[0]), scope)
+                .unwrap()
+                .as_deref(),
+            Some(stale.as_str()),
+            "unverified translations must not overwrite cache entries either"
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_translation_reloads_config_before_cache_lookup() {
+        let source = "This normal translation must use the reloaded model cache scope.";
+        let fresh = "fresh translation ".repeat(16);
+        let server = start_mock_server(vec![MockResponse::Json(fresh.clone())]).await;
+        let cfg = make_stream_config(&server.endpoint_url);
+        let segmenter = fallback_segmenter();
+        let prompt_opts = PromptOpts::default();
+        let plan = plan_translation(
+            source,
+            "zh",
+            &cfg,
+            &segmenter,
+            &TemplateType::Default,
+            &prompt_opts,
+        )
+        .unwrap();
+        assert_eq!(plan.segment_count(), 1);
+        let options_hash = template_options_hash(
+            &prompt_opts,
+            effective_document_translation_policy(&prompt_opts, &cfg),
+        );
+        let old_fingerprint = cfg
+            .inference_fingerprint(TemplateType::Default.as_str(), &options_hash)
+            .unwrap();
+        let old_scope = SegmentCacheScope {
+            target_lang: "zh",
+            template_type: TemplateType::Default.as_str(),
+            options_hash: &options_hash,
+            profile_id: cfg.model_profile().unwrap().id(),
+            inference_fingerprint: old_fingerprint.hash(),
+        };
+        let stale = complete_translation("STALE", &plan.segments[0]);
+        let history = HistoryDB::new(temp_path("normal-reload-cache-history.db"));
+        history
+            .store_segment_cache(
+                &segment_cache_hash(&plan.segments[0]),
+                old_scope,
+                &stale,
+                "2024-01-01T00:00:00Z",
+            )
+            .unwrap();
+        let client = TranslationClient::new(cfg.clone()).unwrap();
+        let updated = std::fs::read_to_string(cfg.path())
+            .unwrap()
+            .replace("model = \"test-model\"", "model = \"reloaded-model\"");
+        std::fs::write(cfg.path(), updated).unwrap();
+        let ctx = TranslationCtx {
+            config: &cfg,
+            client: &client,
+            segmenter: &segmenter,
+            history: &history,
+        };
+
+        let outcome = translate_text(source, "zh", &TemplateType::Default, &prompt_opts, &ctx)
+            .await
+            .unwrap();
+
+        assert!(outcome.text.contains("fresh translation"));
+        let new_fingerprint = cfg
+            .inference_fingerprint(TemplateType::Default.as_str(), &options_hash)
+            .unwrap();
+        assert_ne!(old_fingerprint, new_fingerprint);
+        let new_scope = SegmentCacheScope {
+            inference_fingerprint: new_fingerprint.hash(),
+            ..old_scope
+        };
+        assert_eq!(
+            history
+                .find_segment_cached(&segment_cache_hash(&plan.segments[0]), new_scope)
+                .unwrap()
+                .as_deref(),
+            Some(fresh.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_translation_reloads_config_before_cache_lookup() {
+        let source = "This streaming translation must use the reloaded model cache scope.";
+        let fresh = "fresh streaming translation ".repeat(16);
+        let server = start_mock_server(vec![MockResponse::Sse(vec![fresh.clone()])]).await;
+        let cfg = make_stream_config(&server.endpoint_url);
+        let segmenter = fallback_segmenter();
+        let prompt_opts = PromptOpts::default();
+        let plan = plan_translation(
+            source,
+            "zh",
+            &cfg,
+            &segmenter,
+            &TemplateType::Default,
+            &prompt_opts,
+        )
+        .unwrap();
+        assert_eq!(plan.segment_count(), 1);
+        let options_hash = template_options_hash(
+            &prompt_opts,
+            effective_document_translation_policy(&prompt_opts, &cfg),
+        );
+        let old_fingerprint = cfg
+            .inference_fingerprint(TemplateType::Default.as_str(), &options_hash)
+            .unwrap();
+        let old_scope = SegmentCacheScope {
+            target_lang: "zh",
+            template_type: TemplateType::Default.as_str(),
+            options_hash: &options_hash,
+            profile_id: cfg.model_profile().unwrap().id(),
+            inference_fingerprint: old_fingerprint.hash(),
+        };
+        let stale = complete_translation("STALE", &plan.segments[0]);
+        let history = HistoryDB::new(temp_path("streaming-reload-cache-history.db"));
+        history
+            .store_segment_cache(
+                &segment_cache_hash(&plan.segments[0]),
+                old_scope,
+                &stale,
+                "2024-01-01T00:00:00Z",
+            )
+            .unwrap();
+        let client = TranslationClient::new(cfg.clone()).unwrap();
+        let updated = std::fs::read_to_string(cfg.path())
+            .unwrap()
+            .replace("model = \"test-model\"", "model = \"reloaded-model\"");
+        std::fs::write(cfg.path(), updated).unwrap();
+        let ctx = TranslationCtx {
+            config: &cfg,
+            client: &client,
+            segmenter: &segmenter,
+            history: &history,
+        };
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+
+        let outcome = translate_text_stream(
+            source,
+            "zh",
+            &TemplateType::Default,
+            &prompt_opts,
+            &ctx,
+            event_tx,
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.text.contains("fresh streaming translation"));
+        let new_fingerprint = cfg
+            .inference_fingerprint(TemplateType::Default.as_str(), &options_hash)
+            .unwrap();
+        assert_ne!(old_fingerprint, new_fingerprint);
+        let new_scope = SegmentCacheScope {
+            inference_fingerprint: new_fingerprint.hash(),
+            ..old_scope
+        };
+        assert_eq!(
+            history
+                .find_segment_cached(&segment_cache_hash(&plan.segments[0]), new_scope)
+                .unwrap()
+                .as_deref(),
+            Some(fresh.as_str())
+        );
+    }
+
+    #[tokio::test]
     async fn completeness_best_attempt_marks_degraded_segments() {
         let text = "Hello world paragraph one.\n\nHello world paragraph two.";
         let dir = tempfile::tempdir().unwrap();
@@ -3671,6 +3976,15 @@ max_retries = 0
         );
         assert!(!outcome.text.is_empty());
         assert_eq!(outcome.completeness_degraded_segments, vec![1]);
+        let records = history.fetch_recent(None).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].inference_fingerprint,
+            cfg.inference_fingerprint(TemplateType::Default.as_str(), "")
+                .unwrap()
+                .hash(),
+            "task history must persist the cache's inference fingerprint"
+        );
     }
 
     #[tokio::test]

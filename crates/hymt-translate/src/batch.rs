@@ -119,6 +119,7 @@ pub fn build_batch_plan(
     history: &HistoryDB,
     opts: &BatchPlanOpts<'_>,
 ) -> Result<BatchPlan> {
+    config.maybe_reload()?;
     let (output_dir, target_lang, template, prompt_opts, recursive, explicit_target) = (
         opts.output_dir,
         opts.target_lang,
@@ -140,6 +141,10 @@ pub fn build_batch_plan(
         effective_document_translation_policy(prompt_opts, config),
     );
     let profile_id = config.model_profile()?.id();
+    let inference_fingerprint = config.inference_fingerprint(template_name, &options_hash)?;
+    // Incomplete Generic/server-default identities can change across a server
+    // restart, so they are never eligible for segment-cache reuse.
+    let cache_enabled = inference_fingerprint.is_cache_verified();
     let mut files = Vec::new();
     let mut skipped = Vec::new();
 
@@ -184,6 +189,7 @@ pub fn build_batch_plan(
             template_type: template_name,
             options_hash: &options_hash,
             profile_id,
+            inference_fingerprint: inference_fingerprint.hash(),
         };
 
         let suffix = target_lang_path_suffix(&effective_lang)?;
@@ -232,9 +238,13 @@ pub fn build_batch_plan(
             .map(|s| segment_cache_hash(s))
             .collect();
         let hash_refs: Vec<&str> = seg_hashes.iter().map(|s| s.as_str()).collect();
-        let cached_set = history
-            .find_cached_segment_hashes(&hash_refs, cache_scope)
-            .unwrap_or_default();
+        let cached_set = if cache_enabled {
+            history
+                .find_cached_segment_hashes(&hash_refs, cache_scope)
+                .unwrap_or_default()
+        } else {
+            Default::default()
+        };
         let cached_segments = seg_hashes
             .iter()
             .filter(|h| cached_set.contains(*h))
@@ -368,4 +378,93 @@ pub async fn run_batch_translation(
             .with_context(|| format!("writing {}", file.output_path.display()))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use hymt_cache::history::SegmentCacheScope;
+    use tempfile::TempDir;
+
+    fn cache_config(model: &str) -> String {
+        format!(
+            r#"[endpoint]
+url = "http://127.0.0.1:8401/v1"
+profile = "hy_mt2_7b"
+model = "{model}"
+
+[translation]
+context_window = 512
+max_output_tokens = 40
+concurrency = 1
+timeout = 5
+
+[completeness]
+zh_to_en_min_ratio = 0.3
+en_to_zh_min_ratio = 0.3
+min_paragraph_ratio = 0.5
+max_retries = 1
+"#,
+        )
+    }
+
+    #[test]
+    fn batch_plan_reloads_config_before_cache_lookup() {
+        let tmp = TempDir::new().unwrap();
+        let source_dir = tmp.path().join("source");
+        std::fs::create_dir(&source_dir).unwrap();
+        let source = "A source paragraph long enough to produce one cached translation segment.";
+        std::fs::write(source_dir.join("input.md"), source).unwrap();
+
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, cache_config("old-model")).unwrap();
+        let config = HotConfig::from_path(&config_path).unwrap();
+        let segmenter = Segmenter::fallback();
+        let template = TemplateType::Default;
+        let prompt_opts = PromptOpts::default();
+        let plan =
+            plan_translation(source, "zh", &config, &segmenter, &template, &prompt_opts).unwrap();
+        assert_eq!(plan.segment_count(), 1);
+        let options_hash = template_options_hash(
+            &prompt_opts,
+            effective_document_translation_policy(&prompt_opts, &config),
+        );
+        let old_fingerprint = config
+            .inference_fingerprint(template.as_str(), &options_hash)
+            .unwrap();
+        let old_scope = SegmentCacheScope {
+            target_lang: "zh",
+            template_type: template.as_str(),
+            options_hash: &options_hash,
+            profile_id: config.model_profile().unwrap().id(),
+            inference_fingerprint: old_fingerprint.hash(),
+        };
+        let history = HistoryDB::new(tmp.path().join("history.db"));
+        history
+            .store_segment_cache(
+                &segment_cache_hash(&plan.segments[0]),
+                old_scope,
+                "stale cached translation",
+                "2024-01-01T00:00:00Z",
+            )
+            .unwrap();
+
+        std::fs::write(&config_path, cache_config("new-model")).unwrap();
+        let opts = BatchPlanOpts {
+            output_dir: None,
+            target_lang: "zh",
+            template: &template,
+            prompt_opts: &prompt_opts,
+            recursive: false,
+            explicit_target: true,
+        };
+        let batch = build_batch_plan(&source_dir, &config, &segmenter, &history, &opts).unwrap();
+
+        assert_eq!(batch.files.len(), 1);
+        assert_eq!(
+            batch.files[0].cached_segments, 0,
+            "the changed model identity must miss the old cache entry"
+        );
+    }
 }

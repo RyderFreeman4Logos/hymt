@@ -3,13 +3,16 @@
 //! Reads from `~/.config/hymt/config.toml`, creating it with embedded defaults
 //! when absent. Call `maybe_reload()` to pick up on-disk changes.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
+use sha2::{Digest, Sha256};
+
 use crate::error::CoreError;
 use crate::language::DocumentTranslationPolicy;
-use crate::model_profile::ModelProfile;
+use crate::model_profile::{ModelProfile, UpstreamSource};
 
 pub const DEFAULT_CONFIG: &str = r#"[endpoint]
 url = "http://127.0.0.1:8401/v1"
@@ -107,6 +110,46 @@ const GENERATION_SETTING_KEYS: &[&str] = &[
 ];
 
 const BACKEND_CONTEXT_KEYS: &[&str] = &["total_context", "parallel_slots", "per_request_context"];
+
+/// Canonical inference fingerprint schema. Increment this when its semantics change.
+///
+/// Version 1 writes `null` for quantization because the current configuration has
+/// no quantization field; it never guesses an endpoint's loaded quant. Model and
+/// tokenizer source identities are likewise `null` when generic mode cannot
+/// provide them.
+pub const INFERENCE_FINGERPRINT_SCHEMA_VERSION: u32 = 1;
+
+const PROMPT_SCHEMA_VERSION: u32 = 1;
+
+/// Stable inference identity used to isolate cache and history entries.
+///
+/// `canonical_json` is a recursively key-sorted JSON document and `hash` is its
+/// SHA-256 hex digest. The raw JSON is intentionally retained for diagnostics and
+/// schema audits, while callers should persist only `hash` in cache keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InferenceFingerprint {
+    canonical_json: String,
+    hash: String,
+    cache_verified: bool,
+}
+
+impl InferenceFingerprint {
+    /// Canonical, versioned JSON used as the SHA-256 digest input.
+    pub fn canonical_json(&self) -> &str {
+        &self.canonical_json
+    }
+
+    /// Lowercase hexadecimal SHA-256 digest of [`Self::canonical_json`].
+    pub fn hash(&self) -> &str {
+        &self.hash
+    }
+
+    /// Whether the served model and effective sampler identity are complete
+    /// enough to safely reuse a segment-cache entry.
+    pub fn is_cache_verified(&self) -> bool {
+        self.cache_verified
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GenerationSettingField {
@@ -227,6 +270,20 @@ impl GenerationSettings {
         }
     }
 
+    fn uses_only_server_defaults(&self) -> bool {
+        matches!(
+            self,
+            Self {
+                temperature: Setting::ServerDefault,
+                top_p: Setting::ServerDefault,
+                top_k: Setting::ServerDefault,
+                repetition_penalty: Setting::ServerDefault,
+                min_p: Setting::ServerDefault,
+                repeat_last_n: Setting::ServerDefault,
+            }
+        )
+    }
+
     /// Overlay explicit user overrides on top of a model profile's defaults.
     pub fn with_overrides(self, overrides: Self) -> Self {
         Self {
@@ -328,6 +385,90 @@ fn setting_or_default<T>(default: Setting<T>, override_value: Setting<T>) -> Set
         Setting::ServerDefault => default,
         value => value,
     }
+}
+
+fn canonical_object(
+    fields: impl IntoIterator<Item = (String, serde_json::Value)>,
+) -> serde_json::Value {
+    let sorted: BTreeMap<String, serde_json::Value> = fields.into_iter().collect();
+    serde_json::Value::Object(sorted.into_iter().collect())
+}
+
+fn string_or_null(value: String) -> serde_json::Value {
+    if value.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::String(value)
+    }
+}
+
+fn source_fingerprint_value(source: Option<&UpstreamSource>) -> serde_json::Value {
+    match source {
+        Some(source) => canonical_object([
+            (
+                "repo".to_owned(),
+                serde_json::Value::String(source.repo.to_owned()),
+            ),
+            (
+                "revision".to_owned(),
+                serde_json::Value::String(source.revision.to_owned()),
+            ),
+        ]),
+        None => serde_json::Value::Null,
+    }
+}
+
+fn explicit_f64_setting(setting: Setting<f64>) -> Option<serde_json::Value> {
+    match setting {
+        Setting::ServerDefault => None,
+        Setting::Disabled => Some(serde_json::Value::String("disabled".to_owned())),
+        Setting::Value(value) => Some(serde_json::Value::from(value)),
+    }
+}
+
+fn explicit_i32_setting(setting: Setting<i32>) -> Option<serde_json::Value> {
+    match setting {
+        Setting::ServerDefault => None,
+        Setting::Disabled => Some(serde_json::Value::String("disabled".to_owned())),
+        Setting::Value(value) => Some(serde_json::Value::from(value)),
+    }
+}
+
+fn explicit_i64_setting(setting: Setting<i64>) -> Option<serde_json::Value> {
+    match setting {
+        Setting::ServerDefault => None,
+        Setting::Disabled => Some(serde_json::Value::String("disabled".to_owned())),
+        Setting::Value(value) => Some(serde_json::Value::from(value)),
+    }
+}
+
+fn generation_fingerprint_value(settings: &GenerationSettings) -> serde_json::Value {
+    let mut fields = BTreeMap::new();
+    for (name, value) in [
+        ("temperature", explicit_f64_setting(settings.temperature)),
+        ("top_p", explicit_f64_setting(settings.top_p)),
+        (
+            "repetition_penalty",
+            explicit_f64_setting(settings.repetition_penalty),
+        ),
+        ("min_p", explicit_f64_setting(settings.min_p)),
+    ] {
+        if let Some(value) = value {
+            fields.insert(name.to_owned(), value);
+        }
+    }
+    for (name, value) in [
+        ("top_k", explicit_i32_setting(settings.top_k)),
+        (
+            "repeat_last_n",
+            explicit_i64_setting(settings.repeat_last_n),
+        ),
+    ] {
+        if let Some(value) = value {
+            fields.insert(name.to_owned(), value);
+        }
+    }
+    canonical_object(fields)
 }
 
 fn validate_f64_range(
@@ -805,6 +946,122 @@ impl HotConfig {
     pub fn generation_backend(&self) -> Result<GenerationBackend, CoreError> {
         let state = self.state.read().unwrap();
         generation_backend_from_toml(&state.data)
+    }
+
+    /// Build the complete, normalized identity for a translation request.
+    ///
+    /// This includes every currently configured request field that can change a
+    /// translation: endpoint, backend adapter, configured model/GGUF alias,
+    /// profile model/tokenizer sources, effective non-default samplers, output
+    /// limit, completeness retry/validation policy, and prompt template/options.
+    /// API keys are deliberately excluded.
+    /// Fields unavailable to the current configuration are represented as JSON
+    /// `null` in schema version 1 rather than guessed.
+    pub fn inference_fingerprint(
+        &self,
+        template_type: &str,
+        options_hash: &str,
+    ) -> Result<InferenceFingerprint, CoreError> {
+        let profile = self.model_profile()?;
+        let settings = self.generation_settings()?;
+        let backend = self.generation_backend()?;
+        let model = self.model();
+        // A Generic profile without an explicit served model, or a request that
+        // delegates every sampler to the server, has no stable cache namespace.
+        let cache_verified =
+            !(settings.uses_only_server_defaults() || (profile.is_generic() && model.is_empty()));
+
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "backend".to_owned(),
+            serde_json::Value::String(backend.name().to_owned()),
+        );
+        fields.insert(
+            "completeness".to_owned(),
+            canonical_object([
+                (
+                    "en_to_zh_min_ratio".to_owned(),
+                    serde_json::Value::from(self.completeness_en_to_zh_min_ratio()),
+                ),
+                (
+                    "max_retries".to_owned(),
+                    serde_json::Value::from(self.completeness_max_retries()),
+                ),
+                (
+                    "min_paragraph_ratio".to_owned(),
+                    serde_json::Value::from(self.completeness_min_paragraph_ratio()),
+                ),
+                (
+                    "zh_to_en_min_ratio".to_owned(),
+                    serde_json::Value::from(self.completeness_zh_to_en_min_ratio()),
+                ),
+            ]),
+        );
+        fields.insert(
+            "endpoint_url".to_owned(),
+            serde_json::Value::String(self.endpoint_url()),
+        );
+        fields.insert(
+            "generation".to_owned(),
+            generation_fingerprint_value(&settings),
+        );
+        fields.insert(
+            "model".to_owned(),
+            canonical_object([
+                ("configured_alias".to_owned(), string_or_null(model)),
+                (
+                    "upstream_source".to_owned(),
+                    source_fingerprint_value(profile.model()),
+                ),
+            ]),
+        );
+        fields.insert(
+            "profile_id".to_owned(),
+            serde_json::Value::String(profile.id().to_owned()),
+        );
+        fields.insert(
+            "prompt".to_owned(),
+            canonical_object([
+                (
+                    "options_hash".to_owned(),
+                    serde_json::Value::String(options_hash.to_owned()),
+                ),
+                (
+                    "schema_version".to_owned(),
+                    serde_json::Value::from(PROMPT_SCHEMA_VERSION),
+                ),
+                (
+                    "template_type".to_owned(),
+                    serde_json::Value::String(template_type.to_owned()),
+                ),
+            ]),
+        );
+        fields.insert("quantization".to_owned(), serde_json::Value::Null);
+        fields.insert(
+            "request".to_owned(),
+            canonical_object([(
+                "max_output_tokens".to_owned(),
+                serde_json::Value::from(self.max_output_tokens()),
+            )]),
+        );
+        fields.insert(
+            "schema_version".to_owned(),
+            serde_json::Value::from(INFERENCE_FINGERPRINT_SCHEMA_VERSION),
+        );
+        fields.insert(
+            "tokenizer".to_owned(),
+            source_fingerprint_value(profile.tokenizer()),
+        );
+
+        let canonical_json = serde_json::to_string(&fields).map_err(|error| {
+            CoreError::Config(format!("serializing inference fingerprint: {error}"))
+        })?;
+        let hash = format!("{:x}", Sha256::digest(canonical_json.as_bytes()));
+        Ok(InferenceFingerprint {
+            canonical_json,
+            hash,
+            cache_verified,
+        })
     }
 
     /// Whether this config uses deprecated scalar sampler keys in `[inference]`.
@@ -1504,6 +1761,185 @@ mod tests {
         assert_eq!(
             ModelProfile::Generic.generation_defaults(),
             GenerationSettings::server_defaults()
+        );
+    }
+
+    #[test]
+    fn inference_fingerprint_is_stable_and_changes_with_inference_identity() {
+        fn fingerprint(
+            config: &str,
+            template_type: &str,
+            options_hash: &str,
+        ) -> InferenceFingerprint {
+            let path = temp_config_path("inference_fingerprint");
+            fs::write(&path, config).unwrap();
+            HotConfig::from_path(&path)
+                .unwrap()
+                .inference_fingerprint(template_type, options_hash)
+                .unwrap()
+        }
+
+        let q4 = fingerprint(
+            r#"[endpoint]
+url = "http://localhost:8401/v1"
+model = "hy-mt2-7b-q4_k_m.gguf"
+
+[inference]
+backend = "llama_cpp"
+
+[inference.override]
+temperature = 0.7"#,
+            "default",
+            "",
+        );
+        let profiled = fingerprint(
+            r#"[endpoint]
+url = "http://localhost:8401/v1"
+profile = "hy_mt2_7b""#,
+            "default",
+            "",
+        );
+        let same_q4 = fingerprint(
+            r#"[endpoint]
+url = "http://localhost:8401/v1"
+model = "hy-mt2-7b-q4_k_m.gguf"
+
+[inference]
+backend = "llama_cpp"
+
+[inference.override]
+temperature = 0.7"#,
+            "default",
+            "",
+        );
+        let q6 = fingerprint(
+            r#"[endpoint]
+url = "http://localhost:8401/v1"
+model = "hy-mt2-7b-q6_k.gguf"
+
+[inference]
+backend = "llama_cpp"
+
+[inference.override]
+temperature = 0.7"#,
+            "default",
+            "",
+        );
+        let openai = fingerprint(
+            r#"[endpoint]
+url = "http://localhost:8401/v1"
+model = "hy-mt2-7b-q4_k_m.gguf"
+
+[inference]
+backend = "openai_compatible"
+
+[inference.override]
+temperature = 0.7"#,
+            "default",
+            "",
+        );
+        let hotter = fingerprint(
+            r#"[endpoint]
+url = "http://localhost:8401/v1"
+model = "hy-mt2-7b-q4_k_m.gguf"
+
+[inference]
+backend = "llama_cpp"
+
+[inference.override]
+temperature = 0.8"#,
+            "default",
+            "",
+        );
+        let no_completeness_retries = fingerprint(
+            r#"[endpoint]
+url = "http://localhost:8401/v1"
+model = "hy-mt2-7b-q4_k_m.gguf"
+
+[inference]
+backend = "llama_cpp"
+
+[inference.override]
+temperature = 0.7
+
+[completeness]
+max_retries = 0"#,
+            "default",
+            "",
+        );
+        let prompted = fingerprint(
+            r#"[endpoint]
+url = "http://localhost:8401/v1"
+model = "hy-mt2-7b-q4_k_m.gguf"
+
+[inference]
+backend = "llama_cpp"
+
+[inference.override]
+temperature = 0.7"#,
+            "style",
+            "prompt-options-sha256",
+        );
+
+        assert_eq!(q4, same_q4);
+        assert!(profiled.canonical_json().contains(
+            "\"tokenizer\":{\"repo\":\"tencent/Hy-MT2-7B\",\"revision\":\"9b0eb4e8f001def3e5ff6469a0ac96fdb39ec223\"}"
+        ));
+        assert_ne!(q4, q6, "a configured GGUF alias must scope the cache");
+        assert_ne!(q4, openai, "the request backend must scope the cache");
+        assert_ne!(q4, hotter, "sampling overrides must scope the cache");
+        assert_ne!(
+            q4, no_completeness_retries,
+            "retry policy can construct a different follow-up inference request"
+        );
+        assert_ne!(q4, prompted, "prompt identity must scope the cache");
+        assert_eq!(q4.hash().len(), 64);
+        assert!(q4.canonical_json().contains("\"quantization\":null"));
+        assert!(q4.canonical_json().contains("\"schema_version\":1"));
+    }
+
+    #[test]
+    fn incomplete_inference_identity_is_not_cache_verified() {
+        fn fingerprint(config: &str) -> InferenceFingerprint {
+            let path = temp_config_path("inference_fingerprint_verification");
+            fs::write(&path, config).unwrap();
+            HotConfig::from_path(&path)
+                .unwrap()
+                .inference_fingerprint("default", "")
+                .unwrap()
+        }
+
+        let incomplete = fingerprint(
+            r#"[endpoint]
+url = "http://localhost:8401/v1""#,
+        );
+        let profiled = fingerprint(
+            r#"[endpoint]
+url = "http://localhost:8401/v1"
+profile = "hy_mt2_7b""#,
+        );
+        let explicit_generic = fingerprint(
+            r#"[endpoint]
+url = "http://localhost:8401/v1"
+model = "stable-served-model"
+
+[inference.override]
+temperature = 0.7
+top_p = 0.6
+top_k = 20
+repetition_penalty = 1.05
+min_p = 0.1
+repeat_last_n = 64"#,
+        );
+
+        assert!(
+            !incomplete.is_cache_verified(),
+            "generic model identity plus server-default sampling cannot safely reuse cache"
+        );
+        assert!(profiled.is_cache_verified());
+        assert!(
+            explicit_generic.is_cache_verified(),
+            "a configured served model and explicit sampling establish a usable identity"
         );
     }
 
