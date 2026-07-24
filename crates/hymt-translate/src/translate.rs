@@ -1456,7 +1456,11 @@ async fn reload_config_and_preflight_strict(ctx: &TranslationCtx<'_>) -> Result<
     if ctx.config.strict_backend_preflight()
         && (reloaded || ctx.config.backend_runtime_info().is_none())
     {
-        ctx.client.preflight_backend().await?;
+        if reloaded {
+            ctx.client.refresh_backend_preflight().await?;
+        } else {
+            ctx.client.preflight_backend().await?;
+        }
     }
     Ok(())
 }
@@ -2309,6 +2313,93 @@ mod tests {
             endpoint_url: format!("http://{addr}/v1"),
             handle,
         }
+    }
+
+    async fn start_preflight_counting_server(
+        props_responses: Vec<String>,
+    ) -> (
+        String,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let props_responses = Arc::new(Mutex::new(VecDeque::from(props_responses)));
+        let preflight_requests = Arc::new(AtomicUsize::new(0));
+        let inference_requests = Arc::new(AtomicUsize::new(0));
+        let handle = tokio::spawn({
+            let props_responses = Arc::clone(&props_responses);
+            let preflight_requests = Arc::clone(&preflight_requests);
+            let inference_requests = Arc::clone(&inference_requests);
+            async move {
+                while let Ok((socket, _)) = listener.accept().await {
+                    let props_responses = Arc::clone(&props_responses);
+                    let preflight_requests = Arc::clone(&preflight_requests);
+                    let inference_requests = Arc::clone(&inference_requests);
+                    tokio::spawn(async move {
+                        let _ = serve_preflight_counting_connection(
+                            socket,
+                            props_responses,
+                            preflight_requests,
+                            inference_requests,
+                        )
+                        .await;
+                    });
+                }
+            }
+        });
+
+        (
+            format!("http://{addr}/v1"),
+            preflight_requests,
+            inference_requests,
+            handle,
+        )
+    }
+
+    async fn serve_preflight_counting_connection(
+        mut socket: TcpStream,
+        props_responses: Arc<Mutex<VecDeque<String>>>,
+        preflight_requests: Arc<AtomicUsize>,
+        inference_requests: Arc<AtomicUsize>,
+    ) -> std::io::Result<()> {
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let count = socket.read(&mut chunk).await?;
+            if count == 0 {
+                return Ok(());
+            }
+            request.extend_from_slice(&chunk[..count]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        if request.starts_with(b"GET /props HTTP/1.1") {
+            preflight_requests.fetch_add(1, Ordering::SeqCst);
+            let body = props_responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("preflight response queue exhausted");
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(headers.as_bytes()).await?;
+            socket.write_all(body.as_bytes()).await?;
+            socket.shutdown().await?;
+            return Ok(());
+        }
+
+        inference_requests.fetch_add(1, Ordering::SeqCst);
+        write_mock_response(
+            socket,
+            MockResponse::Json("unexpected inference dispatch ".repeat(16)),
+        )
+        .await
     }
 
     async fn start_request_counting_server(
@@ -4502,20 +4593,26 @@ Bravo one text carries enough source material for cache validation and ordering 
     }
 
     #[tokio::test]
-    async fn strict_hot_reload_preflights_before_normal_planning() {
+    async fn strict_hot_reload_refreshes_preflight_before_normal_planning() {
         let source = "Strict hot reload must preflight before cache lookup or translation.";
-        let server = start_mock_server(vec![MockResponse::Json("ignored".to_owned())]).await;
-        let cfg = make_stream_config(&server.endpoint_url);
-        cfg.set_backend_runtime_info(hymt_core::runtime::BackendRuntimeInfo::unverified(
-            hymt_core::config::GenerationBackend::LlamaCpp,
-            0,
-            "stale initial preflight",
-        ));
+        let props = r#"{"model_alias":"test-model","n_ctx":512,"n_ctx_per_seq":512}"#;
+        let (endpoint_url, preflight_requests, inference_requests, server) =
+            start_preflight_counting_server(vec![props.to_owned(), props.to_owned()]).await;
+        let cfg = make_stream_config(&endpoint_url);
         let client = TranslationClient::new(cfg.clone()).unwrap();
-        let updated = std::fs::read_to_string(cfg.path()).unwrap().replace(
-            "timeout = 5",
-            "timeout = 5\nstrict_backend_preflight = true",
-        );
+        client
+            .preflight_backend()
+            .await
+            .expect("seed client runtime cache under the original model");
+        assert_eq!(preflight_requests.load(Ordering::SeqCst), 1);
+
+        let updated = std::fs::read_to_string(cfg.path())
+            .unwrap()
+            .replace("model = \"test-model\"", "model = \"reloaded-model\"")
+            .replace(
+                "timeout = 5",
+                "timeout = 5\nstrict_backend_preflight = true",
+            );
         std::thread::sleep(Duration::from_millis(10));
         std::fs::write(cfg.path(), updated).unwrap();
         let segmenter = fallback_segmenter();
@@ -4535,9 +4632,21 @@ Bravo one text carries enough source material for cache validation and ordering 
             &ctx,
         )
         .await
-        .expect_err("strict reload must reject identity-incomplete preflight before planning");
+        .expect_err("strict reload must reject the freshly discovered model mismatch");
 
+        server.abort();
         assert!(error.to_string().contains("strict backend preflight"));
+        assert!(error.to_string().contains("profile/model mismatch"));
+        assert_eq!(
+            preflight_requests.load(Ordering::SeqCst),
+            2,
+            "reload must bypass the TTL cache and probe /props again"
+        );
+        assert_eq!(
+            inference_requests.load(Ordering::SeqCst),
+            0,
+            "strict mismatch must stop before cache lookup can dispatch inference"
+        );
     }
 
     #[tokio::test]
