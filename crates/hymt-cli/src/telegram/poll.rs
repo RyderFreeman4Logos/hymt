@@ -1,6 +1,7 @@
 //! Long-poll Bot API loop (feature-gated implementation).
 
-use std::time::Duration;
+use std::collections::BTreeSet;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use hymt_cache::history::HistoryDB;
@@ -8,7 +9,9 @@ use hymt_client::TranslationClient;
 use hymt_core::config::HotConfig;
 use hymt_core::templates::{PromptOpts, TemplateType};
 use hymt_segment::Segmenter;
-use hymt_translate::{translate_text, TranslationCtx};
+use hymt_translate::{
+    plan_translation, translate_text, translate_text_stream, StreamEvent, TranslationCtx,
+};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -44,6 +47,185 @@ struct Chat {
     id: i64,
     #[serde(rename = "type")]
     chat_type: String,
+}
+
+const TELEGRAM_EDIT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Minimal Bot API surface used by progressive delivery. Keeping it narrow makes
+/// the ordered send/edit sequence directly testable without network traffic.
+trait TelegramMessageApi {
+    async fn send_message(&self, chat_id: i64, text: &str) -> Result<i64>;
+    async fn edit_message(&self, chat_id: i64, message_id: i64, text: &str) -> Result<()>;
+}
+
+struct TelegramHttpApi<'a> {
+    http: &'a Client,
+    token: &'a str,
+}
+
+impl<'a> TelegramHttpApi<'a> {
+    const fn new(http: &'a Client, token: &'a str) -> Self {
+        Self { http, token }
+    }
+}
+
+impl TelegramMessageApi for TelegramHttpApi<'_> {
+    async fn send_message(&self, chat_id: i64, text: &str) -> Result<i64> {
+        send_message_id(self.http, self.token, chat_id, text).await
+    }
+
+    async fn edit_message(&self, chat_id: i64, message_id: i64, text: &str) -> Result<()> {
+        edit_message(self.http, self.token, chat_id, message_id, text).await
+    }
+}
+
+#[derive(Default)]
+struct TelegramStreamBatcher {
+    text: String,
+    completed_segments: BTreeSet<usize>,
+    next_segment: usize,
+}
+
+impl TelegramStreamBatcher {
+    fn push_token(&mut self, text: &str) {
+        self.text.push_str(text);
+    }
+
+    /// Return true only when a newly contiguous prefix has completed.
+    fn mark_segment_complete(&mut self, segment: usize) -> bool {
+        self.completed_segments.insert(segment);
+        let previous_next = self.next_segment;
+        while self.completed_segments.remove(&self.next_segment) {
+            self.next_segment += 1;
+        }
+        self.next_segment != previous_next
+    }
+
+    fn replace_with_final(&mut self, text: String) {
+        self.text = text;
+    }
+
+    fn text(&self) -> &str {
+        &self.text
+    }
+}
+
+struct EditRateLimiter {
+    minimum_interval: Duration,
+    last_edit: Option<Instant>,
+}
+
+impl EditRateLimiter {
+    fn new(minimum_interval: Duration) -> Self {
+        Self {
+            minimum_interval,
+            last_edit: None,
+        }
+    }
+
+    fn remaining_delay(&self, now: Instant) -> Option<Duration> {
+        self.last_edit.and_then(|last_edit| {
+            self.minimum_interval
+                .checked_sub(now.saturating_duration_since(last_edit))
+                .filter(|delay| !delay.is_zero())
+        })
+    }
+
+    fn record_edit(&mut self, now: Instant) {
+        self.last_edit = Some(now);
+    }
+
+    async fn wait_before_edit(&mut self) {
+        if let Some(delay) = self.remaining_delay(Instant::now()) {
+            tokio::time::sleep(delay).await;
+        }
+        self.record_edit(Instant::now());
+    }
+}
+
+fn should_stream_telegram(stream_enabled: bool, segment_count: usize) -> bool {
+    stream_enabled && segment_count > 1
+}
+
+async fn publish_stream_batch<A: TelegramMessageApi>(
+    api: &A,
+    chat_id: i64,
+    text: &str,
+    sent_message: &mut Option<(i64, String)>,
+    edit_rate_limiter: &mut EditRateLimiter,
+) {
+    let rendered_text = telegram_message_text(text);
+    if rendered_text.is_empty() {
+        return;
+    }
+
+    let Some((message_id, rendered_prefix)) = sent_message.as_ref() else {
+        match api.send_message(chat_id, &rendered_text).await {
+            Ok(message_id) => *sent_message = Some((message_id, rendered_text)),
+            Err(error) => eprintln!(
+                "hymt telegram: sendMessage failed while streaming; will retry on the next batch: {error:#}"
+            ),
+        }
+        return;
+    };
+
+    if rendered_prefix == &rendered_text {
+        return;
+    }
+    let message_id = *message_id;
+    edit_rate_limiter.wait_before_edit().await;
+    match api.edit_message(chat_id, message_id, &rendered_text).await {
+        Ok(()) => {
+            if let Some((_, rendered_prefix)) = sent_message.as_mut() {
+                *rendered_prefix = rendered_text;
+            }
+        }
+        Err(error) => eprintln!(
+            "hymt telegram: editMessageText failed while streaming; keeping the previous partial response: {error:#}"
+        ),
+    }
+}
+
+async fn deliver_stream_events<A: TelegramMessageApi>(
+    api: &A,
+    chat_id: i64,
+    mut events: tokio::sync::mpsc::Receiver<StreamEvent>,
+    edit_interval: Duration,
+) -> Result<()> {
+    let mut batch = TelegramStreamBatcher::default();
+    let mut sent_message = None;
+    let mut edit_rate_limiter = EditRateLimiter::new(edit_interval);
+
+    while let Some(event) = events.recv().await {
+        match event {
+            StreamEvent::Token(text) => batch.push_token(&text),
+            StreamEvent::SegmentDone(segment) => {
+                if batch.mark_segment_complete(segment) {
+                    publish_stream_batch(
+                        api,
+                        chat_id,
+                        batch.text(),
+                        &mut sent_message,
+                        &mut edit_rate_limiter,
+                    )
+                    .await;
+                }
+            }
+            StreamEvent::AllDone(text) => {
+                batch.replace_with_final(text);
+                publish_stream_batch(
+                    api,
+                    chat_id,
+                    batch.text(),
+                    &mut sent_message,
+                    &mut edit_rate_limiter,
+                )
+                .await;
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Run the Telegram long-poll loop until SIGINT / process exit.
@@ -181,13 +363,46 @@ async fn handle_update(
                 segmenter,
                 history,
             };
-            let outcome = translate_text(&text, &target_lang, &TemplateType::Default, &opts, &ctx)
-                .await
-                .map_err(|e| anyhow::anyhow!("translation failed: {e}"))?;
+            let plan = plan_translation(
+                &text,
+                &target_lang,
+                config,
+                segmenter,
+                &TemplateType::Default,
+                &opts,
+            )
+            .map_err(|e| anyhow::anyhow!("translation failed: {e}"))?;
+            let stream =
+                should_stream_telegram(config.telegram_streaming_enabled(), plan.segment_count());
+            let outcome = if stream {
+                let (event_tx, event_rx) = tokio::sync::mpsc::channel(64);
+                let api = TelegramHttpApi::new(http, token);
+                let translate = translate_text_stream(
+                    &text,
+                    &target_lang,
+                    &TemplateType::Default,
+                    &opts,
+                    &ctx,
+                    event_tx,
+                );
+                let deliver =
+                    deliver_stream_events(&api, incoming.chat_id, event_rx, TELEGRAM_EDIT_INTERVAL);
+                let (outcome, ()) = tokio::try_join!(translate, deliver)
+                    .map_err(|e| anyhow::anyhow!("translation failed: {e}"))?;
+                outcome
+            } else {
+                translate_text(&text, &target_lang, &TemplateType::Default, &opts, &ctx)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("translation failed: {e}"))?
+            };
             if outcome.is_completeness_degraded() {
                 outcome.report_completeness_degraded();
             }
-            send_message(http, token, incoming.chat_id, &outcome.text).await
+            if stream {
+                Ok(())
+            } else {
+                send_message(http, token, incoming.chat_id, &outcome.text).await
+            }
         }
     }
 }
@@ -236,18 +451,27 @@ async fn get_updates(http: &Client, token: &str, offset: i64) -> Result<Vec<Upda
     Ok(parsed.result.unwrap_or_default())
 }
 
-async fn send_message(http: &Client, token: &str, chat_id: i64, text: &str) -> Result<()> {
+fn telegram_message_text(text: &str) -> String {
     // Telegram hard limit ~4096; truncate politely for long translations.
-    let text = if text.chars().count() > 4000 {
+    if text.chars().count() > 4000 {
         let truncated: String = text.chars().take(3990).collect();
         format!("{truncated}…")
     } else {
         text.to_owned()
-    };
+    }
+}
+
+async fn send_message(http: &Client, token: &str, chat_id: i64, text: &str) -> Result<()> {
+    send_message_id(http, token, chat_id, text)
+        .await
+        .map(|_| ())
+}
+
+async fn send_message_id(http: &Client, token: &str, chat_id: i64, text: &str) -> Result<i64> {
     let url = format!("{API_BASE}/bot{token}/sendMessage");
     let payload = json!({
         "chat_id": chat_id,
-        "text": text,
+        "text": telegram_message_text(text),
         "disable_web_page_preview": true,
     });
     let resp = match http.post(&url).json(&payload).send().await {
@@ -269,7 +493,64 @@ async fn send_message(http: &Client, token: &str, chat_id: i64, text: &str) -> R
             redact_token_in_text(token, desc)
         );
     }
-    Ok(())
+    body.pointer("/result/message_id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| anyhow::anyhow!("sendMessage succeeded without a message id"))
+}
+
+async fn edit_message(
+    http: &Client,
+    token: &str,
+    chat_id: i64,
+    message_id: i64,
+    text: &str,
+) -> Result<()> {
+    let url = format!("{API_BASE}/bot{token}/editMessageText");
+    let payload = json!({
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": telegram_message_text(text),
+        "disable_web_page_preview": true,
+    });
+
+    for attempt in 0..=1 {
+        let resp = match http.post(&url).json(&payload).send().await {
+            Ok(r) => r,
+            Err(e) => bail!(
+                "{}",
+                safe_reqwest_error("editMessageText request", token, &e)
+            ),
+        };
+        let status = resp.status();
+        let body: Value = match resp.json().await {
+            Ok(b) => b,
+            Err(e) => bail!("{}", safe_reqwest_error("editMessageText json", token, &e)),
+        };
+        if status.is_success() && body.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+            return Ok(());
+        }
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS && attempt == 0 {
+            if let Some(retry_after) = body
+                .pointer("/parameters/retry_after")
+                .and_then(Value::as_u64)
+            {
+                eprintln!(
+                    "hymt telegram: editMessageText rate-limited; retrying after {retry_after}s"
+                );
+                tokio::time::sleep(Duration::from_secs(retry_after)).await;
+                continue;
+            }
+        }
+        let desc = body
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        bail!(
+            "editMessageText failed HTTP {status}: {}",
+            redact_token_in_text(token, desc)
+        );
+    }
+    unreachable!("the bounded Telegram edit retry returns or fails")
 }
 
 /// Map a reqwest error to a log-safe message that never includes the bot token.
@@ -319,6 +600,157 @@ mod tests {
         assert!(!scrubbed.contains(token));
         assert!(scrubbed.contains("<redacted>"));
         assert!(!scrubbed.contains("ABC-DEF"));
+    }
+
+    #[test]
+    fn telegram_streaming_requires_opt_in_and_multiple_segments() {
+        assert!(!should_stream_telegram(false, 2));
+        assert!(!should_stream_telegram(true, 1));
+        assert!(should_stream_telegram(true, 2));
+    }
+
+    #[test]
+    fn stream_batcher_flushes_only_after_contiguous_segments_complete() {
+        let mut batcher = TelegramStreamBatcher::default();
+        batcher.push_token("first");
+        assert!(!batcher.mark_segment_complete(1));
+        assert!(batcher.mark_segment_complete(0));
+        assert_eq!(batcher.text(), "first");
+    }
+
+    #[test]
+    fn edit_rate_limiter_waits_one_second_between_edits() {
+        let mut limiter = EditRateLimiter::new(Duration::from_secs(1));
+        let now = Instant::now();
+        assert_eq!(limiter.remaining_delay(now), None);
+        limiter.record_edit(now);
+        assert_eq!(
+            limiter.remaining_delay(now + Duration::from_millis(400)),
+            Some(Duration::from_millis(600))
+        );
+        assert_eq!(limiter.remaining_delay(now + Duration::from_secs(1)), None);
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum TelegramCall {
+        Send {
+            chat_id: i64,
+            text: String,
+        },
+        Edit {
+            chat_id: i64,
+            message_id: i64,
+            text: String,
+        },
+    }
+
+    #[derive(Default)]
+    struct MockTelegramApi {
+        calls: std::sync::Mutex<Vec<TelegramCall>>,
+        edit_failures_remaining: std::sync::Mutex<usize>,
+    }
+
+    impl MockTelegramApi {
+        fn with_edit_failures(edit_failures: usize) -> Self {
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                edit_failures_remaining: std::sync::Mutex::new(edit_failures),
+            }
+        }
+
+        fn calls(&self) -> Vec<TelegramCall> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl TelegramMessageApi for MockTelegramApi {
+        async fn send_message(&self, chat_id: i64, text: &str) -> Result<i64> {
+            self.calls.lock().unwrap().push(TelegramCall::Send {
+                chat_id,
+                text: text.to_owned(),
+            });
+            Ok(777)
+        }
+
+        async fn edit_message(&self, chat_id: i64, message_id: i64, text: &str) -> Result<()> {
+            self.calls.lock().unwrap().push(TelegramCall::Edit {
+                chat_id,
+                message_id,
+                text: text.to_owned(),
+            });
+            let mut failures = self.edit_failures_remaining.lock().unwrap();
+            if *failures > 0 {
+                *failures -= 1;
+                return Err(anyhow::anyhow!("mock edit failure"));
+            }
+            Ok(())
+        }
+    }
+
+    async fn deliver_mock_events(api: &MockTelegramApi, events: Vec<StreamEvent>) -> Result<()> {
+        let (tx, rx) = tokio::sync::mpsc::channel(events.len());
+        for event in events {
+            tx.send(event).await.unwrap();
+        }
+        drop(tx);
+        deliver_stream_events(api, 42, rx, Duration::ZERO).await
+    }
+
+    #[tokio::test]
+    async fn streaming_delivery_sends_initial_chunk_then_edits_progressively() {
+        let api = MockTelegramApi::default();
+        deliver_mock_events(
+            &api,
+            vec![
+                StreamEvent::Token("first".into()),
+                StreamEvent::SegmentDone(0),
+                StreamEvent::Token(" second".into()),
+                StreamEvent::SegmentDone(1),
+                StreamEvent::AllDone("first second".into()),
+            ],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            api.calls(),
+            vec![
+                TelegramCall::Send {
+                    chat_id: 42,
+                    text: "first".into(),
+                },
+                TelegramCall::Edit {
+                    chat_id: 42,
+                    message_id: 777,
+                    text: "first second".into(),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_delivery_continues_after_an_edit_failure() {
+        let api = MockTelegramApi::with_edit_failures(1);
+        deliver_mock_events(
+            &api,
+            vec![
+                StreamEvent::Token("first".into()),
+                StreamEvent::SegmentDone(0),
+                StreamEvent::Token(" second".into()),
+                StreamEvent::SegmentDone(1),
+                StreamEvent::AllDone("first second".into()),
+            ],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            api.calls()
+                .iter()
+                .filter(|call| matches!(call, TelegramCall::Edit { .. }))
+                .count(),
+            2
+        );
     }
 }
 

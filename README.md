@@ -155,6 +155,7 @@ Default config includes a disabled Telegram section:
 ```toml
 [telegram]
 enabled = false
+stream = true          # progressively edit one response for multi-segment translations
 bot_token = ""          # or set HYMT_TELEGRAM_BOT_TOKEN
 claim_password = ""     # auto-generated on first `hymt telegram` if empty
 owners = []             # private chat ids after claim
@@ -166,7 +167,7 @@ mode = "owners"         # "owners" | "groups"
 2. Set `enabled = true`.
 3. Run `hymt telegram` (long-poll until Ctrl+C). On first run, hymt generates a claim password, stores it in config, and prints it once.
 4. In a private chat with the bot, send the claim password (or `/claim <password>`) to become an owner. Multiple owners are supported.
-5. Authorized owners (and members of groups listed in `groups` when `mode = "groups"`) receive automatic Chinese↔English translation of text messages. Unauthorized chats get a short denial.
+5. Authorized owners (and members of groups listed in `groups` when `mode = "groups"`) receive automatic Chinese↔English translation of text messages. Multi-segment translations progressively edit one response by default; set `stream = false` to wait and send one final response instead. Unauthorized chats get a short denial.
 6. Regenerate the claim password with `hymt telegram --regenerate-claim-password` (prints the new value once).
 
 Secrets (`bot_token`, `claim_password`) are not re-printed on every run.
