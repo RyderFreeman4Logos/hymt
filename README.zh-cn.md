@@ -224,8 +224,8 @@ hymt translate-doc docs/ --recursive
 
 - 默认目标语言为`zh`，Markdown输出文件会自动命名为`.zh-cn.md`。
 - 当使用`--output-dir`参数时，目录模式会翻译Markdown文件并保留相对路径。
-- 完整性验证通过一系列快速截断/结构检测机制实现：最小字符比例、段落保留以及Markdown标题的保留情况。该机制可提示可能存在截断或结构丢失的问题，但并不能确保翻译在语义上是正确的。
-- 失败的翻译片段会最多重试`[completeness].max_retries`次；普通模式、流式处理、批量处理以及`translate-doc`模式的片段验证都适用此阈值。所有重试结束后，`hymt`仍会输出尽可能好的结果，并在标准错误流中输出`completeness_degraded_segments=…`信息。顶层文本/文件/标准输入命令（包括其流式处理形式）会以非零状态退出，以便脚本能够检测到质量下降的结果；若希望仅显示警告而不改变退出码，可传递`--warn-only-completeness`参数或设置`[completeness].warn_only = true`。默认情况下，`batch`、`translate-doc`和`exec`模式也会输出相同的标准错误信息，但不会因部分片段质量下降而使整个任务失败。
+- 完整性验证是一项快速的分层截断/结构防护机制，**不是**翻译质量估计（QE），也不能证明语义正确性。它对已校准的英语/中文目标使用 Unicode 标量密度上下限；其他目标会显式报告 `unverified_density`，而不会默默声称密度已通过。它还会检查由调用方提供的空响应/终止信息、段落、Markdown 标题和围栏代码块、占位符、URL 以及 JSON 模板是否有效。缓存片段在复用前会由当前防护机制重新验证。
+- 失败的翻译片段会最多重试`[completeness].max_retries`次；普通模式、流式处理、批量处理以及`translate-doc`模式的片段验证都适用此阈值。重试耗尽后，`hymt`会保留验证得分最高的尝试（仅根据可观察的防护信号排序，绝非 QE 得分），并记录 `reason=highest_validation_score`。`hymt`会写入这一降级的尽力结果，并在标准错误流中输出`completeness_status=degraded_best_effort`和`completeness_degraded_segments=…`信息。顶层文本/文件/标准输入命令（包括其流式处理形式）会以非零状态退出，以便脚本能够检测到降级结果；若希望仅显示警告而不改变退出码，可传递`--warn-only-completeness`参数或设置`[completeness].warn_only = true`。默认情况下，`batch`、`translate-doc`和`exec`模式也会输出相同的标准错误信息，但不会因部分片段降级而使整个任务失败。验证式流处理会缓冲一个片段直到其通过；乐观流处理无法收回已发出的无效令牌，因此会报告降级的尽力结果，而不是重试。
 - 源文本片段的长度也受到扩展量/上下文限制以及`[translation].max_source_tokens_per_segment`参数的约束（默认值为`1024`，设置为`0`则取消该限制）。
 
 ## 批量翻译目录树

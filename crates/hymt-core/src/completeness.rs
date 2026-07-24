@@ -1,7 +1,8 @@
-//! Three-layer completeness validation for translated segments.
+//! Layered truncation and structural validation for translated segments.
 //!
-//! Prevents silent content loss caused by LLM early-stop: a translation that
-//! passes all three checks is considered complete enough to cache and use.
+//! This module detects cheap, observable signs of truncated or structurally lost
+//! output. It deliberately does **not** estimate translation quality or semantic
+//! equivalence. A passing result is only suitable for retry/cache decisions.
 
 use std::collections::HashSet;
 
@@ -9,12 +10,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::language_spec::{language_spec_or_none, LanguageFamily};
 
+const MAX_CALIBRATED_DENSITY_RATIO: f64 = 8.0;
+
 /// Threshold configuration for completeness checks.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompletenessThresholds {
-    /// Minimum character-count ratio for zh→en translations (source is zh).
+    /// Minimum Unicode-scalar density ratio for zh→en translations (source is zh).
     pub zh_to_en_min_ratio: f64,
-    /// Minimum character-count ratio for en→zh translations (source is en).
+    /// Minimum Unicode-scalar density ratio for en→zh translations (source is en).
     pub en_to_zh_min_ratio: f64,
     /// Minimum paragraph-count ratio (output / input).
     pub min_paragraph_ratio: f64,
@@ -30,65 +33,170 @@ impl Default for CompletenessThresholds {
     }
 }
 
-/// Raw counts extracted from a text for completeness comparison.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CompletenessStats {
-    pub char_count: usize,
-    pub paragraph_count: usize,
-    pub heading_count: usize,
+/// Machine-readable state for a validation attempt.
+///
+/// `DegradedBestEffort` is assigned by retry orchestration after every retry has
+/// failed; the fast validator itself never claims semantic translation quality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletenessStatus {
+    Valid,
+    ValidWithAdvisories,
+    Unverified,
+    RetryableIncomplete,
+    StructurallyInvalid,
+    DegradedBestEffort,
 }
 
-/// Outcome of a completeness check.
+impl CompletenessStatus {
+    /// Whether this attempt can be used without a completeness retry.
+    pub fn accepts_output(self) -> bool {
+        matches!(
+            self,
+            Self::Valid | Self::ValidWithAdvisories | Self::Unverified
+        )
+    }
+}
+
+/// Transport termination signal supplied when a caller has it available.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionTermination {
+    #[default]
+    Unknown,
+    Stop,
+    Length,
+    Timeout,
+}
+
+/// Optional transport context for layered validation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletenessContext {
+    pub termination: CompletionTermination,
+}
+
+/// Indicates whether density bounds are calibrated for the selected target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DensityStatus {
+    Calibrated,
+    Unverified,
+}
+
+/// Unicode-scalar density measurement and the bounds that applied to it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DensityCheck {
+    pub status: DensityStatus,
+    pub ratio: Option<f64>,
+    pub minimum_ratio: Option<f64>,
+    pub maximum_ratio: Option<f64>,
+}
+
+/// Raw structural and Unicode-scalar counts extracted from a text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletenessStats {
+    /// Count of Unicode scalar values. This is intentionally not UTF-8 byte length.
+    pub unicode_scalar_count: usize,
+    pub paragraph_count: usize,
+    pub heading_count: usize,
+    pub fenced_code_block_count: usize,
+    pub url_count: usize,
+    pub placeholder_count: usize,
+}
+
+/// Outcome of a truncation/structure validation attempt.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompletenessResult {
+    /// Compatibility boolean for callers that only need the retry decision.
     pub is_complete: bool,
-    /// Names of checks that failed: `"token_ratio"`, `"paragraph_count"`, `"heading_preservation"`.
+    pub status: CompletenessStatus,
+    /// Higher is better only for selecting a best failed attempt; it is not a QE score.
+    pub score: i32,
+    pub density: DensityCheck,
+    /// Stable failure codes such as `token_ratio`, `empty_output`, and `json_validity`.
     pub checks_failed: Vec<String>,
-    /// Advisory warnings that do not trigger a retry (e.g. paragraph_count mismatch when token_ratio passes).
+    /// Advisory codes that do not trigger a retry, including `unverified_density`.
     pub advisory_warnings: Vec<String>,
     pub input_stats: CompletenessStats,
     pub output_stats: CompletenessStats,
 }
 
-/// Validates whether `output_text` is a sufficiently complete translation of `input_text`.
-///
-/// `target_lang` determines which character-ratio threshold to apply:
-/// - `"en"` / `"en-*"` → `zh_to_en_min_ratio` (source was Chinese)
-/// - `"zh"` / `"zh-*"` → `en_to_zh_min_ratio` (source was English)
-/// - anything else → no char-ratio check
+impl CompletenessResult {
+    /// Marks a selected failed attempt after retry exhaustion.
+    pub fn into_degraded_best_effort(mut self) -> Self {
+        self.is_complete = false;
+        self.status = CompletenessStatus::DegradedBestEffort;
+        self
+    }
+}
+
+/// Validates whether `output_text` has observable signs of being a complete enough
+/// translation of `input_text`, without making a semantic-quality claim.
 pub fn validate_completeness(
     input_text: &str,
     output_text: &str,
     target_lang: &str,
     thresholds: Option<&CompletenessThresholds>,
 ) -> CompletenessResult {
+    validate_completeness_with_context(
+        input_text,
+        output_text,
+        target_lang,
+        thresholds,
+        &CompletenessContext::default(),
+    )
+}
+
+/// Like [`validate_completeness`], with optional transport termination evidence.
+pub fn validate_completeness_with_context(
+    input_text: &str,
+    output_text: &str,
+    target_lang: &str,
+    thresholds: Option<&CompletenessThresholds>,
+    context: &CompletenessContext,
+) -> CompletenessResult {
     let thresholds = thresholds.cloned().unwrap_or_default();
     let input_stats = compute_stats(input_text);
     let output_stats = compute_stats(output_text);
-    let mut checks_failed: Vec<String> = Vec::new();
-    let mut advisory_warnings: Vec<String> = Vec::new();
+    let density = density_check(&input_stats, &output_stats, target_lang, &thresholds);
+    let mut checks_failed = Vec::new();
+    let mut advisory_warnings = Vec::new();
 
-    // Check 1: character ratio.
-    let mut char_ratio_passed = None; // None means check was not applicable
-    if let Some(min_ratio) = min_char_ratio(target_lang, &thresholds) {
-        if input_stats.char_count > 0 {
-            let actual_ratio = output_stats.char_count as f64 / input_stats.char_count as f64;
-            if actual_ratio < min_ratio {
-                checks_failed.push("token_ratio".to_owned());
-                char_ratio_passed = Some(false);
-            } else {
-                char_ratio_passed = Some(true);
-            }
-        }
+    // Layer 1: transport/termination and empty response.
+    if output_text.trim().is_empty() {
+        checks_failed.push("empty_output".to_owned());
+    }
+    match context.termination {
+        CompletionTermination::Length => checks_failed.push("finish_reason_length".to_owned()),
+        CompletionTermination::Timeout => checks_failed.push("timeout".to_owned()),
+        CompletionTermination::Unknown | CompletionTermination::Stop => {}
     }
 
-    // Check 2: paragraph count ratio.
+    // Layer 2: calibrated Unicode-scalar density. Other targets are explicit,
+    // actionable advisories rather than implicit passes.
+    let mut density_passed = None;
+    match density.status {
+        DensityStatus::Calibrated => {
+            if let Some(ratio) = density.ratio {
+                if ratio < density.minimum_ratio.unwrap_or_default() {
+                    checks_failed.push("token_ratio".to_owned());
+                    density_passed = Some(false);
+                } else if ratio > density.maximum_ratio.unwrap_or(f64::INFINITY) {
+                    checks_failed.push("density_upper_bound".to_owned());
+                    density_passed = Some(false);
+                } else {
+                    density_passed = Some(true);
+                }
+            }
+        }
+        DensityStatus::Unverified => advisory_warnings.push("unverified_density".to_owned()),
+    }
+
+    // Layer 3: cheap structural retention checks.
     if input_stats.paragraph_count > 0 {
         let ratio = output_stats.paragraph_count as f64 / input_stats.paragraph_count as f64;
         if ratio < thresholds.min_paragraph_ratio {
-            // Demote to advisory if char_ratio was applicable AND passed.
-            // If char_ratio was NOT applicable (non en/zh) or FAILED, it's a hard failure.
-            if char_ratio_passed == Some(true) {
+            if density_passed == Some(true) {
                 advisory_warnings.push("paragraph_count".to_owned());
             } else {
                 checks_failed.push("paragraph_count".to_owned());
@@ -96,9 +204,30 @@ pub fn validate_completeness(
         }
     }
 
-    // Check 3: heading preservation.
     if input_stats.heading_count > 0 && output_stats.heading_count < input_stats.heading_count {
         checks_failed.push("heading_preservation".to_owned());
+    }
+    if input_stats.fenced_code_block_count > output_stats.fenced_code_block_count {
+        checks_failed.push("fenced_code_preservation".to_owned());
+    }
+    if !preserves_all(
+        &placeholder_tokens(input_text),
+        &placeholder_tokens(output_text),
+    ) {
+        checks_failed.push("placeholder_preservation".to_owned());
+    }
+    if !preserves_all(&urls(input_text), &urls(output_text)) {
+        checks_failed.push("url_preservation".to_owned());
+    }
+    if let Some(input_json) = parse_json_document(input_text) {
+        match serde_json::from_str::<serde_json::Value>(output_text.trim()) {
+            Ok(output_json) if preserves_json_object_keys(&input_json, &output_json) => {}
+            Ok(_) => checks_failed.push("json_key_preservation".to_owned()),
+            Err(_) => checks_failed.push("json_validity".to_owned()),
+        }
+    }
+    if generic_refusal(output_text) {
+        checks_failed.push("generic_refusal".to_owned());
     }
 
     if cli_help_translation_is_complete(input_text, output_text, target_lang, &checks_failed) {
@@ -109,8 +238,13 @@ pub fn validate_completeness(
         }
     }
 
+    let status = classify_status(&checks_failed, &advisory_warnings);
+    let score = validation_score(status, &checks_failed, &density);
     CompletenessResult {
-        is_complete: checks_failed.is_empty(),
+        is_complete: status.accepts_output(),
+        status,
+        score,
+        density,
         checks_failed,
         advisory_warnings,
         input_stats,
@@ -122,9 +256,195 @@ pub fn validate_completeness(
 
 fn compute_stats(text: &str) -> CompletenessStats {
     CompletenessStats {
-        char_count: text.len(),
+        unicode_scalar_count: text.chars().count(),
         paragraph_count: count_paragraphs(text),
         heading_count: count_markdown_headings(text),
+        fenced_code_block_count: count_fenced_code_blocks(text),
+        url_count: urls(text).len(),
+        placeholder_count: placeholder_tokens(text).len(),
+    }
+}
+
+fn density_check(
+    input: &CompletenessStats,
+    output: &CompletenessStats,
+    target_lang: &str,
+    thresholds: &CompletenessThresholds,
+) -> DensityCheck {
+    let ratio = (input.unicode_scalar_count > 0)
+        .then(|| output.unicode_scalar_count as f64 / input.unicode_scalar_count as f64);
+    let Some(minimum_ratio) = min_unicode_scalar_ratio(target_lang, thresholds) else {
+        return DensityCheck {
+            status: DensityStatus::Unverified,
+            ratio,
+            minimum_ratio: None,
+            maximum_ratio: None,
+        };
+    };
+    DensityCheck {
+        status: DensityStatus::Calibrated,
+        ratio,
+        minimum_ratio: Some(minimum_ratio),
+        maximum_ratio: Some(MAX_CALIBRATED_DENSITY_RATIO),
+    }
+}
+
+fn classify_status(checks_failed: &[String], advisory_warnings: &[String]) -> CompletenessStatus {
+    if checks_failed.is_empty() {
+        if advisory_warnings
+            .iter()
+            .any(|warning| warning == "unverified_density")
+        {
+            CompletenessStatus::Unverified
+        } else if advisory_warnings.is_empty() {
+            CompletenessStatus::Valid
+        } else {
+            CompletenessStatus::ValidWithAdvisories
+        }
+    } else if checks_failed.iter().any(|check| {
+        matches!(
+            check.as_str(),
+            "heading_preservation"
+                | "fenced_code_preservation"
+                | "placeholder_preservation"
+                | "url_preservation"
+                | "json_validity"
+                | "json_key_preservation"
+        )
+    }) {
+        CompletenessStatus::StructurallyInvalid
+    } else {
+        CompletenessStatus::RetryableIncomplete
+    }
+}
+
+fn validation_score(
+    status: CompletenessStatus,
+    checks_failed: &[String],
+    density: &DensityCheck,
+) -> i32 {
+    let mut score = match status {
+        CompletenessStatus::Valid => 1_000,
+        CompletenessStatus::ValidWithAdvisories => 950,
+        CompletenessStatus::Unverified => 700,
+        CompletenessStatus::RetryableIncomplete => 500,
+        CompletenessStatus::StructurallyInvalid => 300,
+        CompletenessStatus::DegradedBestEffort => 0,
+    };
+    score -= (checks_failed.len() as i32) * 75;
+    if density.status == DensityStatus::Calibrated {
+        if let (Some(ratio), Some(minimum)) = (density.ratio, density.minimum_ratio) {
+            score += ((ratio / minimum).min(1.0) * 50.0) as i32;
+        }
+    }
+    score.max(0)
+}
+
+fn count_fenced_code_blocks(text: &str) -> usize {
+    text.lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("```") || trimmed.starts_with("~~~")
+        })
+        .count()
+        .div_ceil(2)
+}
+
+fn placeholder_tokens(text: &str) -> HashSet<String> {
+    let mut tokens = HashSet::new();
+    let mut remaining = text;
+    while let Some(start) = remaining.find("{{") {
+        let after_start = &remaining[start + 2..];
+        let Some(end) = after_start.find("}}") else {
+            break;
+        };
+        let candidate = &after_start[..end];
+        if !candidate.trim().is_empty() {
+            tokens.insert(format!("{{{{{candidate}}}}}"));
+        }
+        remaining = &after_start[end + 2..];
+    }
+
+    let mut remaining = text;
+    while let Some(start) = remaining.find('{') {
+        let after_start = &remaining[start + 1..];
+        let Some(end) = after_start.find('}') else {
+            break;
+        };
+        let candidate = &after_start[..end];
+        if !candidate.is_empty()
+            && candidate.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+            })
+        {
+            tokens.insert(format!("{{{candidate}}}"));
+        }
+        remaining = &after_start[end + 1..];
+    }
+    tokens
+}
+
+fn urls(text: &str) -> HashSet<String> {
+    text.split_whitespace()
+        .filter_map(|token| {
+            let start = token.find("https://").or_else(|| token.find("http://"))?;
+            let url = &token[start..];
+            let url = url.trim_matches(|character: char| {
+                matches!(
+                    character,
+                    '<' | '>'
+                        | '('
+                        | ')'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                        | ','
+                        | '.'
+                        | ';'
+                        | ':'
+                        | '!'
+                        | '?'
+                )
+            });
+            (!url.is_empty()).then(|| url.to_owned())
+        })
+        .collect()
+}
+
+fn preserves_all(input: &HashSet<String>, output: &HashSet<String>) -> bool {
+    input.iter().all(|token| output.contains(token))
+}
+
+fn parse_json_document(text: &str) -> Option<serde_json::Value> {
+    let trimmed = text.trim();
+    (trimmed.starts_with('{') || trimmed.starts_with('['))
+        .then(|| serde_json::from_str::<serde_json::Value>(trimmed).ok())
+        .flatten()
+}
+
+fn preserves_json_object_keys(input: &serde_json::Value, output: &serde_json::Value) -> bool {
+    match input {
+        serde_json::Value::Object(input) => {
+            let serde_json::Value::Object(output) = output else {
+                return false;
+            };
+            input.iter().all(|(key, input_value)| {
+                output.get(key).is_some_and(|output_value| {
+                    preserves_json_object_keys(input_value, output_value)
+                })
+            })
+        }
+        serde_json::Value::Array(input) => {
+            let serde_json::Value::Array(output) = output else {
+                return false;
+            };
+            input.len() <= output.len()
+                && input.iter().zip(output).all(|(input_value, output_value)| {
+                    preserves_json_object_keys(input_value, output_value)
+                })
+        }
+        _ => true,
     }
 }
 
@@ -238,8 +558,8 @@ fn generic_refusal(output_text: &str) -> bool {
     .any(|marker| lower.contains(marker))
 }
 
-/// Returns the applicable minimum char ratio for `target_lang`, or `None`.
-fn min_char_ratio(target_lang: &str, thresholds: &CompletenessThresholds) -> Option<f64> {
+/// Returns the applicable minimum Unicode-scalar density ratio for `target_lang`, or `None`.
+fn min_unicode_scalar_ratio(target_lang: &str, thresholds: &CompletenessThresholds) -> Option<f64> {
     let spec = language_spec_or_none(target_lang)?;
     if spec.canonical_code == "en" {
         return Some(thresholds.zh_to_en_min_ratio);
@@ -578,5 +898,134 @@ verbatim ask --no-generate --format json \"哪些证据是相关的？\"";
 
         assert!(!result.is_complete);
         assert!(result.checks_failed.contains(&"token_ratio".to_owned()));
+    }
+
+    // ── Layered validator regression coverage ────────────────────────────────
+
+    #[test]
+    fn density_uses_unicode_scalars_not_utf8_bytes() {
+        let stats = compute_stats("é中");
+        assert_eq!(stats.unicode_scalar_count, 2);
+    }
+
+    #[test]
+    fn zh_to_en_density_ratio_is_not_a_utf8_byte_ratio() {
+        // Scalar ratio is 1/2 = 0.5, whereas the old byte ratio was 1/6.
+        let result = validate_completeness("中文", "a", "en", None);
+
+        assert!(result.is_complete, "{:?}", result.checks_failed);
+        assert_eq!(result.density.ratio, Some(0.5));
+    }
+
+    #[test]
+    fn uncalibrated_target_reports_actionable_unverified_density() {
+        let result =
+            validate_completeness("A source paragraph with several words.", "Z", "fr", None);
+
+        assert!(result.is_complete, "{:?}", result.checks_failed);
+        assert_eq!(result.status, CompletenessStatus::Unverified);
+        assert!(result
+            .advisory_warnings
+            .contains(&"unverified_density".to_owned()));
+    }
+
+    #[test]
+    fn calibrated_density_rejects_runaway_upper_bound() {
+        let result = validate_completeness("Short source.", &"word ".repeat(100), "en", None);
+
+        assert_eq!(result.status, CompletenessStatus::RetryableIncomplete);
+        assert!(result
+            .checks_failed
+            .contains(&"density_upper_bound".to_owned()));
+    }
+
+    #[test]
+    fn structural_signals_reject_missing_fence_url_and_placeholder() {
+        let input = "# Setup\n\n```sh\necho {name}\n```\n\nRead https://example.test/docs.";
+        let output = "# Configuration\n\nRead the documentation.";
+        let result = validate_completeness(input, output, "fr", None);
+
+        assert_eq!(result.status, CompletenessStatus::StructurallyInvalid);
+        assert!(result
+            .checks_failed
+            .contains(&"fenced_code_preservation".to_owned()));
+        assert!(result
+            .checks_failed
+            .contains(&"placeholder_preservation".to_owned()));
+        assert!(result
+            .checks_failed
+            .contains(&"url_preservation".to_owned()));
+    }
+
+    #[test]
+    fn malformed_json_is_a_structural_failure() {
+        let result = validate_completeness(r#"{"title":"Hello"}"#, "{not-json}", "fr", None);
+
+        assert_eq!(result.status, CompletenessStatus::StructurallyInvalid);
+        assert!(result.checks_failed.contains(&"json_validity".to_owned()));
+    }
+
+    #[test]
+    fn missing_json_object_key_is_a_structural_failure() {
+        let result = validate_completeness(
+            r#"{"required_key":"value","retained_key":"value"}"#,
+            r#"{"retained_key":"valeur"}"#,
+            "fr",
+            None,
+        );
+
+        assert_eq!(result.status, CompletenessStatus::StructurallyInvalid);
+        assert!(result
+            .checks_failed
+            .contains(&"json_key_preservation".to_owned()));
+    }
+
+    #[test]
+    fn replaced_json_object_key_is_a_structural_failure() {
+        let result = validate_completeness(
+            r#"{"required_key":{"nested_key":"value"}}"#,
+            r#"{"different_key":{"nested_key":"valeur"}}"#,
+            "fr",
+            None,
+        );
+
+        assert_eq!(result.status, CompletenessStatus::StructurallyInvalid);
+        assert!(result
+            .checks_failed
+            .contains(&"json_key_preservation".to_owned()));
+    }
+
+    #[test]
+    fn missing_nested_json_object_key_is_a_structural_failure() {
+        let result = validate_completeness(
+            r#"{"required_key":{"nested_key":"value"}}"#,
+            r#"{"required_key":{}}"#,
+            "fr",
+            None,
+        );
+
+        assert_eq!(result.status, CompletenessStatus::StructurallyInvalid);
+        assert!(result
+            .checks_failed
+            .contains(&"json_key_preservation".to_owned()));
+    }
+
+    #[test]
+    fn finish_reason_length_is_retryable_transport_failure() {
+        let context = CompletenessContext {
+            termination: CompletionTermination::Length,
+        };
+        let result = validate_completeness_with_context(
+            "Source text.",
+            "Translated text.",
+            "en",
+            None,
+            &context,
+        );
+
+        assert_eq!(result.status, CompletenessStatus::RetryableIncomplete);
+        assert!(result
+            .checks_failed
+            .contains(&"finish_reason_length".to_owned()));
     }
 }
