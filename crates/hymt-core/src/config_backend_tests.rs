@@ -46,7 +46,7 @@ fn endpoint_backend_selects_vllm_and_accepts_its_documented_extensions() {
 }
 
 #[test]
-fn fingerprint_uses_backend_normalized_effective_sampling() {
+fn fingerprint_omits_profile_sampling_when_server_owns_defaults() {
     with_config(
         "fingerprint-normalized-sampling",
         "[endpoint]\nmodel = \"served-model\"\nprofile = \"hy_mt2_7b\"\nbackend = \"openai_compatible\"\n",
@@ -61,16 +61,59 @@ fn fingerprint_uses_backend_normalized_effective_sampling() {
                 .expect("generation object");
 
             assert_eq!(canonical["backend"], "openai_compatible");
-            assert_eq!(generation["temperature"], 0.7);
-            assert_eq!(generation["top_p"], 0.6);
-            for field in ["top_k", "repetition_penalty", "min_p", "repeat_last_n"] {
-                assert!(
-                    !generation.contains_key(field),
-                    "strict backend fingerprint must omit unsupported {field}"
-                );
-            }
+            assert!(
+                generation.is_empty(),
+                "pure server-default requests must not claim profile sampling values: {generation:?}"
+            );
+            assert!(
+                !fingerprint.is_cache_verified(),
+                "server-owned sampling has no client-verifiable cache namespace"
+            );
         },
     );
+}
+
+#[test]
+fn partial_sampler_override_does_not_verify_the_cache_identity() {
+    with_config(
+        "fingerprint-partial-sampling",
+        "[endpoint]\nmodel = \"served-model\"\nbackend = \"llama_cpp\"\n\n[inference.override]\ntemperature = 0.7\n",
+        |config| {
+            let fingerprint = config
+                .inference_fingerprint("default", "")
+                .expect("fingerprint");
+            let canonical: serde_json::Value =
+                serde_json::from_str(fingerprint.canonical_json()).expect("canonical JSON");
+            let generation = canonical["generation"]
+                .as_object()
+                .expect("generation object");
+
+            assert_eq!(generation["temperature"], 0.7);
+            assert!(
+                !fingerprint.is_cache_verified(),
+                "any service-owned sampler makes the cache identity unverifiable"
+            );
+        },
+    );
+}
+
+#[test]
+fn supplied_llama_cpp_services_pin_the_documented_sampling_profile() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for service in ["hy-mt2-quality.service", "hy-mt2-throughput.service"] {
+        let unit = std::fs::read_to_string(repo_root.join("services").join(service))
+            .expect("read supplied service unit");
+        for flag in [
+            "--temp 0.7",
+            "--top-p 0.6",
+            "--top-k 20",
+            "--repeat-penalty 1.05",
+            "--min-p 0",
+            "--repeat-last-n 64",
+        ] {
+            assert!(unit.contains(flag), "{service} must explicitly set {flag}");
+        }
+    }
 }
 
 #[test]

@@ -1,8 +1,9 @@
 //! Versioned, explicit model metadata for the supported Hy-MT2 family.
 //!
 //! A profile is selected explicitly from `[endpoint].profile`; `Generic` keeps
-//! unknown models usable while withholding family-specific tokenizer and sampler
-//! guarantees.
+//! unknown models usable while withholding family-specific tokenizer guarantees.
+//! Profile sampler guidance is for service deployment documentation, never
+//! automatic request-payload injection.
 
 use crate::config::{GenerationSettings, Setting};
 
@@ -142,7 +143,11 @@ impl ModelProfile {
         }
     }
 
-    /// Semantic upstream sampling defaults for this profile.
+    /// Semantic upstream sampling guidance for service deployment.
+    ///
+    /// These values document tested Hy-MT2 recommendations and are not merged
+    /// into client requests. The inference service owns default sampling until
+    /// an explicit `[inference.override]` value is configured.
     pub const fn generation_defaults(self) -> GenerationSettings {
         match self {
             Self::HyMt2_1_8b | Self::HyMt2_7b => GenerationSettings {

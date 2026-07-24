@@ -57,17 +57,42 @@ fn payload_from_config(contents: &str) -> serde_json::Value {
 }
 
 #[test]
-fn hy_mt2_7b_profile_defaults_are_serialized_for_llama_cpp() {
+fn hy_mt2_7b_profile_omits_sampling_without_explicit_override() {
     let object =
         payload_from_config("[endpoint]\nprofile = \"hy_mt2_7b\"\nbackend = \"llama_cpp\"\n");
 
-    assert_eq!(object["temperature"], 0.7);
-    assert_eq!(object["top_p"], 0.6);
-    assert_eq!(object["top_k"], 20);
-    assert_eq!(object["repeat_penalty"], 1.05);
+    assert_eq!(object["max_tokens"], 128);
+    for key in [
+        "temperature",
+        "top_p",
+        "top_k",
+        "repeat_penalty",
+        "repetition_penalty",
+        "min_p",
+        "repeat_last_n",
+    ] {
+        assert!(
+            object.get(key).is_none(),
+            "profiled server-default request must omit {key}"
+        );
+    }
+}
+
+#[test]
+fn explicit_profile_override_is_serialized_with_llama_cpp_wire_keys() {
+    let object = payload_from_config(
+        "[endpoint]\nprofile = \"hy_mt2_7b\"\nbackend = \"llama_cpp\"\n\n[inference.override]\ntemperature = 0.8\nrepetition_penalty = 1.1\n",
+    );
+
+    assert_eq!(object["temperature"], 0.8);
+    assert_eq!(object["repeat_penalty"], 1.1);
     assert!(object.get("repetition_penalty").is_none());
-    assert!(object.get("min_p").is_none());
-    assert!(object.get("repeat_last_n").is_none());
+    for key in ["top_p", "top_k", "min_p", "repeat_last_n"] {
+        assert!(
+            object.get(key).is_none(),
+            "unconfigured override must omit {key}"
+        );
+    }
 }
 
 #[test]

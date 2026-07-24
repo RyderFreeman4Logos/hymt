@@ -77,10 +77,9 @@ language_detection = true
 force_translate_all = false
 
 [inference]
-# 对 Hy-MT2 配置文件（包括 hy_mt2_7b），省略的覆盖项会在客户端使用该
-# 配置文件的生成默认值；适配器会以正确的后端 wire 字段名序列化其支持的值。
-# 若要让服务端决定某个采样器，其有效设置必须仍为 ServerDefault（例如未设置
-# 覆盖项的 generic）。
+# 推理服务拥有采样器默认值。没有显式覆盖项时，hymt 会从 JSON 请求中省略
+# 所有采样字段，Hy-MT2 配置文件也不例外。配置文件仍提供分词器/模型元数据
+# 和服务部署指导。
 
 [inference.override]
 # 数值表示显式语义值；"disabled" 会被所选适配器映射为该后端文档规定的 wire 值。
@@ -117,7 +116,7 @@ divergence_threshold = 2.0
 | `vllm` | `temperature`、`top_p`、`top_k`、`repetition_penalty`、`min_p` | `repetition_penalty`在线上发送为`repetition_penalty`；禁用的`top_k`发送为`-1`。`repeat_last_n`会被拒绝。 |
 | `openai_compatible` | `temperature`、`top_p` | 只发送通用的聊天补全字段；所有非标准显式覆盖都会被拒绝，不会猜测字段名。 |
 
-只有有效值为`Setting::ServerDefault`的采样器才会从请求中省略。省略`[inference.override]`键并不一定意味着其有效值为`ServerDefault`：Hy-MT2配置文件会先在客户端叠加其生成默认值，再由所选适配器以正确的后端 wire 字段名序列化支持的值。因此，文档中的`hy_mt2_7b`示例会向`llama_cpp`发送配置文件默认的采样器值，其中`repetition_penalty`在线上为`repeat_penalty`；没有覆盖项的`generic`才会让采样器由服务端决定。`"disabled"`和数值是语义配置状态：适配器采用文档规定的 wire 值，而不会不加区分地在`0`和`-1`之间转换。验证错误会给出语义值，并在不存在后端 wire 表示时明确说明。流式与非流式请求使用相同的适配器策略。
+省略`[inference.override]`键始终表示`Setting::ServerDefault`，因此该字段不会出现在 JSON 请求中，由服务应用其自身配置的值。所有 Hy-MT2 配置文件同样如此：配置文件中的采样值仅作为服务部署指导，绝不会自动注入请求负载。只有在客户端必须有意替换服务默认值时才设置数值覆盖项；`"disabled"`和数值是语义配置状态，适配器会采用文档规定的 wire 值，而不会不加区分地在`0`和`-1`之间转换。显式覆盖项会显示在诊断信息中，并进入推理/缓存指纹。直接写在`[inference]`下的旧标量采样值会在一个发布周期内继续作为显式覆盖项接受，并产生启动迁移警告；请将它们移到`[inference.override]`。验证错误会给出语义值，并在不存在后端 wire 表示时明确说明。流式与非流式请求使用相同的适配器策略。
 
 上述扩展名严格限制为已文档化的 llama.cpp 服务端控制项和 vLLM OpenAI 服务端采样参数：[llama.cpp 服务端 API](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)与[vLLM OpenAI 兼容服务端](https://docs.vllm.ai/en/latest/serving/openai_compatible_server/)。旧的`[inference].backend`键会被拒绝；请将其移动到`[endpoint].backend`。
 
@@ -127,10 +126,10 @@ divergence_threshold = 2.0
 
 | 值 | 功能说明 |
 |---|---|
-| `hy_mt2_1_8b` | 经测试的Hy-MT2 1.8B模型配置文件，使用固定的上游分词器源及默认的配置生成方式。 |
-| `hy_mt2_7b` | 经测试的Hy-MT2 7B模型配置文件，使用固定的上游分词器源及默认的配置生成方式。 |
-| `hy_mt2_30b_a3b` | 经测试的Hy-MT2 30B-A3B模型配置文件，使用固定的上游分词器源及默认的配置生成方式。 |
-| `generic`（或省略） | 无配置模式：不使用任何经过测试的Hy-MT2分词器或默认配置。 |
+| `hy_mt2_1_8b` | 经测试的Hy-MT2 1.8B模型配置文件，使用固定的上游分词器源，并提供服务部署采样指导。 |
+| `hy_mt2_7b` | 经测试的Hy-MT2 7B模型配置文件，使用固定的上游分词器源，并提供服务部署采样指导。 |
+| `hy_mt2_30b_a3b` | 经测试的Hy-MT2 30B-A3B模型配置文件，使用固定的上游分词器源，并提供服务部署采样指导。 |
+| `generic`（或省略） | 无配置模式：不使用任何经过测试的Hy-MT2分词器或采样指导。 |
 
 该配置文件会在进程启动时被读取并**固定下来**。其他配置值仍可热加载，但盘中对`[endpoint].profile`的更改会被正在运行的进程忽略；如需使用不同配置文件，需重启`hymt`。分段缓存键和翻译历史记录会保留原始的配置文件ID，因此不同配置文件之间的结果不会相互影响。
 
@@ -343,7 +342,7 @@ hymt telegram --regenerate-claim-password
 
 这两个服务仅绑定到 Tailscale 上的 `100.78.159.38:8401` 地址，而非 `0.0.0.0`。它们都使用 CUDA 版本的 `llama-server`；质量优化版本使用本地构建的程序，而高处理效率版本则使用 `llama-cpp/9294-cuda` 构建版本。这些可执行文件和模型路径是特定于主机的，但替代的后端必须支持所指定的 `llama-server` 上下文配置、并行处理槽数以及 KV 缓存相关参数。
 
-两个服务都设置了 `--temp 0.7`、`--top-k 20`、`--top-p 0.6` 和 `--repeat-penalty 1.05` 这些参数。这两个服务均未明确设置 llama.cpp 的 `min-p` 参数或重复历史记录长度，因此会使用后端的默认值。目前的 Rust 客户端会发送相应的 `[inference]` 请求字段；如需更改这些参数，请确保客户端配置与服务配置保持一致。
+两个服务都显式设置了 `--temp 0.7`、`--top-k 20`、`--top-p 0.6` 和 `--repeat-penalty 1.05`，这些是 Hy-MT2 的部署建议。它们还显式设置 `--min-p 0`（关闭这一 llama.cpp 专用扩展）和 `--repeat-last-n 64`（为 1.05 的重复惩罚刻意选择的 llama.cpp 兼容性设置，并非上游 Hy-MT2 建议）。因此，这些 unit 不会意外继承已安装 llama.cpp 版本的采样配置。除非`[inference.override]`明确替换某个值，hymt 不会发送采样字段，所以更改服务默认值会改变默认翻译。启动时 llama.cpp 客户端会请求`GET /props`，并输出其报告的原始`default_generation_settings`；`/props`不可用或旧版本未提供该字段时，会发出失败开放的警告，请求仍只省略字段。
 
 ## 架构说明
 

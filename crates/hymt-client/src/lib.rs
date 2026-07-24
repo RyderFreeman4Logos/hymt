@@ -317,6 +317,53 @@ impl TranslationClient {
         self.inner.concurrency
     }
 
+    /// Query llama.cpp's `/props` endpoint for its service-owned sampler defaults.
+    ///
+    /// This is diagnostic-only: failures never alter a request or block
+    /// translation. Normal requests still omit sampler fields unless an explicit
+    /// configuration override supplies one.
+    pub async fn llama_cpp_props_diagnostic(&self) -> Option<String> {
+        let _ = self.inner.config.maybe_reload();
+        match self.inner.config.generation_backend() {
+            Ok(GenerationBackend::LlamaCpp) => {}
+            Ok(_) => return None,
+            Err(error) => {
+                return Some(format!(
+                    "Warning: cannot determine backend for llama.cpp /props diagnostics ({error}); \
+                     client will continue omitting sampler fields."
+                ));
+            }
+        }
+
+        let url = Self::llama_cpp_props_url(&self.inner.config.endpoint_url());
+        match self
+            .inner
+            .http
+            .get(&url)
+            .headers(self.build_headers())
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => match response.json().await {
+                Ok(props) => Some(llama_cpp_props_default_message(&url, &props)),
+                Err(error) => Some(format!(
+                    "Warning: llama.cpp GET {url} returned invalid /props JSON ({error}); \
+                     client will continue omitting sampler fields."
+                )),
+            },
+            Ok(response) => Some(format!(
+                "Warning: llama.cpp GET {url} returned HTTP {}; client will continue omitting \
+                 sampler fields.",
+                response.status()
+            )),
+            Err(error) => Some(format!(
+                "Warning: llama.cpp GET {url} is unavailable ({error}); client will continue \
+                 omitting sampler fields."
+            )),
+        }
+    }
+
     /// Translates `prompt` to a single string (non-streaming).
     ///
     /// Acquires one concurrency slot for the duration of the request.
@@ -492,6 +539,12 @@ impl TranslationClient {
 
     fn chat_url(&self) -> String {
         format!("{}/chat/completions", self.inner.config.endpoint_url())
+    }
+
+    fn llama_cpp_props_url(endpoint_url: &str) -> String {
+        let endpoint_url = endpoint_url.trim_end_matches('/');
+        let server_url = endpoint_url.strip_suffix("/v1").unwrap_or(endpoint_url);
+        format!("{server_url}/props")
     }
 
     async fn post_with_retry(
@@ -903,6 +956,18 @@ fn http_error(status: u16, body: &[u8]) -> ClientError {
     ClientError::Http {
         status,
         body: String::from_utf8_lossy(body).chars().take(500).collect(),
+    }
+}
+
+fn llama_cpp_props_default_message(url: &str, props: &serde_json::Value) -> String {
+    match props.get("default_generation_settings") {
+        Some(defaults) if defaults.is_object() => {
+            format!("llama.cpp /props server sampling defaults from {url}: {defaults}")
+        }
+        _ => format!(
+            "Warning: llama.cpp GET {url} did not expose default_generation_settings; \
+             client will continue omitting sampler fields."
+        ),
     }
 }
 
@@ -1331,5 +1396,96 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["role"].as_str().unwrap(), "user");
         assert_eq!(messages[0]["content"].as_str().unwrap(), "translate this");
+    }
+
+    #[test]
+    fn llama_cpp_props_diagnostics_use_the_server_root_and_report_literal_defaults() {
+        assert_eq!(
+            TranslationClient::llama_cpp_props_url("http://127.0.0.1:8401/v1/"),
+            "http://127.0.0.1:8401/props"
+        );
+
+        let message = llama_cpp_props_default_message(
+            "http://127.0.0.1:8401/props",
+            &serde_json::json!({
+                "default_generation_settings": {
+                    "temperature": 0.7,
+                    "top_p": 0.6,
+                    "top_k": 20,
+                    "repeat_penalty": 1.05
+                }
+            }),
+        );
+        assert!(message.contains("server sampling defaults"));
+        assert!(message.contains("\"temperature\":0.7"));
+        assert!(message.contains("\"repeat_penalty\":1.05"));
+    }
+
+    #[test]
+    fn llama_cpp_props_diagnostics_fail_open_when_defaults_are_unavailable() {
+        let message = llama_cpp_props_default_message(
+            "http://127.0.0.1:8401/props",
+            &serde_json::json!({"build": "old-server"}),
+        );
+        assert!(message.contains("did not expose default_generation_settings"));
+        assert!(message.contains("continue omitting sampler fields"));
+    }
+
+    #[tokio::test]
+    async fn llama_cpp_props_diagnostic_queries_props_without_affecting_requests() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let count = socket.read(&mut request).await.unwrap();
+            let request = std::str::from_utf8(&request[..count]).unwrap();
+            assert!(request.starts_with("GET /props HTTP/1.1"));
+            assert!(request
+                .lines()
+                .any(|line| { line.eq_ignore_ascii_case("authorization: Bearer props-test-key") }));
+            assert!(request
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("content-type: application/json")));
+
+            let body = r#"{"default_generation_settings":{"temperature":0.7,"top_p":0.6,"top_k":20,"repeat_penalty":1.05}}"#;
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+
+        let path = std::env::temp_dir().join(format!(
+            "hymt-client-props-{}-{}.toml",
+            std::process::id(),
+            address.port()
+        ));
+        std::fs::write(
+            &path,
+            format!(
+                "[endpoint]\nurl = \"http://{address}/v1\"\nbackend = \"llama_cpp\"\napi_key = \"props-test-key\"\n"
+            ),
+        )
+        .unwrap();
+        let config = HotConfig::from_path(&path).unwrap();
+        let client = TranslationClient::new(config).unwrap();
+        let diagnostic = client
+            .llama_cpp_props_diagnostic()
+            .await
+            .expect("llama.cpp diagnostics");
+
+        server.await.unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(diagnostic.contains("\"temperature\":0.7"));
+        assert!(diagnostic.contains("\"repeat_penalty\":1.05"));
     }
 }
