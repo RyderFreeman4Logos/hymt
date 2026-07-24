@@ -50,6 +50,8 @@ api_key = ""
 model = ""
 # Select one supported, tested Hy-MT2 profile, or use "generic" for an unprofiled endpoint.
 profile = "hy_mt2_7b"
+# 根据服务实现选择适配器，不要从端点 URL 推断。
+backend = "llama_cpp" # "llama_cpp" | "vllm" | "openai_compatible"
 
 [backend]
 # `llama-server -c` is the service-wide allocation. The throughput unit uses
@@ -75,12 +77,16 @@ language_detection = true
 force_translate_all = false
 
 [inference]
-# The client sends these OpenAI-compatible request fields. They match the
-# supplied service profiles; keep client overrides aligned with the endpoint.
-temperature = 0.7
-top_p = 0.6
-top_k = 20
-repetition_penalty = 1.05
+# 省略所有采样器覆盖项时，由所选服务端决定默认值。
+
+[inference.override]
+# 数值表示显式语义值；"disabled" 会被所选适配器映射为该后端文档规定的 wire 值。
+# temperature = 0.7
+# top_p = 0.6
+# top_k = "disabled"
+# repetition_penalty = 1.05
+# min_p = 0.1
+# repeat_last_n = 64 # 仅 llama.cpp
 
 [completeness]
 zh_to_en_min_ratio = 0.3
@@ -97,6 +103,20 @@ divergence_threshold = 2.0
 ```
 
 除`[endpoint].profile`外，其他配置均可热加载，该配置在进程启动时会被固定（详见[模型配置文件](#model-profile-endpointprofile)）。长时间运行的工作流无需重启即可应用其他更改。
+
+### 后端专用采样（`[endpoint].backend`）
+
+应根据服务实现显式选择`backend`；hymt绝不会从端点 URL 推断它。生成的默认配置选择`llama_cpp`。省略此键时，hymt使用保守的`openai_compatible`模式，且不会发送任何非标准采样扩展字段。
+
+| 后端 | 支持的覆盖字段 | 后端专用 wire 行为 |
+|---|---|---|
+| `llama_cpp` | `temperature`、`top_p`、`top_k`、`repetition_penalty`、`min_p`、`repeat_last_n` | `repetition_penalty`在线上发送为`repeat_penalty`；禁用的`top_k`和`repeat_last_n`发送为`0`。 |
+| `vllm` | `temperature`、`top_p`、`top_k`、`repetition_penalty`、`min_p` | `repetition_penalty`在线上发送为`repetition_penalty`；禁用的`top_k`发送为`-1`。`repeat_last_n`会被拒绝。 |
+| `openai_compatible` | `temperature`、`top_p` | 只发送通用的聊天补全字段；所有非标准显式覆盖都会被拒绝，不会猜测字段名。 |
+
+`Setting::ServerDefault`（省略配置键）始终会从请求中省略该采样器。`"disabled"`和数值是语义配置状态：适配器采用文档规定的 wire 值，而不会不加区分地在`0`和`-1`之间转换。验证错误会给出语义值，并在不存在后端 wire 表示时明确说明。流式与非流式请求使用相同的适配器策略。
+
+上述扩展名严格限制为已文档化的 llama.cpp 服务端控制项和 vLLM OpenAI 服务端采样参数：[llama.cpp 服务端 API](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)与[vLLM OpenAI 兼容服务端](https://docs.vllm.ai/en/latest/serving/openai_compatible_server/)。旧的`[inference].backend`键会被拒绝；请将其移动到`[endpoint].backend`。
 
 ## 模型配置文件（`[endpoint].profile`）
 

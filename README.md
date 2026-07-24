@@ -50,6 +50,8 @@ api_key = ""
 model = ""
 # Select one supported, tested Hy-MT2 profile, or use "generic" for an unprofiled endpoint.
 profile = "hy_mt2_7b"
+# Choose the adapter from the server implementation, not its URL.
+backend = "llama_cpp" # "llama_cpp" | "vllm" | "openai_compatible"
 
 [backend]
 # `llama-server -c` is the service-wide allocation. The throughput unit uses
@@ -75,12 +77,17 @@ language_detection = true
 force_translate_all = false
 
 [inference]
-# The client sends these OpenAI-compatible request fields. They match the
-# supplied service profiles; keep client overrides aligned with the endpoint.
-temperature = 0.7
-top_p = 0.6
-top_k = 20
-repetition_penalty = 1.05
+# Omit all sampler overrides to let the selected server own its defaults.
+
+[inference.override]
+# A number is an explicit semantic value; "disabled" is mapped by the selected
+# adapter to that backend's documented wire value.
+# temperature = 0.7
+# top_p = 0.6
+# top_k = "disabled"
+# repetition_penalty = 1.05
+# min_p = 0.1
+# repeat_last_n = 64 # llama.cpp only
 
 [completeness]
 zh_to_en_min_ratio = 0.3
@@ -97,6 +104,20 @@ divergence_threshold = 2.0
 ```
 
 The config is hot-reloadable except for `[endpoint].profile`, which is pinned at startup (see [Model profile](#model-profile-endpointprofile)). Long-running workflows pick up other edits without restarting the process.
+
+### Backend-specific sampling (`[endpoint].backend`)
+
+Choose `backend` explicitly from the server implementation; hymt never infers it from the endpoint URL. The generated config selects `llama_cpp`. If the key is omitted, hymt uses conservative `openai_compatible` mode and sends no nonstandard sampling extension.
+
+| Backend | Supported override fields | Backend-specific wire behavior |
+|---|---|---|
+| `llama_cpp` | `temperature`, `top_p`, `top_k`, `repetition_penalty`, `min_p`, `repeat_last_n` | `repetition_penalty` is sent as `repeat_penalty`; disabled `top_k` and `repeat_last_n` are sent as `0`. |
+| `vllm` | `temperature`, `top_p`, `top_k`, `repetition_penalty`, `min_p` | `repetition_penalty` is sent as `repetition_penalty`; disabled `top_k` is sent as `-1`. `repeat_last_n` is rejected. |
+| `openai_compatible` | `temperature`, `top_p` | Only common chat-completions fields are sent; every nonstandard explicit override is rejected rather than guessed. |
+
+`Setting::ServerDefault` (an omitted key) always omits that sampler from the request. `"disabled"` and numeric values are semantic configuration states: adapters choose documented wire values rather than converting `0` and `-1` indiscriminately. Validation errors name the semantic value and say when no backend wire representation exists. Streaming and non-streaming requests use the same adapter policy.
+
+The supported extension names above are limited to the documented llama.cpp server controls and vLLM OpenAI-server sampling parameters: [llama.cpp server API](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md) and [vLLM OpenAI-compatible server](https://docs.vllm.ai/en/latest/serving/openai_compatible_server/). An old `[inference].backend` key is rejected; move it to `[endpoint].backend`.
 
 ## Model profile (`[endpoint].profile`)
 
