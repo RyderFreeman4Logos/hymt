@@ -35,6 +35,7 @@ use hymt_translate::translate::{
 
 const KNOWN_SUBCOMMANDS: &[&str] = &[
     "config",
+    "backend",
     "man",
     "info",
     "exec",
@@ -185,6 +186,8 @@ impl From<&TemplateArg> for TemplateType {
 enum Cmd {
     /// Show, locate, or edit the hymt configuration file
     Config(ConfigArgs),
+    /// Inspect configured backend values and live service capabilities
+    Backend(BackendArgs),
     /// Translate a man page and display it in a pager
     Man(ManArgs),
     /// Translate an info page and display it in a pager
@@ -227,6 +230,20 @@ enum ConfigAction {
     Path,
     /// Open the config file in $EDITOR
     Edit,
+}
+
+// ── backend ──────────────────────────────────────────────────────────────────
+
+#[derive(Args)]
+struct BackendArgs {
+    #[command(subcommand)]
+    action: Option<BackendAction>,
+}
+
+#[derive(Subcommand)]
+enum BackendAction {
+    /// Print configured values beside freshly discovered service state
+    Inspect,
 }
 
 // ── man ───────────────────────────────────────────────────────────────────────
@@ -506,7 +523,16 @@ async fn run() -> Result<()> {
              total_context, parallel_slots, and optional per_request_context instead."
         );
     }
-    if should_run_llama_cpp_props_diagnostic(cli.cmd.as_ref()) {
+    if should_run_backend_preflight(cli.cmd.as_ref()) {
+        let preflight = TranslationClient::new(config.clone())?
+            .preflight_backend()
+            .await?;
+        for warning in preflight.warnings {
+            eprintln!("Warning: {warning}");
+        }
+    } else if matches!(cli.cmd.as_ref(), Some(Cmd::Telegram(_)))
+        && should_run_llama_cpp_props_diagnostic(cli.cmd.as_ref())
+    {
         if let Some(diagnostic) = TranslationClient::new(config.clone())?
             .llama_cpp_props_diagnostic()
             .await
@@ -579,6 +605,7 @@ async fn run() -> Result<()> {
             .await
         }
         Some(Cmd::Config(args)) => run_config(args, &config),
+        Some(Cmd::Backend(args)) => run_backend(args, &config).await,
         Some(Cmd::Man(args)) => {
             run_man(
                 args,
@@ -713,6 +740,7 @@ fn should_run_llama_cpp_props_diagnostic(command: Option<&Cmd>) -> bool {
             regenerate_claim_password: false,
         })) => true,
         Some(Cmd::Config(_))
+        | Some(Cmd::Backend(_))
         | Some(Cmd::Tokenizer(_))
         | Some(Cmd::Estimate(_))
         | Some(Cmd::History(_))
@@ -729,6 +757,13 @@ fn should_run_llama_cpp_props_diagnostic(command: Option<&Cmd>) -> bool {
     }
 }
 
+/// Translation paths use the resolved backend state before planning/cache lookup.
+/// Keep the pre-existing Telegram probe separate so this feature does not alter
+/// bot lifecycle or strict-policy behavior.
+fn should_run_backend_preflight(command: Option<&Cmd>) -> bool {
+    should_run_llama_cpp_props_diagnostic(command) && !matches!(command, Some(Cmd::Telegram(_)))
+}
+
 fn make_client_with_concurrency(
     config: &HotConfig,
     concurrency_override: Option<u32>,
@@ -738,6 +773,96 @@ fn make_client_with_concurrency(
         .max(1) as usize;
     TranslationClient::with_concurrency(config.clone(), concurrency)
         .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+async fn run_backend(args: BackendArgs, config: &HotConfig) -> Result<()> {
+    match args.action {
+        None | Some(BackendAction::Inspect) => {
+            let report = TranslationClient::new(config.clone())?
+                .inspect_backend()
+                .await?;
+            print_backend_inspection(&report);
+            Ok(())
+        }
+    }
+}
+
+fn inspect_value<T: std::fmt::Display>(value: Option<T>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unavailable".to_owned())
+}
+
+/// Print only configuration and service facts. Deliberately omit endpoint URLs,
+/// authorization headers, and API keys from this diagnostic surface.
+fn print_backend_inspection(report: &hymt_client::BackendPreflight) {
+    let configured = &report.configured;
+    let runtime = &report.runtime;
+    println!("Backend preflight inspection (credentials omitted)");
+    println!("field                         configured                 resolved service");
+    println!(
+        "backend                       {:<26} {}",
+        configured.backend.name(),
+        runtime.backend.name()
+    );
+    println!(
+        "model                         {:<26} {}",
+        configured.model.as_deref().unwrap_or("unconfigured"),
+        runtime.served_model.as_deref().unwrap_or("unavailable")
+    );
+    println!(
+        "profile                       {:<26} {}",
+        configured.profile,
+        runtime.version.as_deref().unwrap_or("unavailable")
+    );
+    println!(
+        "total context                 {:<26} {}",
+        configured.total_context,
+        inspect_value(runtime.total_context)
+    );
+    println!(
+        "per-request context           {:<26} {}",
+        configured.per_request_context,
+        inspect_value(runtime.per_slot_context)
+    );
+    println!(
+        "max output tokens             {:<26} {}",
+        configured.max_output_tokens,
+        inspect_value(runtime.default_max_generation_tokens)
+    );
+    println!(
+        "active / max slots            {} / {:<21} {} / {}",
+        configured.parallel_slots,
+        configured.parallel_slots,
+        inspect_value(runtime.active_slots),
+        inspect_value(runtime.max_parallel_slots)
+    );
+    println!(
+        "sampler overrides             {:?}",
+        configured.sampler_overrides
+    );
+    println!(
+        "sampler defaults              {:?}",
+        runtime.sampler_defaults
+    );
+    println!(
+        "capabilities                  stream={} tokenize={} template={} structured_output={}",
+        inspect_value(runtime.supports_streaming),
+        inspect_value(runtime.supports_tokenization),
+        inspect_value(runtime.supports_templates),
+        inspect_value(runtime.supports_structured_output),
+    );
+    println!(
+        "verification                  {:?}",
+        runtime.verification_status
+    );
+    if report.warnings.is_empty() {
+        println!("warnings                      none");
+    } else {
+        for warning in &report.warnings {
+            println!("warning                       {warning}");
+        }
+    }
 }
 
 fn piped_stdin_placeholder(words: &[String], stdin_is_terminal: bool) -> bool {
@@ -1865,6 +1990,46 @@ Options:\n  --source-id <SOURCE_ID>\n  --context-only\n";
             ),
             hymt_core::language::DocumentTranslationPolicy::TranslateAll
         );
+    }
+
+    #[test]
+    fn backend_inspect_is_a_known_offline_command() {
+        let cli = Cli::try_parse_from(["hymt", "backend", "inspect"]).unwrap();
+        assert!(!should_run_llama_cpp_props_diagnostic(cli.cmd.as_ref()));
+        match cli.cmd {
+            Some(Cmd::Backend(BackendArgs {
+                action: Some(BackendAction::Inspect),
+            })) => {}
+            _ => panic!("expected backend inspect command"),
+        }
+    }
+
+    #[tokio::test]
+    async fn backend_inspect_handler_runs_fail_open_for_an_unavailable_endpoint() {
+        let dir = PathBuf::from("target").join(unique_test_name("hymt-backend-inspect", "dir"));
+        let _cleanup = CleanupPath::Dir(dir.clone());
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "[endpoint]\nurl = \"http://127.0.0.1:1/v1\"\nbackend = \"llama_cpp\"\napi_key = \"inspect-test-secret\"\n\n[translation]\ntimeout = 1\n",
+        )
+        .unwrap();
+        let config = HotConfig::from_path(&path).unwrap();
+
+        run_backend(
+            BackendArgs {
+                action: Some(BackendAction::Inspect),
+            },
+            &config,
+        )
+        .await
+        .unwrap();
+        assert!(config
+            .backend_runtime_info()
+            .expect("inspect stores runtime info")
+            .verification_message
+            .is_some());
     }
 
     #[test]

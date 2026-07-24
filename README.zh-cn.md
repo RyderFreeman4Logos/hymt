@@ -73,6 +73,8 @@ timeout = 600
 # debug_chunk_timing = false
 # 当最终聊天模板无法在本地分词时拒绝规划；否则 hymt 会发出警告并使用保守的近似预算。
 strict_token_budget = false
+# 如果后端运行时无法验证或与配置存在实质差异，则在缓存查询前拒绝翻译。
+strict_backend_preflight = false
 # For Chinese-family targets, preserve confidently target-language paragraphs.
 language_detection = true
 # Override detection and submit every non-code paragraph.
@@ -121,6 +123,14 @@ divergence_threshold = 2.0
 省略`[inference.override]`键始终表示`Setting::ServerDefault`，因此该字段不会出现在 JSON 请求中，由服务应用其自身配置的值。所有 Hy-MT2 配置文件同样如此：配置文件中的采样值仅作为服务部署指导，绝不会自动注入请求负载。只有在客户端必须有意替换服务默认值时才设置数值覆盖项；`"disabled"`和数值是语义配置状态，适配器会采用文档规定的 wire 值，而不会不加区分地在`0`和`-1`之间转换。显式覆盖项会显示在诊断信息中，并进入推理/缓存指纹。直接写在`[inference]`下的旧标量采样值会在一个发布周期内继续作为显式覆盖项接受，并产生启动迁移警告；请将它们移到`[inference.override]`。验证错误会给出语义值，并在不存在后端 wire 表示时明确说明。流式与非流式请求使用相同的适配器策略。
 
 上述扩展名严格限制为已文档化的 llama.cpp 服务端控制项和 vLLM OpenAI 服务端采样参数：[llama.cpp 服务端 API](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)与[vLLM OpenAI 兼容服务端](https://docs.vllm.ai/en/latest/serving/openai_compatible_server/)。旧的`[inference].backend`键会被拒绝；请将其移动到`[endpoint].backend`。
+
+### 运行时后端预检与检查
+
+翻译路径会在规划或缓存查询之前对配置的后端执行预检。llama.cpp 使用 `GET /props`；vLLM 与其他 OpenAI 兼容服务会在可用时使用 `GET /v1/models`。标准化的运行时状态包括服务构建/模型标识、上下文与槽位限制、采样器默认值，以及仅限服务明确声明的能力。缺失字段会保持未知，绝不会由 hymt 推测。
+
+运行 `hymt backend inspect` 可并排显示配置值与服务解析出的值。该命令绝不输出 API 密钥、端点凭据或请求头。警告会指出上下文、模型或配置文件不匹配，意外的服务采样器状态，以及 llama.cpp/vLLM 的重复惩罚 wire 键不匹配。
+
+常规预检为 fail-open：它会发出警告、将推理指纹/缓存标识标记为未验证，并使用保守的上下文与输出限制进行规划。设置 `[translation].strict_backend_preflight = true` 后，若无法验证服务标识或发现实质性不匹配，hymt 会在缓存查询或模型调用前拒绝执行。运行时状态会以 60 秒 TTL 缓存，并在端点、后端或配置文件变化时刷新；服务标识变化会替换旧的解析状态和指纹。
 
 ## 模型配置文件（`[endpoint].profile`）
 

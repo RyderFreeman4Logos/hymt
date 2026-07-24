@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use crate::error::CoreError;
 use crate::language::DocumentTranslationPolicy;
 use crate::model_profile::{ModelProfile, UpstreamSource};
+use crate::runtime::{BackendRuntimeInfo, BackendVerificationStatus};
 
 pub const DEFAULT_CONFIG: &str = r#"[endpoint]
 url = "http://127.0.0.1:8401/v1"
@@ -48,6 +49,9 @@ debug_chunk_timing = false
 # Refuse planning when the active profile/tokenizer cannot count the final chat
 # request locally. Default false keeps an explicitly warned conservative fallback.
 strict_token_budget = false
+# Refuse translation before cache lookup when backend runtime identity cannot be
+# verified or materially differs from this configuration.
+strict_backend_preflight = false
 # Preserve high-confidence target-language paragraphs for Chinese-family targets.
 language_detection = true
 # Submit every non-code paragraph, including already-target-language paragraphs.
@@ -217,7 +221,8 @@ pub enum Setting<T> {
 }
 
 /// Backend profile used only when converting semantic settings to wire values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum GenerationBackend {
     /// llama.cpp's OpenAI-compatible server.
     LlamaCpp,
@@ -304,7 +309,7 @@ impl GenerationSettings {
     }
 
     /// Whether any sampler remains omitted from the request payload.
-    fn uses_any_server_defaults(&self) -> bool {
+    pub fn uses_any_server_defaults(&self) -> bool {
         matches!(self.temperature, Setting::ServerDefault)
             || matches!(self.top_p, Setting::ServerDefault)
             || matches!(self.top_k, Setting::ServerDefault)
@@ -522,6 +527,21 @@ fn generation_fingerprint_value(settings: &GenerationSettings) -> serde_json::Va
         }
     }
     canonical_object(fields)
+}
+
+/// Runtime identity excludes probe-local diagnostics and load: neither changes a
+/// model response, while version/build/model/capability changes do.
+fn runtime_fingerprint_value(info: &BackendRuntimeInfo) -> serde_json::Value {
+    match serde_json::to_value(info) {
+        Ok(serde_json::Value::Object(mut fields)) => {
+            fields.remove("active_slots");
+            fields.remove("observed_at_unix_secs");
+            fields.remove("verification_message");
+            serde_json::Value::Object(fields)
+        }
+        Ok(value) => value,
+        Err(_) => serde_json::Value::Null,
+    }
 }
 
 fn validate_f64_range(
@@ -788,6 +808,7 @@ struct ConfigState {
     profile: Option<ModelProfile>,
     uses_legacy_generation_scalars: bool,
     uses_legacy_context_window: bool,
+    backend_runtime_info: Option<BackendRuntimeInfo>,
 }
 
 impl ConfigState {
@@ -798,6 +819,7 @@ impl ConfigState {
             profile: None,
             uses_legacy_generation_scalars: false,
             uses_legacy_context_window: false,
+            backend_runtime_info: None,
         }
     }
 }
@@ -915,6 +937,44 @@ impl HotConfig {
             .unwrap_or_else(|| self.total_context() / self.parallel_slots())
     }
 
+    /// Latest runtime snapshot recorded by a backend preflight, if one was run.
+    ///
+    /// This is in-memory process state only; it never persists service metadata or
+    /// credentials into `config.toml`.
+    pub fn backend_runtime_info(&self) -> Option<BackendRuntimeInfo> {
+        self.state.read().unwrap().backend_runtime_info.clone()
+    }
+
+    /// Replace the runtime facts used by planner, request, and fingerprint resolution.
+    pub fn set_backend_runtime_info(&self, info: BackendRuntimeInfo) {
+        self.state.write().unwrap().backend_runtime_info = Some(info);
+    }
+
+    /// Clear stale runtime state after an endpoint/profile transition.
+    pub fn clear_backend_runtime_info(&self) {
+        self.state.write().unwrap().backend_runtime_info = None;
+    }
+
+    /// Context available to the planner after applying verified service limits.
+    ///
+    /// An unavailable preflight uses a deliberately conservative 4k context
+    /// rather than promoting the configured maximum as verified service state.
+    pub fn resolved_per_request_context(&self) -> u32 {
+        let configured = self.per_request_context();
+        let backend = self.generation_backend().ok();
+        let runtime = self.backend_runtime_info();
+        match runtime {
+            Some(info) if Some(info.backend) == backend => match info.verification_status {
+                BackendVerificationStatus::Verified => info
+                    .per_slot_context
+                    .map(|runtime_limit| configured.min(runtime_limit))
+                    .unwrap_or(configured),
+                BackendVerificationStatus::Unverified => configured.min(4_096),
+            },
+            _ => configured,
+        }
+    }
+
     /// Whether the deprecated `translation.context_window` needs migration to
     /// the separate backend context settings.
     pub fn uses_legacy_context_window(&self) -> bool {
@@ -927,6 +987,23 @@ impl HotConfig {
             .map(|profile| profile.recommended_max_output_tokens())
             .unwrap_or(4_096);
         self.get_positive_u32("translation", "max_output_tokens", default)
+    }
+
+    /// Output reservation after applying a verified server generation cap.
+    pub fn resolved_max_output_tokens(&self) -> u32 {
+        let configured = self.max_output_tokens();
+        let backend = self.generation_backend().ok();
+        let runtime = self.backend_runtime_info();
+        match runtime {
+            Some(info) if Some(info.backend) == backend => match info.verification_status {
+                BackendVerificationStatus::Verified => info
+                    .default_max_generation_tokens
+                    .map(|runtime_limit| configured.min(runtime_limit))
+                    .unwrap_or(configured),
+                BackendVerificationStatus::Unverified => configured.min(1_024),
+            },
+            _ => configured,
+        }
     }
 
     pub fn concurrency(&self) -> u32 {
@@ -979,6 +1056,11 @@ impl HotConfig {
     /// than use the explicitly warned conservative approximation.
     pub fn strict_token_budget(&self) -> bool {
         self.get_bool("translation", "strict_token_budget", false)
+    }
+
+    /// Refuse translation when preflight cannot attest the selected runtime.
+    pub fn strict_backend_preflight(&self) -> bool {
+        self.get_bool("translation", "strict_backend_preflight", false)
     }
 
     /// Selects whether document planning detects and preserves already-target text.
@@ -1041,10 +1123,38 @@ impl HotConfig {
         let backend = self.generation_backend()?;
         let effective_settings = settings.normalized_for_backend(backend);
         let model = self.model();
-        // A Generic profile without an explicit served model, or a request that
-        // delegates any sampler to the server, has no stable cache namespace.
-        let cache_verified = !(effective_settings.uses_any_server_defaults()
-            || (profile.is_generic() && model.is_empty()));
+        let runtime = self
+            .backend_runtime_info()
+            .filter(|info| info.backend == backend);
+        let configured_model_matches_runtime = runtime.as_ref().is_none_or(|info| {
+            model.is_empty()
+                || info
+                    .served_model
+                    .as_deref()
+                    .is_none_or(|served| served == model)
+        });
+        // A parsed response without a served-model value cannot attest which
+        // model produced cached output. Keep pre-preflight explicit-override
+        // callers compatible, but never trust an identity-incomplete runtime.
+        let runtime_identity_is_attested = runtime
+            .as_ref()
+            .is_none_or(|info| info.is_verified() && info.served_model.is_some());
+        let service_defaults_are_known = !effective_settings.uses_any_server_defaults()
+            || runtime
+                .as_ref()
+                .is_some_and(|info| info.sampler_defaults.is_complete());
+        // A failed preflight explicitly marks the identity unverified. Existing
+        // explicit-override callers retain their pre-preflight deterministic
+        // namespace, while translation paths run preflight before cache lookup.
+        let cache_verified = configured_model_matches_runtime
+            && runtime_identity_is_attested
+            && service_defaults_are_known
+            && !(profile.is_generic()
+                && model.is_empty()
+                && runtime
+                    .as_ref()
+                    .and_then(|info| info.served_model.as_ref())
+                    .is_none());
 
         let mut fields = BTreeMap::new();
         fields.insert(
@@ -1116,8 +1226,15 @@ impl HotConfig {
             "request".to_owned(),
             canonical_object([(
                 "max_output_tokens".to_owned(),
-                serde_json::Value::from(self.max_output_tokens()),
+                serde_json::Value::from(self.resolved_max_output_tokens()),
             )]),
+        );
+        fields.insert(
+            "runtime".to_owned(),
+            runtime
+                .as_ref()
+                .map(runtime_fingerprint_value)
+                .unwrap_or(serde_json::Value::Null),
         );
         fields.insert(
             "schema_version".to_owned(),
@@ -1371,6 +1488,9 @@ impl HotConfig {
         if state.profile.is_none() {
             state.profile = Some(profile);
         }
+        // Runtime facts belong to the config snapshot that was probed. A reload
+        // must force strict callers to preflight again before planning or reuse.
+        state.backend_runtime_info = None;
         state.data = data;
         state.mtime = mtime;
         state.uses_legacy_generation_scalars = uses_legacy_generation_scalars;
