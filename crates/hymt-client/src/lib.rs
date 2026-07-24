@@ -1306,6 +1306,22 @@ mod backend_payload_tests;
 mod backend_preflight_tests;
 
 #[cfg(test)]
+#[path = "contract_test_support.rs"]
+mod contract_test_support;
+
+#[cfg(test)]
+#[path = "payload_snapshot_tests.rs"]
+mod payload_snapshot_tests;
+
+#[cfg(test)]
+#[path = "sse_protocol_tests.rs"]
+mod sse_protocol_tests;
+
+#[cfg(test)]
+#[path = "llama_cpp_integration_tests.rs"]
+mod llama_cpp_integration_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use hymt_core::config::{GenerationBackend, GenerationSettings, Setting};

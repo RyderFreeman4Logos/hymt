@@ -2320,6 +2320,57 @@ mod tests {
         }
     }
 
+    async fn start_segment_identifying_mock_server(
+        base_reply: String,
+        segment_markers: Vec<(String, String)>,
+    ) -> MockServer {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let segment_markers = Arc::new(
+            segment_markers
+                .into_iter()
+                .map(|(segment, marker)| {
+                    let escaped_segment = serde_json::to_string(&segment)
+                        .expect("serialize segment for request matching");
+                    (
+                        escaped_segment
+                            .strip_prefix('"')
+                            .and_then(|value| value.strip_suffix('"'))
+                            .expect("quoted serialized segment")
+                            .to_owned(),
+                        marker,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        let first_response = Arc::new(AtomicBool::new(true));
+        let handle = tokio::spawn({
+            let segment_markers = Arc::clone(&segment_markers);
+            let first_response = Arc::clone(&first_response);
+            async move {
+                while let Ok((socket, _)) = listener.accept().await {
+                    let segment_markers = Arc::clone(&segment_markers);
+                    let first_response = Arc::clone(&first_response);
+                    let base_reply = base_reply.clone();
+                    tokio::spawn(async move {
+                        let _ = serve_segment_identifying_connection(
+                            socket,
+                            base_reply,
+                            segment_markers,
+                            first_response,
+                        )
+                        .await;
+                    });
+                }
+            }
+        });
+
+        MockServer {
+            endpoint_url: format!("http://{addr}/v1"),
+            handle,
+        }
+    }
+
     async fn start_preflight_counting_server(
         props_responses: Vec<String>,
     ) -> (
@@ -2434,6 +2485,33 @@ mod tests {
                 .expect("mock response queue exhausted")
         };
         write_mock_response(socket, response).await
+    }
+
+    async fn serve_segment_identifying_connection(
+        mut socket: TcpStream,
+        base_reply: String,
+        segment_markers: Arc<Vec<(String, String)>>,
+        first_response: Arc<AtomicBool>,
+    ) -> std::io::Result<()> {
+        let request = read_http_request(&mut socket).await?;
+        if first_response.swap(false, Ordering::SeqCst) {
+            return write_mock_response(socket, MockResponse::Json("too short".to_owned())).await;
+        }
+
+        let request = std::str::from_utf8(&request)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let marker = segment_markers
+            .iter()
+            .filter(|(segment, _)| request.contains(segment))
+            .max_by_key(|(segment, _)| segment.len())
+            .map(|(_, marker)| marker)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "request did not contain a planned segment",
+                )
+            })?;
+        write_mock_response(socket, MockResponse::Json(format!("{base_reply} {marker}"))).await
     }
 
     async fn start_counted_mock_server(
@@ -2576,6 +2654,48 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    async fn read_http_request(socket: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        let header_end = loop {
+            let count = socket.read(&mut chunk).await?;
+            if count == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed before HTTP headers",
+                ));
+            }
+            request.extend_from_slice(&chunk[..count]);
+            if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break index + 4;
+            }
+        };
+        let headers = std::str::from_utf8(&request[..header_end])
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "missing content-length")
+            })?;
+        while request.len() - header_end < content_length {
+            let count = socket.read(&mut chunk).await?;
+            if count == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed before HTTP request body",
+                ));
+            }
+            request.extend_from_slice(&chunk[..count]);
+        }
+        Ok(request)
     }
 
     async fn write_mock_response(
@@ -2785,6 +2905,17 @@ max_retries = 1
             .collect()
     }
 
+    fn planned_complete_zh_translations(plan: &TranslationPlan) -> Vec<String> {
+        plan.segments
+            .iter()
+            .map(|segment| {
+                let source_shape = segment.split_whitespace().collect::<Vec<_>>().join(" ");
+                let filler = "译".repeat((segment.chars().count() / 2).max(40));
+                format!("{source_shape} {filler}")
+            })
+            .collect()
+    }
+
     fn make_partially_overridden_stream_config(endpoint_url: &str) -> hymt_core::config::HotConfig {
         let path = temp_path("partial-sampling-config.toml");
         std::fs::write(
@@ -2974,6 +3105,171 @@ max_retries = 1
                 DocumentTranslationPolicy::SkipHighConfidenceTargetParagraphs
             )
         );
+    }
+
+    // ── end-to-end document pipeline ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn document_pipeline_preserves_mixed_markdown_retries_reconstructs_and_writes_atomically()
+    {
+        let source = concat!(
+            "---\n",
+            "title: Preserve this front matter\n",
+            "tags: [hymt, contract]\n",
+            "---\n\n",
+            "# Installation\n\n",
+            "Install the translation service and verify every configured endpoint before continuing. ",
+            "This paragraph intentionally has enough content to be segmented and completeness-checked.\n\n",
+            "## Validation\n\n",
+            "Run the documented validation commands after changing the model profile or request sampler. ",
+            "The reconstructed document must retain every section in order.\n\n",
+            "中文段落必须保持原样，不能发送给模型。\n\n",
+            "```rust\n",
+            "let preserved = \"code fence must remain verbatim\";\n",
+            "```\n"
+        );
+        let segmenter = fallback_segmenter();
+        let opts = PromptOpts::default();
+        let planning_config = make_stream_config("http://127.0.0.1:1/v1");
+        let plan = plan_translation(
+            source,
+            "zh",
+            &planning_config,
+            &segmenter,
+            &TemplateType::Default,
+            &opts,
+        )
+        .expect("document plan");
+        assert!(
+            plan.segment_count() >= 2,
+            "fixture must exercise reconstruction"
+        );
+        assert!(
+            plan.segments
+                .iter()
+                .all(|segment| !segment.contains("中文段落")),
+            "target-language source must remain outside inference requests"
+        );
+
+        let complete = planned_complete_zh_translations(&plan);
+        let base_reply = complete.first().expect("planned translation").clone();
+        let segment_markers: Vec<_> = (0..plan.segment_count())
+            .map(|index| format!("[SEG-{index}]"))
+            .collect();
+        let server = start_segment_identifying_mock_server(
+            base_reply,
+            plan.segments
+                .iter()
+                .cloned()
+                .zip(segment_markers.iter().cloned())
+                .collect(),
+        )
+        .await;
+        let config = make_stream_config(&server.endpoint_url);
+        let client = TranslationClient::new(config.clone()).expect("client");
+        let dir = tempfile::tempdir().expect("temporary document directory");
+        let input = dir.path().join("guide.md");
+        let output = dir.path().join("guide.zh-cn.md");
+        let previous_output = dir.path().join("previous-guide.zh-cn.md");
+        let previous_output_contents = "previous complete document";
+        std::fs::write(&previous_output, previous_output_contents)
+            .expect("write previous document");
+        std::fs::hard_link(&previous_output, &output)
+            .expect("make output path a hard link to the previous document");
+        std::fs::write(&input, source).expect("write source document");
+        let history = HistoryDB::new(dir.path().join("history.db"));
+        let doc_opts = crate::doc_translate::DocTranslationOpts {
+            target_lang: "zh",
+            config: &config,
+            client: &client,
+            segmenter: &segmenter,
+            history: &history,
+            output_path: Some(&output),
+            output_dir: None,
+            recursive: false,
+            template: &TemplateType::Default,
+            prompt_opts: &opts,
+            explicit_target: true,
+        };
+
+        crate::doc_translate::run_doc_translation(&input, &doc_opts)
+            .await
+            .expect("complete Markdown pipeline");
+
+        let written = std::fs::read_to_string(&output).expect("translated output");
+        let marker_positions: Vec<_> = segment_markers
+            .iter()
+            .map(|marker| {
+                assert_eq!(
+                    written.match_indices(marker).count(),
+                    1,
+                    "translated segment marker {marker} must appear exactly once"
+                );
+                written
+                    .find(marker)
+                    .expect("unique translated segment marker position")
+            })
+            .collect();
+        assert!(
+            marker_positions
+                .windows(2)
+                .all(|positions| positions[0] < positions[1]),
+            "translated segment markers must retain document order"
+        );
+        assert!(written.contains("title: Preserve this front matter"));
+        assert!(written.contains("中文段落必须保持原样，不能发送给模型。"));
+        assert!(written.contains("let preserved = \"code fence must remain verbatim\";"));
+        assert!(written.contains("译"));
+        assert!(
+            !written.contains("too short"),
+            "the incomplete first attempt must be retried rather than reconstructed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&previous_output).expect("previous output through hard link"),
+            previous_output_contents,
+            "atomic rename must not mutate the old output inode; direct fs::write would corrupt it"
+        );
+    }
+
+    #[tokio::test]
+    async fn validated_document_stream_is_a_prefix_of_the_reconstructed_final_output() {
+        let source = "---\ntitle: Stream\n---\n\nStreaming output must remain a prefix of the validated final translation.";
+        let segmenter = fallback_segmenter();
+        let opts = PromptOpts::default();
+        let planning_config = make_stream_config("http://127.0.0.1:1/v1");
+        let plan = plan_translation(
+            source,
+            "zh",
+            &planning_config,
+            &segmenter,
+            &TemplateType::Default,
+            &opts,
+        )
+        .expect("stream plan");
+        let responses = planned_complete_zh_translations(&plan)
+            .into_iter()
+            .map(|translation| {
+                let split = translation
+                    .char_indices()
+                    .nth(translation.chars().count() / 2)
+                    .map(|(byte_index, _)| byte_index)
+                    .unwrap_or(translation.len());
+                MockResponse::Sse(vec![
+                    translation[..split].to_owned(),
+                    translation[split..].to_owned(),
+                ])
+            })
+            .collect();
+        let server = start_mock_server(responses).await;
+        let config = make_stream_config(&server.endpoint_url);
+        let history_dir = tempfile::tempdir().expect("history directory");
+        let history = HistoryDB::new(history_dir.path().join("history.db"));
+        let (final_output, rendered_output) =
+            translate_and_render_stdout(source, &config, &segmenter, &history)
+                .await
+                .expect("validated stream");
+        assert_eq!(rendered_output.trim_end(), final_output);
+        assert!(final_output.contains("译"));
     }
 
     // ── plan_translation token budget ─────────────────────────────────────────
