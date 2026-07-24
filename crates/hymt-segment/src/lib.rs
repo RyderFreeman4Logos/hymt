@@ -7,10 +7,11 @@ pub use error::SegmentError;
 
 use std::path::PathBuf;
 
+use hymt_core::model_profile::ModelProfile;
+
 #[cfg(feature = "tokenizer")]
 use tokenizers::Tokenizer as HfTokenizer;
 
-const TOKENIZER_REPO: &str = "tencent/Hy-MT2-7B";
 const TOKENIZER_FILENAME: &str = "tokenizer.json";
 
 /// Fallback token estimate: ~4 UTF-8 bytes per token (matches Python's _estimate_token_count).
@@ -21,28 +22,52 @@ fn estimate_token_count(text: &str) -> usize {
     text.len().div_ceil(4).max(1)
 }
 
-fn tokenizer_cache_dir() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp"))
-        .join(".cache/hymt/tokenizer")
+fn tokenizer_cache_dir(profile: ModelProfile) -> Option<PathBuf> {
+    profile.tokenizer().map(|_| {
+        std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/tmp"))
+            .join(".cache/hymt/tokenizer")
+            .join(profile.id())
+    })
 }
 
-pub fn tokenizer_path() -> PathBuf {
-    tokenizer_cache_dir().join(TOKENIZER_FILENAME)
+/// Cache path for a profile's pinned tokenizer, if it has one.
+///
+/// The profile id is part of the path, so a prior 7B download can never be
+/// silently reused for the 1.8B or 30B-A3B profiles.
+pub fn tokenizer_path(profile: ModelProfile) -> Option<PathBuf> {
+    tokenizer_cache_dir(profile).map(|dir| dir.join(TOKENIZER_FILENAME))
 }
 
-/// Download the HuggingFace tokenizer to `~/.cache/hymt/tokenizer/tokenizer.json`.
+/// Download the selected profile's pinned tokenizer into the profile cache.
 #[cfg(feature = "tokenizer")]
-pub fn ensure_tokenizer(force_download: bool) -> Result<PathBuf, SegmentError> {
-    let dest = tokenizer_path();
+pub fn ensure_tokenizer(
+    profile: ModelProfile,
+    force_download: bool,
+) -> Result<PathBuf, SegmentError> {
+    let source = profile.tokenizer().ok_or_else(|| {
+        SegmentError::Download(
+            "generic model profile has no tested tokenizer; set [endpoint].profile".into(),
+        )
+    })?;
+    let dest = tokenizer_path(profile).ok_or_else(|| {
+        SegmentError::Download("tested model profile is missing a tokenizer cache path".into())
+    })?;
     if dest.exists() && !force_download {
         return Ok(dest);
     }
-    std::fs::create_dir_all(tokenizer_cache_dir())?;
+    let cache_dir = dest.parent().ok_or_else(|| {
+        SegmentError::Download("tokenizer cache path has no parent directory".into())
+    })?;
+    std::fs::create_dir_all(cache_dir)?;
     let api = hf_hub::api::sync::Api::new().map_err(|e| SegmentError::Download(e.to_string()))?;
     let downloaded = api
-        .model(TOKENIZER_REPO.to_string())
+        .repo(hf_hub::Repo::with_revision(
+            source.repo.to_owned(),
+            hf_hub::RepoType::Model,
+            source.revision.to_owned(),
+        ))
         .get(TOKENIZER_FILENAME)
         .map_err(|e| SegmentError::Download(e.to_string()))?;
     std::fs::copy(&downloaded, &dest)?;
@@ -50,7 +75,10 @@ pub fn ensure_tokenizer(force_download: bool) -> Result<PathBuf, SegmentError> {
 }
 
 #[cfg(not(feature = "tokenizer"))]
-pub fn ensure_tokenizer(_force_download: bool) -> Result<PathBuf, SegmentError> {
+pub fn ensure_tokenizer(
+    _profile: ModelProfile,
+    _force_download: bool,
+) -> Result<PathBuf, SegmentError> {
     Err(SegmentError::Download(
         "tokenizer feature not compiled in".into(),
     ))
@@ -58,6 +86,17 @@ pub fn ensure_tokenizer(_force_download: bool) -> Result<PathBuf, SegmentError> 
 
 pub fn has_tokenizer_support() -> bool {
     cfg!(feature = "tokenizer")
+}
+
+/// Create a segmenter using a cached tokenizer for the selected profile.
+///
+/// Missing tokenizers intentionally retain the existing character-estimate
+/// fallback; `hymt tokenizer download` performs the explicit network fetch.
+pub fn create_segmenter(profile: ModelProfile) -> Result<Segmenter, SegmentError> {
+    match tokenizer_path(profile).filter(|path| path.exists()) {
+        Some(path) => Segmenter::new(Some(path)),
+        None => Ok(Segmenter::fallback()),
+    }
 }
 
 pub struct Segmenter {
@@ -287,17 +326,5 @@ impl Segmenter {
         }
 
         Ok(segments)
-    }
-}
-
-/// Create a `Segmenter`, downloading the tokenizer if needed.
-/// Falls back to character-count mode on any error.
-pub fn create_segmenter(force_download: bool) -> Segmenter {
-    if !has_tokenizer_support() {
-        return Segmenter::fallback();
-    }
-    match ensure_tokenizer(force_download) {
-        Ok(path) => Segmenter::new(Some(path)).unwrap_or_else(|_| Segmenter::fallback()),
-        Err(_) => Segmenter::fallback(),
     }
 }

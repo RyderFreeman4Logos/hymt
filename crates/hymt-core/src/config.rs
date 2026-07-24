@@ -8,11 +8,15 @@ use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
 use crate::error::CoreError;
+use crate::model_profile::ModelProfile;
 
 pub const DEFAULT_CONFIG: &str = r#"[endpoint]
 url = "http://127.0.0.1:8401/v1"
 api_key = ""
 model = ""
+# Set this explicitly for a tested Hy-MT2 family member. When omitted, hymt
+# uses generic mode and does not assume a tokenizer or sampler profile.
+# profile = "hy_mt2_7b"
 
 [translation]
 context_window = 16384
@@ -197,6 +201,33 @@ pub struct GenerationSettings {
 }
 
 impl GenerationSettings {
+    /// Omit every sampler parameter so the server supplies its own default.
+    pub const fn server_defaults() -> Self {
+        Self {
+            temperature: Setting::ServerDefault,
+            top_p: Setting::ServerDefault,
+            top_k: Setting::ServerDefault,
+            repetition_penalty: Setting::ServerDefault,
+            min_p: Setting::ServerDefault,
+            repeat_last_n: Setting::ServerDefault,
+        }
+    }
+
+    /// Overlay explicit user overrides on top of a model profile's defaults.
+    pub fn with_overrides(self, overrides: Self) -> Self {
+        Self {
+            temperature: setting_or_default(self.temperature, overrides.temperature),
+            top_p: setting_or_default(self.top_p, overrides.top_p),
+            top_k: setting_or_default(self.top_k, overrides.top_k),
+            repetition_penalty: setting_or_default(
+                self.repetition_penalty,
+                overrides.repetition_penalty,
+            ),
+            min_p: setting_or_default(self.min_p, overrides.min_p),
+            repeat_last_n: setting_or_default(self.repeat_last_n, overrides.repeat_last_n),
+        }
+    }
+
     fn from_toml(data: &toml::Table) -> Result<Self, CoreError> {
         let settings = Self {
             temperature: parse_f64_setting(data, "temperature")?,
@@ -275,6 +306,13 @@ impl GenerationSettings {
                 !matches!(self.repeat_last_n, Setting::ServerDefault)
             }
         }
+    }
+}
+
+fn setting_or_default<T>(default: Setting<T>, override_value: Setting<T>) -> Setting<T> {
+    match override_value {
+        Setting::ServerDefault => default,
+        value => value,
     }
 }
 
@@ -378,6 +416,26 @@ fn generation_backend_from_toml(data: &toml::Table) -> Result<GenerationBackend,
         },
         Some(value) => Err(CoreError::Config(format!(
             "inference.backend must be llama_cpp or openai_compatible, got {value:?}"
+        ))),
+    }
+}
+
+fn model_profile_from_toml(data: &toml::Table) -> Result<ModelProfile, CoreError> {
+    let Some(endpoint) = data.get("endpoint") else {
+        return Ok(ModelProfile::Generic);
+    };
+    let table = endpoint
+        .as_table()
+        .ok_or_else(|| CoreError::Config("endpoint must be a TOML table".to_owned()))?;
+    match table.get("profile") {
+        None => Ok(ModelProfile::Generic),
+        Some(toml::Value::String(value)) => ModelProfile::parse(value).ok_or_else(|| {
+            CoreError::Config(format!(
+                "endpoint.profile must be hy_mt2_1_8b, hy_mt2_7b, hy_mt2_30b_a3b, or generic, got {value:?}"
+            ))
+        }),
+        Some(value) => Err(CoreError::Config(format!(
+            "endpoint.profile must be a string, got {value:?}"
         ))),
     }
 }
@@ -502,6 +560,15 @@ impl HotConfig {
         self.get_str("endpoint", "model", "")
     }
 
+    /// Explicit Hy-MT2 profile selected for this endpoint.
+    ///
+    /// An omitted profile enters [`ModelProfile::Generic`] mode rather than
+    /// inferring a family member from a mutable model name or filename.
+    pub fn model_profile(&self) -> Result<ModelProfile, CoreError> {
+        let state = self.state.read().unwrap();
+        model_profile_from_toml(&state.data)
+    }
+
     // ── translation ─────────────────────────────────────────────────────────
 
     pub fn context_window(&self) -> u32 {
@@ -509,7 +576,11 @@ impl HotConfig {
     }
 
     pub fn max_output_tokens(&self) -> u32 {
-        self.get_positive_u32("translation", "max_output_tokens", 4096)
+        let default = self
+            .model_profile()
+            .map(|profile| profile.recommended_max_output_tokens())
+            .unwrap_or(4_096);
+        self.get_positive_u32("translation", "max_output_tokens", default)
     }
 
     pub fn concurrency(&self) -> u32 {
@@ -572,8 +643,11 @@ impl HotConfig {
     /// Reads and validates the backend-neutral generation overrides.
     pub fn generation_settings(&self) -> Result<GenerationSettings, CoreError> {
         let state = self.state.read().unwrap();
-        let settings = GenerationSettings::from_toml(&state.data)?;
-        generation_backend_from_toml(&state.data)?.validate_settings(&settings)?;
+        let profile = model_profile_from_toml(&state.data)?;
+        let overrides = GenerationSettings::from_toml(&state.data)?;
+        generation_backend_from_toml(&state.data)?.validate_settings(&overrides)?;
+        let settings = profile.generation_defaults().with_overrides(overrides);
+        settings.validate()?;
         Ok(settings)
     }
 
@@ -796,8 +870,11 @@ impl HotConfig {
         let content = std::fs::read_to_string(&self.path)?;
         let data: toml::Table = toml::from_str(&content)
             .map_err(|e| CoreError::Config(format!("{}: {}", self.path.display(), e)))?;
-        let settings = GenerationSettings::from_toml(&data)?;
-        generation_backend_from_toml(&data)?.validate_settings(&settings)?;
+        let profile = model_profile_from_toml(&data)?;
+        let overrides = GenerationSettings::from_toml(&data)?;
+        generation_backend_from_toml(&data)?.validate_settings(&overrides)?;
+        let settings = profile.generation_defaults().with_overrides(overrides);
+        settings.validate()?;
         let uses_legacy_generation_scalars = uses_legacy_generation_scalars(&data);
         let mtime = std::fs::metadata(&self.path)
             .and_then(|m| m.modified())
@@ -1072,6 +1149,139 @@ mod tests {
         assert!(path.exists());
         let contents = fs::read_to_string(&path).unwrap();
         assert!(contents.contains("[endpoint]"));
+    }
+
+    #[test]
+    fn profiles_define_distinct_tokenizers_and_upstream_defaults() {
+        use crate::model_profile::{ArchitectureVariant, ModelProfile};
+
+        let cases = [
+            (
+                ModelProfile::HyMt2_1_8b,
+                "hy_mt2_1_8b",
+                "tencent/Hy-MT2-1.8B",
+                ArchitectureVariant::Dense1_8B,
+                Setting::Value(0.6),
+                Setting::Value(20),
+                Setting::Value(1.05),
+            ),
+            (
+                ModelProfile::HyMt2_7b,
+                "hy_mt2_7b",
+                "tencent/Hy-MT2-7B",
+                ArchitectureVariant::Dense7B,
+                Setting::Value(0.6),
+                Setting::Value(20),
+                Setting::Value(1.05),
+            ),
+            (
+                ModelProfile::HyMt2_30bA3b,
+                "hy_mt2_30b_a3b",
+                "tencent/Hy-MT2-30B-A3B",
+                ArchitectureVariant::MoE30BA3B,
+                Setting::Value(1.0),
+                Setting::Disabled,
+                Setting::Value(1.0),
+            ),
+        ];
+
+        for (profile, id, repo, architecture, top_p, top_k, repetition_penalty) in cases {
+            assert_eq!(profile.id(), id);
+            assert_eq!(ModelProfile::parse(id), Some(profile));
+            assert_eq!(profile.architecture(), architecture);
+            assert_eq!(profile.tokenizer().unwrap().repo, repo);
+            assert_eq!(profile.tokenizer().unwrap().revision.len(), 40);
+            assert!(profile
+                .tokenizer()
+                .unwrap()
+                .revision
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit()));
+            assert_eq!(profile.max_context_tokens(), 262_144);
+            assert_eq!(profile.recommended_max_output_tokens(), 4_096);
+            assert!(!profile.gguf_aliases().is_empty());
+
+            let defaults = profile.generation_defaults();
+            assert_eq!(defaults.temperature, Setting::Value(0.7));
+            assert_eq!(defaults.top_p, top_p);
+            assert_eq!(defaults.top_k, top_k);
+            assert_eq!(defaults.repetition_penalty, repetition_penalty);
+        }
+
+        assert_eq!(ModelProfile::Generic.tokenizer(), None);
+        assert_eq!(
+            ModelProfile::Generic.generation_defaults(),
+            GenerationSettings::server_defaults()
+        );
+    }
+
+    #[test]
+    fn endpoint_profile_selects_generation_defaults_and_rejects_unknown_values() {
+        use crate::model_profile::ModelProfile;
+
+        let path = temp_config_path("profile_defaults");
+        fs::write(
+            &path,
+            r#"[endpoint]
+profile = "hy_mt2_30b_a3b"
+
+[inference.override]
+top_p = 0.8"#,
+        )
+        .unwrap();
+
+        let config = HotConfig::from_path(&path).unwrap();
+        assert_eq!(config.model_profile().unwrap(), ModelProfile::HyMt2_30bA3b);
+        assert_eq!(
+            config.generation_settings().unwrap().temperature,
+            Setting::Value(0.7)
+        );
+        assert_eq!(
+            config.generation_settings().unwrap().top_p,
+            Setting::Value(0.8)
+        );
+        assert_eq!(
+            config.generation_settings().unwrap().top_k,
+            Setting::Disabled
+        );
+        assert_eq!(
+            config.generation_settings().unwrap().repetition_penalty,
+            Setting::Value(1.0)
+        );
+
+        let generic_path = temp_config_path("generic_profile");
+        fs::write(&generic_path, "[endpoint]\nmodel = \"untested-model\"").unwrap();
+        let generic = HotConfig::from_path(&generic_path).unwrap();
+        assert_eq!(generic.model_profile().unwrap(), ModelProfile::Generic);
+        assert_eq!(
+            generic.generation_settings().unwrap(),
+            GenerationSettings::server_defaults()
+        );
+
+        let unknown_path = temp_config_path("unknown_profile");
+        fs::write(&unknown_path, "[endpoint]\nprofile = \"hy_mt2_99b\"").unwrap();
+        let error = HotConfig::from_path(&unknown_path).unwrap_err();
+        assert!(error.to_string().contains("endpoint.profile"));
+    }
+
+    #[test]
+    fn profiles_keep_semantic_defaults_when_openai_omits_unsupported_fields() {
+        let path = temp_config_path("profile_openai_backend");
+        fs::write(
+            &path,
+            r#"[endpoint]
+profile = "hy_mt2_30b_a3b"
+
+[inference]
+backend = "openai_compatible""#,
+        )
+        .unwrap();
+
+        let config = HotConfig::from_path(&path).unwrap();
+        assert_eq!(
+            config.generation_settings().unwrap().top_k,
+            Setting::Disabled
+        );
     }
 
     #[test]
