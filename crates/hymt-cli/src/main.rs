@@ -696,8 +696,12 @@ fn should_run_llama_cpp_props_diagnostic(command: Option<&Cmd>) -> bool {
     match command {
         None
         | Some(Cmd::Text(_))
-        | Some(Cmd::Man(_))
-        | Some(Cmd::Info(_))
+        | Some(Cmd::Man(ManArgs {
+            original: false, ..
+        }))
+        | Some(Cmd::Info(InfoArgs {
+            original: false, ..
+        }))
         | Some(Cmd::Batch(_))
         | Some(Cmd::TranslateDoc(_))
         | Some(Cmd::Exec(ExecArgs { action: None, .. }))
@@ -713,6 +717,8 @@ fn should_run_llama_cpp_props_diagnostic(command: Option<&Cmd>) -> bool {
         | Some(Cmd::Estimate(_))
         | Some(Cmd::History(_))
         | Some(Cmd::Recall(_))
+        | Some(Cmd::Man(ManArgs { original: true, .. }))
+        | Some(Cmd::Info(InfoArgs { original: true, .. }))
         | Some(Cmd::Exec(ExecArgs {
             action: Some(ExecAction::Install(_)),
             ..
@@ -1775,6 +1781,8 @@ Options:\n  --source-id <SOURCE_ID>\n  --context-only\n";
             &["hymt", "estimate", "1"][..],
             &["hymt", "history"][..],
             &["hymt", "recall"][..],
+            &["hymt", "man", "--original", "ls"][..],
+            &["hymt", "info", "--original", "coreutils"][..],
             &["hymt", "exec", "install"][..],
             &["hymt", "telegram", "--regenerate-claim-password"][..],
         ] {
