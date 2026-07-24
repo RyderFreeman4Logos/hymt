@@ -77,7 +77,10 @@ language_detection = true
 force_translate_all = false
 
 [inference]
-# Omit all sampler overrides to let the selected server own its defaults.
+# For Hy-MT2 profiles (including hy_mt2_7b), omitted overrides use that profile's
+# generation defaults client-side; the adapter serializes supported values with
+# backend-correct wire keys. To let the server own a sampler, its effective
+# setting must remain ServerDefault (for example, generic with no override).
 
 [inference.override]
 # A number is an explicit semantic value; "disabled" is mapped by the selected
@@ -115,7 +118,7 @@ Choose `backend` explicitly from the server implementation; hymt never infers it
 | `vllm` | `temperature`, `top_p`, `top_k`, `repetition_penalty`, `min_p` | `repetition_penalty` is sent as `repetition_penalty`; disabled `top_k` is sent as `-1`. `repeat_last_n` is rejected. |
 | `openai_compatible` | `temperature`, `top_p` | Only common chat-completions fields are sent; every nonstandard explicit override is rejected rather than guessed. |
 
-`Setting::ServerDefault` (an omitted key) always omits that sampler from the request. `"disabled"` and numeric values are semantic configuration states: adapters choose documented wire values rather than converting `0` and `-1` indiscriminately. Validation errors name the semantic value and say when no backend wire representation exists. Streaming and non-streaming requests use the same adapter policy.
+Only an effective `Setting::ServerDefault` omits that sampler from the request. An omitted `[inference.override]` key is not necessarily effective `ServerDefault`: Hy-MT2 profiles overlay their generation defaults client-side before the selected adapter serializes supported values with backend-correct wire keys. Thus the documented `hy_mt2_7b` example sends profile-default samplers to `llama_cpp`, including `repetition_penalty` as `repeat_penalty`; `generic` with no override leaves the samplers server-owned. `"disabled"` and numeric values are semantic configuration states: adapters choose documented wire values rather than converting `0` and `-1` indiscriminately. Validation errors name the semantic value and say when no backend wire representation exists. Streaming and non-streaming requests use the same adapter policy.
 
 The supported extension names above are limited to the documented llama.cpp server controls and vLLM OpenAI-server sampling parameters: [llama.cpp server API](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md) and [vLLM OpenAI-compatible server](https://docs.vllm.ai/en/latest/serving/openai_compatible_server/). An old `[inference].backend` key is rejected; move it to `[endpoint].backend`.
 

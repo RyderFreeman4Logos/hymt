@@ -77,7 +77,10 @@ language_detection = true
 force_translate_all = false
 
 [inference]
-# 省略所有采样器覆盖项时，由所选服务端决定默认值。
+# 对 Hy-MT2 配置文件（包括 hy_mt2_7b），省略的覆盖项会在客户端使用该
+# 配置文件的生成默认值；适配器会以正确的后端 wire 字段名序列化其支持的值。
+# 若要让服务端决定某个采样器，其有效设置必须仍为 ServerDefault（例如未设置
+# 覆盖项的 generic）。
 
 [inference.override]
 # 数值表示显式语义值；"disabled" 会被所选适配器映射为该后端文档规定的 wire 值。
@@ -114,7 +117,7 @@ divergence_threshold = 2.0
 | `vllm` | `temperature`、`top_p`、`top_k`、`repetition_penalty`、`min_p` | `repetition_penalty`在线上发送为`repetition_penalty`；禁用的`top_k`发送为`-1`。`repeat_last_n`会被拒绝。 |
 | `openai_compatible` | `temperature`、`top_p` | 只发送通用的聊天补全字段；所有非标准显式覆盖都会被拒绝，不会猜测字段名。 |
 
-`Setting::ServerDefault`（省略配置键）始终会从请求中省略该采样器。`"disabled"`和数值是语义配置状态：适配器采用文档规定的 wire 值，而不会不加区分地在`0`和`-1`之间转换。验证错误会给出语义值，并在不存在后端 wire 表示时明确说明。流式与非流式请求使用相同的适配器策略。
+只有有效值为`Setting::ServerDefault`的采样器才会从请求中省略。省略`[inference.override]`键并不一定意味着其有效值为`ServerDefault`：Hy-MT2配置文件会先在客户端叠加其生成默认值，再由所选适配器以正确的后端 wire 字段名序列化支持的值。因此，文档中的`hy_mt2_7b`示例会向`llama_cpp`发送配置文件默认的采样器值，其中`repetition_penalty`在线上为`repeat_penalty`；没有覆盖项的`generic`才会让采样器由服务端决定。`"disabled"`和数值是语义配置状态：适配器采用文档规定的 wire 值，而不会不加区分地在`0`和`-1`之间转换。验证错误会给出语义值，并在不存在后端 wire 表示时明确说明。流式与非流式请求使用相同的适配器策略。
 
 上述扩展名严格限制为已文档化的 llama.cpp 服务端控制项和 vLLM OpenAI 服务端采样参数：[llama.cpp 服务端 API](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)与[vLLM OpenAI 兼容服务端](https://docs.vllm.ai/en/latest/serving/openai_compatible_server/)。旧的`[inference].backend`键会被拒绝；请将其移动到`[endpoint].backend`。
 

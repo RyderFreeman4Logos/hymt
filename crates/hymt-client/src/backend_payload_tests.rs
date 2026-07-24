@@ -1,5 +1,10 @@
+use std::fs;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use super::ChatPayload;
-use hymt_core::config::{GenerationBackend, GenerationSettings, Setting};
+use hymt_core::config::{GenerationBackend, GenerationSettings, HotConfig, Setting};
+
+static NEXT_CONFIG_ID: AtomicUsize = AtomicUsize::new(0);
 
 fn settings() -> GenerationSettings {
     GenerationSettings {
@@ -22,6 +27,47 @@ fn payload(backend: GenerationBackend, stream: bool) -> serde_json::Value {
         backend,
     ))
     .expect("payload must serialize")
+}
+
+fn payload_from_config(contents: &str) -> serde_json::Value {
+    let id = NEXT_CONFIG_ID.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "hymt-client-payload-{}-{id}.toml",
+        std::process::id()
+    ));
+    fs::write(&path, contents).expect("write config fixture");
+
+    let result = (|| {
+        let config = HotConfig::from_path(&path).expect("load config fixture");
+        let settings = config.generation_settings().expect("generation settings");
+        let backend = config.generation_backend().expect("generation backend");
+        serde_json::to_value(ChatPayload::from_generation_settings(
+            "translate this",
+            128,
+            "hy-mt2".to_owned(),
+            false,
+            &settings,
+            backend,
+        ))
+        .expect("payload must serialize")
+    })();
+
+    fs::remove_file(path).expect("remove config fixture");
+    result
+}
+
+#[test]
+fn hy_mt2_7b_profile_defaults_are_serialized_for_llama_cpp() {
+    let object =
+        payload_from_config("[endpoint]\nprofile = \"hy_mt2_7b\"\nbackend = \"llama_cpp\"\n");
+
+    assert_eq!(object["temperature"], 0.7);
+    assert_eq!(object["top_p"], 0.6);
+    assert_eq!(object["top_k"], 20);
+    assert_eq!(object["repeat_penalty"], 1.05);
+    assert!(object.get("repetition_penalty").is_none());
+    assert!(object.get("min_p").is_none());
+    assert!(object.get("repeat_last_n").is_none());
 }
 
 #[test]
