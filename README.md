@@ -51,11 +51,16 @@ model = ""
 # Select one supported, tested Hy-MT2 profile, or use "generic" for an unprofiled endpoint.
 profile = "hy_mt2_7b"
 
+[backend]
+# `llama-server -c` is the service-wide allocation. The throughput unit uses
+# 65,536 total tokens across 8 slots; the quality unit uses 24,576 across 3.
+total_context = 65536
+parallel_slots = 8
+# Optional: omit to derive total_context / parallel_slots. Set this explicitly
+# when the backend guarantees a lower per-request limit.
+per_request_context = 8192
+
 [translation]
-# `llama-server -c` is service-wide. Both supplied units provide about 8,192
-# tokens per request: quality is 24,576 / 3 slots; throughput is 65,536 / 8.
-# Use the per-slot limit here, not the service-wide `-c` total.
-context_window = 8192
 max_output_tokens = 4096
 max_source_tokens_per_segment = 1024
 concurrency = 8 # use 3 with hy-mt2-quality.service

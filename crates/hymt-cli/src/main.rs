@@ -488,6 +488,12 @@ async fn run() -> Result<()> {
             "Warning: legacy [inference] sampler scalars are deprecated; move them under [inference.override]."
         );
     }
+    if config.uses_legacy_context_window() {
+        eprintln!(
+            "Warning: [translation].context_window is deprecated; configure [backend] \
+             total_context, parallel_slots, and optional per_request_context instead."
+        );
+    }
     if cli.debug_chunk_timing {
         // CLI flag forces timing logs for this process; config/env also enable them.
         std::env::set_var("HYMT_DEBUG_CHUNK_TIMING", "1");

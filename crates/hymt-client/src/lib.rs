@@ -24,7 +24,7 @@ pub enum ClientError {
     /// Model stopped at `max_tokens` rather than completing the text.
     #[error(
         "segment truncated (hit max_tokens); \
-         reduce context_window or increase max_output_tokens"
+         reduce per_request_context or increase max_output_tokens"
     )]
     Truncated,
 
