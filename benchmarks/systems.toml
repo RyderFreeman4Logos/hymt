@@ -1,0 +1,176 @@
+schema_version = "hymt-benchmark-systems/v1"
+prompt_schema_version = "hy-mt2-prompts/v2"
+
+[[systems]]
+id = "transformers"
+backend = "transformers"
+quantization = "full-precision"
+endpoint_env = "HYMT_BENCH_TRANSFORMERS_URL"
+model_env = "HYMT_BENCH_TRANSFORMERS_MODEL"
+model_revision_env = "HYMT_BENCH_TRANSFORMERS_MODEL_REVISION"
+tokenizer_revision_env = "HYMT_BENCH_TRANSFORMERS_TOKENIZER_REVISION"
+backend_version_env = "HYMT_BENCH_TRANSFORMERS_VERSION"
+supports_min_p = true
+supports_repeat_last_n = false
+props_path = "/props"
+
+[[systems.sampler_variants]]
+id = "service-defaults"
+client_overrides = false
+
+[[systems.sampler_variants]]
+id = "min-p-enabled-top-p-0.8"
+client_overrides = true
+top_p = 0.8
+min_p = 0.10
+repeat_last_n = 64
+
+[[systems.sampler_variants]]
+id = "min-p-disabled-top-p-0.8"
+client_overrides = true
+top_p = 0.8
+min_p = 0.0
+repeat_last_n = 64
+
+[[systems.sampler_variants]]
+id = "repeat-last-n-64"
+client_overrides = true
+top_p = 0.95
+repeat_last_n = 64
+
+[[systems.sampler_variants]]
+id = "repeat-last-n-full"
+client_overrides = true
+top_p = 0.95
+repeat_last_n = -1
+
+[[systems]]
+id = "vllm"
+backend = "vllm"
+quantization = "server-configured"
+endpoint_env = "HYMT_BENCH_VLLM_URL"
+model_env = "HYMT_BENCH_VLLM_MODEL"
+model_revision_env = "HYMT_BENCH_VLLM_MODEL_REVISION"
+tokenizer_revision_env = "HYMT_BENCH_VLLM_TOKENIZER_REVISION"
+backend_version_env = "HYMT_BENCH_VLLM_VERSION"
+supports_min_p = true
+supports_repeat_last_n = false
+props_path = "/props"
+
+[[systems.sampler_variants]]
+id = "service-defaults"
+client_overrides = false
+
+[[systems.sampler_variants]]
+id = "min-p-enabled-top-p-0.8"
+client_overrides = true
+top_p = 0.8
+min_p = 0.10
+repeat_last_n = 64
+
+[[systems.sampler_variants]]
+id = "min-p-disabled-top-p-0.8"
+client_overrides = true
+top_p = 0.8
+min_p = 0.0
+repeat_last_n = 64
+
+[[systems.sampler_variants]]
+id = "repeat-last-n-64"
+client_overrides = true
+top_p = 0.95
+repeat_last_n = 64
+
+[[systems.sampler_variants]]
+id = "repeat-last-n-full"
+client_overrides = true
+top_p = 0.95
+repeat_last_n = -1
+
+[[systems]]
+id = "llama-cpp-q6-k"
+backend = "llama.cpp"
+quantization = "Q6_K"
+endpoint_env = "HYMT_BENCH_LLAMA_CPP_Q6_K_URL"
+model_env = "HYMT_BENCH_LLAMA_CPP_Q6_K_MODEL"
+model_revision_env = "HYMT_BENCH_LLAMA_CPP_Q6_K_MODEL_REVISION"
+tokenizer_revision_env = "HYMT_BENCH_LLAMA_CPP_Q6_K_TOKENIZER_REVISION"
+gguf_sha256_env = "HYMT_BENCH_LLAMA_CPP_Q6_K_GGUF_SHA256"
+backend_version_env = "HYMT_BENCH_LLAMA_CPP_Q6_K_VERSION"
+supports_min_p = true
+supports_repeat_last_n = true
+props_path = "/props"
+
+[[systems.sampler_variants]]
+id = "service-defaults"
+client_overrides = false
+
+[[systems.sampler_variants]]
+id = "min-p-enabled-top-p-0.8"
+client_overrides = true
+top_p = 0.8
+min_p = 0.10
+repeat_last_n = 64
+
+[[systems.sampler_variants]]
+id = "min-p-disabled-top-p-0.8"
+client_overrides = true
+top_p = 0.8
+min_p = 0.0
+repeat_last_n = 64
+
+[[systems.sampler_variants]]
+id = "repeat-last-n-64"
+client_overrides = true
+top_p = 0.95
+repeat_last_n = 64
+
+[[systems.sampler_variants]]
+id = "repeat-last-n-full"
+client_overrides = true
+top_p = 0.95
+repeat_last_n = -1
+
+[[systems]]
+id = "llama-cpp-q4-k-m"
+backend = "llama.cpp"
+quantization = "Q4_K_M"
+endpoint_env = "HYMT_BENCH_LLAMA_CPP_Q4_K_M_URL"
+model_env = "HYMT_BENCH_LLAMA_CPP_Q4_K_M_MODEL"
+model_revision_env = "HYMT_BENCH_LLAMA_CPP_Q4_K_M_MODEL_REVISION"
+tokenizer_revision_env = "HYMT_BENCH_LLAMA_CPP_Q4_K_M_TOKENIZER_REVISION"
+gguf_sha256_env = "HYMT_BENCH_LLAMA_CPP_Q4_K_M_GGUF_SHA256"
+backend_version_env = "HYMT_BENCH_LLAMA_CPP_Q4_K_M_VERSION"
+supports_min_p = true
+supports_repeat_last_n = true
+props_path = "/props"
+
+[[systems.sampler_variants]]
+id = "service-defaults"
+client_overrides = false
+
+[[systems.sampler_variants]]
+id = "min-p-enabled-top-p-0.8"
+client_overrides = true
+top_p = 0.8
+min_p = 0.10
+repeat_last_n = 64
+
+[[systems.sampler_variants]]
+id = "min-p-disabled-top-p-0.8"
+client_overrides = true
+top_p = 0.8
+min_p = 0.0
+repeat_last_n = 64
+
+[[systems.sampler_variants]]
+id = "repeat-last-n-64"
+client_overrides = true
+top_p = 0.95
+repeat_last_n = 64
+
+[[systems.sampler_variants]]
+id = "repeat-last-n-full"
+client_overrides = true
+top_p = 0.95
+repeat_last_n = -1

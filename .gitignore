@@ -222,3 +222,6 @@ __marimo__/
 # Project runtime artifacts
 tmp/
 *.wav
+
+# Generated benchmark reports (the corpus/configuration above remain versioned)
+benchmarks/results/
