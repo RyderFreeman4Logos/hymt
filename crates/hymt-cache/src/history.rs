@@ -1023,6 +1023,65 @@ mod tests {
     }
 
     #[test]
+    fn cache_contract_reuses_a_segment_only_for_the_identical_full_fingerprint() {
+        let tmp = TempDir::new().unwrap();
+        let db = HistoryDB::new(tmp.path().join("history.db"));
+        let baseline = SegmentCacheScope {
+            target_lang: "zh",
+            template_type: "default",
+            options_hash: "options:v1",
+            profile_id: "hy_mt2_7b",
+            // Represents Q4_K_M + llama.cpp defaults + prompt schema v2 + tokenizer v1.
+            inference_fingerprint: "sha256:q4-llama-defaults-prompts-v2-tokenizer-v1",
+        };
+        let changed_quantization = SegmentCacheScope {
+            inference_fingerprint: "sha256:q6-llama-defaults-prompts-v2-tokenizer-v1",
+            ..baseline
+        };
+        let changed_sampler = SegmentCacheScope {
+            inference_fingerprint: "sha256:q4-llama-temp-0.2-prompts-v2-tokenizer-v1",
+            ..baseline
+        };
+        let changed_prompt_schema = SegmentCacheScope {
+            inference_fingerprint: "sha256:q4-llama-defaults-prompts-v3-tokenizer-v1",
+            ..baseline
+        };
+        let changed_tokenizer = SegmentCacheScope {
+            inference_fingerprint: "sha256:q4-llama-defaults-prompts-v2-tokenizer-v2",
+            ..baseline
+        };
+
+        db.store_segment_cache(
+            "same-source-segment",
+            baseline,
+            "cached Q4 translation",
+            "2024-01-01T00:00:00Z",
+        )
+        .unwrap();
+
+        assert_eq!(
+            db.find_segment_cached("same-source-segment", baseline)
+                .unwrap()
+                .as_deref(),
+            Some("cached Q4 translation"),
+            "only the exact full inference fingerprint may hit"
+        );
+        for (name, changed_scope) in [
+            ("quantization Q4 -> Q6", changed_quantization),
+            ("sampler defaults", changed_sampler),
+            ("prompt schema", changed_prompt_schema),
+            ("tokenizer revision", changed_tokenizer),
+        ] {
+            assert!(
+                db.find_segment_cached("same-source-segment", changed_scope)
+                    .unwrap()
+                    .is_none(),
+                "changed {name} must never reuse the baseline cache entry"
+            );
+        }
+    }
+
+    #[test]
     fn test_legacy_segment_cache_rows_without_fingerprint_do_not_hit() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("legacy-history.db");

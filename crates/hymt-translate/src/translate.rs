@@ -2785,6 +2785,17 @@ max_retries = 1
             .collect()
     }
 
+    fn planned_complete_zh_translations(plan: &TranslationPlan) -> Vec<String> {
+        plan.segments
+            .iter()
+            .map(|segment| {
+                let source_shape = segment.split_whitespace().collect::<Vec<_>>().join(" ");
+                let filler = "译".repeat((segment.chars().count() / 2).max(40));
+                format!("{source_shape} {filler}")
+            })
+            .collect()
+    }
+
     fn make_partially_overridden_stream_config(endpoint_url: &str) -> hymt_core::config::HotConfig {
         let path = temp_path("partial-sampling-config.toml");
         std::fs::write(
@@ -2974,6 +2985,140 @@ max_retries = 1
                 DocumentTranslationPolicy::SkipHighConfidenceTargetParagraphs
             )
         );
+    }
+
+    // ── end-to-end document pipeline ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn document_pipeline_preserves_mixed_markdown_retries_reconstructs_and_writes_atomically()
+    {
+        let source = concat!(
+            "---\n",
+            "title: Preserve this front matter\n",
+            "tags: [hymt, contract]\n",
+            "---\n\n",
+            "# Installation\n\n",
+            "Install the translation service and verify every configured endpoint before continuing. ",
+            "This paragraph intentionally has enough content to be segmented and completeness-checked.\n\n",
+            "## Validation\n\n",
+            "Run the documented validation commands after changing the model profile or request sampler. ",
+            "The reconstructed document must retain every section in order.\n\n",
+            "中文段落必须保持原样，不能发送给模型。\n\n",
+            "```rust\n",
+            "let preserved = \"code fence must remain verbatim\";\n",
+            "```\n"
+        );
+        let segmenter = fallback_segmenter();
+        let opts = PromptOpts::default();
+        let planning_config = make_stream_config("http://127.0.0.1:1/v1");
+        let plan = plan_translation(
+            source,
+            "zh",
+            &planning_config,
+            &segmenter,
+            &TemplateType::Default,
+            &opts,
+        )
+        .expect("document plan");
+        assert!(
+            plan.segment_count() >= 2,
+            "fixture must exercise reconstruction"
+        );
+        assert!(
+            plan.segments
+                .iter()
+                .all(|segment| !segment.contains("中文段落")),
+            "target-language source must remain outside inference requests"
+        );
+
+        let complete = planned_complete_zh_translations(&plan);
+        let valid_reply = complete.first().expect("planned translation").clone();
+        let mut replies = Vec::with_capacity(33);
+        replies.push(MockResponse::Json("too short".to_owned()));
+        replies.extend((0..32).map(|_| MockResponse::Json(valid_reply.clone())));
+        let server = start_mock_server(replies).await;
+        let config = make_stream_config(&server.endpoint_url);
+        let client = TranslationClient::new(config.clone()).expect("client");
+        let dir = tempfile::tempdir().expect("temporary document directory");
+        let input = dir.path().join("guide.md");
+        let output = dir.path().join("guide.zh-cn.md");
+        std::fs::write(&input, source).expect("write source document");
+        let history = HistoryDB::new(dir.path().join("history.db"));
+        let doc_opts = crate::doc_translate::DocTranslationOpts {
+            target_lang: "zh",
+            config: &config,
+            client: &client,
+            segmenter: &segmenter,
+            history: &history,
+            output_path: Some(&output),
+            output_dir: None,
+            recursive: false,
+            template: &TemplateType::Default,
+            prompt_opts: &opts,
+            explicit_target: true,
+        };
+
+        crate::doc_translate::run_doc_translation(&input, &doc_opts)
+            .await
+            .expect("complete Markdown pipeline");
+
+        let written = std::fs::read_to_string(&output).expect("translated output");
+        assert!(written.contains("title: Preserve this front matter"));
+        assert!(written.contains("中文段落必须保持原样，不能发送给模型。"));
+        assert!(written.contains("let preserved = \"code fence must remain verbatim\";"));
+        assert!(written.contains("译"));
+        assert!(
+            !written.contains("too short"),
+            "the incomplete first attempt must be retried rather than reconstructed"
+        );
+        assert!(
+            std::fs::read_dir(dir.path())
+                .expect("output directory")
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().contains(".tmp.")),
+            "atomic output write must leave no temporary document behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn validated_document_stream_is_a_prefix_of_the_reconstructed_final_output() {
+        let source = "---\ntitle: Stream\n---\n\nStreaming output must remain a prefix of the validated final translation.";
+        let segmenter = fallback_segmenter();
+        let opts = PromptOpts::default();
+        let planning_config = make_stream_config("http://127.0.0.1:1/v1");
+        let plan = plan_translation(
+            source,
+            "zh",
+            &planning_config,
+            &segmenter,
+            &TemplateType::Default,
+            &opts,
+        )
+        .expect("stream plan");
+        let responses = planned_complete_zh_translations(&plan)
+            .into_iter()
+            .map(|translation| {
+                let split = translation
+                    .char_indices()
+                    .nth(translation.chars().count() / 2)
+                    .map(|(byte_index, _)| byte_index)
+                    .unwrap_or(translation.len());
+                MockResponse::Sse(vec![
+                    translation[..split].to_owned(),
+                    translation[split..].to_owned(),
+                ])
+            })
+            .collect();
+        let server = start_mock_server(responses).await;
+        let config = make_stream_config(&server.endpoint_url);
+        let history_dir = tempfile::tempdir().expect("history directory");
+        let history = HistoryDB::new(history_dir.path().join("history.db"));
+        let (final_output, rendered_output) =
+            translate_and_render_stdout(source, &config, &segmenter, &history)
+                .await
+                .expect("validated stream");
+        assert_eq!(rendered_output.trim_end(), final_output);
+        assert!(final_output.contains("译"));
     }
 
     // ── plan_translation token budget ─────────────────────────────────────────
