@@ -23,9 +23,8 @@ model = ""
 # `per_request_context` is the guaranteed context for one request slot.
 total_context = 16384
 parallel_slots = 1
-# Set this explicitly when the backend guarantees a lower per-slot limit.
-# When omitted, hymt derives total_context / parallel_slots.
-per_request_context = 16384
+# Set per_request_context explicitly only when the backend guarantees a lower
+# per-slot limit. When omitted, hymt derives total_context / parallel_slots.
 
 [translation]
 max_output_tokens = 4096
@@ -384,6 +383,35 @@ fn uses_legacy_context_window(data: &toml::Table) -> bool {
                 .any(|key| table.contains_key(*key))
         });
     uses_context_window && !has_backend_context
+}
+
+fn validate_backend_context(data: &toml::Table) -> Result<(), CoreError> {
+    let Some(backend) = data.get("backend") else {
+        return Ok(());
+    };
+    let backend = backend
+        .as_table()
+        .ok_or_else(|| CoreError::Config("backend must be a TOML table".to_owned()))?;
+
+    for key in BACKEND_CONTEXT_KEYS {
+        let Some(value) = backend.get(*key) else {
+            continue;
+        };
+        let value = value.as_integer().ok_or_else(|| {
+            CoreError::Config(format!(
+                "backend.{key} must be an integer in 1..={}",
+                u32::MAX
+            ))
+        })?;
+        if !(1..=i64::from(u32::MAX)).contains(&value) {
+            return Err(CoreError::Config(format!(
+                "backend.{key} must be an integer in 1..={}",
+                u32::MAX
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 fn parse_f64_setting(data: &toml::Table, key: &str) -> Result<Setting<f64>, CoreError> {
@@ -936,6 +964,7 @@ impl HotConfig {
         let content = std::fs::read_to_string(&self.path)?;
         let data: toml::Table = toml::from_str(&content)
             .map_err(|e| CoreError::Config(format!("{}: {}", self.path.display(), e)))?;
+        validate_backend_context(&data)?;
         let profile = self
             .state
             .read()
@@ -1223,6 +1252,25 @@ mod tests {
     }
 
     #[test]
+    fn generated_default_config_derives_per_request_context_after_backend_change() {
+        let path = temp_config_path("generated_default_context");
+        HotConfig::from_path(&path).unwrap();
+        let defaults = fs::read_to_string(&path).unwrap();
+        assert!(
+            !defaults.contains("per_request_context ="),
+            "generated defaults must not pin the derived per-request context"
+        );
+
+        let adjusted = defaults
+            .replace("total_context = 16384", "total_context = 24576")
+            .replace("parallel_slots = 1", "parallel_slots = 3");
+        fs::write(&path, adjusted).unwrap();
+
+        let cfg = HotConfig::from_path(&path).unwrap();
+        assert_eq!(cfg.per_request_context(), 8_192);
+    }
+
+    #[test]
     fn creates_default_file_when_absent() {
         let path = temp_config_path("create");
         assert!(!path.exists());
@@ -1232,6 +1280,7 @@ mod tests {
         assert!(contents.contains("[endpoint]"));
         assert!(contents.contains("[backend]"));
         assert!(!contents.contains("context_window"));
+        assert!(!contents.contains("per_request_context ="));
     }
 
     #[test]
@@ -1267,6 +1316,35 @@ mod tests {
         assert_eq!(cfg.total_context(), 65_536);
         assert_eq!(cfg.parallel_slots(), 8);
         assert_eq!(cfg.per_request_context(), 7_000);
+    }
+
+    #[test]
+    fn rejects_invalid_backend_context_values_at_load_without_panicking() {
+        for (tag, key, value) in [
+            (
+                "parallel_slots_above_u32_max",
+                "parallel_slots",
+                "4294967296",
+            ),
+            ("parallel_slots_zero", "parallel_slots", "0"),
+            ("total_context_above_u32_max", "total_context", "4294967296"),
+            ("total_context_zero", "total_context", "0"),
+            ("per_request_context_zero", "per_request_context", "0"),
+        ] {
+            let path = temp_config_path(tag);
+            fs::write(&path, format!("[backend]\n{key} = {value}\n")).unwrap();
+
+            let result = std::panic::catch_unwind(|| {
+                let config = HotConfig::from_path(&path)?;
+                Ok::<u32, CoreError>(config.per_request_context())
+            });
+            let result = result.expect("invalid backend context must not panic");
+            let error = result.expect_err("invalid backend context must fail at load");
+            assert!(
+                error.to_string().contains(&format!("backend.{key}")),
+                "{tag}: {error}"
+            );
+        }
     }
 
     #[test]
