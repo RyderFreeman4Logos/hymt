@@ -1072,11 +1072,15 @@ pub async fn translate_text(
         effective_document_translation_policy(opts, ctx.config),
     );
     let profile_id = ctx.config.model_profile()?.id();
+    let inference_fingerprint = ctx
+        .config
+        .inference_fingerprint(template_name, &options_hash)?;
     let cache_scope = SegmentCacheScope {
         target_lang,
         template_type: template_name,
         options_hash: &options_hash,
         profile_id,
+        inference_fingerprint: inference_fingerprint.hash(),
     };
     let seg_hashes: Vec<String> = plan
         .segments
@@ -1202,6 +1206,7 @@ pub async fn translate_text(
             }
         },
         profile_id: profile_id.to_owned(),
+        inference_fingerprint: inference_fingerprint.hash().to_owned(),
         tokens_per_second: tps,
         input_chars: text.len() as i64,
         output_chars: translated.len() as i64,
@@ -1319,11 +1324,15 @@ pub async fn translate_text_stream_with_mode(
         effective_document_translation_policy(opts, ctx.config),
     );
     let profile_id = ctx.config.model_profile()?.id();
+    let inference_fingerprint = ctx
+        .config
+        .inference_fingerprint(template_name, &options_hash)?;
     let cache_scope = SegmentCacheScope {
         target_lang,
         template_type: template_name,
         options_hash: &options_hash,
         profile_id,
+        inference_fingerprint: inference_fingerprint.hash(),
     };
     let seg_hashes: Vec<String> = plan
         .segments
@@ -1652,6 +1661,7 @@ pub async fn translate_text_stream_with_mode(
             }
         },
         profile_id: profile_id.to_owned(),
+        inference_fingerprint: inference_fingerprint.hash().to_owned(),
         tokens_per_second: tps,
         input_chars: text.len() as i64,
         output_chars: translated.len() as i64,
@@ -3146,6 +3156,10 @@ Bravo one text carries enough source material for cache validation and ordering 
                     template_type: TemplateType::Default.as_str(),
                     options_hash: "",
                     profile_id: "generic",
+                    inference_fingerprint: cfg
+                        .inference_fingerprint(TemplateType::Default.as_str(), "")
+                        .unwrap()
+                        .hash(),
                 },
                 &translations[0],
                 &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
@@ -3373,6 +3387,10 @@ Bravo one text carries enough source material for cache validation and ordering 
                     template_type: TemplateType::Default.as_str(),
                     options_hash: "",
                     profile_id: "generic",
+                    inference_fingerprint: cfg
+                        .inference_fingerprint(TemplateType::Default.as_str(), "")
+                        .unwrap()
+                        .hash(),
                 },
                 &translations[0],
                 &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
@@ -3425,6 +3443,10 @@ Bravo one text carries enough source material for cache validation and ordering 
                     template_type: TemplateType::Default.as_str(),
                     options_hash: "",
                     profile_id: "generic",
+                    inference_fingerprint: cfg
+                        .inference_fingerprint(TemplateType::Default.as_str(), "")
+                        .unwrap()
+                        .hash(),
                 },
                 &translations[0],
                 &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
@@ -3671,6 +3693,15 @@ max_retries = 0
         );
         assert!(!outcome.text.is_empty());
         assert_eq!(outcome.completeness_degraded_segments, vec![1]);
+        let records = history.fetch_recent(None).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].inference_fingerprint,
+            cfg.inference_fingerprint(TemplateType::Default.as_str(), "")
+                .unwrap()
+                .hash(),
+            "task history must persist the cache's inference fingerprint"
+        );
     }
 
     #[tokio::test]

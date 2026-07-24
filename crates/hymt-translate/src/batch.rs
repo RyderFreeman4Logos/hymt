@@ -140,6 +140,7 @@ pub fn build_batch_plan(
         effective_document_translation_policy(prompt_opts, config),
     );
     let profile_id = config.model_profile()?.id();
+    let inference_fingerprint = config.inference_fingerprint(template_name, &options_hash)?;
     let mut files = Vec::new();
     let mut skipped = Vec::new();
 
@@ -184,6 +185,7 @@ pub fn build_batch_plan(
             template_type: template_name,
             options_hash: &options_hash,
             profile_id,
+            inference_fingerprint: inference_fingerprint.hash(),
         };
 
         let suffix = target_lang_path_suffix(&effective_lang)?;
