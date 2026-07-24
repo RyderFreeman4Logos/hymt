@@ -1,0 +1,35 @@
+schema_version = "hymt-benchmark-gates/v1"
+
+[quality]
+# Minimum corpus-weighted chrF (character n-grams 1..6, beta=2).
+min_chrf = 0.45
+# A baseline is optional; when supplied its comparable summary cannot regress by more than this.
+max_baseline_chrf_regression = 0.02
+
+[preservation]
+# Placeholders, URLs, flags, keys, delimiters, and code tokens are exact-match invariants.
+min_rate = 1.0
+
+[parse]
+# JSON, YAML, and TOML cases must remain parseable.
+min_rate = 0.98
+
+[truncation]
+# A completion marked length, empty, malformed structured output, or trailing ellipsis is a failure.
+max_rate = 0.01
+
+[residue]
+# Script-detection residue is a heuristic, not a quality score.
+max_rate = 0.05
+
+[quantization]
+# Q4_K_M may lose at most this much aggregate chrF relative to Q6_K.
+q4_vs_q6_max_chrf_drop = 0.03
+# If both systems report throughput, Q4_K_M must achieve at least this Q6_K ratio.
+q4_min_throughput_ratio = 0.90
+
+[sampler]
+# Per-system sampler variants must stay compatible with production defaults.
+max_chrf_spread = 0.05
+min_preservation_rate = 1.0
+max_truncation_rate = 0.01

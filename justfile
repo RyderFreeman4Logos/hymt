@@ -37,6 +37,11 @@ check:
 test:
     {{_io_prefix}} cargo test --workspace
 
+# Complete reproducible benchmark suite. Default is deterministic mock mode;
+# pass runner arguments directly, for example: just benchmark --dry-run.
+benchmark *args:
+    {{_io_prefix}} cargo run -p hymt-bench -- run {{args}}
+
 # ==============================================================================
 # Individual commands
 # ==============================================================================

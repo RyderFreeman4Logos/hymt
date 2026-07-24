@@ -1,0 +1,31 @@
+[package]
+name = "hymt-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "hymt_bench"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hymt-bench"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+chrono = { version = "0.4", features = ["clock", "serde"] }
+clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
+hex = "0.4"
+hymt-core = { path = "../hymt-core" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+serde = { workspace = true }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+tokio = { workspace = true }
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
