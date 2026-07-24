@@ -19,7 +19,7 @@ Use `hymt` when an agent should drive the local Hy-MT2 CLI instead of hand-writi
 - Skip interactive checks: `hymt input.txt -l ja --yes`
 - If the source text matches a subcommand name, disambiguate with `--`: `hymt -l zh -- "config"`
 - Without an explicit `-l/--lang`, hymt routes between `[language].primary` (default `zh`) and `[language].secondary` (default `en`): mostly-primary input targets secondary, otherwise it targets primary.
-- Mixed-language documents use smart partial translation when language detection is available: target-language paragraphs are kept, non-target paragraphs are translated, and fenced code blocks are always preserved.
+- Mixed-language documents targeting `zh`, `zh-Hant`, or `yue` preserve only high-confidence CJK target-language paragraphs by default; code blocks and frontmatter are always preserved. Use `--force-translate-all` (or `[translation].force_translate_all = true`) to submit every non-code paragraph, or `--no-language-detection` / `[translation].language_detection = false` to disable detection for one run or configuration.
 
 ## Batch translate directories
 
@@ -32,7 +32,7 @@ Use `hymt` when an agent should drive the local Hy-MT2 CLI instead of hand-writi
 - Output names are `{stem}.{target}.{ext}` using the effective target; with default routing, English files write `README.zh.md` and mostly-primary files write `README.en.md`.
 - Files whose resolved output path would leave the scan root or `--output-dir` are skipped with a stderr warning.
 - Batch target names accept only ASCII letters, digits, and hyphens; dots, path separators, and other characters are rejected.
-- Files already detected as target-language documents are skipped. Mixed-language files keep target-language paragraphs and translate the remaining paragraphs.
+- Files are planned by translatable segments; a file made entirely of preserved target-language paragraphs has no model segments but is still reconstructed to its normal output path. Mixed-language files preserve high-confidence Chinese-family target paragraphs and translate the remaining paragraphs.
 - Batch planning progress is written to stderr before the preview, including scanned file count, per-file analysis, and selected/skipped totals.
 - The preview lists every selected file with `full`, `partial`, or `none` segment-cache status, cached segment counts, per-file ETA, and total ETA.
 - `--dry-run` (or global `--plan`) shows the plan and exits without writing any files.
@@ -103,9 +103,7 @@ Related skills cover command/documentation translation:
 - Stdout translations end with a trailing newline.
 - With piped stdin, a single positional `.` is treated as a stdin placeholder so commands like `producer | hymt .` translate the pipe instead of the literal dot.
 - Explicit `-l/--lang` disables default language routing and uses the requested target for prompts, cache/history keys, and output suffixes.
-- When optional language detection support is installed, mixed-language runs show a per-paragraph plan and prompt: `X of Y paragraphs are already in <target_lang>. Translate only the remaining Z paragraphs? (y/n/all)`. `y` keeps target-language paragraphs, `all` translates every non-code paragraph, and `n` cancels.
-- `--yes` and non-interactive stdin auto-select partial translation for mixed-language input.
-- If all detected paragraphs are already in the target language, interactive runs still ask whether to translate anyway.
+- Target-language paragraph preservation is CJK-only (`zh`, `zh-Hant`, `yue`): explicit `-l/--lang` selects the target but does not disable it. High-confidence target paragraphs are reconstructed byte-for-byte; non-Chinese targets translate every non-code paragraph. `--plan` reports each paragraph's detection metadata and translation decision.
 - Fenced code blocks and leading YAML frontmatter are excluded from language detection and translation in every mode.
 - `--stream` is the default for stdout translation. Streaming emits any cached segment-0 prefix immediately; if segment 0 is uncached, it starts only that request first, then starts remaining chunks after segment 0's first non-empty backend token. Normal stdout/stdin translation emits segment 0 tokens optimistically for low TTFT even through pipes; CLI help/usage/options-like input stays validated so completeness checks can retry before stdout is written. `--output <path>` defaults to buffered throughput mode, and `--no-stream` / `--no-streaming` keep buffered stdout behavior.
 - `--concurrency N` overrides `[translation].concurrency` for the process (client semaphore). Higher values improve wall-clock throughput once first-token fan-out begins; `--concurrency 1` is strictly serial and continuous but slower overall. Remaining completed segments are flushed to stdout in document order as soon as the contiguous prefix is ready.

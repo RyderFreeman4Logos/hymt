@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use chrono::{SecondsFormat, Utc};
+use hymt_core::language::DocumentTranslationPolicy;
 use rusqlite::{Connection, OpenFlags};
 use sha2::{Digest, Sha256};
 
@@ -25,6 +26,8 @@ pub struct ExecCacheKey {
     pub subcommand: String,
     pub output_hash: String,
     pub target_lang: String,
+    /// Stable document policy label included in `output_hash` key material.
+    pub document_policy: String,
 }
 
 /// Two-tier translation cache: user-private tier and a shared (read-only) tier.
@@ -59,15 +62,22 @@ impl ExecCache {
         &self.shared_path
     }
 
-    /// Search user tier first, then shared tier.
+    /// Search user tier first, then shared tier, scoped by document policy.
     pub fn find(
         &self,
         command: &str,
         subcommand: &str,
         source_text: &str,
         target_lang: &str,
+        document_policy: DocumentTranslationPolicy,
     ) -> Result<Option<String>, CacheError> {
-        let key = build_key(command, subcommand, source_text, target_lang);
+        let key = build_key(
+            command,
+            subcommand,
+            source_text,
+            target_lang,
+            document_policy,
+        );
         if let Some(hit) = self.find_in_user(&key)? {
             return Ok(Some(hit));
         }
@@ -80,9 +90,16 @@ impl ExecCache {
         subcommand: &str,
         source_text: &str,
         target_lang: &str,
+        document_policy: DocumentTranslationPolicy,
         translated_text: &str,
     ) -> Result<(), CacheError> {
-        let key = build_key(command, subcommand, source_text, target_lang);
+        let key = build_key(
+            command,
+            subcommand,
+            source_text,
+            target_lang,
+            document_policy,
+        );
         if let Some(parent) = self.user_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -104,9 +121,16 @@ impl ExecCache {
         subcommand: &str,
         source_text: &str,
         target_lang: &str,
+        document_policy: DocumentTranslationPolicy,
         translated_text: &str,
     ) -> Result<(), CacheError> {
-        let key = build_key(command, subcommand, source_text, target_lang);
+        let key = build_key(
+            command,
+            subcommand,
+            source_text,
+            target_lang,
+            document_policy,
+        );
         if let Some(parent) = self.shared_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -165,13 +189,35 @@ pub fn build_key(
     subcommand: &str,
     source_text: &str,
     target_lang: &str,
+    document_policy: DocumentTranslationPolicy,
 ) -> ExecCacheKey {
+    let document_policy = document_policy_key(document_policy);
     ExecCacheKey {
         command: command.to_owned(),
         subcommand: subcommand.to_owned(),
-        output_hash: hash_text(source_text),
+        output_hash: hash_text_with_document_policy(source_text, document_policy),
         target_lang: target_lang.to_owned(),
+        document_policy: document_policy.to_owned(),
     }
+}
+
+fn document_policy_key(policy: DocumentTranslationPolicy) -> &'static str {
+    match policy {
+        DocumentTranslationPolicy::TranslateAll => "translate_all",
+        DocumentTranslationPolicy::SkipHighConfidenceTargetParagraphs => {
+            "skip_high_confidence_target_paragraphs"
+        }
+    }
+}
+
+/// Hash source text with its document policy so policy changes cannot reuse an
+/// exec-cache entry created under a different translation plan.
+fn hash_text_with_document_policy(source_text: &str, document_policy: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(document_policy.as_bytes());
+    hasher.update([0]);
+    hasher.update(source_text.as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 fn ensure_schema(conn: &Connection) -> Result<(), CacheError> {
@@ -256,6 +302,9 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    const DEFAULT_DOCUMENT_POLICY: DocumentTranslationPolicy =
+        DocumentTranslationPolicy::SkipHighConfidenceTargetParagraphs;
+
     fn make_cache(tmp: &TempDir) -> ExecCache {
         let shared = tmp.path().join("shared.db");
         let user = tmp.path().join("user.db");
@@ -266,7 +315,9 @@ mod tests {
     fn test_missing_key_returns_none() {
         let tmp = TempDir::new().unwrap();
         let cache = make_cache(&tmp);
-        let result = cache.find("ls", "-la", "some source", "en").unwrap();
+        let result = cache
+            .find("ls", "-la", "some source", "en", DEFAULT_DOCUMENT_POLICY)
+            .unwrap();
         assert!(result.is_none());
     }
 
@@ -275,10 +326,59 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cache = make_cache(&tmp);
         cache
-            .store_user("ls", "-la", "hello world", "en", "你好世界")
+            .store_user(
+                "ls",
+                "-la",
+                "hello world",
+                "en",
+                DEFAULT_DOCUMENT_POLICY,
+                "你好世界",
+            )
             .unwrap();
-        let found = cache.find("ls", "-la", "hello world", "en").unwrap();
+        let found = cache
+            .find("ls", "-la", "hello world", "en", DEFAULT_DOCUMENT_POLICY)
+            .unwrap();
         assert_eq!(found.as_deref(), Some("你好世界"));
+    }
+
+    #[test]
+    fn test_document_policy_separates_cache_entries() {
+        let tmp = TempDir::new().unwrap();
+        let cache = make_cache(&tmp);
+        cache
+            .store_user(
+                "ls",
+                "-la",
+                "hello world",
+                "en",
+                DocumentTranslationPolicy::TranslateAll,
+                "translation with every paragraph submitted",
+            )
+            .unwrap();
+
+        assert_eq!(
+            cache
+                .find(
+                    "ls",
+                    "-la",
+                    "hello world",
+                    "en",
+                    DocumentTranslationPolicy::TranslateAll,
+                )
+                .unwrap()
+                .as_deref(),
+            Some("translation with every paragraph submitted")
+        );
+        assert!(cache
+            .find(
+                "ls",
+                "-la",
+                "hello world",
+                "en",
+                DocumentTranslationPolicy::SkipHighConfidenceTargetParagraphs,
+            )
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -286,14 +386,29 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cache = make_cache(&tmp);
         cache
-            .store_shared("git", "status", "source text", "zh", "源文本")
+            .store_shared(
+                "git",
+                "status",
+                "source text",
+                "zh",
+                DEFAULT_DOCUMENT_POLICY,
+                "源文本",
+            )
             .unwrap();
         // Different user DB (no user entry), so shared is queried
         let cache2 = ExecCache::with_user_path(
             tmp.path().join("shared.db"),
             tmp.path().join("absent-user.db"),
         );
-        let found = cache2.find("git", "status", "source text", "zh").unwrap();
+        let found = cache2
+            .find(
+                "git",
+                "status",
+                "source text",
+                "zh",
+                DEFAULT_DOCUMENT_POLICY,
+            )
+            .unwrap();
         assert_eq!(found.as_deref(), Some("源文本"));
     }
 
@@ -302,12 +417,28 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cache = make_cache(&tmp);
         cache
-            .store_shared("cmd", "sub", "text", "en", "shared-translation")
+            .store_shared(
+                "cmd",
+                "sub",
+                "text",
+                "en",
+                DEFAULT_DOCUMENT_POLICY,
+                "shared-translation",
+            )
             .unwrap();
         cache
-            .store_user("cmd", "sub", "text", "en", "user-translation")
+            .store_user(
+                "cmd",
+                "sub",
+                "text",
+                "en",
+                DEFAULT_DOCUMENT_POLICY,
+                "user-translation",
+            )
             .unwrap();
-        let found = cache.find("cmd", "sub", "text", "en").unwrap();
+        let found = cache
+            .find("cmd", "sub", "text", "en", DEFAULT_DOCUMENT_POLICY)
+            .unwrap();
         assert_eq!(found.as_deref(), Some("user-translation"));
     }
 
@@ -316,17 +447,37 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cache = make_cache(&tmp);
         cache
-            .store_user("cmd-a", "sub", "text", "en", "translation-a")
+            .store_user(
+                "cmd-a",
+                "sub",
+                "text",
+                "en",
+                DEFAULT_DOCUMENT_POLICY,
+                "translation-a",
+            )
             .unwrap();
         cache
-            .store_user("cmd-b", "sub", "text", "en", "translation-b")
+            .store_user(
+                "cmd-b",
+                "sub",
+                "text",
+                "en",
+                DEFAULT_DOCUMENT_POLICY,
+                "translation-b",
+            )
             .unwrap();
         assert_eq!(
-            cache.find("cmd-a", "sub", "text", "en").unwrap().as_deref(),
+            cache
+                .find("cmd-a", "sub", "text", "en", DEFAULT_DOCUMENT_POLICY)
+                .unwrap()
+                .as_deref(),
             Some("translation-a")
         );
         assert_eq!(
-            cache.find("cmd-b", "sub", "text", "en").unwrap().as_deref(),
+            cache
+                .find("cmd-b", "sub", "text", "en", DEFAULT_DOCUMENT_POLICY)
+                .unwrap()
+                .as_deref(),
             Some("translation-b")
         );
     }
@@ -339,10 +490,19 @@ mod tests {
         let cache = ExecCache::with_user_path(&shared_path, &user_path);
         // The subdir doesn't exist yet; store_user must create it
         cache
-            .store_user("cmd", "sub", "text", "en", "translation")
+            .store_user(
+                "cmd",
+                "sub",
+                "text",
+                "en",
+                DEFAULT_DOCUMENT_POLICY,
+                "translation",
+            )
             .unwrap();
         assert!(user_path.exists());
-        let found = cache.find("cmd", "sub", "text", "en").unwrap();
+        let found = cache
+            .find("cmd", "sub", "text", "en", DEFAULT_DOCUMENT_POLICY)
+            .unwrap();
         assert_eq!(found.as_deref(), Some("translation"));
     }
 
@@ -351,12 +511,21 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cache = make_cache(&tmp);
         cache
-            .store_user("cmd", "sub", "text", "en", "first")
+            .store_user("cmd", "sub", "text", "en", DEFAULT_DOCUMENT_POLICY, "first")
             .unwrap();
         cache
-            .store_user("cmd", "sub", "text", "en", "second")
+            .store_user(
+                "cmd",
+                "sub",
+                "text",
+                "en",
+                DEFAULT_DOCUMENT_POLICY,
+                "second",
+            )
             .unwrap();
-        let found = cache.find("cmd", "sub", "text", "en").unwrap();
+        let found = cache
+            .find("cmd", "sub", "text", "en", DEFAULT_DOCUMENT_POLICY)
+            .unwrap();
         assert_eq!(found.as_deref(), Some("second"));
     }
 

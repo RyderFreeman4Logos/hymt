@@ -13,11 +13,11 @@ use hymt_cache::history::HistoryDB;
 use hymt_cache::ExecCache;
 use hymt_client::TranslationClient;
 use hymt_core::config::HotConfig;
-use hymt_core::language::resolve_target_language;
+use hymt_core::language::{resolve_target_language, DocumentTranslationPolicy};
 use hymt_core::templates::{PromptOpts, TemplateType};
 use hymt_segment::Segmenter;
 
-use crate::translate::{translate_text, TranslationCtx};
+use crate::translate::{effective_document_translation_policy, translate_text, TranslationCtx};
 
 const ANSI_CYAN: &str = "\x1b[36m";
 const ANSI_YELLOW: &str = "\x1b[33m";
@@ -25,17 +25,28 @@ const ANSI_RESET: &str = "\x1b[0m";
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
+/// Dependencies and translation policy for an `exec` invocation.
+pub struct ExecCommandOpts<'a> {
+    pub target_lang: &'a str,
+    pub config: &'a HotConfig,
+    pub client: &'a TranslationClient,
+    pub segmenter: &'a Segmenter,
+    pub history: &'a HistoryDB,
+    pub explicit_target: bool,
+    /// Prompt options, including the document-planning policy selected by CLI flags.
+    pub prompt_opts: &'a PromptOpts,
+}
+
 /// Run `command`, capture stdout/stderr, translate the output, and print it.
 /// Returns the subprocess exit code.
-pub async fn run_exec_command(
-    command: &[&str],
-    target_lang: &str,
-    config: &HotConfig,
-    client: &TranslationClient,
-    segmenter: &Segmenter,
-    history: &HistoryDB,
-    explicit_target: bool,
-) -> Result<i32> {
+pub async fn run_exec_command(command: &[&str], opts: &ExecCommandOpts<'_>) -> Result<i32> {
+    let target_lang = opts.target_lang;
+    let config = opts.config;
+    let client = opts.client;
+    let segmenter = opts.segmenter;
+    let history = opts.history;
+    let explicit_target = opts.explicit_target;
+    let prompt_opts = opts.prompt_opts;
     if command.is_empty() {
         anyhow::bail!("command is required");
     }
@@ -75,7 +86,17 @@ pub async fn run_exec_command(
     if config.exec_translate_stderr() && !stderr_bytes.is_empty() {
         if let Some(text) = decode_for_translation(&stderr_bytes) {
             let cache = ExecCache::new(config.exec_shared_cache_path());
-            match translate_cached(&exe, &subcmd, &text, &effective_lang, &cache, &tctx).await {
+            match translate_cached(
+                &exe,
+                &subcmd,
+                &text,
+                &effective_lang,
+                &cache,
+                prompt_opts,
+                &tctx,
+            )
+            .await
+            {
                 Ok(translated) => {
                     write_translation("stderr", &translated, false, ANSI_YELLOW);
                 }
@@ -90,7 +111,17 @@ pub async fn run_exec_command(
         if let Some(text) = decode_for_translation(&stdout_bytes) {
             let cache = ExecCache::new(config.exec_shared_cache_path());
             let use_tty = std::io::stdout().is_terminal();
-            match translate_cached(&exe, &subcmd, &text, &effective_lang, &cache, &tctx).await {
+            match translate_cached(
+                &exe,
+                &subcmd,
+                &text,
+                &effective_lang,
+                &cache,
+                prompt_opts,
+                &tctx,
+            )
+            .await
+            {
                 Ok(translated) => {
                     write_translation("stdout", &translated, use_tty, ANSI_CYAN);
                 }
@@ -126,21 +157,37 @@ pub(crate) async fn translate_cached(
     text: &str,
     target_lang: &str,
     cache: &ExecCache,
+    prompt_opts: &PromptOpts,
     ctx: &TranslationCtx<'_>,
 ) -> Result<String> {
-    if let Ok(Some(cached)) = cache.find(command, subcommand, text, target_lang) {
+    let document_policy = document_policy_for_exec_cache(prompt_opts, ctx.config);
+    if let Ok(Some(cached)) = cache.find(command, subcommand, text, target_lang, document_policy) {
         return Ok(cached);
     }
 
-    let opts = PromptOpts::default();
-    let outcome = translate_text(text, target_lang, &TemplateType::Default, &opts, ctx).await?;
+    let outcome =
+        translate_text(text, target_lang, &TemplateType::Default, prompt_opts, ctx).await?;
     outcome.report_completeness_degraded();
     let translated = outcome.text;
 
-    if let Err(e) = cache.store_user(command, subcommand, text, target_lang, &translated) {
+    if let Err(e) = cache.store_user(
+        command,
+        subcommand,
+        text,
+        target_lang,
+        document_policy,
+        &translated,
+    ) {
         eprintln!("Warning: exec cache store failed: {e}");
     }
     Ok(translated)
+}
+
+fn document_policy_for_exec_cache(
+    prompt_opts: &PromptOpts,
+    config: &HotConfig,
+) -> DocumentTranslationPolicy {
+    effective_document_translation_policy(prompt_opts, config)
 }
 
 fn write_translation(stream_name: &str, translated: &str, use_color: bool, color: &str) {
@@ -337,6 +384,25 @@ pub fn looks_like_build_progress(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hymt_core::language::DocumentTranslationPolicy;
+    use tempfile::TempDir;
+
+    #[test]
+    fn exec_policy_uses_the_prompt_option_override() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("hymt.toml");
+        std::fs::write(&config_path, "[translation]\n").unwrap();
+        let config = HotConfig::from_path(&config_path).unwrap();
+        let opts = PromptOpts {
+            document_translation_policy: Some(DocumentTranslationPolicy::TranslateAll),
+            ..PromptOpts::default()
+        };
+
+        assert_eq!(
+            document_policy_for_exec_cache(&opts, &config),
+            DocumentTranslationPolicy::TranslateAll
+        );
+    }
 
     // ── looks_binary ─────────────────────────────────────────────────────────
 

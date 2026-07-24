@@ -15,6 +15,21 @@ fn is_cjk_char(c: char) -> bool {
 /// Minimum paragraph ratio required to declare a section "already in target language".
 pub const TARGET_PARAGRAPH_RATIO: f64 = 0.60;
 
+/// Minimum analyzed characters required before paragraph-level target detection can skip text.
+pub const MIN_TARGET_PARAGRAPH_ANALYZED_CHARS: usize = 4;
+
+/// How the document planner should treat already-target-language paragraphs.
+///
+/// Code and frontmatter are preserved under every policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DocumentTranslationPolicy {
+    /// Submit every non-code paragraph to the translation model.
+    TranslateAll,
+    /// Preserve only paragraphs detected as confidently already in the target language.
+    SkipHighConfidenceTargetParagraphs,
+}
+
 // ── Result types ─────────────────────────────────────────────────────────────
 
 /// Result of running language detection on a text chunk.
@@ -118,6 +133,14 @@ pub fn resolve_target_language(
     canonical_or_requested(primary_lang)
 }
 
+fn is_short_code_like_paragraph(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.chars().count() <= 32
+        && trimmed
+            .chars()
+            .any(|c| matches!(c, ';' | '=' | '{' | '}' | '(' | ')' | '[' | ']' | '`'))
+}
+
 /// Splits `text` into sections and annotates each paragraph with language
 /// detection results. Paragraphs already in `target_lang` are flagged
 /// `is_target_language = true` and `should_translate = false`.
@@ -131,10 +154,14 @@ pub fn analyze_document_language(text: &str, target_lang: &str) -> DocumentLangu
                 return section;
             }
             let detection = detect_chunk_sequence(&[section.text.clone()], detects_chinese);
-            let is_target = detection
-                .as_ref()
-                .map(|d| d.target_ratio > TARGET_PARAGRAPH_RATIO)
-                .unwrap_or(false);
+            let is_target = !is_short_code_like_paragraph(&section.text)
+                && detection
+                    .as_ref()
+                    .map(|d| {
+                        d.analyzed_chars >= MIN_TARGET_PARAGRAPH_ANALYZED_CHARS
+                            && d.target_ratio > TARGET_PARAGRAPH_RATIO
+                    })
+                    .unwrap_or(false);
             section.detected_lang = detection.as_ref().and_then(|d| d.detected_lang.clone());
             section.target_ratio = detection.as_ref().map(|d| d.target_ratio);
             section.analyzed_chars = detection.as_ref().map(|d| d.analyzed_chars).unwrap_or(0);
@@ -147,6 +174,26 @@ pub fn analyze_document_language(text: &str, target_lang: &str) -> DocumentLangu
     DocumentLanguagePlan {
         sections,
         target_lang: canonical_or_requested(target_lang),
+    }
+}
+
+/// Builds a document translation plan according to `policy`.
+///
+/// [`DocumentTranslationPolicy::SkipHighConfidenceTargetParagraphs`] reuses the
+/// CJK-only analyzer; unsupported target languages conservatively translate all
+/// paragraphs. [`DocumentTranslationPolicy::TranslateAll`] bypasses detection.
+pub fn plan_document_translation(
+    text: &str,
+    target_lang: &str,
+    policy: DocumentTranslationPolicy,
+) -> DocumentLanguagePlan {
+    match policy {
+        DocumentTranslationPolicy::TranslateAll => {
+            build_document_translation_plan(text, target_lang)
+        }
+        DocumentTranslationPolicy::SkipHighConfidenceTargetParagraphs => {
+            analyze_document_language(text, target_lang)
+        }
     }
 }
 
@@ -553,6 +600,19 @@ mod tests {
             );
             assert!(!section.should_translate);
         }
+    }
+
+    #[test]
+    fn short_code_like_paragraph_is_not_confidently_classified_as_target_language() {
+        let plan = analyze_document_language("变量名;", "zh");
+        let paragraph = plan
+            .sections
+            .iter()
+            .find(|section| section.kind == SectionKind::Paragraph)
+            .unwrap();
+        assert!(paragraph.target_ratio.unwrap() > TARGET_PARAGRAPH_RATIO);
+        assert!(!paragraph.is_target_language);
+        assert!(paragraph.should_translate);
     }
 
     #[test]

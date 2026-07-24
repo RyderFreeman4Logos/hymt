@@ -13,6 +13,7 @@ use hymt_cache::ExecCache;
 use hymt_client::TranslationClient;
 use hymt_core::config::HotConfig;
 use hymt_core::language::resolve_target_language;
+use hymt_core::templates::PromptOpts;
 use hymt_segment::Segmenter;
 
 use crate::exec_wrapper::translate_cached;
@@ -27,6 +28,8 @@ pub struct ManInfoOpts<'a> {
     pub client: &'a TranslationClient,
     pub segmenter: &'a Segmenter,
     pub history: &'a HistoryDB,
+    /// Prompt options, including the document-planning policy selected by CLI flags.
+    pub prompt_opts: &'a PromptOpts,
     /// Show original (untranslated) output.
     pub original: bool,
     /// Whether the caller explicitly specified the target language.
@@ -61,8 +64,16 @@ pub async fn run_man_command(args: &[&str], opts: &ManInfoOpts<'_>) -> Result<i3
         segmenter: opts.segmenter,
         history: opts.history,
     };
-    let translated =
-        translate_cached("man", &subcmd, &text, &effective_lang, &cache, &tctx).await?;
+    let translated = translate_cached(
+        "man",
+        &subcmd,
+        &text,
+        &effective_lang,
+        &cache,
+        opts.prompt_opts,
+        &tctx,
+    )
+    .await?;
     page_text(&translated)
 }
 
@@ -90,8 +101,16 @@ pub async fn run_info_command(args: &[&str], opts: &ManInfoOpts<'_>) -> Result<i
         segmenter: opts.segmenter,
         history: opts.history,
     };
-    let translated =
-        translate_cached("info", &subcmd, &text, &effective_lang, &cache, &tctx).await?;
+    let translated = translate_cached(
+        "info",
+        &subcmd,
+        &text,
+        &effective_lang,
+        &cache,
+        opts.prompt_opts,
+        &tctx,
+    )
+    .await?;
     page_text(&translated)
 }
 

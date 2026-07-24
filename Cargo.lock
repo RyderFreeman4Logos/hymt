@@ -737,6 +737,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "hex",
+ "hymt-core",
  "rusqlite",
  "sha2",
  "tempfile",
