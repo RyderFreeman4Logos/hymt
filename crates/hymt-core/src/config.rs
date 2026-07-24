@@ -18,8 +18,16 @@ model = ""
 # uses generic mode and does not assume a tokenizer or sampler profile.
 # profile = "hy_mt2_7b"
 
+[backend]
+# `total_context` is the server-wide allocation (`llama-server -c`), while
+# `per_request_context` is the guaranteed context for one request slot.
+total_context = 16384
+parallel_slots = 1
+# Set this explicitly when the backend guarantees a lower per-slot limit.
+# When omitted, hymt derives total_context / parallel_slots.
+per_request_context = 16384
+
 [translation]
-context_window = 16384
 max_output_tokens = 4096
 concurrency = 1
 stream = true
@@ -27,7 +35,7 @@ config_version = 1
 timeout = 600
 first_chunk_priority = false
 # Hard cap on source tokens submitted per segment. Prevents oversized single-segment
-# hangs when context_window/max_output_tokens alone still leave a multi-k budget.
+# hangs when the per-request context/max_output_tokens alone still leave a multi-k budget.
 # Set to 0 to disable the hard cap (budget is then only expansion/context-limited).
 max_source_tokens_per_segment = 1024
 debug_chunk_timing = false
@@ -93,6 +101,8 @@ const GENERATION_SETTING_KEYS: &[&str] = &[
     "min_p",
     "repeat_last_n",
 ];
+
+const BACKEND_CONTEXT_KEYS: &[&str] = &["total_context", "parallel_slots", "per_request_context"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GenerationSettingField {
@@ -360,6 +370,22 @@ fn uses_legacy_generation_scalars(data: &toml::Table) -> bool {
         })
 }
 
+fn uses_legacy_context_window(data: &toml::Table) -> bool {
+    let uses_context_window = data
+        .get("translation")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|table| table.contains_key("context_window"));
+    let has_backend_context = data
+        .get("backend")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|table| {
+            BACKEND_CONTEXT_KEYS
+                .iter()
+                .any(|key| table.contains_key(*key))
+        });
+    uses_context_window && !has_backend_context
+}
+
 fn parse_f64_setting(data: &toml::Table, key: &str) -> Result<Setting<f64>, CoreError> {
     match inference_value(data, key)? {
         None => Ok(Setting::ServerDefault),
@@ -481,6 +507,7 @@ struct ConfigState {
     mtime: Option<SystemTime>,
     profile: Option<ModelProfile>,
     uses_legacy_generation_scalars: bool,
+    uses_legacy_context_window: bool,
 }
 
 impl ConfigState {
@@ -490,6 +517,7 @@ impl ConfigState {
             mtime: None,
             profile: None,
             uses_legacy_generation_scalars: false,
+            uses_legacy_context_window: false,
         }
     }
 }
@@ -580,8 +608,37 @@ impl HotConfig {
 
     // ── translation ─────────────────────────────────────────────────────────
 
+    /// Legacy context setting retained as the fallback total backend context.
     pub fn context_window(&self) -> u32 {
         self.get_positive_u32("translation", "context_window", 16384)
+    }
+
+    /// Total server context allocation, such as llama.cpp's `-c` value.
+    pub fn total_context(&self) -> u32 {
+        self.get_positive_u32("backend", "total_context", self.context_window())
+    }
+
+    /// Number of server request slots that share [`Self::total_context`].
+    pub fn parallel_slots(&self) -> u32 {
+        self.get_positive_u32("backend", "parallel_slots", 1)
+    }
+
+    /// Guaranteed context available to one translation request.
+    ///
+    /// An explicit backend value wins; otherwise this is derived from the total
+    /// server allocation divided by its parallel request slots.
+    pub fn per_request_context(&self) -> u32 {
+        self.section_value("backend", "per_request_context")
+            .and_then(|value| value.as_integer())
+            .filter(|&value| value > 0)
+            .map(|value| value as u32)
+            .unwrap_or_else(|| self.total_context() / self.parallel_slots())
+    }
+
+    /// Whether the deprecated `translation.context_window` needs migration to
+    /// the separate backend context settings.
+    pub fn uses_legacy_context_window(&self) -> bool {
+        self.state.read().unwrap().uses_legacy_context_window
     }
 
     pub fn max_output_tokens(&self) -> u32 {
@@ -891,6 +948,7 @@ impl HotConfig {
         let settings = profile.generation_defaults().with_overrides(overrides);
         settings.validate()?;
         let uses_legacy_generation_scalars = uses_legacy_generation_scalars(&data);
+        let uses_legacy_context_window = uses_legacy_context_window(&data);
         let mtime = std::fs::metadata(&self.path)
             .and_then(|m| m.modified())
             .ok();
@@ -901,6 +959,7 @@ impl HotConfig {
         state.data = data;
         state.mtime = mtime;
         state.uses_legacy_generation_scalars = uses_legacy_generation_scalars;
+        state.uses_legacy_context_window = uses_legacy_context_window;
         Ok(())
     }
 
@@ -1146,6 +1205,10 @@ mod tests {
         let cfg = HotConfig::from_path(&path).unwrap();
 
         assert_eq!(cfg.endpoint_url(), "http://127.0.0.1:8401/v1");
+        assert_eq!(cfg.total_context(), 16_384);
+        assert_eq!(cfg.parallel_slots(), 1);
+        assert_eq!(cfg.per_request_context(), 16_384);
+        assert!(!cfg.uses_legacy_context_window());
         assert_eq!(cfg.concurrency(), 1);
         assert_eq!(cfg.primary_lang(), "zh");
         assert_eq!(cfg.secondary_lang(), "en");
@@ -1167,6 +1230,55 @@ mod tests {
         assert!(path.exists());
         let contents = fs::read_to_string(&path).unwrap();
         assert!(contents.contains("[endpoint]"));
+        assert!(contents.contains("[backend]"));
+        assert!(!contents.contains("context_window"));
+    }
+
+    #[test]
+    fn backend_context_derives_per_request_limit_from_parallel_slots() {
+        for (total_context, parallel_slots) in [(24_576, 3), (65_536, 8)] {
+            let path = temp_config_path("derived_per_request_context");
+            fs::write(
+                &path,
+                format!(
+                    "[backend]\ntotal_context = {total_context}\nparallel_slots = {parallel_slots}\n"
+                ),
+            )
+            .unwrap();
+
+            let cfg = HotConfig::from_path(&path).unwrap();
+            assert_eq!(cfg.total_context(), total_context);
+            assert_eq!(cfg.parallel_slots(), parallel_slots);
+            assert_eq!(cfg.per_request_context(), 8_192);
+            assert!(!cfg.uses_legacy_context_window());
+        }
+    }
+
+    #[test]
+    fn backend_context_allows_explicit_per_request_limit() {
+        let path = temp_config_path("explicit_per_request_context");
+        fs::write(
+            &path,
+            "[backend]\ntotal_context = 65536\nparallel_slots = 8\nper_request_context = 7000\n",
+        )
+        .unwrap();
+
+        let cfg = HotConfig::from_path(&path).unwrap();
+        assert_eq!(cfg.total_context(), 65_536);
+        assert_eq!(cfg.parallel_slots(), 8);
+        assert_eq!(cfg.per_request_context(), 7_000);
+    }
+
+    #[test]
+    fn legacy_context_window_is_total_context_and_requests_migration_warning() {
+        let path = temp_config_path("legacy_context_window");
+        fs::write(&path, "[translation]\ncontext_window = 24576\n").unwrap();
+
+        let cfg = HotConfig::from_path(&path).unwrap();
+        assert_eq!(cfg.total_context(), 24_576);
+        assert_eq!(cfg.parallel_slots(), 1);
+        assert_eq!(cfg.per_request_context(), 24_576);
+        assert!(cfg.uses_legacy_context_window());
     }
 
     #[test]

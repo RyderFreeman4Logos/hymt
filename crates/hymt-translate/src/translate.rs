@@ -408,13 +408,14 @@ pub fn plan_translation(
 ) -> Result<TranslationPlan> {
     let overhead_prompt = build_prompt("", target_lang, template, opts)?;
     let overhead_tokens = segmenter.count_tokens(&overhead_prompt);
-    let context_window = config.context_window() as usize;
+    let per_request_context = config.per_request_context() as usize;
     let max_output = config.max_output_tokens() as usize;
 
-    let base_budget = context_window.saturating_sub(overhead_tokens + max_output);
+    let reserved_tokens = overhead_tokens + max_output;
+    let base_budget = per_request_context.saturating_sub(reserved_tokens);
     if base_budget == 0 {
         anyhow::bail!(
-            "context_window ({context_window}) too small for template overhead \
+            "per_request_context ({per_request_context}) too small for template overhead \
              ({overhead_tokens}) + max_output_tokens ({max_output})"
         );
     }
@@ -423,7 +424,7 @@ pub fn plan_translation(
     let max_safe = ((max_output as f64) / (ratio * OUTPUT_SAFETY_FACTOR)) as usize;
     let mut available = base_budget.min(max_safe).max(1);
     // Hard cap keeps multi-k documents from remaining a single slow segment when
-    // context_window/max_output_tokens still leave a multi-k expansion budget.
+    // the request budget and max output reservation still leave a multi-k source budget.
     let hard_cap = config.max_source_tokens_per_segment() as usize;
     if hard_cap > 0 {
         available = available.min(hard_cap).max(1);
@@ -443,6 +444,16 @@ pub fn plan_translation(
     let doc_plan = build_document_translation_plan(text, target_lang);
     let source_tokens = segmenter.count_tokens(text);
     let (segments, indexes, groups) = segment_document_plan(&doc_plan, segmenter, available)?;
+    for (index, segment) in segments.iter().enumerate() {
+        let segment_tokens = segmenter.count_tokens(segment);
+        if segment_tokens > available {
+            anyhow::bail!(
+                "segment {index} exceeds per-request source budget: {segment_tokens} tokens > \
+                 {available} after reserving template overhead ({overhead_tokens}) and \
+                 max_output_tokens ({max_output}) from per_request_context ({per_request_context})"
+            );
+        }
+    }
 
     Ok(TranslationPlan {
         source_tokens,
@@ -1783,6 +1794,20 @@ mod tests {
         }
     }
 
+    async fn start_request_counting_server(
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let server_request_count = Arc::clone(&request_count);
+        let handle = tokio::spawn(async move {
+            while let Ok((_socket, _)) = listener.accept().await {
+                server_request_count.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        (format!("http://{addr}/v1"), request_count, handle)
+    }
+
     async fn serve_mock_connection(
         mut socket: TcpStream,
         responses: Arc<Mutex<VecDeque<MockResponse>>>,
@@ -2384,6 +2409,120 @@ max_retries = 1
         // Without hard cap, zh expansion 0.7→1.0 * 1.5 → max_safe = 4096/1.5 ≈ 2730,
         // base_budget also large → available > 1024.
         assert!(plan.available_source_tokens > 1024);
+    }
+
+    fn assert_per_slot_context_rejects_output_reservation(total_context: u32, parallel_slots: u32) {
+        let seg = fallback_segmenter();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "[backend]\ntotal_context = {total_context}\nparallel_slots = {parallel_slots}\n\n[translation]\nmax_output_tokens = 8192\nmax_source_tokens_per_segment = 0\n"
+            ),
+        )
+        .unwrap();
+        let cfg = hymt_core::config::HotConfig::from_path(&cfg_path).unwrap();
+
+        let error = plan_translation(
+            "source",
+            "zh",
+            &cfg,
+            &seg,
+            &TemplateType::Default,
+            &PromptOpts::default(),
+        )
+        .err()
+        .expect("per-slot context must reject the output reservation");
+        assert!(
+            error.to_string().contains("per_request_context (8192)"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn plan_uses_24576_divided_by_three_as_per_slot_context() {
+        assert_per_slot_context_rejects_output_reservation(24_576, 3);
+    }
+
+    #[test]
+    fn plan_uses_65536_divided_by_eight_as_per_slot_context() {
+        assert_per_slot_context_rejects_output_reservation(65_536, 8);
+    }
+
+    #[test]
+    fn plan_subtracts_template_overhead_and_max_output_from_per_request_context() {
+        let seg = fallback_segmenter();
+        let opts = PromptOpts {
+            context: Some("preserve the heading hierarchy".to_owned()),
+            ..PromptOpts::default()
+        };
+        let overhead =
+            seg.count_tokens(&build_prompt("", "zh", &TemplateType::Default, &opts).unwrap());
+        let max_output_tokens = 512;
+        let expected_available = 64;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "[backend]\ntotal_context = 65536\nparallel_slots = 8\nper_request_context = {}\n\n[translation]\nmax_output_tokens = {max_output_tokens}\nmax_source_tokens_per_segment = 0\n",
+                overhead + max_output_tokens + expected_available,
+            ),
+        )
+        .unwrap();
+        let cfg = hymt_core::config::HotConfig::from_path(&cfg_path).unwrap();
+
+        let plan =
+            plan_translation("source", "zh", &cfg, &seg, &TemplateType::Default, &opts).unwrap();
+        assert_eq!(plan.available_source_tokens, expected_available);
+    }
+
+    #[tokio::test]
+    async fn oversized_atomic_table_is_rejected_before_http_submission() {
+        let (endpoint_url, request_count, server) = start_request_counting_server().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "[endpoint]\nurl = \"{endpoint_url}\"\n\n[backend]\ntotal_context = 1024\nparallel_slots = 1\nper_request_context = 1024\n\n[translation]\nmax_output_tokens = 512\nmax_source_tokens_per_segment = 0\n"
+            ),
+        )
+        .unwrap();
+        let cfg = hymt_core::config::HotConfig::from_path(&cfg_path).unwrap();
+        let segmenter = fallback_segmenter();
+        let history = HistoryDB::new(temp_path("oversized-atomic-segment-history.db"));
+        let client = TranslationClient::new(cfg.clone()).unwrap();
+        let ctx = TranslationCtx {
+            config: &cfg,
+            client: &client,
+            segmenter: &segmenter,
+            history: &history,
+        };
+        let rows = (0..100)
+            .map(|i| format!("| source phrase {i} | target phrase {i} |\n"))
+            .collect::<String>();
+        let table = format!("Translate this glossary:\n| Source | Target |\n|---|---|\n{rows}");
+
+        let error = translate_text(
+            &table,
+            "zh",
+            &TemplateType::Default,
+            &PromptOpts::default(),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds per-request source budget"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(request_count.load(Ordering::SeqCst), 0);
+        server.abort();
     }
 
     // ── reconstruct ───────────────────────────────────────────────────────────

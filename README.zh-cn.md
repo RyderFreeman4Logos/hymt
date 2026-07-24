@@ -50,11 +50,16 @@ model = ""
 # 选择一个受支持且经过测试的 Hy-MT2 profile；未覆盖的端点使用 "generic"。
 profile = "hy_mt2_7b"
 
+[backend]
+# `llama-server -c` 是服务总上下文。throughput 服务使用 65,536 总 tokens
+# 和 8 个槽；quality 服务使用 24,576 总 tokens 和 3 个槽。
+total_context = 65536
+parallel_slots = 8
+# 可选：省略时自动计算 total_context / parallel_slots。若后端保证的每请求
+# 上限更低，请显式设置此值。
+per_request_context = 8192
+
 [translation]
-# `llama-server -c` 是服务总上下文。两个示例服务的每请求上限都约为
-# 8,192 tokens：quality 为 24,576 / 3 槽，throughput 为 65,536 / 8 槽。
-# 此处填写每槽上限，而不是服务级 `-c` 总量。
-context_window = 8192
 max_output_tokens = 4096
 max_source_tokens_per_segment = 1024
 concurrency = 8 # 使用 hy-mt2-quality.service 时设为 3
