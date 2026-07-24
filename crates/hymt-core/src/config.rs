@@ -99,6 +99,10 @@ blocklist = [
 [telegram]
 enabled = false
 stream = true
+# Set false to ignore Telegram documents entirely.
+accept_documents = true
+# Maximum .txt/.md document size accepted from Telegram, in bytes (1 MiB).
+max_document_size = 1048576
 bot_token = ""
 claim_password = ""
 owners = []
@@ -1385,6 +1389,16 @@ impl HotConfig {
         self.get_bool("telegram", "stream", true)
     }
 
+    /// Whether Telegram accepts `.txt` and `.md` documents for translation.
+    pub fn telegram_accept_documents(&self) -> bool {
+        self.get_bool("telegram", "accept_documents", true)
+    }
+
+    /// Maximum accepted Telegram document size in bytes (default: 1 MiB).
+    pub fn telegram_max_document_size(&self) -> u64 {
+        self.get_non_negative_u64("telegram", "max_document_size", 1_048_576)
+    }
+
     /// Bot token from config, or empty when unset.
     ///
     /// Callers should prefer [`Self::telegram_bot_token_resolved`] so the
@@ -1554,6 +1568,14 @@ impl HotConfig {
             .and_then(|v| v.as_integer())
             .filter(|&n| n >= 0)
             .map(|n| n as u32)
+            .unwrap_or(default)
+    }
+
+    fn get_non_negative_u64(&self, section: &str, key: &str, default: u64) -> u64 {
+        self.section_value(section, key)
+            .and_then(|v| v.as_integer())
+            .filter(|&n| n >= 0)
+            .map(|n| n as u64)
             .unwrap_or(default)
     }
 
@@ -2536,6 +2558,8 @@ blocklist = ["foo", "bar"]"#,
         let cfg = HotConfig::from_path(&path).unwrap();
         assert!(!cfg.telegram_enabled());
         assert!(cfg.telegram_streaming_enabled());
+        assert!(cfg.telegram_accept_documents());
+        assert_eq!(cfg.telegram_max_document_size(), 1_048_576);
         assert!(cfg.telegram_bot_token().is_empty());
         assert!(cfg.telegram_claim_password().is_empty());
         assert!(cfg.telegram_owners().is_empty());
@@ -2552,6 +2576,8 @@ blocklist = ["foo", "bar"]"#,
 [telegram]
 enabled = true
 stream = false
+accept_documents = false
+max_document_size = 42
 bot_token = "token-from-file"
 claim_password = "CLAIM-ME"
 owners = [111, 222]
@@ -2563,6 +2589,8 @@ mode = "groups"
         let cfg = HotConfig::from_path(&path).unwrap();
         assert!(cfg.telegram_enabled());
         assert!(!cfg.telegram_streaming_enabled());
+        assert!(!cfg.telegram_accept_documents());
+        assert_eq!(cfg.telegram_max_document_size(), 42);
         assert_eq!(cfg.telegram_bot_token(), "token-from-file");
         assert_eq!(cfg.telegram_claim_password(), "CLAIM-ME");
         assert_eq!(cfg.telegram_owners(), vec![111, 222]);
