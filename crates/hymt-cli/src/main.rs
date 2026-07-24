@@ -13,7 +13,7 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 use hymt_cache::history::HistoryDB;
 use hymt_client::TranslationClient;
 use hymt_core::config::HotConfig;
-use hymt_core::language::resolve_target_language;
+use hymt_core::language::{resolve_target_language, DocumentTranslationPolicy};
 use hymt_core::language_spec::{language_spec_or_none, LanguageFamily};
 use hymt_core::model_profile::ModelProfile;
 use hymt_core::templates::{looks_like_cli_help_source, PromptOpts, TemplateType};
@@ -25,9 +25,10 @@ use hymt_translate::doc_translate::{run_doc_translation, DocTranslationOpts};
 use hymt_translate::docs::{run_info_command, run_man_command, ManInfoOpts};
 use hymt_translate::exec_wrapper::run_exec_command;
 use hymt_translate::precache::run_precache;
-use hymt_translate::{
+use hymt_translate::translate::{
     plan_translation, translate_file, translate_text, translate_text_stream_with_mode,
     write_translation_output, StreamEvent, StreamOutputMode, TranslationCtx, TranslationOutcome,
+    TranslationPlan,
 };
 
 // ── Known subcommand names (for smart routing) ────────────────────────────────
@@ -94,6 +95,14 @@ struct Cli {
     /// Log per-chunk pipeline timestamps on stderr
     #[arg(long = "debug-chunk-timing", global = true)]
     debug_chunk_timing: bool,
+
+    /// Submit every non-code paragraph, including text already in the target language
+    #[arg(long, global = true, conflicts_with = "no_language_detection")]
+    force_translate_all: bool,
+
+    /// Disable target-language detection and preserve no target-language paragraphs
+    #[arg(long, global = true, conflicts_with = "force_translate_all")]
+    no_language_detection: bool,
 
     /// Write top-level text/stdin/file translation to this file
     #[arg(short = 'o', long)]
@@ -500,6 +509,8 @@ async fn run() -> Result<()> {
         std::env::set_var("HYMT_DEBUG_CHUNK_TIMING", "1");
     }
     let concurrency_override = cli.concurrency;
+    let document_policy =
+        document_translation_policy(&config, cli.force_translate_all, cli.no_language_detection);
     let default_lang = config.primary_lang();
     let target_lang = cli.lang.as_deref().unwrap_or(&default_lang);
     let explicit_target = cli.lang.is_some();
@@ -518,6 +529,7 @@ async fn run() -> Result<()> {
         instructions: cli.instructions.as_deref().map(|s| vec![s.to_owned()]),
         format_type: cli.format_type.clone(),
         context: cli.ctx.clone(),
+        document_translation_policy: Some(document_policy),
     };
 
     match cli.cmd {
@@ -700,6 +712,44 @@ fn completeness_warn_only(config: &HotConfig, flag: bool) -> bool {
     flag || config.completeness_warn_only()
 }
 
+fn document_translation_policy(
+    config: &HotConfig,
+    force_translate_all: bool,
+    no_language_detection: bool,
+) -> DocumentTranslationPolicy {
+    if force_translate_all || no_language_detection {
+        DocumentTranslationPolicy::TranslateAll
+    } else {
+        config.document_translation_policy()
+    }
+}
+
+fn print_translation_plan(plan: &TranslationPlan) {
+    eprintln!(
+        "Plan: {} segments, ~{} tokens",
+        plan.segments.len(),
+        plan.source_tokens
+    );
+    if let Some(document_plan) = &plan.document_plan {
+        for section in document_plan
+            .sections
+            .iter()
+            .filter(|section| section.paragraph_index.is_some())
+        {
+            eprintln!(
+                "  paragraph {}: detected_lang={:?} target_ratio={:?} analyzed_chars={} \
+                 is_target_language={} should_translate={}",
+                section.paragraph_index.unwrap_or_default() + 1,
+                section.detected_lang,
+                section.target_ratio,
+                section.analyzed_chars,
+                section.is_target_language,
+                section.should_translate,
+            );
+        }
+    }
+}
+
 fn finalize_top_level_outcome(outcome: &TranslationOutcome, warn_only: bool) -> Result<()> {
     if !outcome.is_completeness_degraded() {
         return Ok(());
@@ -762,11 +812,7 @@ async fn run_translate_text(
 
     if flags.show_plan {
         let plan = plan_translation(&text, &effective_lang, config, &segmenter, template, opts)?;
-        eprintln!(
-            "Plan: {} segments, ~{} tokens",
-            plan.segments.len(),
-            plan.source_tokens
-        );
+        print_translation_plan(&plan);
         return Ok(());
     }
 
@@ -837,11 +883,7 @@ async fn run_translate_stdin(
 
     if flags.show_plan {
         let plan = plan_translation(&text, &effective_lang, config, &segmenter, template, opts)?;
-        eprintln!(
-            "Plan: {} segments, ~{} tokens",
-            plan.segments.len(),
-            plan.source_tokens
-        );
+        print_translation_plan(&plan);
         return Ok(());
     }
 
@@ -903,11 +945,7 @@ async fn run_translate_path(
 
     if flags.show_plan {
         let plan = plan_translation(&text, &effective_lang, config, &segmenter, template, opts)?;
-        eprintln!(
-            "Plan: {} segments, ~{} tokens",
-            plan.segments.len(),
-            plan.source_tokens
-        );
+        print_translation_plan(&plan);
         return Ok(());
     }
 
@@ -1657,10 +1695,48 @@ Options:\n  --source-id <SOURCE_ID>\n  --context-only\n";
     }
 
     #[test]
+    fn force_translate_all_flag_selects_translate_all_policy() {
+        let path = PathBuf::from("target").join(unique_test_name("hymt-cli-force-policy", "toml"));
+        let _cleanup = CleanupPath::File(path.clone());
+        std::fs::write(&path, "[translation]\n").unwrap();
+        let config = HotConfig::from_path(&path).unwrap();
+
+        let cli = Cli::try_parse_from(["hymt", "--force-translate-all", "hello"]).unwrap();
+        assert_eq!(
+            document_translation_policy(
+                &config,
+                cli.force_translate_all,
+                cli.no_language_detection
+            ),
+            hymt_core::language::DocumentTranslationPolicy::TranslateAll
+        );
+    }
+
+    #[test]
+    fn no_language_detection_flag_selects_translate_all_policy() {
+        let path = PathBuf::from("target").join(unique_test_name("hymt-cli-no-detection", "toml"));
+        let _cleanup = CleanupPath::File(path.clone());
+        std::fs::write(&path, "[translation]\n").unwrap();
+        let config = HotConfig::from_path(&path).unwrap();
+
+        let cli = Cli::try_parse_from(["hymt", "--no-language-detection", "hello"]).unwrap();
+        assert_eq!(
+            document_translation_policy(
+                &config,
+                cli.force_translate_all,
+                cli.no_language_detection
+            ),
+            hymt_core::language::DocumentTranslationPolicy::TranslateAll
+        );
+    }
+
+    #[test]
     fn concurrency_flag_parses_and_overrides_absent_by_default() {
         let default_cli = Cli::try_parse_from(["hymt", "hello"]).unwrap();
         assert_eq!(default_cli.concurrency, None);
         assert!(!default_cli.debug_chunk_timing);
+        assert!(!default_cli.force_translate_all);
+        assert!(!default_cli.no_language_detection);
 
         let cli = Cli::try_parse_from([
             "hymt",

@@ -69,6 +69,10 @@ config_version = 1
 timeout = 600
 # first_chunk_priority = false
 # debug_chunk_timing = false
+# For Chinese-family targets, preserve confidently target-language paragraphs.
+language_detection = true
+# Override detection and submit every non-code paragraph.
+force_translate_all = false
 
 [inference]
 # The client sends these OpenAI-compatible request fields. They match the
@@ -162,9 +166,26 @@ Use `--no-stream` if you need a fully buffered response.
 
 Force concurrency for one run with `--concurrency N` (overrides `[translation].concurrency`). Use `--debug-chunk-timing` (or `HYMT_DEBUG_CHUNK_TIMING=1`) to print per-chunk queue/request/first-token/complete timings on stderr while diagnosing multi-segment stalls.
 
-### Mixed-language documents: current limitation
+### Mixed-language document planning
 
-The Rust main translation paths do **not** yet use paragraph-level language analysis to skip paragraphs already written in the target language. For text, `batch`, and `translate-doc`, do not rely on automatic target-paragraph preservation: translatable text segments are sent to the model. Markdown-aware segmentation remains useful for structure, but it is not a mixed-language filtering guarantee. There is no legacy detector compatibility install path or CLI force/disable switch for that unfinished behavior.
+For Chinese-family targets (`zh`, `zh-Hant`, and `yue`), hymt plans a document paragraph by paragraph before it segments requests. With the default `[translation].language_detection = true`, a paragraph is preserved when its CJK-character ratio is over 60% and it has at least four analyzed non-whitespace characters. Its original UTF-8 bytes are carried through reconstruction unchanged; other paragraphs are sent to the model.
+
+Markdown headings, list items, blockquotes, and table rows use the same paragraph rule. Fenced code blocks and leading YAML frontmatter are always preserved. Very short, code-like, or otherwise ambiguous snippets are translated rather than classified as already-target-language. `--plan` for text, stdin, and file input prints each paragraph's detection metadata, including `is_target_language` and `should_translate`.
+
+Use either a one-run override or configuration to translate every non-code paragraph:
+
+```bash
+hymt --force-translate-all -l zh "English text\n\n已有中文段落"
+hymt --no-language-detection -l zh -f article.md
+```
+
+```toml
+[translation]
+language_detection = true      # default: use CJK detection for Chinese-family targets
+force_translate_all = false    # default: false; set true to translate all non-code paragraphs
+```
+
+`--force-translate-all`, `--no-language-detection`, `force_translate_all = true`, and `language_detection = false` all select the translate-all policy. An explicit `-l/--lang` chooses the target but does **not** disable preservation. Detection is intentionally CJK-only: for non-Chinese targets, hymt translates all non-code paragraphs rather than claiming general multilingual detection.
 
 ## Smart segmentation and cache reuse
 

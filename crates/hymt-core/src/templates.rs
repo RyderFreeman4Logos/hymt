@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::CoreError;
+use crate::language::DocumentTranslationPolicy;
 use crate::language_spec::{language_spec, LanguageFamily};
 
 // ── Template type ────────────────────────────────────────────────────────────
@@ -59,7 +60,7 @@ impl std::fmt::Display for TemplateType {
 
 // ── Options ──────────────────────────────────────────────────────────────────
 
-/// Extra parameters for prompt templates that require them.
+/// Extra options used to build translation prompts or plans.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PromptOpts {
     /// Terminology pairs for `Terminology` template: `(source_term, target_term)`.
@@ -72,6 +73,8 @@ pub struct PromptOpts {
     pub format_type: Option<String>,
     /// Background/context paragraph for `ContextAware` template.
     pub context: Option<String>,
+    /// Optional document-planning override; `None` uses the translation config.
+    pub document_translation_policy: Option<DocumentTranslationPolicy>,
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────

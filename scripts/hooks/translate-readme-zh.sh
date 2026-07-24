@@ -34,7 +34,7 @@ run_hymt() {
 }
 
 set +e
-run_hymt translate-doc "${readme_en}" -t zh -o "${readme_zh}"
+run_hymt translate-doc "${readme_en}" -l zh --output "${readme_zh}"
 status=$?
 set -e
 

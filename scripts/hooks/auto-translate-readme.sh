@@ -33,4 +33,4 @@ fi
 
 mkdir -p "${repo_root}/.git/just-tmp"
 env JUST_TEMPDIR="${repo_root}/.git/just-tmp" \
-  git commit --only -- README.zh-cn.md -m "docs(readme): auto-translate README.zh-cn.md"
+  git commit --only -m "docs(readme): auto-translate README.zh-cn.md" -- README.zh-cn.md

@@ -21,7 +21,9 @@ use hymt_cache::history::{format_duration, HistoryDB, SegmentCacheScope, TaskRec
 use hymt_client::TranslationClient;
 use hymt_core::completeness::{validate_completeness, CompletenessResult, CompletenessThresholds};
 use hymt_core::config::HotConfig;
-use hymt_core::language::{build_document_translation_plan, DocumentLanguagePlan, SectionKind};
+use hymt_core::language::{
+    plan_document_translation, DocumentLanguagePlan, DocumentTranslationPolicy, SectionKind,
+};
 use hymt_core::language_spec::{language_spec_or_none, LanguageFamily};
 use hymt_core::templates::{build_prompt, PromptOpts, TemplateType};
 use hymt_segment::Segmenter;
@@ -398,6 +400,14 @@ fn reconstruct_section_groups(
 
 // ── plan_translation ──────────────────────────────────────────────────────────
 
+pub(crate) fn effective_document_translation_policy(
+    opts: &PromptOpts,
+    config: &HotConfig,
+) -> DocumentTranslationPolicy {
+    opts.document_translation_policy
+        .unwrap_or_else(|| config.document_translation_policy())
+}
+
 /// Compute token budget and segment `text` into a [`TranslationPlan`].
 ///
 /// The available token budget per segment accounts for:
@@ -411,6 +421,27 @@ pub fn plan_translation(
     segmenter: &Segmenter,
     template: &TemplateType,
     opts: &PromptOpts,
+) -> Result<TranslationPlan> {
+    plan_translation_with_policy(
+        text,
+        target_lang,
+        config,
+        segmenter,
+        template,
+        opts,
+        effective_document_translation_policy(opts, config),
+    )
+}
+
+/// Compute a translation plan with an explicit document-language policy.
+pub fn plan_translation_with_policy(
+    text: &str,
+    target_lang: &str,
+    config: &HotConfig,
+    segmenter: &Segmenter,
+    template: &TemplateType,
+    opts: &PromptOpts,
+    document_policy: DocumentTranslationPolicy,
 ) -> Result<TranslationPlan> {
     let overhead_prompt = build_prompt("", target_lang, template, opts)?;
     let overhead_tokens = segmenter.count_tokens(&overhead_prompt);
@@ -447,7 +478,7 @@ pub fn plan_translation(
         });
     }
 
-    let doc_plan = build_document_translation_plan(text, target_lang);
+    let doc_plan = plan_document_translation(text, target_lang, document_policy);
     let source_tokens = segmenter.count_tokens(text);
     let (segments, indexes, groups) = segment_document_plan(&doc_plan, segmenter, available)?;
     for (index, segment) in segments.iter().enumerate() {
@@ -540,8 +571,17 @@ pub(crate) fn segment_cache_hash(text: &str) -> String {
     hex::encode(h.finalize())
 }
 
-pub(crate) fn template_options_hash(opts: &PromptOpts) -> String {
+pub(crate) fn template_options_hash(
+    opts: &PromptOpts,
+    document_policy: DocumentTranslationPolicy,
+) -> String {
     let mut entries: Vec<(&str, serde_json::Value)> = Vec::new();
+    if document_policy == DocumentTranslationPolicy::TranslateAll {
+        entries.push((
+            "document_translation_policy",
+            serde_json::json!(document_policy),
+        ));
+    }
     if let Some(terms) = &opts.terms {
         let v: Vec<_> = terms.iter().map(|(a, b)| [a, b]).collect();
         entries.push(("terms", serde_json::json!(v)));
@@ -1027,7 +1067,10 @@ pub async fn translate_text(
         plan.segment_count()
     );
 
-    let options_hash = template_options_hash(opts);
+    let options_hash = template_options_hash(
+        opts,
+        effective_document_translation_policy(opts, ctx.config),
+    );
     let profile_id = ctx.config.model_profile()?.id();
     let cache_scope = SegmentCacheScope {
         target_lang,
@@ -1271,7 +1314,10 @@ pub async fn translate_text_stream_with_mode(
         plan.segment_count()
     );
 
-    let options_hash = template_options_hash(opts);
+    let options_hash = template_options_hash(
+        opts,
+        effective_document_translation_policy(opts, ctx.config),
+    );
     let profile_id = ctx.config.model_profile()?.id();
     let cache_scope = SegmentCacheScope {
         target_lang,
@@ -2238,7 +2284,25 @@ max_retries = 1
     #[test]
     fn template_options_hash_empty_returns_empty() {
         let opts = PromptOpts::default();
-        assert_eq!(template_options_hash(&opts), "");
+        assert_eq!(
+            template_options_hash(
+                &opts,
+                DocumentTranslationPolicy::SkipHighConfidenceTargetParagraphs
+            ),
+            ""
+        );
+    }
+
+    #[test]
+    fn template_options_hash_differs_for_document_policy() {
+        let opts = PromptOpts::default();
+        assert_ne!(
+            template_options_hash(
+                &opts,
+                DocumentTranslationPolicy::SkipHighConfidenceTargetParagraphs
+            ),
+            template_options_hash(&opts, DocumentTranslationPolicy::TranslateAll),
+        );
     }
 
     #[test]
@@ -2247,7 +2311,16 @@ max_retries = 1
             style: Some("formal".to_owned()),
             ..Default::default()
         };
-        assert_eq!(template_options_hash(&opts), template_options_hash(&opts));
+        assert_eq!(
+            template_options_hash(
+                &opts,
+                DocumentTranslationPolicy::SkipHighConfidenceTargetParagraphs
+            ),
+            template_options_hash(
+                &opts,
+                DocumentTranslationPolicy::SkipHighConfidenceTargetParagraphs
+            )
+        );
     }
 
     #[test]
@@ -2260,7 +2333,16 @@ max_retries = 1
             style: Some("informal".to_owned()),
             ..Default::default()
         };
-        assert_ne!(template_options_hash(&a), template_options_hash(&b));
+        assert_ne!(
+            template_options_hash(
+                &a,
+                DocumentTranslationPolicy::SkipHighConfidenceTargetParagraphs
+            ),
+            template_options_hash(
+                &b,
+                DocumentTranslationPolicy::SkipHighConfidenceTargetParagraphs
+            )
+        );
     }
 
     // ── plan_translation token budget ─────────────────────────────────────────
@@ -2313,6 +2395,170 @@ max_retries = 1
         .unwrap();
         assert_eq!(plan.segment_count(), 1);
         assert_eq!(plan.segments[0], "Hello world.");
+    }
+
+    #[test]
+    fn plan_skips_high_confidence_chinese_paragraphs_and_reconstructs_them_verbatim() {
+        let seg = fallback_segmenter();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            "[translation]\ncontext_window = 4096\nmax_output_tokens = 512\n",
+        )
+        .unwrap();
+        let cfg = hymt_core::config::HotConfig::from_path(&cfg_path).unwrap();
+        let english = "Translate this English paragraph.";
+        let preserved = "## 中文标题\n\n- 这是足够长的中文列表项，必须逐字保留。\n\n> 这是足够长的中文引用，必须逐字保留。\n\n| 列一 | 列二 |\n| --- | --- |\n| 这是一段足够长的中文表格文字 | 更多中文内容 |\n\n```rust\nlet code = \"unchanged\";\n```\n";
+        let source = format!("---\ntitle: Example\n---\n\n{english}\n\n{preserved}");
+
+        let plan = plan_translation(
+            &source,
+            "zh",
+            &cfg,
+            &seg,
+            &TemplateType::Default,
+            &PromptOpts::default(),
+        )
+        .unwrap();
+
+        assert!(
+            plan.segments
+                .iter()
+                .all(|segment| !segment.contains("中文")),
+            "target-language paragraphs must not be sent to the model: {:?}",
+            plan.segments
+        );
+        let document_plan = plan.document_plan.as_ref().unwrap();
+        let skipped: Vec<_> = document_plan
+            .sections
+            .iter()
+            .filter(|section| section.is_target_language)
+            .collect();
+        assert!(
+            !skipped.is_empty(),
+            "target detection metadata must reach the plan"
+        );
+        assert!(skipped.iter().all(|section| !section.should_translate));
+
+        let reconstructed = plan.reconstruct(&vec![
+            "Translated English.".to_owned();
+            plan.segment_count()
+        ]);
+        assert_eq!(
+            reconstructed,
+            format!("---\ntitle: Example\n---\n\nTranslated English.\n\n{preserved}")
+        );
+    }
+
+    #[test]
+    fn plan_force_translate_all_sends_target_language_paragraphs_to_model() {
+        let seg = fallback_segmenter();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            "[translation]\ncontext_window = 4096\nmax_output_tokens = 512\nforce_translate_all = true\n",
+        )
+        .unwrap();
+        let cfg = hymt_core::config::HotConfig::from_path(&cfg_path).unwrap();
+        let source =
+            "English source paragraph.\n\n这是一段足够长的中文段落，用于验证强制重新翻译。\n";
+
+        let plan = plan_translation(
+            source,
+            "zh",
+            &cfg,
+            &seg,
+            &TemplateType::Default,
+            &PromptOpts::default(),
+        )
+        .unwrap();
+
+        assert!(
+            plan.segments
+                .iter()
+                .any(|segment| segment.contains("中文段落")),
+            "force_translate_all must submit already-target paragraphs: {:?}",
+            plan.segments
+        );
+        assert!(plan
+            .document_plan
+            .as_ref()
+            .unwrap()
+            .sections
+            .iter()
+            .filter(|section| section.kind == SectionKind::Paragraph)
+            .all(|section| section.should_translate));
+    }
+
+    #[test]
+    fn plan_without_language_detection_sends_target_language_paragraphs_to_model() {
+        let seg = fallback_segmenter();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            "[translation]\ncontext_window = 4096\nmax_output_tokens = 512\nlanguage_detection = false\n",
+        )
+        .unwrap();
+        let cfg = hymt_core::config::HotConfig::from_path(&cfg_path).unwrap();
+        let source = "这是一段足够长的中文段落，用于验证禁用检测。\n";
+
+        let plan = plan_translation(
+            source,
+            "zh",
+            &cfg,
+            &seg,
+            &TemplateType::Default,
+            &PromptOpts::default(),
+        )
+        .unwrap();
+
+        assert!(plan
+            .segments
+            .iter()
+            .any(|segment| segment.contains("中文段落")));
+        assert!(plan
+            .document_plan
+            .as_ref()
+            .unwrap()
+            .sections
+            .iter()
+            .filter(|section| section.kind == SectionKind::Paragraph)
+            .all(|section| section.should_translate));
+    }
+
+    #[test]
+    fn plan_prompt_policy_override_sends_target_language_paragraphs_to_model() {
+        let seg = fallback_segmenter();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            "[translation]\ncontext_window = 4096\nmax_output_tokens = 512\n",
+        )
+        .unwrap();
+        let cfg = hymt_core::config::HotConfig::from_path(&cfg_path).unwrap();
+        let opts = PromptOpts {
+            document_translation_policy: Some(DocumentTranslationPolicy::TranslateAll),
+            ..PromptOpts::default()
+        };
+
+        let plan = plan_translation(
+            "这是一段足够长的中文段落，用于验证命令行覆盖。\n",
+            "zh",
+            &cfg,
+            &seg,
+            &TemplateType::Default,
+            &opts,
+        )
+        .unwrap();
+
+        assert!(plan
+            .segments
+            .iter()
+            .any(|segment| segment.contains("中文段落")));
     }
 
     #[test]

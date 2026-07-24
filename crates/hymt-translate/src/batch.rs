@@ -19,7 +19,8 @@ use hymt_segment::Segmenter;
 
 use crate::doc_translate::{build_output_path, target_lang_path_suffix};
 use crate::translate::{
-    plan_translation, segment_cache_hash, template_options_hash, translate_text, TranslationCtx,
+    effective_document_translation_policy, plan_translation, segment_cache_hash,
+    template_options_hash, translate_text, TranslationCtx,
 };
 
 // Supported source file extensions
@@ -134,7 +135,10 @@ pub fn build_batch_plan(
     eprintln!("Scanned {} files in {}", source_paths.len(), root.display());
 
     let template_name = template.as_str();
-    let options_hash = template_options_hash(prompt_opts);
+    let options_hash = template_options_hash(
+        prompt_opts,
+        effective_document_translation_policy(prompt_opts, config),
+    );
     let profile_id = config.model_profile()?.id();
     let mut files = Vec::new();
     let mut skipped = Vec::new();

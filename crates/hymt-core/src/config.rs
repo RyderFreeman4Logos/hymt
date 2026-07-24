@@ -8,6 +8,7 @@ use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
 use crate::error::CoreError;
+use crate::language::DocumentTranslationPolicy;
 use crate::model_profile::ModelProfile;
 
 pub const DEFAULT_CONFIG: &str = r#"[endpoint]
@@ -38,6 +39,10 @@ first_chunk_priority = false
 # Set to 0 to disable the hard cap (budget is then only expansion/context-limited).
 max_source_tokens_per_segment = 1024
 debug_chunk_timing = false
+# Preserve high-confidence target-language paragraphs for Chinese-family targets.
+language_detection = true
+# Submit every non-code paragraph, including already-target-language paragraphs.
+force_translate_all = false
 
 [language]
 primary = "zh"
@@ -760,6 +765,17 @@ impl HotConfig {
             return true;
         }
         self.get_bool("translation", "debug_chunk_timing", false)
+    }
+
+    /// Selects whether document planning detects and preserves already-target text.
+    pub fn document_translation_policy(&self) -> DocumentTranslationPolicy {
+        if self.get_bool("translation", "force_translate_all", false)
+            || !self.get_bool("translation", "language_detection", true)
+        {
+            DocumentTranslationPolicy::TranslateAll
+        } else {
+            DocumentTranslationPolicy::SkipHighConfidenceTargetParagraphs
+        }
     }
 
     // ── language ────────────────────────────────────────────────────────────
