@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_stream::StreamExt as _;
 
-use hymt_cache::history::{format_duration, HistoryDB, TaskRecord};
+use hymt_cache::history::{format_duration, HistoryDB, SegmentCacheScope, TaskRecord};
 use hymt_client::TranslationClient;
 use hymt_core::completeness::{validate_completeness, CompletenessResult, CompletenessThresholds};
 use hymt_core::config::HotConfig;
@@ -1011,6 +1011,13 @@ pub async fn translate_text(
     );
 
     let options_hash = template_options_hash(opts);
+    let profile_id = ctx.config.model_profile()?.id();
+    let cache_scope = SegmentCacheScope {
+        target_lang,
+        template_type: template_name,
+        options_hash: &options_hash,
+        profile_id,
+    };
     let seg_hashes: Vec<String> = plan
         .segments
         .iter()
@@ -1031,10 +1038,7 @@ pub async fn translate_text(
     let mut missing: Vec<usize> = Vec::new();
 
     for (i, hash) in seg_hashes.iter().enumerate() {
-        match ctx
-            .history
-            .find_segment_cached(hash, target_lang, template_name, &options_hash)
-        {
+        match ctx.history.find_segment_cached(hash, cache_scope) {
             Ok(Some(cached))
                 if cached_segment_is_complete(
                     i,
@@ -1090,14 +1094,10 @@ pub async fn translate_text(
                 degraded_segments.push(idx + 1);
             }
             let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-            if let Err(e) = ctx.history.store_segment_cache(
-                &seg_hashes[idx],
-                target_lang,
-                template_name,
-                &translated,
-                &now,
-                &options_hash,
-            ) {
+            if let Err(e) =
+                ctx.history
+                    .store_segment_cache(&seg_hashes[idx], cache_scope, &translated, &now)
+            {
                 eprintln!("Warning: cache store error: {e}");
             }
             translations[idx] = Some(translated);
@@ -1141,6 +1141,7 @@ pub async fn translate_text(
                 Some(m)
             }
         },
+        profile_id: profile_id.to_owned(),
         tokens_per_second: tps,
         input_chars: text.len() as i64,
         output_chars: translated.len() as i64,
@@ -1254,6 +1255,13 @@ pub async fn translate_text_stream_with_mode(
     );
 
     let options_hash = template_options_hash(opts);
+    let profile_id = ctx.config.model_profile()?.id();
+    let cache_scope = SegmentCacheScope {
+        target_lang,
+        template_type: template_name,
+        options_hash: &options_hash,
+        profile_id,
+    };
     let seg_hashes: Vec<String> = plan
         .segments
         .iter()
@@ -1272,10 +1280,7 @@ pub async fn translate_text_stream_with_mode(
     let mut missing: Vec<usize> = Vec::new();
 
     for (i, hash) in seg_hashes.iter().enumerate() {
-        match ctx
-            .history
-            .find_segment_cached(hash, target_lang, template_name, &options_hash)
-        {
+        match ctx.history.find_segment_cached(hash, cache_scope) {
             Ok(Some(cached))
                 if cached_segment_is_complete(
                     i,
@@ -1410,11 +1415,9 @@ pub async fn translate_text_stream_with_mode(
                 let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
                 if let Err(e) = ctx.history.store_segment_cache(
                     &seg_hashes[idx],
-                    target_lang,
-                    template_name,
+                    cache_scope,
                     &translated,
                     &now,
-                    &options_hash,
                 ) {
                     eprintln!("Warning: cache store error: {e}");
                 }
@@ -1448,11 +1451,9 @@ pub async fn translate_text_stream_with_mode(
                     let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
                     if let Err(e) = ctx.history.store_segment_cache(
                         &seg_hashes[idx],
-                        target_lang,
-                        template_name,
+                        cache_scope,
                         &translated,
                         &now,
-                        &options_hash,
                     ) {
                         eprintln!("Warning: cache store error: {e}");
                     }
@@ -1474,11 +1475,9 @@ pub async fn translate_text_stream_with_mode(
                 let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
                 if let Err(e) = ctx.history.store_segment_cache(
                     &seg_hashes[idx],
-                    target_lang,
-                    template_name,
+                    cache_scope,
                     &translated,
                     &now,
-                    &options_hash,
                 ) {
                     eprintln!("Warning: cache store error: {e}");
                 }
@@ -1530,11 +1529,9 @@ pub async fn translate_text_stream_with_mode(
                 let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
                 if let Err(e) = ctx.history.store_segment_cache(
                     &seg_hashes[idx],
-                    target_lang,
-                    template_name,
+                    cache_scope,
                     &translated,
                     &now,
-                    &options_hash,
                 ) {
                     eprintln!("Warning: cache store error: {e}");
                 }
@@ -1591,6 +1588,7 @@ pub async fn translate_text_stream_with_mode(
                 Some(m)
             }
         },
+        profile_id: profile_id.to_owned(),
         tokens_per_second: tps,
         input_chars: text.len() as i64,
         output_chars: translated.len() as i64,
@@ -2752,11 +2750,14 @@ Bravo one text carries enough source material for cache validation and ordering 
         history
             .store_segment_cache(
                 &segment_cache_hash(&plan.segments[0]),
-                "zh",
-                TemplateType::Default.as_str(),
+                SegmentCacheScope {
+                    target_lang: "zh",
+                    template_type: TemplateType::Default.as_str(),
+                    options_hash: "",
+                    profile_id: "generic",
+                },
                 &translations[0],
                 &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
-                "",
             )
             .unwrap();
 
@@ -2976,11 +2977,14 @@ Bravo one text carries enough source material for cache validation and ordering 
         history
             .store_segment_cache(
                 &segment_cache_hash(&plan.segments[0]),
-                "zh",
-                TemplateType::Default.as_str(),
+                SegmentCacheScope {
+                    target_lang: "zh",
+                    template_type: TemplateType::Default.as_str(),
+                    options_hash: "",
+                    profile_id: "generic",
+                },
                 &translations[0],
                 &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
-                "",
             )
             .unwrap();
 
@@ -3025,11 +3029,14 @@ Bravo one text carries enough source material for cache validation and ordering 
         history
             .store_segment_cache(
                 &segment_cache_hash(&plan.segments[0]),
-                "zh",
-                TemplateType::Default.as_str(),
+                SegmentCacheScope {
+                    target_lang: "zh",
+                    template_type: TemplateType::Default.as_str(),
+                    options_hash: "",
+                    profile_id: "generic",
+                },
                 &translations[0],
                 &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
-                "",
             )
             .unwrap();
 

@@ -47,6 +47,8 @@ just install-no-telegram
 url = "http://100.78.159.38:8401/v1"
 api_key = ""
 model = ""
+# 选择一个受支持且经过测试的 Hy-MT2 profile；未覆盖的端点使用 "generic"。
+profile = "hy_mt2_7b"
 
 [translation]
 # `llama-server -c` 是服务总上下文。两个示例服务的每请求上限都约为
@@ -83,7 +85,20 @@ warn_only = false
 divergence_threshold = 2.0
 ```
 
-该配置支持热加载。长时间运行的工作流无需重启即可应用更改。
+该配置支持热加载，但 `[endpoint].profile` 会在启动时固定（参见[模型 Profile](#模型-profileendpointprofile)）。长时间运行的工作流无需重启即可应用其他更改。
+
+## 模型 Profile（`[endpoint].profile`）
+
+请为 Hy-MT2 端点显式设置 `[endpoint].profile`。可识别的值及覆盖范围如下：
+
+| 值 | 覆盖范围 |
+|---|---|
+| `hy_mt2_1_8b` | 经过测试的 Hy-MT2 1.8B profile，具有固定的上游分词器来源和 profile 生成默认值。 |
+| `hy_mt2_7b` | 经过测试的 Hy-MT2 7B profile，具有固定的上游分词器来源和 profile 生成默认值。 |
+| `hy_mt2_30b_a3b` | 经过测试的 Hy-MT2 30B-A3B profile，具有固定的上游分词器来源和 profile 生成默认值。 |
+| `generic`（或省略） | 未建档 profile 模式：没有经过测试的 Hy-MT2 分词器或生成默认值覆盖。 |
+
+Profile 会在**进程启动时固定**。其他配置仍然支持热加载；运行中修改磁盘上的 `[endpoint].profile` 会被忽略，必须重启 `hymt` 才会使用其他 profile。分段缓存键和翻译历史记录会保留规范的 profile ID，因此结果不会在 profile 之间共享。
 
 ## 快速开始
 

@@ -479,6 +479,7 @@ fn env_flag_enabled(name: &str) -> bool {
 struct ConfigState {
     data: toml::Table,
     mtime: Option<SystemTime>,
+    profile: Option<ModelProfile>,
     uses_legacy_generation_scalars: bool,
 }
 
@@ -487,12 +488,16 @@ impl ConfigState {
         Self {
             data: toml::Table::new(),
             mtime: None,
+            profile: None,
             uses_legacy_generation_scalars: false,
         }
     }
 }
 
 /// Hot-reloadable TOML configuration.
+///
+/// `[endpoint].profile` is pinned when this object is created so a running
+/// session cannot mix a startup tokenizer with reloaded model defaults.
 #[derive(Debug, Clone)]
 pub struct HotConfig {
     path: PathBuf,
@@ -560,13 +565,17 @@ impl HotConfig {
         self.get_str("endpoint", "model", "")
     }
 
-    /// Explicit Hy-MT2 profile selected for this endpoint.
+    /// Explicit Hy-MT2 profile selected when this config session started.
     ///
-    /// An omitted profile enters [`ModelProfile::Generic`] mode rather than
-    /// inferring a family member from a mutable model name or filename.
+    /// Profile changes on disk require a new [`HotConfig`] and are intentionally
+    /// ignored by hot reload so the tokenizer and generation defaults stay aligned.
     pub fn model_profile(&self) -> Result<ModelProfile, CoreError> {
-        let state = self.state.read().unwrap();
-        model_profile_from_toml(&state.data)
+        Ok(self
+            .state
+            .read()
+            .unwrap()
+            .profile
+            .unwrap_or(ModelProfile::Generic))
     }
 
     // ── translation ─────────────────────────────────────────────────────────
@@ -643,7 +652,7 @@ impl HotConfig {
     /// Reads and validates the backend-neutral generation overrides.
     pub fn generation_settings(&self) -> Result<GenerationSettings, CoreError> {
         let state = self.state.read().unwrap();
-        let profile = model_profile_from_toml(&state.data)?;
+        let profile = state.profile.unwrap_or(ModelProfile::Generic);
         let overrides = GenerationSettings::from_toml(&state.data)?;
         generation_backend_from_toml(&state.data)?.validate_settings(&overrides)?;
         let settings = profile.generation_defaults().with_overrides(overrides);
@@ -870,7 +879,13 @@ impl HotConfig {
         let content = std::fs::read_to_string(&self.path)?;
         let data: toml::Table = toml::from_str(&content)
             .map_err(|e| CoreError::Config(format!("{}: {}", self.path.display(), e)))?;
-        let profile = model_profile_from_toml(&data)?;
+        let profile = self
+            .state
+            .read()
+            .unwrap()
+            .profile
+            .map(Ok)
+            .unwrap_or_else(|| model_profile_from_toml(&data))?;
         let overrides = GenerationSettings::from_toml(&data)?;
         generation_backend_from_toml(&data)?.validate_settings(&overrides)?;
         let settings = profile.generation_defaults().with_overrides(overrides);
@@ -880,6 +895,9 @@ impl HotConfig {
             .and_then(|m| m.modified())
             .ok();
         let mut state = self.state.write().unwrap();
+        if state.profile.is_none() {
+            state.profile = Some(profile);
+        }
         state.data = data;
         state.mtime = mtime;
         state.uses_legacy_generation_scalars = uses_legacy_generation_scalars;
@@ -1469,11 +1487,30 @@ url = "http://localhost:8401/v1/""#,
         let cfg = HotConfig::from_path(&path).unwrap();
         assert_eq!(cfg.concurrency(), 1);
 
-        // Overwrite and force a different mtime
         std::thread::sleep(std::time::Duration::from_millis(10));
         fs::write(&path, "[translation]\nconcurrency = 8").unwrap();
         cfg.maybe_reload().unwrap();
         assert_eq!(cfg.concurrency(), 8);
+    }
+
+    #[test]
+    fn model_profile_is_pinned_when_config_reloads() {
+        use crate::model_profile::ModelProfile;
+
+        let path = temp_config_path("pinned_profile");
+        fs::write(&path, "[endpoint]\nprofile = \"hy_mt2_7b\"").unwrap();
+        let cfg = HotConfig::from_path(&path).unwrap();
+        assert_eq!(cfg.model_profile().unwrap(), ModelProfile::HyMt2_7b);
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        fs::write(&path, "[endpoint]\nprofile = \"hy_mt2_30b_a3b\"").unwrap();
+        assert!(cfg.maybe_reload().unwrap());
+
+        assert_eq!(
+            cfg.model_profile().unwrap(),
+            ModelProfile::HyMt2_7b,
+            "profile changes require a new HotConfig/session"
+        );
     }
 
     #[test]

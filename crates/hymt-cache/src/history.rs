@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     output_chars INTEGER NOT NULL,
     output_text TEXT,
     input_hash TEXT,
-    config_version INTEGER DEFAULT 1
+    config_version INTEGER DEFAULT 1,
+    profile_id TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS segment_cache (
@@ -32,9 +33,10 @@ CREATE TABLE IF NOT EXISTS segment_cache (
     target_lang TEXT NOT NULL,
     template_type TEXT NOT NULL,
     options_hash TEXT NOT NULL DEFAULT '',
+    profile_id TEXT NOT NULL DEFAULT '',
     translated_text TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    PRIMARY KEY (content_hash, target_lang, template_type, options_hash)
+    PRIMARY KEY (content_hash, target_lang, template_type, options_hash, profile_id)
 );
 ";
 
@@ -52,12 +54,26 @@ pub struct TaskRecord {
     pub target_lang: String,
     pub template_type: String,
     pub model: Option<String>,
+    /// Stable endpoint model-profile identifier pinned for this translation.
+    pub profile_id: String,
     pub tokens_per_second: f64,
     pub input_chars: i64,
     pub output_chars: i64,
     pub output_text: Option<String>,
     pub input_hash: Option<String>,
     pub config_version: i64,
+}
+
+/// Cache-key dimensions shared by every segment in one translation session.
+///
+/// The profile ID is deliberately part of this scope so results generated with
+/// different tokenizers or generation defaults cannot collide.
+#[derive(Debug, Clone, Copy)]
+pub struct SegmentCacheScope<'a> {
+    pub target_lang: &'a str,
+    pub template_type: &'a str,
+    pub options_hash: &'a str,
+    pub profile_id: &'a str,
 }
 
 #[derive(Debug, Clone)]
@@ -150,8 +166,8 @@ impl HistoryDB {
                 input_tokens, output_tokens, segments, concurrency,
                 source_lang, target_lang, template_type, model,
                 tokens_per_second, input_chars, output_chars,
-                output_text, input_hash, config_version
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                output_text, input_hash, config_version, profile_id
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
             rusqlite::params![
                 record.started_at,
                 record.finished_at,
@@ -170,6 +186,7 @@ impl HistoryDB {
                 record.output_text,
                 record.input_hash,
                 record.config_version,
+                record.profile_id,
             ],
         )?;
         Ok(())
@@ -178,9 +195,7 @@ impl HistoryDB {
     pub fn find_segment_cached(
         &self,
         content_hash: &str,
-        target_lang: &str,
-        template_type: &str,
-        options_hash: &str,
+        scope: SegmentCacheScope<'_>,
     ) -> Result<Option<String>, CacheError> {
         let conn = match self.connect_if_exists()? {
             Some(c) => c,
@@ -190,9 +205,15 @@ impl HistoryDB {
         let result = conn.query_row(
             "SELECT translated_text FROM segment_cache
              WHERE content_hash = ?1 AND target_lang = ?2
-               AND template_type = ?3 AND options_hash = ?4
+               AND template_type = ?3 AND options_hash = ?4 AND profile_id = ?5
              LIMIT 1",
-            rusqlite::params![content_hash, target_lang, template_type, options_hash],
+            rusqlite::params![
+                content_hash,
+                scope.target_lang,
+                scope.template_type,
+                scope.options_hash,
+                scope.profile_id
+            ],
             |row| row.get::<_, String>(0),
         );
         match result {
@@ -206,9 +227,7 @@ impl HistoryDB {
     pub fn find_cached_segment_hashes(
         &self,
         content_hashes: &[&str],
-        target_lang: &str,
-        template_type: &str,
-        options_hash: &str,
+        scope: SegmentCacheScope<'_>,
     ) -> Result<HashSet<String>, CacheError> {
         if content_hashes.is_empty() {
             return Ok(HashSet::new());
@@ -236,20 +255,23 @@ impl HistoryDB {
             let tl_idx = chunk.len() + 1;
             let tt_idx = chunk.len() + 2;
             let oh_idx = chunk.len() + 3;
+            let profile_idx = chunk.len() + 4;
             let sql = format!(
                 "SELECT content_hash FROM segment_cache
                  WHERE content_hash IN ({placeholders})
                    AND target_lang = ?{tl_idx}
                    AND template_type = ?{tt_idx}
-                   AND options_hash = ?{oh_idx}"
+                   AND options_hash = ?{oh_idx}
+                   AND profile_id = ?{profile_idx}"
             );
             let mut params: Vec<rusqlite::types::Value> = chunk
                 .iter()
                 .map(|h| rusqlite::types::Value::Text(h.to_string()))
                 .collect();
-            params.push(rusqlite::types::Value::Text(target_lang.to_owned()));
-            params.push(rusqlite::types::Value::Text(template_type.to_owned()));
-            params.push(rusqlite::types::Value::Text(options_hash.to_owned()));
+            params.push(rusqlite::types::Value::Text(scope.target_lang.to_owned()));
+            params.push(rusqlite::types::Value::Text(scope.template_type.to_owned()));
+            params.push(rusqlite::types::Value::Text(scope.options_hash.to_owned()));
+            params.push(rusqlite::types::Value::Text(scope.profile_id.to_owned()));
 
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt
@@ -265,27 +287,26 @@ impl HistoryDB {
     pub fn store_segment_cache(
         &self,
         content_hash: &str,
-        target_lang: &str,
-        template_type: &str,
+        scope: SegmentCacheScope<'_>,
         translated_text: &str,
         created_at: &str,
-        options_hash: &str,
     ) -> Result<(), CacheError> {
         let conn = self.connect_create()?;
         ensure_schema(&conn)?;
         conn.execute(
             "INSERT INTO segment_cache
-                 (content_hash, target_lang, template_type, options_hash, translated_text, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(content_hash, target_lang, template_type, options_hash)
+                 (content_hash, target_lang, template_type, options_hash, profile_id, translated_text, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(content_hash, target_lang, template_type, options_hash, profile_id)
              DO UPDATE SET
                  translated_text = excluded.translated_text,
                  created_at = excluded.created_at",
             rusqlite::params![
                 content_hash,
-                target_lang,
-                template_type,
-                options_hash,
+                scope.target_lang,
+                scope.template_type,
+                scope.options_hash,
+                scope.profile_id,
                 translated_text,
                 created_at,
             ],
@@ -594,15 +615,28 @@ fn migrate_tasks_columns(conn: &Connection) -> Result<(), CacheError> {
     if !cols.contains("config_version") {
         conn.execute_batch("ALTER TABLE tasks ADD COLUMN config_version INTEGER DEFAULT 1")?;
     }
+    if !cols.contains("profile_id") {
+        conn.execute_batch("ALTER TABLE tasks ADD COLUMN profile_id TEXT NOT NULL DEFAULT ''")?;
+    }
     Ok(())
 }
 
 fn migrate_segment_cache_columns(conn: &Connection) -> Result<(), CacheError> {
     let cols = table_column_names(conn, "segment_cache")?;
+    let mut rebuild_primary_key = false;
     if !cols.contains("options_hash") {
         conn.execute_batch(
             "ALTER TABLE segment_cache ADD COLUMN options_hash TEXT NOT NULL DEFAULT ''",
         )?;
+        rebuild_primary_key = true;
+    }
+    if !cols.contains("profile_id") {
+        conn.execute_batch(
+            "ALTER TABLE segment_cache ADD COLUMN profile_id TEXT NOT NULL DEFAULT ''",
+        )?;
+        rebuild_primary_key = true;
+    }
+    if rebuild_primary_key {
         rebuild_segment_cache_pk(conn)?;
     }
     Ok(())
@@ -615,14 +649,15 @@ fn rebuild_segment_cache_pk(conn: &Connection) -> Result<(), CacheError> {
              target_lang TEXT NOT NULL,
              template_type TEXT NOT NULL,
              options_hash TEXT NOT NULL DEFAULT '',
+             profile_id TEXT NOT NULL DEFAULT '',
              translated_text TEXT NOT NULL,
              created_at TEXT NOT NULL,
-             PRIMARY KEY (content_hash, target_lang, template_type, options_hash)
+             PRIMARY KEY (content_hash, target_lang, template_type, options_hash, profile_id)
          );
          INSERT OR REPLACE INTO segment_cache_new
-             (content_hash, target_lang, template_type, options_hash, translated_text, created_at)
+             (content_hash, target_lang, template_type, options_hash, profile_id, translated_text, created_at)
          SELECT content_hash, target_lang, template_type,
-                COALESCE(options_hash, ''), translated_text, created_at
+                COALESCE(options_hash, ''), COALESCE(profile_id, ''), translated_text, created_at
          FROM segment_cache;
          DROP TABLE segment_cache;
          ALTER TABLE segment_cache_new RENAME TO segment_cache;",
@@ -652,6 +687,9 @@ fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
         target_lang: row.get("target_lang")?,
         template_type: row.get("template_type")?,
         model: row.get("model")?,
+        profile_id: row
+            .get::<_, Option<String>>("profile_id")?
+            .unwrap_or_default(),
         tokens_per_second: row.get("tokens_per_second")?,
         input_chars: row.get("input_chars")?,
         output_chars: row.get("output_chars")?,
@@ -778,6 +816,7 @@ mod tests {
             target_lang: "en".to_owned(),
             template_type: "default".to_owned(),
             model: None,
+            profile_id: "hy_mt2_7b".to_owned(),
             tokens_per_second: tps,
             input_chars: 500,
             output_chars: 400,
@@ -795,6 +834,7 @@ mod tests {
         let records = db.fetch_recent(Some(10)).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].target_lang, "en");
+        assert_eq!(records[0].profile_id, "hy_mt2_7b");
         assert!((records[0].tokens_per_second - 50.0).abs() < 1e-9);
     }
 
@@ -828,38 +868,46 @@ mod tests {
     }
 
     #[test]
-    fn test_segment_cache_roundtrip() {
+    fn test_segment_cache_is_scoped_to_model_profile() {
         let tmp = TempDir::new().unwrap();
         let db = HistoryDB::new(tmp.path().join("history.db"));
-        db.store_segment_cache(
-            "hash1",
-            "en",
-            "default",
-            "translation",
-            "2024-01-01T00:00:00Z",
-            "",
-        )
-        .unwrap();
-        let found = db
-            .find_segment_cached("hash1", "en", "default", "")
+        let seven_b = SegmentCacheScope {
+            target_lang: "en",
+            template_type: "default",
+            options_hash: "",
+            profile_id: "hy_mt2_7b",
+        };
+        let thirty_b = SegmentCacheScope {
+            profile_id: "hy_mt2_30b_a3b",
+            ..seven_b
+        };
+        db.store_segment_cache("hash1", seven_b, "translation", "2024-01-01T00:00:00Z")
             .unwrap();
+        let found = db.find_segment_cached("hash1", seven_b).unwrap();
         assert_eq!(found.as_deref(), Some("translation"));
-        let miss = db
-            .find_segment_cached("hash1", "fr", "default", "")
-            .unwrap();
-        assert!(miss.is_none());
+        let miss = db.find_segment_cached("hash1", thirty_b).unwrap();
+        assert!(
+            miss.is_none(),
+            "a different profile must not reuse this cache entry"
+        );
     }
 
     #[test]
     fn test_find_cached_segment_hashes() {
         let tmp = TempDir::new().unwrap();
         let db = HistoryDB::new(tmp.path().join("history.db"));
-        db.store_segment_cache("aaa", "en", "default", "t1", "2024-01-01T00:00:00Z", "")
+        let scope = SegmentCacheScope {
+            target_lang: "en",
+            template_type: "default",
+            options_hash: "",
+            profile_id: "hy_mt2_7b",
+        };
+        db.store_segment_cache("aaa", scope, "t1", "2024-01-01T00:00:00Z")
             .unwrap();
-        db.store_segment_cache("bbb", "en", "default", "t2", "2024-01-01T00:00:00Z", "")
+        db.store_segment_cache("bbb", scope, "t2", "2024-01-01T00:00:00Z")
             .unwrap();
         let found = db
-            .find_cached_segment_hashes(&["aaa", "bbb", "ccc"], "en", "default", "")
+            .find_cached_segment_hashes(&["aaa", "bbb", "ccc"], scope)
             .unwrap();
         assert!(found.contains("aaa"));
         assert!(found.contains("bbb"));
