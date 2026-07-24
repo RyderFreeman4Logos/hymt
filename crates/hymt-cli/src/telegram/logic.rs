@@ -2,6 +2,7 @@
 
 use hymt_core::config::TelegramMode;
 use hymt_core::language::detect_target_language;
+use hymt_core::language_spec::normalize_language_code;
 
 /// Kind of Telegram chat we care about for v1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,18 +67,25 @@ pub fn claim_password_matches(provided: &str, expected: &str) -> bool {
 /// When the source looks predominantly like `primary` (default zh), target
 /// `secondary` (default en); otherwise target `primary`.
 pub fn cn_en_target_lang(text: &str, primary: &str, secondary: &str) -> String {
-    let primary = if primary.is_empty() { "zh" } else { primary };
-    let secondary = if secondary.is_empty() {
-        "en"
-    } else {
-        secondary
-    };
-    if let Some(det) = detect_target_language(text, primary) {
+    let primary = canonical_or_default(primary, "zh");
+    let secondary = canonical_or_default(secondary, "en");
+    if let Some(det) = detect_target_language(text, &primary) {
         if det.target_ratio > hymt_core::language::TARGET_PARAGRAPH_RATIO {
-            return secondary.to_owned();
+            return secondary;
         }
     }
-    primary.to_owned()
+    primary
+}
+
+fn canonical_or_default(language: &str, default: &str) -> String {
+    let requested = if language.trim().is_empty() {
+        default
+    } else {
+        language
+    };
+    normalize_language_code(requested)
+        .map(str::to_owned)
+        .unwrap_or_else(|_| requested.trim().to_owned())
 }
 
 /// Authorize a chat under the configured mode.
@@ -204,6 +212,18 @@ mod tests {
             "en",
         );
         assert_eq!(target, "zh");
+    }
+
+    #[test]
+    fn cn_en_normalizes_aliases_to_canonical_targets() {
+        assert_eq!(
+            cn_en_target_lang("English source", "zh_TW", "EN_US"),
+            "zh-Hant"
+        );
+        assert_eq!(
+            cn_en_target_lang("这是一段中文测试文本用于检测", "zh_TW", "EN_US"),
+            "en"
+        );
     }
 
     #[test]

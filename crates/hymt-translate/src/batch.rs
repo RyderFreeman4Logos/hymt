@@ -13,6 +13,7 @@ use hymt_cache::history::{HistoryDB, SegmentCacheScope};
 use hymt_client::TranslationClient;
 use hymt_core::config::HotConfig;
 use hymt_core::language::resolve_target_language;
+use hymt_core::language_spec::normalize_language_code;
 use hymt_core::templates::{PromptOpts, TemplateType};
 use hymt_segment::Segmenter;
 
@@ -163,7 +164,7 @@ pub fn build_batch_plan(
         }
 
         let effective_lang = if explicit_target {
-            target_lang.to_owned()
+            normalize_language_code(target_lang)?.to_owned()
         } else {
             resolve_target_language(
                 &text,
@@ -181,7 +182,7 @@ pub fn build_batch_plan(
             profile_id,
         };
 
-        let suffix = target_lang_path_suffix(&effective_lang);
+        let suffix = target_lang_path_suffix(&effective_lang)?;
 
         // Skip files whose stem already ends with the target suffix
         if path

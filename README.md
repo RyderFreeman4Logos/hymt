@@ -140,6 +140,14 @@ printf 'Release notes go here.\n' | hymt -t ja
 hymt -f CHANGELOG.md -t fr -o CHANGELOG.fr.md
 ```
 
+### Target language codes
+
+All prompt construction, validation, detection, output filenames, CLI estimates, and Telegram routing use one canonical registry. Supported canonical codes are:
+
+`zh`, `zh-Hant`, `en`, `fr`, `pt`, `es`, `ja`, `tr`, `ru`, `ar`, `ko`, `th`, `it`, `de`, `vi`, `ms`, `id`, `tl`, `hi`, `pl`, `cs`, `nl`, `km`, `my`, `fa`, `gu`, `ur`, `te`, `mr`, `he`, `bn`, `ta`, `uk`, `bo`, `kk`, `mn`, `ug`, and `yue`.
+
+Codes are case-insensitive and normalize `_` to `-`: `zh-CN`/`zh_CN` resolve to `zh`, while `zh-TW`/`zh_Hant` resolve to `zh-Hant`. `zh`, `zh-Hant`, and `yue` share Chinese-family CJK handling; the Hy-MT2 profiles use this same registry for every supported target.
+
 ### Keep streaming friendly
 
 Streaming is enabled by default. That means you can keep normal shell pipes:

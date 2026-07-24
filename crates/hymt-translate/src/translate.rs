@@ -22,6 +22,7 @@ use hymt_client::TranslationClient;
 use hymt_core::completeness::{validate_completeness, CompletenessResult, CompletenessThresholds};
 use hymt_core::config::HotConfig;
 use hymt_core::language::{build_document_translation_plan, DocumentLanguagePlan, SectionKind};
+use hymt_core::language_spec::{language_spec_or_none, LanguageFamily};
 use hymt_core::templates::{build_prompt, PromptOpts, TemplateType};
 use hymt_segment::Segmenter;
 
@@ -87,9 +88,14 @@ const OUTPUT_SAFETY_FACTOR: f64 = 1.5;
 const MIN_EXPANSION_FOR_BUDGET: f64 = 1.0;
 
 fn expansion_ratio(target_lang: &str) -> f64 {
-    match target_lang.to_lowercase().trim() {
+    let Some(spec) = language_spec_or_none(target_lang) else {
+        return 1.2;
+    };
+    if spec.family == LanguageFamily::Chinese {
+        return 0.7;
+    }
+    match spec.canonical_code {
         "en" => 1.8,
-        "zh" | "zh-cn" | "zh-tw" => 0.7,
         "ja" => 1.0,
         "ko" => 0.9,
         "de" | "fr" | "es" => 1.3,

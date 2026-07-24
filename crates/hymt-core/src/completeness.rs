@@ -7,6 +7,8 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
+use crate::language_spec::{language_spec_or_none, LanguageFamily};
+
 /// Threshold configuration for completeness checks.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompletenessThresholds {
@@ -205,11 +207,13 @@ fn long_options(text: &str) -> HashSet<String> {
 }
 
 fn output_has_target_language_signal(output_text: &str, target_lang: &str) -> bool {
-    let normalized = target_lang.to_lowercase().replace('_', "-");
-    if normalized == "zh" || normalized.starts_with("zh-") {
+    let Some(spec) = language_spec_or_none(target_lang) else {
+        return !output_text.trim().is_empty();
+    };
+    if spec.family == LanguageFamily::Chinese {
         return output_text.chars().any(is_cjk_char);
     }
-    if normalized == "en" || normalized.starts_with("en-") {
+    if spec.canonical_code == "en" {
         return output_text.chars().any(|c| c.is_ascii_alphabetic());
     }
     !output_text.trim().is_empty()
@@ -236,11 +240,11 @@ fn generic_refusal(output_text: &str) -> bool {
 
 /// Returns the applicable minimum char ratio for `target_lang`, or `None`.
 fn min_char_ratio(target_lang: &str, thresholds: &CompletenessThresholds) -> Option<f64> {
-    let normalized = target_lang.to_lowercase().replace('_', "-");
-    if normalized == "en" || normalized.starts_with("en-") {
+    let spec = language_spec_or_none(target_lang)?;
+    if spec.canonical_code == "en" {
         return Some(thresholds.zh_to_en_min_ratio);
     }
-    if normalized == "zh" || normalized.starts_with("zh-") {
+    if spec.family == LanguageFamily::Chinese {
         return Some(thresholds.en_to_zh_min_ratio);
     }
     None
@@ -305,6 +309,14 @@ mod tests {
         let result = validate_completeness(input, output, "fr", None);
         // No token_ratio check applies for fr
         assert!(!result.checks_failed.contains(&"token_ratio".to_owned()));
+    }
+
+    #[test]
+    fn chinese_family_targets_use_zh_completeness_rules() {
+        let input = "This is a long English sentence designed to test the character ratio check.";
+        let output = "短";
+        let result = validate_completeness(input, output, "yue", None);
+        assert!(result.checks_failed.contains(&"token_ratio".to_owned()));
     }
 
     // ── Paragraph count failures ─────────────────────────────────────────────

@@ -12,6 +12,7 @@ use hymt_cache::history::HistoryDB;
 use hymt_client::TranslationClient;
 use hymt_core::config::HotConfig;
 use hymt_core::language::resolve_target_language;
+use hymt_core::language_spec::{language_spec, normalize_language_code};
 use hymt_core::templates::{PromptOpts, TemplateType};
 use hymt_segment::Segmenter;
 
@@ -20,12 +21,9 @@ use crate::translate::{translate_text, TranslationCtx};
 // ── Output path helpers ───────────────────────────────────────────────────────
 
 /// Maps a target language code to its canonical path suffix.
-/// `zh` → `zh-cn`; all others pass through unchanged.
-pub fn target_lang_path_suffix(target_lang: &str) -> &str {
-    match target_lang {
-        "zh" => "zh-cn",
-        other => other,
-    }
+/// `zh` / `zh-CN` → `zh-cn`; `zh-Hant` / `zh-TW` → `zh-hant`.
+pub fn target_lang_path_suffix(target_lang: &str) -> Result<&'static str> {
+    Ok(language_spec(target_lang)?.output_suffix)
 }
 
 /// Build the output path for a translated markdown file.
@@ -116,7 +114,7 @@ pub(crate) fn build_doc_translation_targets(
     if resolved.is_file() {
         validate_markdown(&resolved)?;
         let effective = resolve_file_target_lang(&resolved, target_lang, config, explicit_target);
-        let suffix = target_lang_path_suffix(&effective);
+        let suffix = target_lang_path_suffix(&effective)?;
         validate_lang_suffix(suffix)?;
         let out = build_output_path(
             &resolved,
@@ -140,7 +138,7 @@ pub(crate) fn build_doc_translation_targets(
     let mut targets = Vec::new();
     for path in files {
         let effective = resolve_file_target_lang(&path, target_lang, config, explicit_target);
-        let suffix = target_lang_path_suffix(&effective);
+        let suffix = target_lang_path_suffix(&effective)?;
         validate_lang_suffix(suffix)?;
         // Skip files whose stem already ends with the target suffix
         if path
@@ -168,7 +166,7 @@ fn resolve_file_target_lang(
     explicit_target: bool,
 ) -> String {
     if explicit_target {
-        return requested.to_owned();
+        return canonical_or_requested(requested);
     }
     if let Some(cfg) = config {
         if let Ok(text) = std::fs::read_to_string(path) {
@@ -181,7 +179,13 @@ fn resolve_file_target_lang(
             );
         }
     }
-    requested.to_owned()
+    canonical_or_requested(requested)
+}
+
+fn canonical_or_requested(target_lang: &str) -> String {
+    normalize_language_code(target_lang)
+        .map(str::to_owned)
+        .unwrap_or_else(|_| target_lang.trim().to_owned())
 }
 
 fn validate_markdown(path: &Path) -> Result<()> {
@@ -322,22 +326,28 @@ mod tests {
 
     #[test]
     fn zh_maps_to_zh_cn() {
-        assert_eq!(target_lang_path_suffix("zh"), "zh-cn");
+        assert_eq!(target_lang_path_suffix("zh").unwrap(), "zh-cn");
     }
 
     #[test]
     fn fr_passes_through() {
-        assert_eq!(target_lang_path_suffix("fr"), "fr");
+        assert_eq!(target_lang_path_suffix("fr").unwrap(), "fr");
     }
 
     #[test]
     fn en_passes_through() {
-        assert_eq!(target_lang_path_suffix("en"), "en");
+        assert_eq!(target_lang_path_suffix("en").unwrap(), "en");
     }
 
     #[test]
     fn zh_cn_passes_through() {
-        assert_eq!(target_lang_path_suffix("zh-cn"), "zh-cn");
+        assert_eq!(target_lang_path_suffix("zh-cn").unwrap(), "zh-cn");
+    }
+
+    #[test]
+    fn language_aliases_use_canonical_output_suffixes() {
+        assert_eq!(target_lang_path_suffix("ZH_CN").unwrap(), "zh-cn");
+        assert_eq!(target_lang_path_suffix("zh-TW").unwrap(), "zh-hant");
     }
 
     // ── build_output_path ─────────────────────────────────────────────────────

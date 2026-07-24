@@ -115,6 +115,14 @@ printf 'Release notes go here.\n' | hymt -t ja
 hymt -f CHANGELOG.md -t fr -o CHANGELOG.fr.md
 ```
 
+### 目标语言代码
+
+提示词构建、完整性校验、语言检测、输出文件名、CLI 估算与 Telegram 路由共用同一个规范语言注册表。支持的规范代码为：
+
+`zh`、`zh-Hant`、`en`、`fr`、`pt`、`es`、`ja`、`tr`、`ru`、`ar`、`ko`、`th`、`it`、`de`、`vi`、`ms`、`id`、`tl`、`hi`、`pl`、`cs`、`nl`、`km`、`my`、`fa`、`gu`、`ur`、`te`、`mr`、`he`、`bn`、`ta`、`uk`、`bo`、`kk`、`mn`、`ug` 与 `yue`。
+
+代码不区分大小写，且会将 `_` 规范化为 `-`：`zh-CN`/`zh_CN` 会解析为 `zh`，`zh-TW`/`zh_Hant` 会解析为 `zh-Hant`。`zh`、`zh-Hant` 与 `yue` 共享中文语系的 CJK 处理；所有 Hy-MT2 profile 都使用同一注册表。
+
 ### 保持适合流媒体播放
 
 流式传输默认是启用的。这意味着你可以继续使用常规的shell管道：

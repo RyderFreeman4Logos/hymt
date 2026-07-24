@@ -3,56 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::CoreError;
-
-// ── Language registry ────────────────────────────────────────────────────────
-
-/// Returns the display name for a BCP-47-style language code.
-pub fn language_name(code: &str) -> Result<&'static str, CoreError> {
-    match code.to_lowercase().as_str() {
-        "zh" => Ok("中文"),
-        "en" => Ok("English"),
-        "fr" => Ok("Français"),
-        "pt" => Ok("Português"),
-        "es" => Ok("Español"),
-        "ja" => Ok("日本語"),
-        "tr" => Ok("Türkçe"),
-        "ru" => Ok("Русский"),
-        "ar" => Ok("العربية"),
-        "ko" => Ok("한국어"),
-        "th" => Ok("ไทย"),
-        "it" => Ok("Italiano"),
-        "de" => Ok("Deutsch"),
-        "vi" => Ok("Tiếng Việt"),
-        "ms" => Ok("Bahasa Melayu"),
-        "id" => Ok("Bahasa Indonesia"),
-        "tl" => Ok("Tagalog"),
-        "hi" => Ok("हिन्दी"),
-        "pl" => Ok("Polski"),
-        "cs" => Ok("Čeština"),
-        "nl" => Ok("Nederlands"),
-        "km" => Ok("ខ្មែរ"),
-        "my" => Ok("မြန်မာ"),
-        "fa" => Ok("فارسی"),
-        "gu" => Ok("ગુજરાતી"),
-        "ur" => Ok("اردو"),
-        "te" => Ok("తెలుగు"),
-        "mr" => Ok("मराठी"),
-        "he" => Ok("עברית"),
-        "bn" => Ok("বাংলা"),
-        "ta" => Ok("தமிழ்"),
-        "uk" => Ok("Українська"),
-        "bo" => Ok("བོད་སྐད"),
-        "kk" => Ok("Қазақша"),
-        "mn" => Ok("Монгол"),
-        "ug" => Ok("ئۇيغۇرچە"),
-        "yue" => Ok("粤语"),
-        other => Err(CoreError::UnsupportedLanguage(other.to_owned())),
-    }
-}
-
-fn is_chinese_prompt_lang(code: &str) -> bool {
-    matches!(code.to_lowercase().as_str(), "zh" | "yue")
-}
+use crate::language_spec::{language_spec, LanguageFamily};
 
 // ── Template type ────────────────────────────────────────────────────────────
 
@@ -127,7 +78,7 @@ pub struct PromptOpts {
 
 /// Builds a prompt string for the given `template`, `source` text, and `target_lang`.
 ///
-/// `target_lang` must be a recognized language code (see `language_name`).
+/// `target_lang` must be a recognized language code in the shared registry.
 /// Some templates require additional opts; returns `Err` when they are absent.
 pub fn build_prompt(
     source: &str,
@@ -135,8 +86,13 @@ pub fn build_prompt(
     template: &TemplateType,
     opts: &PromptOpts,
 ) -> Result<String, CoreError> {
-    let target_name = language_name(target_lang)?;
-    let chinese = is_chinese_prompt_lang(target_lang);
+    let target = language_spec(target_lang)?;
+    let chinese = target.family == LanguageFamily::Chinese;
+    let target_name = if chinese {
+        target.chinese_name
+    } else {
+        target.english_name
+    };
 
     let prompt = match template {
         TemplateType::Default => build_default(source, target_name, chinese),
@@ -357,24 +313,67 @@ taking the provided background information into consideration.\n\n\
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::language_spec::{LanguageFamily, LANGUAGE_SPECS};
 
     fn opts() -> PromptOpts {
         PromptOpts::default()
     }
 
     #[test]
-    fn language_name_known() {
-        assert_eq!(language_name("zh").unwrap(), "中文");
-        assert_eq!(language_name("en").unwrap(), "English");
-        assert_eq!(language_name("ZH").unwrap(), "中文"); // case-insensitive
+    fn prompts_use_localized_names_after_alias_normalization() {
+        let german = build_prompt("Hallo", "DE", &TemplateType::Default, &opts()).unwrap();
+        assert!(german.contains("Translate the following text into German"));
+        assert!(!german.contains("Deutsch"));
+
+        let traditional = build_prompt("Hello", "ZH_tw", &TemplateType::Default, &opts()).unwrap();
+        assert!(traditional.contains("翻译成繁体中文"));
+    }
+
+    #[test]
+    fn every_registry_language_has_english_and_chinese_default_prompt_goldens() {
+        for spec in LANGUAGE_SPECS {
+            assert_eq!(
+                build_default("registry source", spec.english_name, false),
+                format!(
+                    "Translate the following text into {}. Note that you should only output the translated result without any additional explanation:\n\nregistry source",
+                    spec.english_name
+                )
+            );
+            assert_eq!(
+                build_default("registry source", spec.chinese_name, true),
+                format!(
+                    "请将以下文本翻译成{}。注意，你应该只输出翻译结果，不要添加任何解释：\n\nregistry source",
+                    spec.chinese_name
+                )
+            );
+
+            let selected = build_prompt(
+                "registry source",
+                spec.canonical_code,
+                &TemplateType::Default,
+                &opts(),
+            )
+            .unwrap();
+            let expected_name = if spec.family == LanguageFamily::Chinese {
+                spec.chinese_name
+            } else {
+                spec.english_name
+            };
+            assert!(
+                selected.contains(expected_name),
+                "target={}",
+                spec.canonical_code
+            );
+        }
     }
 
     #[test]
     fn language_name_unknown() {
-        assert!(matches!(
-            language_name("xx"),
-            Err(CoreError::UnsupportedLanguage(_))
-        ));
+        let error = build_prompt("text", "xx", &TemplateType::Default, &opts())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unsupported language 'xx'"));
+        assert!(error.contains("zh-Hant"));
     }
 
     #[test]

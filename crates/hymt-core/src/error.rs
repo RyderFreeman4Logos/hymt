@@ -8,8 +8,8 @@ pub enum CoreError {
     #[error("config parse error: {0}")]
     Config(String),
 
-    #[error("unsupported language '{0}'")]
-    UnsupportedLanguage(String),
+    #[error("unsupported language '{code}'; supported canonical codes: {supported}")]
+    UnsupportedLanguage { code: String, supported: String },
 
     #[error("unsupported template type '{0}'")]
     InvalidTemplate(String),
