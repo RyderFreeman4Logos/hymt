@@ -13,6 +13,7 @@ use hymt_cache::history::HistoryDB;
 use hymt_cache::ExecCache;
 use hymt_client::TranslationClient;
 use hymt_core::config::HotConfig;
+use hymt_core::templates::PromptOpts;
 use hymt_segment::Segmenter;
 
 use crate::docs::capture_man;
@@ -317,6 +318,7 @@ pub async fn run_precache(
     segmenter: &Segmenter,
     history: &HistoryDB,
     _explicit_target: bool,
+    prompt_opts: &PromptOpts,
 ) -> Result<PrecacheSummary> {
     let commands = discover_recent_commands(config);
     eprintln!("hymt precache: {} commands discovered", commands.len());
@@ -335,7 +337,9 @@ pub async fn run_precache(
         match capture_man(&[cmd.as_str()]) {
             Ok(text) if !text.trim().is_empty() => {
                 let cache = ExecCache::new(config.exec_shared_cache_path());
-                match translate_cached("man", cmd, &text, target_lang, &cache, &tctx).await {
+                match translate_cached("man", cmd, &text, target_lang, &cache, prompt_opts, &tctx)
+                    .await
+                {
                     Ok(_) => {
                         translated += 1;
                         eprintln!("hymt precache: translated man {cmd}");
@@ -353,7 +357,17 @@ pub async fn run_precache(
         // Translate --help output
         if let Some(text) = capture_help(cmd) {
             let cache = ExecCache::new(config.exec_shared_cache_path());
-            match translate_cached(cmd, "--help", &text, target_lang, &cache, &tctx).await {
+            match translate_cached(
+                cmd,
+                "--help",
+                &text,
+                target_lang,
+                &cache,
+                prompt_opts,
+                &tctx,
+            )
+            .await
+            {
                 Ok(_) => {
                     translated += 1;
                     eprintln!("hymt precache: translated {cmd} --help");

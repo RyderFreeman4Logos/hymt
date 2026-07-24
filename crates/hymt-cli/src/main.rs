@@ -23,7 +23,7 @@ use hymt_translate::batch::{
 };
 use hymt_translate::doc_translate::{run_doc_translation, DocTranslationOpts};
 use hymt_translate::docs::{run_info_command, run_man_command, ManInfoOpts};
-use hymt_translate::exec_wrapper::run_exec_command;
+use hymt_translate::exec_wrapper::{run_exec_command, ExecCommandOpts};
 use hymt_translate::precache::run_precache;
 use hymt_translate::translate::{
     plan_translation, translate_file, translate_text, translate_text_stream_with_mode,
@@ -1118,7 +1118,7 @@ async fn run_man(
     target_lang: &str,
     explicit_target: bool,
     config: &HotConfig,
-    _opts: &PromptOpts,
+    opts: &PromptOpts,
     concurrency_override: Option<u32>,
 ) -> Result<()> {
     if args.args.is_empty() {
@@ -1134,6 +1134,7 @@ async fn run_man(
         client: &client,
         segmenter: &segmenter,
         history: &history,
+        prompt_opts: opts,
         original: args.original,
         explicit_target,
     };
@@ -1148,7 +1149,7 @@ async fn run_info(
     target_lang: &str,
     explicit_target: bool,
     config: &HotConfig,
-    _opts: &PromptOpts,
+    opts: &PromptOpts,
     concurrency_override: Option<u32>,
 ) -> Result<()> {
     if args.args.is_empty() {
@@ -1164,6 +1165,7 @@ async fn run_info(
         client: &client,
         segmenter: &segmenter,
         history: &history,
+        prompt_opts: opts,
         original: args.original,
         explicit_target,
     };
@@ -1178,7 +1180,7 @@ async fn run_exec(
     target_lang: &str,
     explicit_target: bool,
     config: &HotConfig,
-    _opts: &PromptOpts,
+    opts: &PromptOpts,
     concurrency_override: Option<u32>,
 ) -> Result<()> {
     match args.action {
@@ -1203,6 +1205,7 @@ async fn run_exec(
                 &segmenter,
                 &history,
                 explicit_target,
+                opts,
             )
             .await?;
             eprintln!(
@@ -1229,16 +1232,16 @@ async fn run_exec(
             let segmenter = make_segmenter(config)?;
             let history = HistoryDB::default();
             let client = make_client_with_concurrency(config, concurrency_override)?;
-            let code = run_exec_command(
-                &command,
+            let exec_opts = ExecCommandOpts {
                 target_lang,
                 config,
-                &client,
-                &segmenter,
-                &history,
+                client: &client,
+                segmenter: &segmenter,
+                history: &history,
                 explicit_target,
-            )
-            .await?;
+                prompt_opts: opts,
+            };
+            let code = run_exec_command(&command, &exec_opts).await?;
             std::process::exit(code);
         }
     }

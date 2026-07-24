@@ -185,7 +185,7 @@ language_detection = true      # default: use CJK detection for Chinese-family t
 force_translate_all = false    # default: false; set true to translate all non-code paragraphs
 ```
 
-`--force-translate-all`、`--no-language-detection`、`force_translate_all = true`以及`language_detection = false`都会选择全量翻译策略。显式的 `-l/--lang` 参数可以指定目标语言，但**不会**禁用内容保留功能。该工具的检测功能仅针对简体中文、繁体中文和日文：对于非中文目标语言，hymt会翻译所有非代码段落，而不会尝试进行通用多语言检测。
+`--force-translate-all`、`--no-language-detection`、`force_translate_all = true`以及`language_detection = false`都会选择全量翻译策略。显式的 `-l/--lang` 参数可以指定目标语言，但**不会**禁用内容保留功能。该工具的检测功能仅适用于中文系目标语言（`zh`、`zh-Hant` 和 `yue`）：对于非中文系目标语言，hymt会翻译所有非代码段落，而不会尝试进行通用多语言检测。
 
 ## 智能分块与缓存复用
 
