@@ -139,7 +139,7 @@ impl ModelProfile {
             )),
             Self::HyMt2_7b => Some(format!("<|startoftext|>{prompt}<|extra_0|>")),
             Self::HyMt2_30bA3b => Some(format!(
-                "<｜hy_begin▁of▁sentence｜><｜reasoning_mode｜>reasoning_effort:no_think<｜hy_User｜>{prompt}<｜hy_Assistant｜>"
+                "<｜hy_begin▁of▁sentence｜><｜reasoning_mode｜>reasoning_effort:no_think<｜hy_User｜>{prompt}<｜hy_Assistant｜><think></think>"
             )),
             Self::Generic => None,
         }
@@ -228,7 +228,7 @@ mod tests {
             (ModelProfile::HyMt2_7b, "<|startoftext|>P<|extra_0|>"),
             (
                 ModelProfile::HyMt2_30bA3b,
-                "<｜hy_begin▁of▁sentence｜><｜reasoning_mode｜>reasoning_effort:no_think<｜hy_User｜>P<｜hy_Assistant｜>",
+                "<｜hy_begin▁of▁sentence｜><｜reasoning_mode｜>reasoning_effort:no_think<｜hy_User｜>P<｜hy_Assistant｜><think></think>",
             ),
         ] {
             assert_eq!(profile.render_chat_user_prompt("P").as_deref(), Some(expected));
