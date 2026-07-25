@@ -64,6 +64,12 @@ pub struct BackendRuntimeInfo {
     pub sampler_defaults: BackendSamplerDefaults,
     pub supports_streaming: Option<bool>,
     pub supports_tokenization: Option<bool>,
+    /// A single ASCII character that llama.cpp incorrectly advertises as EOS.
+    ///
+    /// The client resolves this candidate through `/tokenize` during preflight.
+    pub false_eos_token: Option<String>,
+    /// Token ID resolved from [`Self::false_eos_token`] and suppressed in requests.
+    pub false_eos_token_id: Option<u32>,
     pub supports_templates: Option<bool>,
     pub supports_structured_output: Option<bool>,
     pub observed_at_unix_secs: u64,
@@ -95,6 +101,8 @@ impl BackendRuntimeInfo {
             sampler_defaults: BackendSamplerDefaults::default(),
             supports_streaming: None,
             supports_tokenization: None,
+            false_eos_token: None,
+            false_eos_token_id: None,
             supports_templates: None,
             supports_structured_output: None,
             observed_at_unix_secs,
@@ -136,6 +144,11 @@ impl BackendRuntimeInfo {
         let supports_streaming = optional_bool_any(object, &["supports_streaming", "streaming"])?;
         let supports_tokenization =
             optional_bool_any(object, &["supports_tokenization", "tokenization"])?;
+        let false_eos_token = optional_string(object, "eos_token")?.filter(|token| {
+            token.len() == 1
+                && token.is_ascii()
+                && !(token.starts_with("<|") && token.ends_with("|>"))
+        });
         let supports_structured_output = optional_bool_any(
             object,
             &["supports_structured_output", "structured_output", "grammar"],
@@ -171,6 +184,8 @@ impl BackendRuntimeInfo {
             sampler_defaults,
             supports_streaming,
             supports_tokenization,
+            false_eos_token,
+            false_eos_token_id: None,
             supports_templates,
             supports_structured_output,
             observed_at_unix_secs,
@@ -218,6 +233,8 @@ impl BackendRuntimeInfo {
             sampler_defaults: BackendSamplerDefaults::default(),
             supports_streaming: None,
             supports_tokenization: None,
+            false_eos_token: None,
+            false_eos_token_id: None,
             supports_templates: None,
             supports_structured_output: None,
             observed_at_unix_secs,

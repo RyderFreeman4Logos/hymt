@@ -3,6 +3,7 @@
 //! Provides concurrency limiting, exponential-backoff retry on transient errors,
 //! `finish_reason == "length"` truncation detection, and SSE streaming support.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -155,6 +156,12 @@ impl ChatPayload {
             }
         }
     }
+
+    fn suppress_false_eos_token(&mut self, token_id: Option<u32>) {
+        if let (Some(token_id), Self::LlamaCpp(payload)) = (token_id, self) {
+            payload.suppress_false_eos_token(token_id);
+        }
+    }
 }
 
 /// llama.cpp's documented native sampler extensions.
@@ -174,6 +181,8 @@ struct LlamaCppPayload {
     min_p: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     repeat_last_n: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logit_bias: Option<BTreeMap<String, i32>>,
 }
 
 impl LlamaCppPayload {
@@ -186,7 +195,12 @@ impl LlamaCppPayload {
             repeat_penalty: map_f64_setting(settings.repetition_penalty, 1.0),
             min_p: map_f64_setting(settings.min_p, 0.0),
             repeat_last_n: map_i64_setting(settings.repeat_last_n, 0),
+            logit_bias: None,
         }
+    }
+
+    fn suppress_false_eos_token(&mut self, token_id: u32) {
+        self.logit_bias = Some(BTreeMap::from([(token_id.to_string(), -100)]));
     }
 }
 
@@ -269,6 +283,11 @@ fn map_i64_setting(setting: Setting<i64>, disabled_value: i64) -> Option<i64> {
 #[derive(Debug, Deserialize)]
 struct ChatResponse {
     choices: Option<Vec<Choice>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LlamaCppTokenizeResponse {
+    tokens: Vec<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -473,7 +492,13 @@ impl TranslationClient {
                         }
                     };
                     match parsed {
-                        Ok(runtime) => runtime,
+                        Ok(mut runtime) => {
+                            if let Some(false_eos_token) = runtime.false_eos_token.clone() {
+                                runtime.false_eos_token_id =
+                                    self.llama_cpp_false_eos_token_id(&false_eos_token).await;
+                            }
+                            runtime
+                        }
                         Err(error) => BackendRuntimeInfo::unverified(
                             backend,
                             observed_at_unix_secs,
@@ -497,6 +522,29 @@ impl TranslationClient {
                 observed_at_unix_secs,
                 "backend endpoint is unavailable",
             ),
+        }
+    }
+
+    async fn llama_cpp_false_eos_token_id(&self, eos_token: &str) -> Option<u32> {
+        let response = self
+            .inner
+            .http
+            .post(Self::llama_cpp_tokenize_url(
+                &self.inner.config.endpoint_url(),
+            ))
+            .headers(self.build_headers())
+            .json(&serde_json::json!({"content": eos_token}))
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let response: LlamaCppTokenizeResponse = response.json().await.ok()?;
+        match response.tokens.as_slice() {
+            [token_id] => Some(*token_id),
+            _ => None,
         }
     }
 
@@ -825,14 +873,21 @@ impl TranslationClient {
 
     fn build_payload(&self, prompt: &str, stream: bool) -> Result<ChatPayload, ClientError> {
         let cfg = &self.inner.config;
-        Ok(ChatPayload::from_generation_settings(
+        let backend = cfg.generation_backend()?;
+        let false_eos_token_id = cfg
+            .backend_runtime_info()
+            .filter(|runtime| runtime.backend == backend)
+            .and_then(|runtime| runtime.false_eos_token_id);
+        let mut payload = ChatPayload::from_generation_settings(
             prompt,
             cfg.resolved_max_output_tokens(),
             cfg.model(),
             stream,
             &cfg.generation_settings()?,
-            cfg.generation_backend()?,
-        ))
+            backend,
+        );
+        payload.suppress_false_eos_token(false_eos_token_id);
+        Ok(payload)
     }
 
     fn build_headers(&self) -> reqwest::header::HeaderMap {
@@ -858,6 +913,12 @@ impl TranslationClient {
         let endpoint_url = endpoint_url.trim_end_matches('/');
         let server_url = endpoint_url.strip_suffix("/v1").unwrap_or(endpoint_url);
         format!("{server_url}/props")
+    }
+
+    fn llama_cpp_tokenize_url(endpoint_url: &str) -> String {
+        let endpoint_url = endpoint_url.trim_end_matches('/');
+        let server_url = endpoint_url.strip_suffix("/v1").unwrap_or(endpoint_url);
+        format!("{server_url}/tokenize")
     }
 
     fn models_url(endpoint_url: &str) -> String {
