@@ -129,7 +129,7 @@ divergence_threshold = 2.0
 
 翻译路径会在规划或缓存查询之前对配置的后端执行预检。llama.cpp 使用 `GET /props`；vLLM 与其他 OpenAI 兼容服务会在可用时使用 `GET /v1/models`。标准化的运行时状态包括服务构建/模型标识、上下文与槽位限制、采样器默认值，以及仅限服务明确声明的能力。缺失字段会保持未知，绝不会由 hymt 推测。
 
-当 llama.cpp 的 `/props` 报告单个 ASCII 字符的 `eos_token`（例如错误 GGUF 报告的 `$`）时，hymt 会将其视为错误的 EOS 元数据。预检会通过 `/tokenize` 解析该字符，并仅在 llama.cpp 请求中发送 `logit_bias` `{ "<token_id>": -100 }`，以避免错误停止，同时不抑制实际的聊天模板 EOS 标记（例如 `<|eos|>`）。
+当 llama.cpp 的 `/props` 报告单个 ASCII 标点字符的 `eos_token`，*且*聊天模板包含 `<|...|>` 控制标记时，hymt 会检测到矛盾：模板中的标记才是真正的 EOS，而元数据中的标记是错误的。预检会通过 `/tokenize` 解析该错误标记，并仅在 llama.cpp 请求中发送 `logit_bias` `{ "<token_id>": -100 }`，以避免错误停止，同时不抑制实际的聊天模板 EOS 标记（例如 `<|eos|>`）。如果聊天模板本身就使用该单字符 EOS，则不会触发抑制。
 
 运行 `hymt backend inspect` 可并排显示配置值与服务解析出的值。该命令绝不输出 API 密钥、端点凭据或请求头。警告会指出上下文、模型或配置文件不匹配，意外的服务采样器状态，以及 llama.cpp/vLLM 的重复惩罚 wire 键不匹配。
 
