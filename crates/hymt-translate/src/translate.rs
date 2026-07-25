@@ -906,7 +906,7 @@ fn segment_document_plan(
     segmenter: &Segmenter,
     max_tokens: usize,
 ) -> Result<SegmentPlanResult> {
-    mark_oversized_protected_tables(doc_plan, segmenter, max_tokens);
+    split_oversized_protected_blocks(doc_plan, segmenter, max_tokens);
     let mut segments: Vec<String> = Vec::new();
     let mut indexes: Vec<usize> = Vec::new();
     let mut groups: Vec<Vec<usize>> = Vec::new();
@@ -929,41 +929,139 @@ fn segment_document_plan(
     Ok((segments, indexes, groups))
 }
 
-/// Tables are atomic Markdown blocks. Keep an oversized one out of model input
-/// so the surrounding document can still be segmented and translated.
-fn mark_oversized_protected_tables(
+/// Keep oversized atomic Markdown blocks out of model input while preserving
+/// translatable text around them as independently segmentable sections.
+fn split_oversized_protected_blocks(
     doc_plan: &mut DocumentLanguagePlan,
     segmenter: &Segmenter,
     max_tokens: usize,
 ) {
-    for section in &mut doc_plan.sections {
-        if section.kind != SectionKind::Paragraph
-            || !section.should_translate
-            || !is_markdown_table(&section.text)
-        {
+    let mut split_sections = Vec::with_capacity(doc_plan.sections.len());
+    for section in std::mem::take(&mut doc_plan.sections) {
+        if section.kind != SectionKind::Paragraph || !section.should_translate {
+            split_sections.push(section);
             continue;
         }
-        let tokens = segmenter.count_tokens(&section.text);
-        if tokens > max_tokens {
-            eprintln!(
-                "Warning: preserved protected block untranslated ({tokens} tokens exceeds segment limit {max_tokens})"
-            );
-            section.should_translate = false;
+
+        let oversized_ranges: Vec<_> = protected_markdown_block_ranges(&section.text)
+            .into_iter()
+            .filter(|range| {
+                let tokens = segmenter.count_tokens(&section.text[range.clone()]);
+                if tokens <= max_tokens {
+                    return false;
+                }
+                eprintln!(
+                    "Warning: preserved protected block untranslated ({tokens} tokens exceeds segment limit {max_tokens})"
+                );
+                true
+            })
+            .collect();
+        if oversized_ranges.is_empty() {
+            split_sections.push(section);
+            continue;
+        }
+
+        let mut cursor = 0;
+        for range in oversized_ranges {
+            if cursor < range.start {
+                let mut before = section.clone();
+                before.text = section.text[cursor..range.start].to_owned();
+                split_sections.push(before);
+            }
+            let mut protected = section.clone();
+            protected.text = section.text[range.clone()].to_owned();
+            protected.should_translate = false;
+            split_sections.push(protected);
+            cursor = range.end;
+        }
+        if cursor < section.text.len() {
+            let mut after = section;
+            after.text = after.text[cursor..].to_owned();
+            split_sections.push(after);
         }
     }
+    doc_plan.sections = split_sections;
 }
 
-fn is_markdown_table(text: &str) -> bool {
-    let mut lines = text.lines();
-    let Some(header) = lines.next() else {
+fn protected_markdown_block_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut offset = 0;
+    let lines: Vec<_> = text
+        .split_inclusive('\n')
+        .map(|line| {
+            let start = offset;
+            offset += line.len();
+            (start, offset, line.trim_end_matches(['\r', '\n']))
+        })
+        .collect();
+    let mut ranges = Vec::new();
+    let mut line_index = 0;
+
+    while line_index < lines.len() {
+        let line = lines[line_index].2.trim_start();
+        if let Some(fence_width) = opening_fence_width(line) {
+            if let Some(closing_index) = lines[line_index + 1..]
+                .iter()
+                .position(|(_, _, candidate)| is_closing_fence(candidate, fence_width))
+                .map(|relative| line_index + relative + 1)
+            {
+                ranges.push(lines[line_index].0..lines[closing_index].1);
+                line_index = closing_index + 1;
+                continue;
+            }
+        }
+
+        if line_index + 2 < lines.len()
+            && is_markdown_table_line(lines[line_index].2)
+            && is_markdown_table_separator(lines[line_index + 1].2)
+            && is_markdown_table_line(lines[line_index + 2].2)
+        {
+            let mut end_index = line_index + 3;
+            while end_index < lines.len() && is_markdown_table_line(lines[end_index].2) {
+                end_index += 1;
+            }
+            ranges.push(lines[line_index].0..lines[end_index - 1].1);
+            line_index = end_index;
+            continue;
+        }
+
+        line_index += 1;
+    }
+    ranges
+}
+
+fn opening_fence_width(line: &str) -> Option<usize> {
+    let width = line
+        .chars()
+        .take_while(|character| *character == '`')
+        .count();
+    (width >= 3).then_some(width)
+}
+
+fn is_closing_fence(line: &str, opening_width: usize) -> bool {
+    let line = line.trim_start();
+    let width = line
+        .chars()
+        .take_while(|character| *character == '`')
+        .count();
+    width >= opening_width && line[width..].trim().is_empty()
+}
+
+fn is_markdown_table_line(line: &str) -> bool {
+    let line = line.trim_start();
+    line.starts_with('|') && line[1..].contains('|')
+}
+
+fn is_markdown_table_separator(line: &str) -> bool {
+    let line = line.trim();
+    if !line.starts_with('|') || !line.ends_with('|') {
         return false;
-    };
-    let Some(separator) = lines.next() else {
-        return false;
-    };
-    header.trim_start().starts_with('|')
-        && separator.trim_start().starts_with('|')
-        && separator.contains('-')
+    }
+    let cells: Vec<_> = line[1..line.len() - 1].split('|').collect();
+    cells.len() >= 2
+        && cells.iter().all(|cell| {
+            let marker = cell.trim().trim_matches(':');
+            marker.len() >= 3 && marker.bytes().all(|byte| byte == b'-')
+        })
 }
 
 /// Groups consecutive translatable sections, absorbing intervening separators
@@ -3328,14 +3426,65 @@ max_retries = 1
         assert!(first_position < table_position && table_position < last_position);
     }
 
+    #[test]
+    fn planner_preserves_oversized_fence_and_translates_surrounding_prose() {
+        let fence = format!(
+            "```text\nOVERSIZED_PROTECTED_FENCE\n{}\n```\n",
+            "x".repeat(2_000)
+        );
+        let source = format!("Before fenced content.\n{fence}After fenced content.\n");
+        let segmenter = fallback_segmenter();
+        assert!(segmenter.count_tokens(&fence) > 384);
+
+        let config = make_protected_block_config("http://127.0.0.1:1/v1");
+        let plan = plan_translation(
+            &source,
+            "zh",
+            &config,
+            &segmenter,
+            &TemplateType::Default,
+            &PromptOpts::default(),
+        )
+        .expect("oversized fenced block must not abort document planning");
+        assert_eq!(plan.segment_count(), 2);
+        assert!(plan
+            .segments
+            .iter()
+            .all(|segment| !segment.contains("OVERSIZED_PROTECTED_FENCE")));
+
+        let translations = planned_complete_translations(&plan);
+        let reconstructed = plan.reconstruct(&translations);
+        assert_eq!(reconstructed.matches(&fence).count(), 1);
+        assert_preserved_protected_table_with_translated_surroundings(
+            &reconstructed,
+            &fence,
+            &translations,
+        );
+    }
+
+    #[test]
+    fn ordinary_pipe_prose_is_not_a_protected_table() {
+        let source = "Ordinary prose | with pipes | remains translatable.\n";
+        assert!(protected_markdown_block_ranges(source).is_empty());
+    }
+
     #[tokio::test]
     async fn oversized_protected_table_is_preserved_without_model_requests() {
         let table = oversized_protected_table();
         let source = format!(
-            "Before ordinary prose must be translated in document order.\n\n{table}\n\nAfter ordinary prose must also be translated in document order.\n"
+            "Before ordinary prose must be translated in document order.\n\
+{table}\
+After ordinary prose must also be translated in document order.\n"
         );
         let segmenter = fallback_segmenter();
         assert_eq!(segmenter.count_tokens(&table), 500);
+
+        let initial_document_plan =
+            plan_document_translation(&source, "zh", DocumentTranslationPolicy::TranslateAll);
+        assert!(matches!(
+            initial_document_plan.sections.as_slice(),
+            [section] if section.kind == SectionKind::Paragraph && section.text == source
+        ));
 
         let planning_config = make_protected_block_config("http://127.0.0.1:1/v1");
         let plan = plan_translation(
@@ -3415,10 +3564,27 @@ max_retries = 1
         let streaming_server = start_capturing_mock_server(streaming_responses).await;
         let streaming_config = make_protected_block_config(&streaming_server.endpoint_url);
         let streaming_history = HistoryDB::new(temp_path("protected-table-streaming-history.db"));
-        let (streaming_translated, stdout) =
-            translate_and_render_stdout(&source, &streaming_config, &segmenter, &streaming_history)
-                .await
-                .expect("streaming translation");
+        let streaming_client = TranslationClient::new(streaming_config.clone()).unwrap();
+        let streaming_ctx = TranslationCtx {
+            config: &streaming_config,
+            client: &streaming_client,
+            segmenter: &segmenter,
+            history: &streaming_history,
+        };
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(64);
+        let streaming_prompt_opts = PromptOpts::default();
+        let streaming = translate_text_stream(
+            &source,
+            "zh",
+            &TemplateType::Default,
+            &streaming_prompt_opts,
+            &streaming_ctx,
+            event_tx,
+        );
+        let render = render_events_as_stdout(event_rx);
+        let (streaming_outcome, stdout) =
+            tokio::try_join!(streaming, render).expect("streaming translation");
+        let streaming_translated = streaming_outcome.text;
         assert_preserved_protected_table_with_translated_surroundings(
             &streaming_translated,
             &table,
