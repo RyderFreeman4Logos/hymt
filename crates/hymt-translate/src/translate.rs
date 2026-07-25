@@ -624,9 +624,9 @@ pub fn plan_translation_with_policy(
         });
     }
 
-    let doc_plan = plan_document_translation(text, target_lang, document_policy);
+    let mut doc_plan = plan_document_translation(text, target_lang, document_policy);
     let source_tokens = segmenter.count_tokens(text);
-    let (segments, indexes, groups) = segment_document_plan(&doc_plan, segmenter, available)?;
+    let (segments, indexes, groups) = segment_document_plan(&mut doc_plan, segmenter, available)?;
     let fitted = fit_segments_to_final_request_budget(
         segments,
         indexes,
@@ -902,10 +902,11 @@ fn fit_segments_to_final_request_budget(
 type SegmentPlanResult = (Vec<String>, Vec<usize>, Vec<Vec<usize>>);
 
 fn segment_document_plan(
-    doc_plan: &DocumentLanguagePlan,
+    doc_plan: &mut DocumentLanguagePlan,
     segmenter: &Segmenter,
     max_tokens: usize,
 ) -> Result<SegmentPlanResult> {
+    mark_oversized_protected_tables(doc_plan, segmenter, max_tokens);
     let mut segments: Vec<String> = Vec::new();
     let mut indexes: Vec<usize> = Vec::new();
     let mut groups: Vec<Vec<usize>> = Vec::new();
@@ -926,6 +927,43 @@ fn segment_document_plan(
         segments.extend(segs);
     }
     Ok((segments, indexes, groups))
+}
+
+/// Tables are atomic Markdown blocks. Keep an oversized one out of model input
+/// so the surrounding document can still be segmented and translated.
+fn mark_oversized_protected_tables(
+    doc_plan: &mut DocumentLanguagePlan,
+    segmenter: &Segmenter,
+    max_tokens: usize,
+) {
+    for section in &mut doc_plan.sections {
+        if section.kind != SectionKind::Paragraph
+            || !section.should_translate
+            || !is_markdown_table(&section.text)
+        {
+            continue;
+        }
+        let tokens = segmenter.count_tokens(&section.text);
+        if tokens > max_tokens {
+            eprintln!(
+                "Warning: preserved protected block untranslated ({tokens} tokens exceeds segment limit {max_tokens})"
+            );
+            section.should_translate = false;
+        }
+    }
+}
+
+fn is_markdown_table(text: &str) -> bool {
+    let mut lines = text.lines();
+    let Some(header) = lines.next() else {
+        return false;
+    };
+    let Some(separator) = lines.next() else {
+        return false;
+    };
+    header.trim_start().starts_with('|')
+        && separator.trim_start().starts_with('|')
+        && separator.contains('-')
 }
 
 /// Groups consecutive translatable sections, absorbing intervening separators
@@ -2339,6 +2377,12 @@ mod tests {
         handle: tokio::task::JoinHandle<()>,
     }
 
+    struct CapturingMockServer {
+        endpoint_url: String,
+        requests: Arc<Mutex<Vec<String>>>,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
     impl Drop for MockServer {
         fn drop(&mut self) {
             self.handle.abort();
@@ -2352,6 +2396,12 @@ mod tests {
     }
 
     impl Drop for CountedMockServer {
+        fn drop(&mut self) {
+            self.handle.abort();
+        }
+    }
+
+    impl Drop for CapturingMockServer {
         fn drop(&mut self) {
             self.handle.abort();
         }
@@ -2373,6 +2423,44 @@ mod tests {
 
         MockServer {
             endpoint_url: format!("http://{addr}/v1"),
+            handle,
+        }
+    }
+
+    async fn start_capturing_mock_server(responses: Vec<MockResponse>) -> CapturingMockServer {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let responses = Arc::new(Mutex::new(VecDeque::from(responses)));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let handle = tokio::spawn({
+            let responses = Arc::clone(&responses);
+            let requests = Arc::clone(&requests);
+            async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    let responses = Arc::clone(&responses);
+                    let requests = Arc::clone(&requests);
+                    tokio::spawn(async move {
+                        let Ok(request) = read_http_request(&mut socket).await else {
+                            return;
+                        };
+                        let Ok(request) = String::from_utf8(request) else {
+                            return;
+                        };
+                        requests.lock().unwrap().push(request);
+                        let response = responses
+                            .lock()
+                            .unwrap()
+                            .pop_front()
+                            .expect("mock response queue exhausted");
+                        let _ = write_mock_response(socket, response).await;
+                    });
+                }
+            }
+        });
+
+        CapturingMockServer {
+            endpoint_url: format!("http://{addr}/v1"),
+            requests,
             handle,
         }
     }
@@ -2546,20 +2634,6 @@ mod tests {
             MockResponse::Json("unexpected inference dispatch ".repeat(16)),
         )
         .await
-    }
-
-    async fn start_request_counting_server(
-    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let request_count = Arc::new(AtomicUsize::new(0));
-        let server_request_count = Arc::clone(&request_count);
-        let handle = tokio::spawn(async move {
-            while let Ok((_socket, _)) = listener.accept().await {
-                server_request_count.fetch_add(1, Ordering::SeqCst);
-            }
-        });
-        (format!("http://{addr}/v1"), request_count, handle)
     }
 
     async fn serve_mock_connection(
@@ -2916,6 +2990,37 @@ mod tests {
         make_stream_config_with_concurrency(endpoint_url, 1)
     }
 
+    fn make_protected_block_config(endpoint_url: &str) -> hymt_core::config::HotConfig {
+        let path = temp_path("protected-block-config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"[endpoint]
+url = "{endpoint_url}"
+profile = "hy_mt2_7b"
+model = "test-model"
+backend = "llama_cpp"
+
+[translation]
+context_window = 8192
+max_output_tokens = 4096
+max_source_tokens_per_segment = 384
+concurrency = 1
+first_chunk_priority = true
+timeout = 5
+
+[completeness]
+zh_to_en_min_ratio = 0.3
+en_to_zh_min_ratio = 0.3
+min_paragraph_ratio = 0.5
+max_retries = 1
+"#
+            ),
+        )
+        .unwrap();
+        hymt_core::config::HotConfig::from_path(&path).unwrap()
+    }
+
     fn make_stream_config_with_concurrency(
         endpoint_url: &str,
         concurrency: usize,
@@ -2980,6 +3085,13 @@ max_retries = 1
 
     fn frontmatter_regression_source() -> String {
         "---\ntitle: Streaming Test\n---\n\n".to_owned() + &streaming_regression_source()
+    }
+
+    fn oversized_protected_table() -> String {
+        let prefix = "| OVERSIZED_PROTECTED_TABLE | Translation |\n| --- | --- |\n| ";
+        let suffix = " |\n";
+        let padding = "x".repeat(500 * 4 - prefix.len() - suffix.len());
+        format!("{prefix}{padding}{suffix}")
     }
 
     fn complete_translation(label: &str, source_segment: &str) -> String {
@@ -3198,6 +3310,131 @@ max_retries = 1
     }
 
     // ── end-to-end document pipeline ───────────────────────────────────────────
+
+    fn assert_preserved_protected_table_with_translated_surroundings(
+        translated: &str,
+        table: &str,
+        translations: &[String],
+    ) {
+        let table_position = translated
+            .find(table)
+            .expect("protected table is preserved");
+        let first_position = translated
+            .find(translations[0].trim_end())
+            .expect("leading prose was translated");
+        let last_position = translated
+            .find(translations[1].trim_end())
+            .expect("trailing prose was translated");
+        assert!(first_position < table_position && table_position < last_position);
+    }
+
+    #[tokio::test]
+    async fn oversized_protected_table_is_preserved_without_model_requests() {
+        let table = oversized_protected_table();
+        let source = format!(
+            "Before ordinary prose must be translated in document order.\n\n{table}\n\nAfter ordinary prose must also be translated in document order.\n"
+        );
+        let segmenter = fallback_segmenter();
+        assert_eq!(segmenter.count_tokens(&table), 500);
+
+        let planning_config = make_protected_block_config("http://127.0.0.1:1/v1");
+        let plan = plan_translation(
+            &source,
+            "zh",
+            &planning_config,
+            &segmenter,
+            &TemplateType::Default,
+            &PromptOpts::default(),
+        )
+        .expect("oversized protected table must not abort document planning");
+        assert_eq!(plan.available_source_tokens, 384);
+        assert_eq!(plan.segment_count(), 2);
+        assert!(
+            plan.segments
+                .iter()
+                .all(|segment| !segment.contains("OVERSIZED_PROTECTED_TABLE")),
+            "protected content must not be a model segment: {:?}",
+            plan.segments
+        );
+
+        let translations = planned_complete_translations(&plan);
+        let expected = plan.reconstruct(&translations);
+        let table_position = expected.find(&table).expect("protected table is preserved");
+        let first_position = expected
+            .find(&translations[0])
+            .expect("leading prose was translated");
+        let last_position = expected
+            .find(&translations[1])
+            .expect("trailing prose was translated");
+        assert!(first_position < table_position && table_position < last_position);
+
+        let server = start_capturing_mock_server(
+            translations
+                .iter()
+                .cloned()
+                .map(MockResponse::Json)
+                .collect(),
+        )
+        .await;
+        let config = make_protected_block_config(&server.endpoint_url);
+        let history = HistoryDB::new(temp_path("protected-table-history.db"));
+        let client = TranslationClient::new(config.clone()).unwrap();
+        let ctx = TranslationCtx {
+            config: &config,
+            client: &client,
+            segmenter: &segmenter,
+            history: &history,
+        };
+        let translated = translate_text(
+            &source,
+            "zh",
+            &TemplateType::Default,
+            &PromptOpts::default(),
+            &ctx,
+        )
+        .await
+        .expect("non-stream translation");
+        assert_preserved_protected_table_with_translated_surroundings(
+            &translated.text,
+            &table,
+            &translations,
+        );
+
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), plan.segment_count());
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.contains("OVERSIZED_PROTECTED_TABLE")),
+            "protected table reached the model: {requests:?}"
+        );
+        drop(requests);
+
+        let mut streaming_responses = vec![MockResponse::Sse(vec![translations[0].clone()])];
+        streaming_responses.extend(translations.iter().skip(1).cloned().map(MockResponse::Json));
+        let streaming_server = start_capturing_mock_server(streaming_responses).await;
+        let streaming_config = make_protected_block_config(&streaming_server.endpoint_url);
+        let streaming_history = HistoryDB::new(temp_path("protected-table-streaming-history.db"));
+        let (streaming_translated, stdout) =
+            translate_and_render_stdout(&source, &streaming_config, &segmenter, &streaming_history)
+                .await
+                .expect("streaming translation");
+        assert_preserved_protected_table_with_translated_surroundings(
+            &streaming_translated,
+            &table,
+            &translations,
+        );
+        assert!(stdout.contains(&table));
+
+        let streaming_requests = streaming_server.requests.lock().unwrap();
+        assert_eq!(streaming_requests.len(), plan.segment_count());
+        assert!(
+            streaming_requests
+                .iter()
+                .all(|request| !request.contains("OVERSIZED_PROTECTED_TABLE")),
+            "protected table reached the streaming model path: {streaming_requests:?}"
+        );
+    }
 
     #[tokio::test]
     async fn document_pipeline_preserves_mixed_markdown_retries_reconstructs_and_writes_atomically()
@@ -4152,51 +4389,6 @@ max_retries = 1
             "larger prompt overhead must reduce source capacity"
         );
         assert_eq!(long_plan.token_budget.prompt_schema, PROMPT_SCHEMA_ID);
-    }
-
-    #[tokio::test]
-    async fn oversized_atomic_table_is_rejected_before_http_submission() {
-        let (endpoint_url, request_count, server) = start_request_counting_server().await;
-        let dir = tempfile::tempdir().unwrap();
-        let cfg_path = dir.path().join("config.toml");
-        std::fs::write(
-            &cfg_path,
-            format!(
-                "[endpoint]\nurl = \"{endpoint_url}\"\n\n[backend]\ntotal_context = 1024\nparallel_slots = 1\nper_request_context = 1024\n\n[translation]\nmax_output_tokens = 512\nmax_source_tokens_per_segment = 0\n"
-            ),
-        )
-        .unwrap();
-        let cfg = hymt_core::config::HotConfig::from_path(&cfg_path).unwrap();
-        let segmenter = fallback_segmenter();
-        let history = HistoryDB::new(temp_path("oversized-atomic-segment-history.db"));
-        let client = TranslationClient::new(cfg.clone()).unwrap();
-        let ctx = TranslationCtx {
-            config: &cfg,
-            client: &client,
-            segmenter: &segmenter,
-            history: &history,
-        };
-        let rows = (0..100)
-            .map(|i| format!("| source phrase {i} | target phrase {i} |\n"))
-            .collect::<String>();
-        let table = format!("Translate this glossary:\n| Source | Target |\n|---|---|\n{rows}");
-
-        let error = translate_text(
-            &table,
-            "zh",
-            &TemplateType::Default,
-            &PromptOpts::default(),
-            &ctx,
-        )
-        .await
-        .unwrap_err();
-
-        assert!(
-            error.to_string().contains("protected block too large"),
-            "unexpected error: {error:#}"
-        );
-        assert_eq!(request_count.load(Ordering::SeqCst), 0);
-        server.abort();
     }
 
     // ── reconstruct ───────────────────────────────────────────────────────────
