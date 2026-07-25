@@ -1085,7 +1085,7 @@ fn approx_source_tokens(segment: &str) -> usize {
 /// A best-effort fallback must retain enough source material to remain usable.
 /// Completeness is deliberately advisory for borderline translations, but an
 /// empty response or one below this floor must not reach a document write path.
-const MIN_BEST_EFFORT_OUTPUT_RATIO_DENOMINATOR: usize = 5;
+const MIN_BEST_EFFORT_OUTPUT_RATIO_DENOMINATOR: usize = 3;
 
 fn reject_unrecoverably_incomplete_best_attempt(
     index: usize,
