@@ -207,7 +207,7 @@ fn scan_markdown_files(dir: &Path, recursive: bool) -> Vec<PathBuf> {
     let walker = WalkDir::new(dir)
         .max_depth(if recursive { usize::MAX } else { 1 })
         .follow_links(false);
-    walker
+    let mut files = walker
         .into_iter()
         .filter_map(|entry| entry.ok())
         .filter(|e| e.file_type().is_file())
@@ -219,7 +219,9 @@ fn scan_markdown_files(dir: &Path, recursive: bool) -> Vec<PathBuf> {
                 .unwrap_or(false)
         })
         .map(|e| e.path().to_owned())
-        .collect()
+        .collect::<Vec<_>>();
+    files.sort();
+    files
 }
 
 // ── DocTranslationOpts ────────────────────────────────────────────────────────
@@ -424,6 +426,26 @@ mod tests {
         let files = scan_markdown_files(dir.path(), false);
         assert_eq!(files.len(), 1);
         assert!(files[0].file_name().unwrap() == "a.md");
+    }
+
+    #[test]
+    fn scan_markdown_files_are_sorted() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(dir.path().join("z-last.md"), "").unwrap();
+        std::fs::write(nested.join("middle.md"), "").unwrap();
+        std::fs::write(dir.path().join("a-first.md"), "").unwrap();
+
+        let files = scan_markdown_files(dir.path(), true);
+        assert_eq!(
+            files,
+            vec![
+                dir.path().join("a-first.md"),
+                nested.join("middle.md"),
+                dir.path().join("z-last.md"),
+            ]
+        );
     }
 
     // ── validate_lang_suffix ──────────────────────────────────────────────────
