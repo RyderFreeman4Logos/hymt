@@ -429,6 +429,20 @@ fn reconstruction_newline_after_segment(
     (!output.ends_with('\n')).then(|| "\n".to_owned())
 }
 
+/// Restore trailing newlines from `original` onto `out` if the translation
+/// output lost them. Markdown structure (e.g. blank lines between headings
+/// and body) depends on preserving the original trailing newline count.
+fn restore_trailing_newlines(out: &mut String, original: &str) {
+    let orig_trailing = original.chars().rev().take_while(|&c| c == '\n').count();
+    if orig_trailing == 0 {
+        return;
+    }
+    let out_trailing = out.chars().rev().take_while(|&c| c == '\n').count();
+    if out_trailing < orig_trailing {
+        out.push_str(&"\n".repeat(orig_trailing - out_trailing));
+    }
+}
+
 fn reconstruct_sections(
     plan: &DocumentLanguagePlan,
     segment_section_indexes: &[usize],
@@ -448,9 +462,7 @@ fn reconstruct_sections(
                 .get(&i)
                 .map(|ts| ts.join(""))
                 .unwrap_or_default();
-            if section.text.ends_with('\n') && !out.ends_with('\n') {
-                out.push('\n');
-            }
+            restore_trailing_newlines(&mut out, &section.text);
             parts.push(out);
         } else {
             parts.push(section.text.clone());
@@ -489,9 +501,7 @@ fn reconstruct_section_groups(
             if let Some(ts) = group_trans.get(&i) {
                 let mut out = ts.join("");
                 if let Some(gt) = group_texts.get(&i) {
-                    if gt.ends_with('\n') && !out.ends_with('\n') {
-                        out.push('\n');
-                    }
+                    restore_trailing_newlines(&mut out, gt);
                 }
                 parts.push(out);
             }
