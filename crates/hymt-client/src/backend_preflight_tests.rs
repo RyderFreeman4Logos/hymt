@@ -3,7 +3,7 @@ use hymt_core::config::HotConfig;
 use hymt_core::runtime::BackendVerificationStatus;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 
 static NEXT_PREFLIGHT_CONFIG_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -41,6 +41,102 @@ async fn respond(listener: TcpListener, bodies: Vec<&'static str>) {
             .await
             .expect("write props response");
     }
+}
+
+async fn read_http_request(socket: &mut TcpStream) -> String {
+    let mut request = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    let header_end = loop {
+        let count = socket.read(&mut chunk).await.expect("read request");
+        assert!(count > 0, "request ended before headers");
+        request.extend_from_slice(&chunk[..count]);
+        if let Some(pos) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            break pos + 4;
+        }
+    };
+    let headers = std::str::from_utf8(&request[..header_end]).expect("UTF-8 headers");
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("content-length:")
+                .or_else(|| line.strip_prefix("Content-Length:"))
+        })
+        .map(str::trim)
+        .map(|value| value.parse::<usize>().expect("valid content length"))
+        .unwrap_or(0);
+    while request.len() < header_end + content_length {
+        let count = socket.read(&mut chunk).await.expect("read request body");
+        assert!(count > 0, "request ended before body");
+        request.extend_from_slice(&chunk[..count]);
+    }
+    String::from_utf8(request).expect("UTF-8 request")
+}
+
+async fn respond_json(socket: &mut TcpStream, body: &str) {
+    socket
+        .write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write JSON response");
+}
+
+async fn respond_eos_sequence(
+    listener: TcpListener,
+    eos_token: &'static str,
+    expected_false_eos_token_id: Option<u32>,
+) {
+    let (mut socket, _) = listener.accept().await.expect("accept props request");
+    let request = read_http_request(&mut socket).await;
+    assert!(request.starts_with("GET /props HTTP/1.1"));
+    respond_json(
+        &mut socket,
+        &format!(
+            r#"{{"model_alias":"served-model","n_ctx":16384,"n_ctx_per_seq":16384,"eos_token":"{eos_token}","chat_template":"<|eos|>"}}"#
+        ),
+    )
+    .await;
+
+    if let Some(token_id) = expected_false_eos_token_id {
+        let (mut socket, _) = listener.accept().await.expect("accept tokenize request");
+        let request = read_http_request(&mut socket).await;
+        assert!(request.starts_with("POST /tokenize HTTP/1.1"));
+        let (_, body) = request.split_once("\r\n\r\n").expect("request body");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(body).expect("tokenize JSON"),
+            serde_json::json!({"content": eos_token}),
+        );
+        respond_json(
+            &mut socket,
+            &serde_json::json!({"tokens": [token_id]}).to_string(),
+        )
+        .await;
+    }
+
+    let (mut socket, _) = listener.accept().await.expect("accept completion request");
+    let request = read_http_request(&mut socket).await;
+    assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1"));
+    let (_, body) = request.split_once("\r\n\r\n").expect("request body");
+    let payload: serde_json::Value = serde_json::from_str(body).expect("completion JSON");
+    match expected_false_eos_token_id {
+        Some(token_id) => assert_eq!(
+            payload["logit_bias"],
+            serde_json::json!({token_id.to_string(): -100}),
+        ),
+        None => assert!(
+            payload.get("logit_bias").is_none(),
+            "a normal chat-control EOS must not be biased"
+        ),
+    }
+    respond_json(
+        &mut socket,
+        r#"{"choices":[{"finish_reason":"stop","message":{"content":"translated"}}]}"#,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -129,6 +225,48 @@ async fn preflight_reports_profile_model_mismatch() {
         .warnings
         .iter()
         .any(|warning| warning.contains("unexpected sampler state")));
+}
+
+#[tokio::test]
+async fn false_ascii_eos_is_tokenized_and_suppressed_in_llama_payload() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
+    let address = listener.local_addr().expect("listener address");
+    let server = tokio::spawn(respond_eos_sequence(listener, "$", Some(3)));
+    let config = config_for(&format!("http://{address}/v1"), false);
+    let client = TranslationClient::new(config.clone()).expect("client");
+
+    let report = client.preflight_backend().await.expect("preflight");
+    assert_eq!(report.runtime.false_eos_token.as_deref(), Some("$"));
+    assert_eq!(report.runtime.false_eos_token_id, Some(3));
+    assert_eq!(
+        client
+            .translate("translate this")
+            .await
+            .expect("translation"),
+        "translated"
+    );
+
+    server.await.expect("server task");
+}
+
+#[tokio::test]
+async fn chat_control_eos_does_not_add_llama_logit_bias() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
+    let address = listener.local_addr().expect("listener address");
+    let server = tokio::spawn(respond_eos_sequence(listener, "<|eos|>", None));
+    let config = config_for(&format!("http://{address}/v1"), false);
+    let client = TranslationClient::new(config).expect("client");
+
+    client.preflight_backend().await.expect("preflight");
+    assert_eq!(
+        client
+            .translate("translate this")
+            .await
+            .expect("translation"),
+        "translated"
+    );
+
+    server.await.expect("server task");
 }
 
 #[tokio::test]

@@ -64,6 +64,12 @@ pub struct BackendRuntimeInfo {
     pub sampler_defaults: BackendSamplerDefaults,
     pub supports_streaming: Option<bool>,
     pub supports_tokenization: Option<bool>,
+    /// A single ASCII character that llama.cpp incorrectly advertises as EOS.
+    ///
+    /// The client resolves this candidate through `/tokenize` during preflight.
+    pub false_eos_token: Option<String>,
+    /// Token ID resolved from [`Self::false_eos_token`] and suppressed in requests.
+    pub false_eos_token_id: Option<u32>,
     pub supports_templates: Option<bool>,
     pub supports_structured_output: Option<bool>,
     pub observed_at_unix_secs: u64,
@@ -95,6 +101,8 @@ impl BackendRuntimeInfo {
             sampler_defaults: BackendSamplerDefaults::default(),
             supports_streaming: None,
             supports_tokenization: None,
+            false_eos_token: None,
+            false_eos_token_id: None,
             supports_templates: None,
             supports_structured_output: None,
             observed_at_unix_secs,
@@ -136,15 +144,26 @@ impl BackendRuntimeInfo {
         let supports_streaming = optional_bool_any(object, &["supports_streaming", "streaming"])?;
         let supports_tokenization =
             optional_bool_any(object, &["supports_tokenization", "tokenization"])?;
+        let chat_template = match object.get("chat_template") {
+            Some(Value::String(template)) => Some(template.as_str()),
+            Some(Value::Null) | None => None,
+            Some(_) => return Err("chat_template must be a string".to_owned()),
+        };
+        let false_eos_token = optional_string(object, "eos_token")?.filter(|token| {
+            // Some llama.cpp GGUF conversions advertise a single ASCII
+            // punctuation `eos_token` even though the template uses a
+            // `<|...|>` control marker instead. Require that contradiction so
+            // legitimate single-character EOS tokens remain active.
+            token.len() == 1
+                && token.is_ascii()
+                && token.as_bytes()[0].is_ascii_punctuation()
+                && chat_template.is_some_and(template_contains_control_marker)
+        });
         let supports_structured_output = optional_bool_any(
             object,
             &["supports_structured_output", "structured_output", "grammar"],
         )?;
-        let supports_templates = match object.get("chat_template") {
-            Some(Value::String(template)) => Some(!template.is_empty()),
-            Some(Value::Null) | None => None,
-            Some(_) => return Err("chat_template must be a string".to_owned()),
-        };
+        let supports_templates = chat_template.map(|template| !template.is_empty());
         let model_metadata = model_path.map(|path| {
             Value::Object(Map::from_iter([(
                 String::from("model_path"),
@@ -171,6 +190,8 @@ impl BackendRuntimeInfo {
             sampler_defaults,
             supports_streaming,
             supports_tokenization,
+            false_eos_token,
+            false_eos_token_id: None,
             supports_templates,
             supports_structured_output,
             observed_at_unix_secs,
@@ -218,6 +239,8 @@ impl BackendRuntimeInfo {
             sampler_defaults: BackendSamplerDefaults::default(),
             supports_streaming: None,
             supports_tokenization: None,
+            false_eos_token: None,
+            false_eos_token_id: None,
             supports_templates: None,
             supports_structured_output: None,
             observed_at_unix_secs,
@@ -301,6 +324,14 @@ fn optional_string(object: &Map<String, Value>, field: &str) -> Result<Option<St
         Some(Value::Null) | None => Ok(None),
         Some(_) => Err(format!("{field} must be a string")),
     }
+}
+
+fn template_contains_control_marker(template: &str) -> bool {
+    template.split("<|").skip(1).any(|suffix| {
+        suffix
+            .split_once("|>")
+            .is_some_and(|(marker, _)| !marker.is_empty())
+    })
 }
 
 fn optional_string_any(

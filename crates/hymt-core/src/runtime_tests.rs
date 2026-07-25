@@ -114,6 +114,40 @@ fn older_llama_props_leave_unknown_values_unknown() {
 }
 
 #[test]
+fn llama_props_identify_ascii_punctuation_eos_as_false_when_template_uses_control_eos() {
+    let info = BackendRuntimeInfo::from_llama_cpp_props(
+        &serde_json::json!({"eos_token": "$", "chat_template": "<|eos|>"}),
+        42,
+    )
+    .expect("plain ASCII eos token must be parseable");
+
+    assert_eq!(info.false_eos_token.as_deref(), Some("$"));
+    assert_eq!(info.false_eos_token_id, None);
+}
+
+#[test]
+fn llama_props_preserve_legitimate_single_ascii_eos_used_by_template() {
+    let info = BackendRuntimeInfo::from_llama_cpp_props(
+        &serde_json::json!({"eos_token": "$", "chat_template": "{{ content }}$"}),
+        42,
+    )
+    .expect("single-character EOS token must be parseable");
+
+    assert_eq!(info.false_eos_token, None);
+    assert_eq!(info.false_eos_token_id, None);
+}
+
+#[test]
+fn llama_props_do_not_flag_chat_control_eos_as_false() {
+    let info =
+        BackendRuntimeInfo::from_llama_cpp_props(&serde_json::json!({"eos_token": "<|eos|>"}), 42)
+            .expect("chat control eos token must be parseable");
+
+    assert_eq!(info.false_eos_token, None);
+    assert_eq!(info.false_eos_token_id, None);
+}
+
+#[test]
 fn hot_reload_clears_stale_backend_runtime_state() {
     with_config("runtime-reload", cacheable_llama_config(), |config| {
         config.set_backend_runtime_info(
