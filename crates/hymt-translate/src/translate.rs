@@ -1086,6 +1086,7 @@ fn approx_source_tokens(segment: &str) -> usize {
 /// Completeness is deliberately advisory for borderline translations, but an
 /// empty response or one below this floor must not reach a document write path.
 const MIN_BEST_EFFORT_OUTPUT_RATIO_DENOMINATOR: usize = 3;
+const MIN_BEST_EFFORT_OUTPUT_RATIO_PERCENT: usize = 100 / MIN_BEST_EFFORT_OUTPUT_RATIO_DENOMINATOR;
 
 fn reject_unrecoverably_incomplete_best_attempt(
     index: usize,
@@ -1100,7 +1101,7 @@ fn reject_unrecoverably_incomplete_best_attempt(
     if empty || severely_truncated {
         anyhow::bail!(
             "segment {} best attempt is unrecoverably incomplete \
-             (output_tokens={}, source_tokens={}, minimum_output_ratio=20%)",
+             (output_tokens={}, source_tokens={}, minimum_output_ratio={MIN_BEST_EFFORT_OUTPUT_RATIO_PERCENT}%)",
             index + 1,
             output_tokens,
             source_tokens,
@@ -2427,6 +2428,39 @@ mod tests {
         }
     }
 
+    async fn start_document_batch_mock_server(
+        failed_segment_marker: String,
+        successful_reply: String,
+    ) -> MockServer {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let failed_segment_marker = failed_segment_marker.clone();
+                let successful_reply = successful_reply.clone();
+                tokio::spawn(async move {
+                    let Ok(request) = read_http_request(&mut socket).await else {
+                        return;
+                    };
+                    let response = if request
+                        .windows(failed_segment_marker.len())
+                        .any(|window| window == failed_segment_marker.as_bytes())
+                    {
+                        "译".to_owned()
+                    } else {
+                        successful_reply
+                    };
+                    let _ = write_mock_response(socket, MockResponse::Json(response)).await;
+                });
+            }
+        });
+
+        MockServer {
+            endpoint_url: format!("http://{addr}/v1"),
+            handle,
+        }
+    }
+
     async fn start_preflight_counting_server(
         props_responses: Vec<String>,
     ) -> (
@@ -3339,9 +3373,14 @@ max_retries = 1
             let error = crate::doc_translate::run_doc_translation(&input, &doc_opts)
                 .await
                 .expect_err("{name} output must fail instead of overwriting the document");
+            let error_message = format!("{error:#}");
             assert!(
-                format!("{error:#}").contains("unrecoverably incomplete"),
-                "unexpected error for {name} output: {error:#}"
+                error_message.contains("unrecoverably incomplete"),
+                "unexpected error for {name} output: {error_message}"
+            );
+            assert!(
+                error_message.contains("minimum_output_ratio=33%"),
+                "incorrect minimum output ratio in error for {name} output: {error_message}"
             );
             assert_eq!(
                 std::fs::read_to_string(&output).expect("prior output must remain readable"),
@@ -3349,6 +3388,73 @@ max_retries = 1
                 "{name} best attempt must not overwrite the prior output"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn document_batch_continues_after_a_segment_translation_failure() {
+        let failed_segment_marker = "FAILED_DOCUMENT_SEGMENT".to_owned();
+        let server =
+            start_document_batch_mock_server(failed_segment_marker.clone(), "译".repeat(200)).await;
+        let config = make_stream_config(&server.endpoint_url);
+        let client = TranslationClient::new(config.clone()).expect("client");
+        let segmenter = fallback_segmenter();
+        let opts = PromptOpts::default();
+        let dir = tempfile::tempdir().expect("temporary document directory");
+        let source_dir = dir.path().join("documents");
+        std::fs::create_dir(&source_dir).expect("create source directory");
+
+        let first = source_dir.join("first.md");
+        let failed = source_dir.join("failed.md");
+        let last = source_dir.join("last.md");
+        std::fs::write(
+            &first,
+            "The first document contains enough distinct source material for a complete translation. ".repeat(12),
+        )
+        .expect("write first document");
+        std::fs::write(&failed, format!("{failed_segment_marker} ").repeat(80))
+            .expect("write failed document");
+        std::fs::write(
+            &last,
+            "The last document must still be translated after an earlier segment failure. "
+                .repeat(12),
+        )
+        .expect("write last document");
+
+        let history = HistoryDB::new(dir.path().join("history.db"));
+        let doc_opts = crate::doc_translate::DocTranslationOpts {
+            target_lang: "zh",
+            config: &config,
+            client: &client,
+            segmenter: &segmenter,
+            history: &history,
+            output_path: None,
+            output_dir: None,
+            recursive: false,
+            template: &TemplateType::Default,
+            prompt_opts: &opts,
+            explicit_target: true,
+        };
+
+        let error = crate::doc_translate::run_doc_translation(&source_dir, &doc_opts)
+            .await
+            .expect_err("a failed document must make the batch exit non-zero");
+
+        assert!(
+            format!("{error:#}").contains("1 document(s) failed"),
+            "unexpected batch error: {error:#}"
+        );
+        assert!(
+            source_dir.join("first.zh-cn.md").is_file(),
+            "the document before the failure must be translated"
+        );
+        assert!(
+            source_dir.join("last.zh-cn.md").is_file(),
+            "the document after the failure must be translated"
+        );
+        assert!(
+            !source_dir.join("failed.zh-cn.md").exists(),
+            "an unrecoverably incomplete document must not produce an output"
+        );
     }
 
     #[tokio::test]

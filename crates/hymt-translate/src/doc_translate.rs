@@ -263,6 +263,8 @@ pub async fn run_doc_translation(source: &Path, opts: &DocTranslationOpts<'_>) -
         return Ok(());
     }
 
+    let mut failed_documents = 0;
+    let mut first_error = None;
     for (i, target) in targets.iter().enumerate() {
         eprintln!(
             "Document {}/{}: {} -> {}",
@@ -272,47 +274,74 @@ pub async fn run_doc_translation(source: &Path, opts: &DocTranslationOpts<'_>) -
             target.output_path.display()
         );
 
-        let text = tokio::fs::read_to_string(&target.source_path)
-            .await
-            .with_context(|| format!("reading {}", target.source_path.display()))?;
-
-        let tctx = TranslationCtx {
-            config: opts.config,
-            client: opts.client,
-            segmenter: opts.segmenter,
-            history: opts.history,
-        };
-        let outcome = translate_text(
-            &text,
-            &target.target_lang,
-            opts.template,
-            opts.prompt_opts,
-            &tctx,
-        )
-        .await?;
-        outcome.report_completeness_degraded();
-        let translated = outcome.text;
-
-        // Atomic write: PID + epoch-ns suffix prevents concurrent temp-file collisions.
-        if let Some(parent) = target.output_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+        if let Err(error) = run_doc_translation_target(target, opts).await {
+            failed_documents += 1;
+            eprintln!(
+                "Document {}/{} failed: {}\n{error:#}",
+                i + 1,
+                targets.len(),
+                target.source_path.display()
+            );
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
         }
-        let uid = format!(
-            "tmp.{}.{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
-        let tmp = target.output_path.with_extension(uid);
-        tokio::fs::write(&tmp, &translated)
-            .await
-            .with_context(|| format!("writing temp file {}", tmp.display()))?;
-        tokio::fs::rename(&tmp, &target.output_path)
-            .await
-            .with_context(|| format!("renaming to {}", target.output_path.display()))?;
     }
+
+    if let Some(error) = first_error {
+        return Err(error.context(format!(
+            "{failed_documents} document(s) failed to translate"
+        )));
+    }
+
+    Ok(())
+}
+
+async fn run_doc_translation_target(
+    target: &DocTranslationTarget,
+    opts: &DocTranslationOpts<'_>,
+) -> Result<()> {
+    let text = tokio::fs::read_to_string(&target.source_path)
+        .await
+        .with_context(|| format!("reading {}", target.source_path.display()))?;
+
+    let tctx = TranslationCtx {
+        config: opts.config,
+        client: opts.client,
+        segmenter: opts.segmenter,
+        history: opts.history,
+    };
+    let outcome = translate_text(
+        &text,
+        &target.target_lang,
+        opts.template,
+        opts.prompt_opts,
+        &tctx,
+    )
+    .await?;
+    outcome.report_completeness_degraded();
+    let translated = outcome.text;
+
+    // Atomic write: PID + epoch-ns suffix prevents concurrent temp-file collisions.
+    if let Some(parent) = target.output_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let uid = format!(
+        "tmp.{}.{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let tmp = target.output_path.with_extension(uid);
+    tokio::fs::write(&tmp, &translated)
+        .await
+        .with_context(|| format!("writing temp file {}", tmp.display()))?;
+    tokio::fs::rename(&tmp, &target.output_path)
+        .await
+        .with_context(|| format!("renaming to {}", target.output_path.display()))?;
+
     Ok(())
 }
 
