@@ -78,9 +78,12 @@ zh_to_en_min_ratio = 0.3
 en_to_zh_min_ratio = 0.3
 min_paragraph_ratio = 0.5
 max_retries = 2
-# When false (default), top-level CLI translation exits non-zero after writing best
-# attempt if any segment exhausted completeness retries. Set true (or pass
-# --warn-only-completeness) to keep exit 0 with warnings only.
+# When false (default), top-level CLI translation exits non-zero after writing
+# best attempt if any segment exhausted completeness retries (provided the
+# attempt meets the minimum 33% output floor). Set true (or pass
+# --warn-only-completeness) to keep exit 0 with warnings only. Attempts that
+# are empty or below the 33% floor are always rejected as errors and never
+# written, even with warn_only = true.
 warn_only = false
 
 [exec]
