@@ -64,7 +64,7 @@ per_request_context = 8192
 
 [translation]
 max_output_tokens = 4096
-max_source_tokens_per_segment = 1024
+max_source_tokens_per_segment = 384
 concurrency = 8 # use 3 with hy-mt2-quality.service
 stream = true
 config_version = 1
@@ -102,9 +102,11 @@ zh_to_en_min_ratio = 0.3
 en_to_zh_min_ratio = 0.3
 min_paragraph_ratio = 0.5
 max_retries = 2
-# When false (default), top-level text/file/stdin exits non-zero after writing best
-# attempt if any segment exhausted completeness retries. Set true (or pass
-# --warn-only-completeness) to keep exit 0 with warnings only.
+# After retries are exhausted, a non-empty best attempt meeting the 33% completeness
+# floor is written. Set true (or pass --warn-only-completeness) to keep exit 0 with
+# warnings for this degraded best-effort result.
+# Empty or below-33% candidates are unrecoverably incomplete: they are rejected as
+# errors and are not written, even when warn_only is true.
 warn_only = false
 
 [timing]
@@ -268,8 +270,8 @@ Behavior:
 - Default target is `zh`, and Markdown outputs normalize to `.zh-cn.md`.
 - Directory mode translates Markdown files and preserves relative paths when `--output-dir` is used.
 - Completeness validation is a fast, layered truncation/structure guard — **not** translation quality estimation (QE) or proof of semantic correctness. It uses Unicode-scalar density bounds for calibrated English/Chinese targets; other targets explicitly report `unverified_density` rather than silently claiming density has passed. It also checks empty/terminated responses when supplied by a caller, paragraphs, Markdown headings and fenced blocks, placeholders, URLs, and valid JSON templates. Cached segments are revalidated with the current guard before reuse.
-- Failed segments retry up to `[completeness].max_retries`; the same value applies to normal, streaming, batch, and `translate-doc` segment validation. Exhausted retries retain the highest validation-scored attempt (a ranking of observable guard signals, never a QE score) and record `reason=highest_validation_score`. `hymt` writes this degraded best effort and emits `completeness_status=degraded_best_effort` plus `completeness_degraded_segments=…` on stderr. Top-level text/file/stdin commands, including their streaming form, then exit non-zero so scripts detect degraded results; pass `--warn-only-completeness` or set `[completeness].warn_only = true` to keep exit 0 with warnings only. `batch`, `translate-doc`, and `exec` report the same stderr marker by default but do not fail the whole job for degraded segments. Validated streaming buffers a segment until it passes; optimistic streaming cannot retract emitted invalid tokens and therefore reports degraded best effort rather than retrying.
-- Source segments are bounded by the expansion/context budget and `[translation].max_source_tokens_per_segment` (default `1024`, `0` disables). For a pinned Hy-MT2 profile with its tokenizer downloaded, the planner renders and counts the complete chat request (role framing, prompt/context, assistant marker, and the completeness-retry reservation) before reserving output tokens. `--plan` reports the counting source, profile/tokenizer/template identity, per-slot capacity, input/output breakdown, and any segment revisions.
+- Failed segments retry up to `[completeness].max_retries`; the same value applies to normal, streaming, batch, and `translate-doc` segment validation. Exhausted retries retain the highest validation-scored attempt (a ranking of observable guard signals, never a QE score) and record `reason=highest_validation_score`. A non-empty best attempt that meets the 33% approximate source-token floor is ordinary degraded best effort: `hymt` writes it and emits `completeness_status=degraded_best_effort` plus `completeness_degraded_segments=…` on stderr. An empty best attempt or one below that floor is unrecoverably incomplete and is rejected with an error instead of being written. For `translate-doc`, a rejected document leaves any existing output file untouched; directory translation continues with later documents but exits non-zero if any document failed. Top-level text/file/stdin commands, including their streaming form, exit non-zero for ordinary degraded results so scripts detect them; pass `--warn-only-completeness` or set `[completeness].warn_only = true` to keep exit 0 with warnings only for those eligible degraded results, not unrecoverably incomplete output. `batch`, `translate-doc`, and `exec` report the same stderr marker by default but do not fail the whole job for eligible degraded segments. Validated streaming buffers a segment until it passes; optimistic streaming cannot retract emitted invalid tokens and therefore reports degraded best effort rather than retrying.
+- Source segments are bounded by the expansion/context budget and `[translation].max_source_tokens_per_segment` (default `384`, `0` disables). The conservative default avoids 7B models ending a long translation before their requested output limit; raise it only after validating complete output on the deployed endpoint. For a pinned Hy-MT2 profile with its tokenizer downloaded, the planner renders and counts the complete chat request (role framing, prompt/context, assistant marker, and the completeness-retry reservation) before reserving output tokens. `--plan` reports the counting source, profile/tokenizer/template identity, per-slot capacity, input/output breakdown, and any segment revisions.
 - If the active profile/template or tokenizer is unavailable, hymt prints an explicit stderr warning and applies a conservative `2x` input estimate plus a `64`-token chat-framing allowance. Set `[translation].strict_token_budget = true` to reject that approximate path instead; configure `[endpoint].profile` and run `hymt tokenizer download` for local budgeting.
 - Oversized fenced-code and Markdown-table protected blocks fail closed with `ProtectedBlockTooLarge` before any HTTP request is submitted; split them or preserve them outside the model.
 

@@ -42,10 +42,11 @@ stream = true
 config_version = 1
 timeout = 600
 first_chunk_priority = false
-# Hard cap on source tokens submitted per segment. Prevents oversized single-segment
-# hangs when the per-request context/max_output_tokens alone still leave a multi-k budget.
+# Hard cap on source tokens submitted per segment. The conservative default keeps
+# 7B models from ending a long translation before the requested max-output limit.
+# Raise it only after validating complete output from the deployed endpoint.
 # Set to 0 to disable the hard cap (budget is then only expansion/context-limited).
-max_source_tokens_per_segment = 1024
+max_source_tokens_per_segment = 384
 debug_chunk_timing = false
 # Refuse planning when the active profile/tokenizer cannot count the final chat
 # request locally. Default false keeps an explicitly warned conservative fallback.
@@ -77,9 +78,12 @@ zh_to_en_min_ratio = 0.3
 en_to_zh_min_ratio = 0.3
 min_paragraph_ratio = 0.5
 max_retries = 2
-# When false (default), top-level CLI translation exits non-zero after writing best
-# attempt if any segment exhausted completeness retries. Set true (or pass
-# --warn-only-completeness) to keep exit 0 with warnings only.
+# When false (default), top-level CLI translation exits non-zero after writing
+# best attempt if any segment exhausted completeness retries (provided the
+# attempt meets the minimum 33% output floor). Set true (or pass
+# --warn-only-completeness) to keep exit 0 with warnings only. Attempts that
+# are empty or below the 33% floor are always rejected as errors and never
+# written, even with warn_only = true.
 warn_only = false
 
 [exec]
@@ -1038,11 +1042,12 @@ impl HotConfig {
 
     /// Hard upper bound on source tokens per translation segment.
     ///
-    /// Caps the expansion/context-derived budget so multi-k documents always
-    /// split instead of hanging as one oversized request. Defaults to `1024`.
+    /// Caps the expansion/context-derived budget so 7B models receive segments
+    /// small enough to complete even when they stop before their requested output
+    /// limit. Defaults to `384`.
     /// `0` disables the hard cap (budget is only expansion/context-limited).
     pub fn max_source_tokens_per_segment(&self) -> u32 {
-        self.get_non_negative_u32("translation", "max_source_tokens_per_segment", 1024)
+        self.get_non_negative_u32("translation", "max_source_tokens_per_segment", 384)
     }
 
     /// When true, emit per-chunk pipeline timestamps on stderr.
@@ -1783,7 +1788,7 @@ mod tests {
         assert_eq!(cfg.secondary_lang(), "en");
         assert_eq!(cfg.stream(), true);
         assert!((cfg.timeout() - 600.0).abs() < f64::EPSILON);
-        assert_eq!(cfg.max_source_tokens_per_segment(), 1024);
+        assert_eq!(cfg.max_source_tokens_per_segment(), 384);
         assert!((cfg.completeness_zh_to_en_min_ratio() - 0.3).abs() < f64::EPSILON);
         assert!((cfg.completeness_en_to_zh_min_ratio() - 0.3).abs() < f64::EPSILON);
         assert!((cfg.completeness_min_paragraph_ratio() - 0.5).abs() < f64::EPSILON);
