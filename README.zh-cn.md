@@ -99,9 +99,10 @@ zh_to_en_min_ratio = 0.3
 en_to_zh_min_ratio = 0.3
 min_paragraph_ratio = 0.5
 max_retries = 2
-# When false (default), top-level text/file/stdin exits non-zero after writing best
-# attempt if any segment exhausted completeness retries. Set true (or pass
-# --warn-only-completeness) to keep exit 0 with warnings only.
+# 重试耗尽后，非空且达到 33% 完整性下限的最佳尝试会被写入。设置为 true（或传递
+# --warn-only-completeness）会让此类降级尽力结果仅发出警告且保持退出码为 0。
+# 空候选或低于 33% 的候选属于无法恢复的不完整输出：即使 warn_only 为 true，也会被
+# 作为错误拒绝且不会写入。
 warn_only = false
 
 [timing]

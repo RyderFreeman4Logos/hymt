@@ -102,9 +102,11 @@ zh_to_en_min_ratio = 0.3
 en_to_zh_min_ratio = 0.3
 min_paragraph_ratio = 0.5
 max_retries = 2
-# When false (default), top-level text/file/stdin exits non-zero after writing best
-# attempt if any segment exhausted completeness retries. Set true (or pass
-# --warn-only-completeness) to keep exit 0 with warnings only.
+# After retries are exhausted, a non-empty best attempt meeting the 33% completeness
+# floor is written. Set true (or pass --warn-only-completeness) to keep exit 0 with
+# warnings for this degraded best-effort result.
+# Empty or below-33% candidates are unrecoverably incomplete: they are rejected as
+# errors and are not written, even when warn_only is true.
 warn_only = false
 
 [timing]
