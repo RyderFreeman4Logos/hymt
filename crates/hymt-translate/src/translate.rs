@@ -3686,6 +3686,46 @@ max_retries = 1
     }
 
     #[test]
+    fn plan_default_hard_cap_splits_820_token_document_for_7b_model() {
+        let seg = fallback_segmenter();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            "[endpoint]\nprofile = \"hy_mt2_7b\"\n\n[backend]\ntotal_context = 24576\nparallel_slots = 3\n\n[translation]\nmax_output_tokens = 4096\n",
+        )
+        .unwrap();
+        let cfg = hymt_core::config::HotConfig::from_path(&cfg_path).unwrap();
+        // This matches the approximate source size that stopped early on the
+        // 7B llama.cpp deployment. It must not be retried as one oversized request.
+        let text =
+            "This English documentation sentence must be translated completely before continuing. "
+                .repeat(39);
+        let text = &text[..3_280];
+        assert_eq!(seg.count_tokens(text), 820);
+
+        let plan = plan_translation(
+            &text,
+            "zh",
+            &cfg,
+            &seg,
+            &TemplateType::Default,
+            &PromptOpts::default(),
+        )
+        .unwrap();
+
+        assert_eq!(plan.available_source_tokens, 384);
+        assert!(
+            plan.segment_count() >= 2,
+            "an 820-token document must not remain one 7B request"
+        );
+        assert!(plan
+            .segments
+            .iter()
+            .all(|segment| seg.count_tokens(segment) <= plan.available_source_tokens));
+    }
+
+    #[test]
     fn plan_hard_cap_zero_disables_cap() {
         let seg = fallback_segmenter();
         let dir = tempfile::tempdir().unwrap();
