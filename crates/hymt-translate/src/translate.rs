@@ -283,9 +283,12 @@ impl TranslationPlan {
         debug_assert_eq!(translations.len(), self.segments.len());
         match &self.document_plan {
             None => translations.join(""),
-            Some(plan) if !self.segment_section_groups.is_empty() => {
-                reconstruct_section_groups(plan, &self.segment_section_groups, translations)
-            }
+            Some(plan) if !self.segment_section_groups.is_empty() => reconstruct_section_groups(
+                plan,
+                &self.segment_section_groups,
+                &self.segments,
+                translations,
+            ),
             Some(plan) => reconstruct_sections(plan, &self.segment_section_indexes, translations),
         }
     }
@@ -387,24 +390,24 @@ fn reconstruction_newline_after_segment(
             .get(segment_index + 1)
             .is_some_and(|next| next == group)
         {
-            return None;
+            let source_segment = plan.segments.get(segment_index)?;
+            let translated = translations.get(segment_index)?.as_deref()?;
+            let missing = trailing_newline_deficit(translated, source_segment);
+            return (missing > 0).then(|| "\n".repeat(missing));
         }
 
         let source_text: String = group
             .iter()
             .map(|&i| doc_plan.sections[i].text.as_str())
             .collect();
-        if !source_text.ends_with('\n') {
-            return None;
-        }
-
         let mut output = String::new();
         for (idx, candidate) in plan.segment_section_groups.iter().enumerate() {
             if candidate == group {
                 output.push_str(translations.get(idx)?.as_deref()?);
             }
         }
-        return (!output.ends_with('\n')).then(|| "\n".to_owned());
+        let missing = trailing_newline_deficit(&output, &source_text);
+        return (missing > 0).then(|| "\n".repeat(missing));
     }
 
     let section_index = *plan.segment_section_indexes.get(segment_index)?;
@@ -416,30 +419,29 @@ fn reconstruction_newline_after_segment(
         return None;
     }
     let section = doc_plan.sections.get(section_index)?;
-    if !section.text.ends_with('\n') {
-        return None;
-    }
-
     let mut output = String::new();
     for (idx, candidate) in plan.segment_section_indexes.iter().enumerate() {
         if *candidate == section_index {
             output.push_str(translations.get(idx)?.as_deref()?);
         }
     }
-    (!output.ends_with('\n')).then(|| "\n".to_owned())
+    let missing = trailing_newline_deficit(&output, &section.text);
+    (missing > 0).then(|| "\n".repeat(missing))
+}
+
+fn trailing_newline_deficit(out: &str, original: &str) -> usize {
+    let original_trailing = original.chars().rev().take_while(|&c| c == '\n').count();
+    let output_trailing = out.chars().rev().take_while(|&c| c == '\n').count();
+    original_trailing.saturating_sub(output_trailing)
 }
 
 /// Restore trailing newlines from `original` onto `out` if the translation
 /// output lost them. Markdown structure (e.g. blank lines between headings
 /// and body) depends on preserving the original trailing newline count.
 fn restore_trailing_newlines(out: &mut String, original: &str) {
-    let orig_trailing = original.chars().rev().take_while(|&c| c == '\n').count();
-    if orig_trailing == 0 {
-        return;
-    }
-    let out_trailing = out.chars().rev().take_while(|&c| c == '\n').count();
-    if out_trailing < orig_trailing {
-        out.push_str(&"\n".repeat(orig_trailing - out_trailing));
+    let missing = trailing_newline_deficit(out, original);
+    if missing > 0 {
+        out.push_str(&"\n".repeat(missing));
     }
 }
 
@@ -474,18 +476,26 @@ fn reconstruct_sections(
 fn reconstruct_section_groups(
     plan: &DocumentLanguagePlan,
     segment_section_groups: &[Vec<usize>],
+    source_segments: &[String],
     translations: &[String],
 ) -> String {
-    let mut group_trans: HashMap<usize, Vec<&str>> = HashMap::new();
+    let mut group_trans: HashMap<usize, Vec<(&str, &str)>> = HashMap::new();
     let mut group_texts: HashMap<usize, String> = HashMap::new();
     let mut covered: HashSet<usize> = HashSet::new();
 
-    for (group, trans) in segment_section_groups.iter().zip(translations.iter()) {
+    for ((group, source), trans) in segment_section_groups
+        .iter()
+        .zip(source_segments.iter())
+        .zip(translations.iter())
+    {
         if group.is_empty() {
             continue;
         }
         let first = group[0];
-        group_trans.entry(first).or_default().push(trans.as_str());
+        group_trans
+            .entry(first)
+            .or_default()
+            .push((source.as_str(), trans.as_str()));
         group_texts.entry(first).or_insert_with(|| {
             group
                 .iter()
@@ -499,7 +509,13 @@ fn reconstruct_section_groups(
     for (i, section) in plan.sections.iter().enumerate() {
         if covered.contains(&i) {
             if let Some(ts) = group_trans.get(&i) {
-                let mut out = ts.join("");
+                let mut out = String::new();
+                for (segment_index, (source, translation)) in ts.iter().enumerate() {
+                    out.push_str(translation);
+                    if segment_index + 1 < ts.len() {
+                        restore_trailing_newlines(&mut out, source);
+                    }
+                }
                 if let Some(gt) = group_texts.get(&i) {
                     restore_trailing_newlines(&mut out, gt);
                 }
@@ -1066,6 +1082,33 @@ fn approx_source_tokens(segment: &str) -> usize {
     }
 }
 
+/// A best-effort fallback must retain enough source material to remain usable.
+/// Completeness is deliberately advisory for borderline translations, but an
+/// empty response or one below this floor must not reach a document write path.
+const MIN_BEST_EFFORT_OUTPUT_RATIO_DENOMINATOR: usize = 5;
+
+fn reject_unrecoverably_incomplete_best_attempt(
+    index: usize,
+    source: &str,
+    translated: &str,
+) -> Result<()> {
+    let source_tokens = approx_source_tokens(source);
+    let output_tokens = approx_source_tokens(translated);
+    let empty = translated.trim().is_empty();
+    let severely_truncated =
+        output_tokens.saturating_mul(MIN_BEST_EFFORT_OUTPUT_RATIO_DENOMINATOR) < source_tokens;
+    if empty || severely_truncated {
+        anyhow::bail!(
+            "segment {} best attempt is unrecoverably incomplete \
+             (output_tokens={}, source_tokens={}, minimum_output_ratio=20%)",
+            index + 1,
+            output_tokens,
+            source_tokens,
+        );
+    }
+    Ok(())
+}
+
 fn map_segment_http_error(
     index: usize,
     segment: &str,
@@ -1143,6 +1186,7 @@ async fn translate_segment_with_completeness(
     }
 
     let best = best.expect("a retry loop always has at least one attempt");
+    reject_unrecoverably_incomplete_best_attempt(index, segment, &best.text)?;
     eprintln!(
         "Warning: segment {} exceeded {} retries, selected attempt {}/{} \
          (score={}, reason={})",
@@ -1314,6 +1358,7 @@ async fn translate_segment_with_completeness_streaming(
     // Retrying would produce text that diverges from the emitted prefix,
     // corrupting stdout. Accept the best attempt and warn instead.
     if emitted_optimistically {
+        reject_unrecoverably_incomplete_best_attempt(request.index, request.segment, &best.text)?;
         eprintln!(
             "Warning: segment {} failed completeness, using streamed attempt (retry skipped \
              — tokens already emitted): {:?}",
@@ -1411,6 +1456,7 @@ async fn translate_segment_with_completeness_streaming(
         best = select_best_attempt(Some(best), candidate);
     }
 
+    reject_unrecoverably_incomplete_best_attempt(request.index, request.segment, &best.text)?;
     eprintln!(
         "Warning: segment {} exceeded {} retries, selected attempt {}/{} \
          (score={}, reason={})",
@@ -3242,6 +3288,70 @@ max_retries = 1
     }
 
     #[tokio::test]
+    async fn document_pipeline_refuses_empty_or_severely_truncated_best_attempts() {
+        let source = "This source paragraph is deliberately long enough that an empty or one-character \
+                      translation is an unrecoverable completeness failure rather than useful degraded output.";
+        let segmenter = fallback_segmenter();
+        let opts = PromptOpts::default();
+        let planning_config = make_stream_config("http://127.0.0.1:1/v1");
+        let plan = plan_translation(
+            source,
+            "zh",
+            &planning_config,
+            &segmenter,
+            &TemplateType::Default,
+            &opts,
+        )
+        .expect("document plan");
+        assert!(
+            plan.segment_count() > 0,
+            "fixture must have translated segments"
+        );
+
+        for (name, reply) in [("empty", ""), ("truncated", "译")] {
+            let responses = (0..plan.segment_count() * 2)
+                .map(|_| MockResponse::Json(reply.to_owned()))
+                .collect();
+            let server = start_mock_server(responses).await;
+            let config = make_stream_config(&server.endpoint_url);
+            let client = TranslationClient::new(config.clone()).expect("client");
+            let dir = tempfile::tempdir().expect("temporary document directory");
+            let input = dir.path().join("guide.md");
+            let output = dir.path().join("guide.zh-cn.md");
+            let previous_output_contents = "previous complete document";
+            std::fs::write(&input, source).expect("write source document");
+            std::fs::write(&output, previous_output_contents).expect("write prior output");
+            let history = HistoryDB::new(dir.path().join("history.db"));
+            let doc_opts = crate::doc_translate::DocTranslationOpts {
+                target_lang: "zh",
+                config: &config,
+                client: &client,
+                segmenter: &segmenter,
+                history: &history,
+                output_path: Some(&output),
+                output_dir: None,
+                recursive: false,
+                template: &TemplateType::Default,
+                prompt_opts: &opts,
+                explicit_target: true,
+            };
+
+            let error = crate::doc_translate::run_doc_translation(&input, &doc_opts)
+                .await
+                .expect_err("{name} output must fail instead of overwriting the document");
+            assert!(
+                format!("{error:#}").contains("unrecoverably incomplete"),
+                "unexpected error for {name} output: {error:#}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&output).expect("prior output must remain readable"),
+                previous_output_contents,
+                "{name} best attempt must not overwrite the prior output"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn validated_document_stream_is_a_prefix_of_the_reconstructed_final_output() {
         let source = "---\ntitle: Stream\n---\n\nStreaming output must remain a prefix of the validated final translation.";
         let segmenter = fallback_segmenter();
@@ -3975,6 +4085,50 @@ max_retries = 1
     }
 
     #[test]
+    fn reconstruct_section_groups_restores_each_source_segment_newline_boundary() {
+        use hymt_core::language::build_document_translation_plan;
+
+        let document_plan = build_document_translation_plan(
+            "# Heading\n\nBody text that must remain separate.\n",
+            "zh",
+        );
+        let group = translation_section_groups(&document_plan)
+            .into_iter()
+            .next()
+            .expect("fixture must create a translatable group");
+        let plan = TranslationPlan {
+            source_tokens: 0,
+            segments: vec![
+                "# Heading\n\n".to_owned(),
+                "Body text that must remain separate.\n".to_owned(),
+            ],
+            available_source_tokens: 100,
+            token_budget: TokenBudget {
+                prompt_schema: PROMPT_SCHEMA_ID,
+                counting_source: TokenCountingSource::Local,
+                profile_id: "test".to_owned(),
+                tokenizer_revision: None,
+                chat_template_identity: None,
+                per_slot_context: 100,
+                input_capacity_tokens: 90,
+                output_reservation_tokens: 10,
+                template_tokens: 0,
+                safety_margin_tokens: 0,
+                revisions: 0,
+                segment_input_tokens: vec![1, 1],
+                warning: None,
+            },
+            document_plan: Some(document_plan),
+            segment_section_indexes: vec![group[0], group[0]],
+            segment_section_groups: vec![group.clone(), group],
+        };
+
+        let translated = plan.reconstruct(&["# 标题".to_owned(), "正文保持分段。".to_owned()]);
+
+        assert_eq!(translated, "# 标题\n\n正文保持分段。\n");
+    }
+
+    #[test]
     fn translation_section_groups_all_translatable() {
         use hymt_core::language::build_document_translation_plan;
         let plan = build_document_translation_plan("Paragraph one.\n\nParagraph two.\n", "zh");
@@ -4202,7 +4356,8 @@ Bravo one text carries enough source material for cache validation and ordering 
         let expected = plan.reconstruct(&translations);
         let between = format!("{}{}", translations[0], translations[1]);
         assert!(
-            !expected.contains(&between) || expected.contains(&format!("{}\n{}", translations[0], translations[1])),
+            !expected.contains(&between)
+                || expected.contains(&format!("{}\n{}", translations[0], translations[1])),
             "reconstruct must insert a separator newline between priority and later segments; expected={expected:?}"
         );
         assert!(
