@@ -96,7 +96,7 @@ async fn respond_eos_sequence(
     respond_json(
         &mut socket,
         &format!(
-            r#"{{"model_alias":"served-model","n_ctx":16384,"n_ctx_per_seq":16384,"eos_token":"{eos_token}"}}"#
+            r#"{{"model_alias":"served-model","n_ctx":16384,"n_ctx_per_seq":16384,"eos_token":"{eos_token}","chat_template":"<|eos|>"}}"#
         ),
     )
     .await;
