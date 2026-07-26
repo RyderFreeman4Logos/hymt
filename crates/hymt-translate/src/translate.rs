@@ -1231,12 +1231,21 @@ fn approx_source_tokens(segment: &str) -> usize {
 fn is_cjk_char(character: char) -> bool {
     matches!(
         character as u32,
-        0x3000..=0x30FF // CJK punctuation, Hiragana, Katakana
+        0x1100..=0x11FF // Hangul Jamo
+            | 0x3000..=0x30FF // CJK punctuation, Hiragana, Katakana
             | 0x3400..=0x4DBF // CJK Extension A
             | 0x4E00..=0x9FFF // CJK Unified Ideographs
-            | 0xF900..=0xFAFF // CJK Compatibility Ideographs
+            | 0xA960..=0xA97F // Hangul Jamo Extended-A
             | 0xAC00..=0xD7AF // Hangul Syllables
+            | 0xD7B0..=0xD7FF // Hangul Jamo Extended-B
+            | 0xF900..=0xFAFF // CJK Compatibility Ideographs
             | 0xFF00..=0xFFEF // Fullwidth Forms
+            | 0x20000..=0x2A6DF // CJK Unified Ideographs Extension B
+            | 0x2A700..=0x2B73F // CJK Unified Ideographs Extension C
+            | 0x2B740..=0x2B81F // CJK Unified Ideographs Extension D
+            | 0x2B820..=0x2CEAF // CJK Unified Ideographs Extension E
+            | 0x2CEB0..=0x2EBEF // CJK Unified Ideographs Extension F
+            | 0x2F800..=0x2FA1F // CJK Compatibility Ideographs Supplement
     )
 }
 
