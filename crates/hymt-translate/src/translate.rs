@@ -1212,10 +1212,32 @@ struct SegmentTranslateRequest<'a> {
 
 fn approx_source_tokens(segment: &str) -> usize {
     if segment.is_empty() {
-        0
-    } else {
-        segment.chars().count().div_ceil(4).max(1)
+        return 0;
     }
+
+    let mut cjk = 0usize;
+    let mut other = 0usize;
+    for character in segment.chars() {
+        if is_cjk_char(character) {
+            cjk += 1;
+        } else {
+            other += 1;
+        }
+    }
+
+    cjk + other.div_ceil(4)
+}
+
+fn is_cjk_char(character: char) -> bool {
+    matches!(
+        character as u32,
+        0x3000..=0x30FF // CJK punctuation, Hiragana, Katakana
+            | 0x3400..=0x4DBF // CJK Extension A
+            | 0x4E00..=0x9FFF // CJK Unified Ideographs
+            | 0xF900..=0xFAFF // CJK Compatibility Ideographs
+            | 0xAC00..=0xD7AF // Hangul Syllables
+            | 0xFF00..=0xFFEF // Fullwidth Forms
+    )
 }
 
 /// A best-effort fallback must retain enough source material to remain usable.
@@ -6080,5 +6102,32 @@ max_retries = 1
         assert_eq!(selected.attempt, 0);
         assert!(selected.validation.score > 0);
         assert_eq!(selected.selection_reason(), "highest_validation_score");
+    }
+
+    #[test]
+    fn approx_source_tokens_counts_chinese_characters_individually() {
+        assert_eq!(approx_source_tokens("你好世界"), 4);
+    }
+
+    #[test]
+    fn approx_source_tokens_combines_cjk_and_ascii_estimates() {
+        assert_eq!(approx_source_tokens("Hello 世界"), 4);
+    }
+
+    #[test]
+    fn approx_source_tokens_preserves_english_estimate() {
+        assert_eq!(approx_source_tokens("Hello World"), 3);
+    }
+
+    #[test]
+    fn chinese_best_attempt_is_not_rejected_by_ascii_token_estimate() {
+        let source = "English source text ".repeat(48);
+        let translated = "译".repeat(280);
+
+        assert_eq!(source.chars().count(), 960);
+        assert!(
+            reject_unrecoverably_incomplete_best_attempt(0, &source, &translated).is_ok(),
+            "a 280-character Chinese translation of a 960-character English segment is not severely truncated"
+        );
     }
 }
