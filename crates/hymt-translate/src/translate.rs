@@ -1232,20 +1232,27 @@ fn is_cjk_char(character: char) -> bool {
     matches!(
         character as u32,
         0x1100..=0x11FF // Hangul Jamo
-            | 0x3000..=0x30FF // CJK punctuation, Hiragana, Katakana
+            | 0x3000..=0x30FF // CJK symbols/punctuation, Hiragana, Katakana
             | 0x3400..=0x4DBF // CJK Extension A
             | 0x4E00..=0x9FFF // CJK Unified Ideographs
             | 0xA960..=0xA97F // Hangul Jamo Extended-A
             | 0xAC00..=0xD7AF // Hangul Syllables
             | 0xD7B0..=0xD7FF // Hangul Jamo Extended-B
             | 0xF900..=0xFAFF // CJK Compatibility Ideographs
-            | 0xFF00..=0xFFEF // Fullwidth Forms
-            | 0x20000..=0x2A6DF // CJK Unified Ideographs Extension B
-            | 0x2A700..=0x2B73F // CJK Unified Ideographs Extension C
-            | 0x2B740..=0x2B81F // CJK Unified Ideographs Extension D
-            | 0x2B820..=0x2CEAF // CJK Unified Ideographs Extension E
-            | 0x2CEB0..=0x2EBEF // CJK Unified Ideographs Extension F
+            | 0xFF00..=0xFFEF // Halfwidth and Fullwidth Forms
+            | 0x1B000..=0x1B0FF // Kana Supplement
+            | 0x1B100..=0x1B12F // Kana Extended-A
+            | 0x1B130..=0x1B16F // Small Kana Extension
+            | 0x20000..=0x2A6DF // CJK Extension B
+            | 0x2A700..=0x2B73F // CJK Extension C
+            | 0x2B740..=0x2B81F // CJK Extension D
+            | 0x2B820..=0x2CEAF // CJK Extension E
+            | 0x2CEB0..=0x2EBEF // CJK Extension F
+            | 0x2EBF0..=0x2EE5F // CJK Extension I
             | 0x2F800..=0x2FA1F // CJK Compatibility Ideographs Supplement
+            | 0x30000..=0x3134F // CJK Extension G
+            | 0x31350..=0x323AF // CJK Extension H
+            | 0x323B0..=0x3347F // CJK Extension J
     )
 }
 
