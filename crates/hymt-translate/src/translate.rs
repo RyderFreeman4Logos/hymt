@@ -1212,10 +1212,52 @@ struct SegmentTranslateRequest<'a> {
 
 fn approx_source_tokens(segment: &str) -> usize {
     if segment.is_empty() {
-        0
-    } else {
-        segment.chars().count().div_ceil(4).max(1)
+        return 0;
     }
+
+    let mut cjk = 0usize;
+    let mut other = 0usize;
+    for character in segment.chars() {
+        if is_cjk_char(character) {
+            cjk += 1;
+        } else {
+            other += 1;
+        }
+    }
+
+    cjk + other.div_ceil(4)
+}
+
+const CJK_RANGES: &[(u32, u32)] = &[
+    (0x1100, 0x11FF), // Hangul Jamo
+    // CJK Radicals Supplement, Kangxi Radicals, Ideographic Description
+    // Characters, CJK Symbols and Punctuation, Hiragana, Katakana,
+    // Bopomofo, Hangul Compatibility Jamo, Kanbun, Bopomofo Extended,
+    // CJK Strokes (U+31C0..=U+31EF), Katakana Phonetic Extensions,
+    // Enclosed CJK Letters and Months, CJK Compatibility, and CJK Unified
+    // Ideographs Extension A.
+    (0x2E80, 0x4DBF),
+    (0x4E00, 0x9FFF),   // CJK Unified Ideographs
+    (0xA960, 0xA97F),   // Hangul Jamo Extended-A
+    (0xAC00, 0xD7FF),   // Hangul Syllables, Hangul Jamo Extended-B
+    (0xF900, 0xFAFF),   // CJK Compatibility Ideographs
+    (0xFE10, 0xFE1F),   // Vertical Forms
+    (0xFE30, 0xFE4F),   // CJK Compatibility Forms
+    (0xFF00, 0xFFEF),   // Halfwidth and Fullwidth Forms
+    (0x16FE0, 0x16FFF), // Ideographic Symbols and Punctuation
+    (0x1AFF0, 0x1B2FF), // Kana Extended-B, Kana Supplement, Kana Extended-A, Small Kana Extension, Nushu
+    (0x1F200, 0x1F2FF), // Enclosed Ideographic Supplement
+    (0x20000, 0x2A6DF), // CJK Unified Ideographs Extension B
+    (0x2A700, 0x2EE5F), // CJK Unified Ideographs Extensions C, D, E, F, I
+    (0x2F800, 0x2FA1F), // CJK Compatibility Ideographs Supplement
+    (0x30000, 0x3347F), // CJK Unified Ideographs Extensions G, H, J
+];
+
+fn is_cjk_char(character: char) -> bool {
+    let codepoint = character as u32;
+    CJK_RANGES
+        .iter()
+        .any(|&(start, end)| (start..=end).contains(&codepoint))
 }
 
 /// A best-effort fallback must retain enough source material to remain usable.
@@ -6080,5 +6122,69 @@ max_retries = 1
         assert_eq!(selected.attempt, 0);
         assert!(selected.validation.score > 0);
         assert_eq!(selected.selection_reason(), "highest_validation_score");
+    }
+
+    #[test]
+    fn is_cjk_char_classifies_every_cjk_range_boundary() {
+        const CJK_RANGE_BOUNDARIES: &[(u32, u32)] = &[
+            (0x1100, 0x11FF),
+            (0x2E80, 0x4DBF),
+            (0x4E00, 0x9FFF),
+            (0xA960, 0xA97F),
+            (0xAC00, 0xD7FF),
+            (0xF900, 0xFAFF),
+            (0xFE10, 0xFE1F),
+            (0xFE30, 0xFE4F),
+            (0xFF00, 0xFFEF),
+            (0x16FE0, 0x16FFF),
+            (0x1AFF0, 0x1B2FF),
+            (0x1F200, 0x1F2FF),
+            (0x20000, 0x2A6DF),
+            (0x2A700, 0x2EE5F),
+            (0x2F800, 0x2FA1F),
+            (0x30000, 0x3347F),
+        ];
+
+        for &(start, end) in CJK_RANGE_BOUNDARIES {
+            for (codepoint, expected) in [
+                (start - 1, false),
+                (start, true),
+                (end, true),
+                (end + 1, false),
+            ] {
+                assert_eq!(
+                    char::from_u32(codepoint).is_some_and(is_cjk_char),
+                    expected,
+                    "U+{codepoint:04X} for CJK range U+{start:04X}..=U+{end:04X}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn approx_source_tokens_counts_chinese_characters_individually() {
+        assert_eq!(approx_source_tokens("你好世界"), 4);
+    }
+
+    #[test]
+    fn approx_source_tokens_combines_cjk_and_ascii_estimates() {
+        assert_eq!(approx_source_tokens("Hello 世界"), 4);
+    }
+
+    #[test]
+    fn approx_source_tokens_preserves_english_estimate() {
+        assert_eq!(approx_source_tokens("Hello World"), 3);
+    }
+
+    #[test]
+    fn chinese_best_attempt_is_not_rejected_by_ascii_token_estimate() {
+        let source = "English source text ".repeat(48);
+        let translated = "译".repeat(280);
+
+        assert_eq!(source.chars().count(), 960);
+        assert!(
+            reject_unrecoverably_incomplete_best_attempt(0, &source, &translated).is_ok(),
+            "a 280-character Chinese translation of a 960-character English segment is not severely truncated"
+        );
     }
 }
