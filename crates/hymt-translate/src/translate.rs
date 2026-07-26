@@ -1231,18 +1231,27 @@ fn approx_source_tokens(segment: &str) -> usize {
 fn is_cjk_char(character: char) -> bool {
     matches!(
         character as u32,
-        0x1100..=0x11FF // Hangul Jamo
-            | 0x3000..=0x30FF // CJK symbols/punctuation, Hiragana, Katakana
-            | 0x3400..=0x4DBF // CJK Extension A
-            | 0x4E00..=0x9FFF // CJK Unified Ideographs
-            | 0xA960..=0xA97F // Hangul Jamo Extended-A
-            | 0xAC00..=0xD7AF // Hangul Syllables
-            | 0xD7B0..=0xD7FF // Hangul Jamo Extended-B
-            | 0xF900..=0xFAFF // CJK Compatibility Ideographs
-            | 0xFF00..=0xFFEF // Halfwidth and Fullwidth Forms
-            | 0x1B000..=0x1B0FF // Kana Supplement
-            | 0x1B100..=0x1B12F // Kana Extended-A
-            | 0x1B130..=0x1B16F // Small Kana Extension
+        | 0x1100..=0x11FF // Hangul Jamo
+        | 0x3000..=0x312F // CJK symbols/punctuation, Hiragana, Katakana, Bopomofo
+        | 0x3130..=0x318F // Hangul Compatibility Jamo
+        | 0x3190..=0x319F // Kanbun
+        | 0x31A0..=0x31BF // Bopomofo Extended, CJK Strokes
+        | 0x31F0..=0x31FF // Katakana Phonetic Extensions
+        | 0x3200..=0x32FF // Enclosed CJK Letters and Months
+        | 0x3300..=0x33FF // CJK Compatibility
+        | 0x3400..=0x4DBF // CJK Extension A
+        | 0x4E00..=0x9FFF // CJK Unified Ideographs
+        | 0xA960..=0xA97F // Hangul Jamo Extended-A
+        | 0xAC00..=0xD7AF // Hangul Syllables
+        | 0xD7B0..=0xD7FF // Hangul Jamo Extended-B
+        | 0xF900..=0xFAFF // CJK Compatibility Ideographs
+        | 0xFE30..=0xFE4F // CJK Compatibility Forms
+        | 0xFF00..=0xFFEF // Halfwidth and Fullwidth Forms
+        | 0x1AFF0..=0x1AFFF // Kana Extended-B
+        | 0x1B000..=0x1B0FF // Kana Supplement
+        | 0x1B100..=0x1B12F // Kana Extended-A
+        | 0x1B130..=0x1B16F // Small Kana Extension
+        | 0x1B170..=0x1B2FF // Nushu
             | 0x20000..=0x2A6DF // CJK Extension B
             | 0x2A700..=0x2B73F // CJK Extension C
             | 0x2B740..=0x2B81F // CJK Extension D
