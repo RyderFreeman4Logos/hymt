@@ -670,9 +670,19 @@ impl TranslationClient {
         if configured.sampler_overrides.uses_any_server_defaults()
             && !runtime.sampler_defaults.is_complete()
         {
-            warnings.push(
-                "unexpected sampler state: service-owned sampler defaults are incomplete in runtime metadata"
-                    .to_owned(),
+            // Informational: incomplete /props sampler metadata only means hymt
+            // cannot attest service-owned defaults for cache verification. Request
+            // construction still omits those fields (server defaults apply).
+            eprintln!(
+                "debug: service-owned sampler defaults are incomplete in runtime metadata \
+                 (temperature={:?}, top_p={:?}, top_k={:?}, min_p={:?}, \
+                 repetition_penalty={:?}, repeat_last_n={:?})",
+                runtime.sampler_defaults.temperature,
+                runtime.sampler_defaults.top_p,
+                runtime.sampler_defaults.top_k,
+                runtime.sampler_defaults.min_p,
+                runtime.sampler_defaults.repetition_penalty,
+                runtime.sampler_defaults.repeat_last_n,
             );
         }
         Ok(warnings)

@@ -240,6 +240,8 @@ pub struct DocTranslationOpts<'a> {
     pub prompt_opts: &'a PromptOpts,
     /// Whether the caller explicitly specified the target language.
     pub explicit_target: bool,
+    /// When `false`, bypass segment-cache reads and writes for this run.
+    pub cache_enabled: bool,
 }
 
 // ── run_doc_translation ───────────────────────────────────────────────────────
@@ -312,6 +314,7 @@ async fn run_doc_translation_target(
         client: opts.client,
         segmenter: opts.segmenter,
         history: opts.history,
+        cache_enabled: opts.cache_enabled,
     };
     let outcome = translate_text(
         &text,

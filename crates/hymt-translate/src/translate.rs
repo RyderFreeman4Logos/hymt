@@ -42,6 +42,12 @@ pub struct TranslationCtx<'a> {
     pub client: &'a TranslationClient,
     pub segmenter: &'a Segmenter,
     pub history: &'a HistoryDB,
+    /// When `false`, bypass segment-cache reads and writes for this run
+    /// (for example CLI `--no-cache` / `--disable-cache`).
+    ///
+    /// This is independent of inference-fingerprint verification: a verified
+    /// identity still skips the cache when this flag is off.
+    pub cache_enabled: bool,
 }
 
 /// Incremental translation output emitted by [`translate_text_stream`].
@@ -1741,7 +1747,8 @@ pub async fn translate_text(
     let inference_fingerprint = ctx
         .config
         .inference_fingerprint(template_name, &options_hash)?;
-    let cache_enabled = inference_fingerprint.is_cache_verified();
+    // CLI/runtime can force-disable cache without changing the fingerprint identity.
+    let cache_enabled = ctx.cache_enabled && inference_fingerprint.is_cache_verified();
     let cache_scope = SegmentCacheScope {
         target_lang,
         template_type: template_name,
@@ -2004,7 +2011,8 @@ pub async fn translate_text_stream_with_mode(
     let inference_fingerprint = ctx
         .config
         .inference_fingerprint(template_name, &options_hash)?;
-    let cache_enabled = inference_fingerprint.is_cache_verified();
+    // CLI/runtime can force-disable cache without changing the fingerprint identity.
+    let cache_enabled = ctx.cache_enabled && inference_fingerprint.is_cache_verified();
     let cache_scope = SegmentCacheScope {
         target_lang,
         template_type: template_name,
@@ -3349,6 +3357,7 @@ max_retries = 1
             client: &client,
             segmenter,
             history,
+            cache_enabled: true,
         };
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let opts = PromptOpts::default();
@@ -3575,6 +3584,7 @@ After ordinary prose must also be translated in document order.\n"
             client: &client,
             segmenter: &segmenter,
             history: &history,
+            cache_enabled: true,
         };
         let translated = translate_text(
             &source,
@@ -3612,6 +3622,7 @@ After ordinary prose must also be translated in document order.\n"
             client: &streaming_client,
             segmenter: &segmenter,
             history: &streaming_history,
+            cache_enabled: true,
         };
         let (event_tx, event_rx) = tokio::sync::mpsc::channel(64);
         let streaming_prompt_opts = PromptOpts::default();
@@ -3725,6 +3736,7 @@ After ordinary prose must also be translated in document order.\n"
             template: &TemplateType::Default,
             prompt_opts: &opts,
             explicit_target: true,
+            cache_enabled: true,
         };
 
         crate::doc_translate::run_doc_translation(&input, &doc_opts)
@@ -3813,6 +3825,7 @@ After ordinary prose must also be translated in document order.\n"
                 template: &TemplateType::Default,
                 prompt_opts: &opts,
                 explicit_target: true,
+                cache_enabled: true,
             };
 
             let error = crate::doc_translate::run_doc_translation(&input, &doc_opts)
@@ -3878,6 +3891,7 @@ After ordinary prose must also be translated in document order.\n"
             template: &TemplateType::Default,
             prompt_opts: &opts,
             explicit_target: true,
+            cache_enabled: true,
         };
 
         let error = crate::doc_translate::run_doc_translation(&source_dir, &doc_opts)
@@ -4923,6 +4937,7 @@ Bravo one text carries enough source material for cache validation and ordering 
             client: &client,
             segmenter: &segmenter,
             history: &history,
+            cache_enabled: true,
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         let outcome = translate_text_stream_with_mode(
@@ -5044,6 +5059,7 @@ Bravo one text carries enough source material for cache validation and ordering 
             client: &client,
             segmenter: &segmenter,
             history: &history,
+            cache_enabled: true,
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         let outcome = translate_text_stream(
@@ -5331,6 +5347,7 @@ Bravo one text carries enough source material for cache validation and ordering 
             client: &client,
             segmenter: &segmenter,
             history: &history,
+            cache_enabled: true,
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         let outcome = translate_text_stream_with_mode(
@@ -5389,6 +5406,7 @@ Bravo one text carries enough source material for cache validation and ordering 
             client: &client,
             segmenter: &segmenter,
             history: &history,
+            cache_enabled: true,
         };
 
         let outcome = translate_text(
@@ -5562,6 +5580,7 @@ Bravo one text carries enough source material for cache validation and ordering 
             client: &client,
             segmenter: &segmenter,
             history: &history,
+            cache_enabled: true,
         };
 
         let outcome = translate_text(source, "zh", &TemplateType::Default, &prompt_opts, &ctx)
@@ -5631,6 +5650,7 @@ Bravo one text carries enough source material for cache validation and ordering 
             client: &client,
             segmenter: &segmenter,
             history: &history,
+            cache_enabled: true,
         };
 
         let outcome = translate_text(source, "zh", &TemplateType::Default, &prompt_opts, &ctx)
@@ -5685,6 +5705,7 @@ Bravo one text carries enough source material for cache validation and ordering 
             client: &client,
             segmenter: &segmenter,
             history: &history,
+            cache_enabled: true,
         };
 
         let error = translate_text(
@@ -5764,6 +5785,7 @@ Bravo one text carries enough source material for cache validation and ordering 
             client: &client,
             segmenter: &segmenter,
             history: &history,
+            cache_enabled: true,
         };
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
 
@@ -5846,6 +5868,7 @@ max_retries = 1
             client: &client,
             segmenter: &segmenter,
             history: &history,
+            cache_enabled: true,
         };
         let outcome = translate_text(
             text,
@@ -5923,6 +5946,7 @@ max_retries = 0
             client: &client,
             segmenter: &segmenter,
             history: &history,
+            cache_enabled: true,
         };
         let err = translate_text(
             "Hello timeout diagnostic segment.",
@@ -5985,6 +6009,7 @@ max_retries = 0
             client: &client,
             segmenter: &segmenter,
             history: &history,
+            cache_enabled: true,
         };
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let opts = PromptOpts::default();
@@ -6066,6 +6091,7 @@ max_retries = 1
                 client: &client,
                 segmenter: &segmenter,
                 history: &history,
+                cache_enabled: true,
             };
             let (tx, mut rx) = tokio::sync::mpsc::channel(64);
             // Capture stderr by running translation; assertions rely on config flag being true
