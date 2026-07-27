@@ -388,15 +388,9 @@ fn urls(text: &str) -> HashSet<String> {
     let mut urls = HashSet::new();
     let mut remaining = text;
 
-    while let Some(start) = remaining
-        .find("https://")
-        .or_else(|| remaining.find("http://"))
-    {
+    while let Some(start) = earliest_url_scheme_start(remaining) {
         let candidate = &remaining[start..];
-        let end = candidate
-            .char_indices()
-            .find_map(|(index, character)| character.is_whitespace().then_some(index))
-            .unwrap_or(candidate.len());
+        let end = url_candidate_end(candidate);
         let candidate = &candidate[..end];
         if let Some(url) = normalize_url(candidate) {
             urls.insert(url);
@@ -407,10 +401,33 @@ fn urls(text: &str) -> HashSet<String> {
     urls
 }
 
+fn earliest_url_scheme_start(text: &str) -> Option<usize> {
+    match (text.find("http://"), text.find("https://")) {
+        (Some(http_start), Some(https_start)) => Some(http_start.min(https_start)),
+        (Some(start), None) | (None, Some(start)) => Some(start),
+        (None, None) => None,
+    }
+}
+
+fn url_candidate_end(candidate: &str) -> usize {
+    candidate
+        .char_indices()
+        .find_map(|(index, character)| {
+            (character.is_whitespace()
+                || is_fullwidth_url_punctuation(character)
+                || is_unmatched_closing_delimiter(
+                    &candidate[..index + character.len_utf8()],
+                    character,
+                ))
+            .then_some(index)
+        })
+        .unwrap_or(candidate.len())
+}
+
 fn normalize_url(candidate: &str) -> Option<String> {
     let mut url = candidate;
     while let Some((index, character)) = url.char_indices().last() {
-        if is_trailing_cjk_or_fullwidth_punctuation(character)
+        if is_fullwidth_url_punctuation(character)
             || matches!(character, ',' | '.' | ';' | ':' | '!' | '?')
             || is_unmatched_closing_delimiter(url, character)
         {
@@ -422,7 +439,7 @@ fn normalize_url(candidate: &str) -> Option<String> {
     (!url.is_empty()).then(|| url.to_owned())
 }
 
-fn is_trailing_cjk_or_fullwidth_punctuation(character: char) -> bool {
+fn is_fullwidth_url_punctuation(character: char) -> bool {
     matches!(
         character,
         '，' | '。'
@@ -440,14 +457,6 @@ fn is_trailing_cjk_or_fullwidth_punctuation(character: char) -> bool {
             | '』'
             | '】'
             | '、'
-    ) || matches!(
-        character as u32,
-        0x3040..=0x30ff
-            | 0x31f0..=0x31ff
-            | 0x3400..=0x4dbf
-            | 0x4e00..=0x9fff
-            | 0xac00..=0xd7af
-            | 0xf900..=0xfaff
     )
 }
 
@@ -1016,8 +1025,8 @@ verbatim ask --no-generate --format json \"哪些证据是相关的？\"";
     }
 
     #[test]
-    fn url_preservation_normalizes_markdown_and_cjk_adjacent_urls() {
-        let input = "Open letter: [original source](https://example.test/open-letter)中文。";
+    fn url_preservation_normalizes_bare_urls_before_cjk_prose_after_delimiters() {
+        let input = "Open letter: https://example.test/open-letter）中文。";
         let output = "公开信来源：https://example.test/open-letter";
 
         let result = validate_completeness(input, output, "fr", None);
@@ -1026,7 +1035,7 @@ verbatim ask --no-generate --format json \"哪些证据是相关的？\"";
             !result
                 .checks_failed
                 .contains(&"url_preservation".to_owned()),
-            "a markdown URL and a CJK-adjacent bare URL have the same target: {result:?}"
+            "a bare URL before a CJK delimiter and prose has the same target: {result:?}"
         );
     }
 
@@ -1050,6 +1059,40 @@ verbatim ask --no-generate --format json \"哪些证据是相关的？\"";
         assert!(result
             .checks_failed
             .contains(&"url_preservation".to_owned()));
+    }
+
+    #[test]
+    fn url_preservation_rejects_missing_earliest_http_target() {
+        let result = validate_completeness(
+            "References: http://first.example/required and https://second.example/retained",
+            "References: https://second.example/retained",
+            "fr",
+            None,
+        );
+
+        assert!(result
+            .checks_failed
+            .contains(&"url_preservation".to_owned()));
+    }
+
+    #[test]
+    fn url_preservation_keeps_cjk_path_characters() {
+        let input = "[source](https://example.test/中文)";
+        let preserved = validate_completeness(input, input, "fr", None);
+        let truncated = validate_completeness(input, "[source](https://example.test/)", "fr", None);
+
+        assert!(
+            !preserved
+                .checks_failed
+                .contains(&"url_preservation".to_owned()),
+            "CJK path should be preserved: {preserved:?}"
+        );
+        assert!(
+            truncated
+                .checks_failed
+                .contains(&"url_preservation".to_owned()),
+            "dropping the CJK path should fail preservation: {truncated:?}"
+        );
     }
 
     #[test]
