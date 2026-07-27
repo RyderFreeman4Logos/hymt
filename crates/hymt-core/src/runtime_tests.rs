@@ -156,6 +156,52 @@ backend = "llama_cpp"
 }
 
 #[test]
+fn nested_unlimited_llama_props_params_attest_sampling_for_cache() {
+    let props = serde_json::json!({
+        "build_info": "b123",
+        "model_alias": "served-hy-mt2",
+        "default_generation_settings": {
+            "params": {
+                "n_predict": -1,
+                "max_tokens": -1,
+                "temperature": 0.7,
+                "top_p": 0.6,
+                "top_k": 20,
+                "min_p": 0.1,
+                "repeat_penalty": 1.05,
+                "repeat_last_n": 64
+            }
+        }
+    });
+    let runtime = BackendRuntimeInfo::from_llama_cpp_props(&props, 42)
+        .expect("unlimited nested llama.cpp props parse");
+
+    assert!(runtime.is_verified());
+    assert_eq!(runtime.default_max_generation_tokens, None);
+    assert!(runtime.sampler_defaults.is_complete());
+
+    with_config(
+        "nested-unlimited-props-cacheable",
+        r#"
+[endpoint]
+url = "http://127.0.0.1:8401/v1"
+model = "served-hy-mt2"
+backend = "llama_cpp"
+"#,
+        |config| {
+            config.set_backend_runtime_info(runtime);
+            assert!(
+                config
+                    .inference_fingerprint("default", "")
+                    .expect("fingerprint")
+                    .is_cache_verified(),
+                "unlimited generation defaults must not make a complete nested props response unverified"
+            );
+        },
+    );
+}
+
+#[test]
 fn older_llama_props_leave_unknown_values_unknown() {
     let info = BackendRuntimeInfo::from_llama_cpp_props(
         &serde_json::json!({"build_info": "old-server", "n_ctx": 4096}),
@@ -295,6 +341,24 @@ fn malformed_props_are_rejected_without_inventing_runtime_metadata() {
 
     assert!(
         error.contains("n_ctx"),
+        "error should name malformed field: {error}"
+    );
+}
+
+#[test]
+fn malformed_generation_limit_is_rejected() {
+    let error = BackendRuntimeInfo::from_llama_cpp_props(
+        &serde_json::json!({
+            "default_generation_settings": {
+                "params": {"n_predict": "unlimited"}
+            }
+        }),
+        42,
+    )
+    .expect_err("non-numeric generation limits must not be accepted");
+
+    assert!(
+        error.contains("n_predict"),
         "error should name malformed field: {error}"
     );
 }

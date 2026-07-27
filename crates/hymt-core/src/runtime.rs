@@ -137,7 +137,7 @@ impl BackendRuntimeInfo {
             .unwrap_or_default();
         let default_max_generation_tokens = defaults
             .map(|settings| {
-                optional_u32_any_preferred(
+                optional_generation_limit_any_preferred(
                     optional_object(settings, "params")?,
                     settings,
                     &["n_predict", "max_tokens", "max_new_tokens"],
@@ -379,13 +379,20 @@ fn optional_u32_any(object: &Map<String, Value>, fields: &[&str]) -> Result<Opti
     Ok(None)
 }
 
-fn optional_u32_any_preferred(
+fn optional_generation_limit_any_preferred(
     preferred: Option<&Map<String, Value>>,
     fallback: &Map<String, Value>,
     fields: &[&str],
 ) -> Result<Option<u32>, String> {
     for object in preferred.into_iter().chain(std::iter::once(fallback)) {
         if let Some(field) = fields.iter().find(|field| object.contains_key(**field)) {
+            if object
+                .get(*field)
+                .and_then(Value::as_i64)
+                .is_some_and(|value| value < 0)
+            {
+                return Ok(None);
+            }
             return optional_u32(object, field);
         }
     }
