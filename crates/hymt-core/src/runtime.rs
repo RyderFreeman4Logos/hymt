@@ -137,7 +137,11 @@ impl BackendRuntimeInfo {
             .unwrap_or_default();
         let default_max_generation_tokens = defaults
             .map(|settings| {
-                optional_u32_any(settings, &["n_predict", "max_tokens", "max_new_tokens"])
+                optional_u32_any_preferred(
+                    optional_object(settings, "params")?,
+                    settings,
+                    &["n_predict", "max_tokens", "max_new_tokens"],
+                )
             })
             .transpose()?
             .flatten();
@@ -256,32 +260,41 @@ impl BackendRuntimeInfo {
 }
 
 fn parse_sampler_defaults(settings: &Map<String, Value>) -> Result<BackendSamplerDefaults, String> {
-    let (repetition_penalty, repetition_penalty_wire_key) = match settings.get("repeat_penalty") {
-        Some(value) => (
+    let params = optional_object(settings, "params")?;
+    let (repetition_penalty, repetition_penalty_wire_key) = match params
+        .and_then(|params| params.get("repeat_penalty"))
+        .map(|value| (value, "repeat_penalty"))
+        .or_else(|| {
+            params
+                .and_then(|params| params.get("repetition_penalty"))
+                .map(|value| (value, "repetition_penalty"))
+        })
+        .or_else(|| {
+            settings
+                .get("repeat_penalty")
+                .map(|value| (value, "repeat_penalty"))
+        })
+        .or_else(|| {
+            settings
+                .get("repetition_penalty")
+                .map(|value| (value, "repetition_penalty"))
+        }) {
+        Some((value, wire_key)) => (
             Some(number_as_f64(
                 value,
-                "default_generation_settings.repeat_penalty",
+                &format!("default_generation_settings.params.{wire_key}"),
             )?),
-            Some("repeat_penalty".to_owned()),
+            Some(wire_key.to_owned()),
         ),
-        None => match settings.get("repetition_penalty") {
-            Some(value) => (
-                Some(number_as_f64(
-                    value,
-                    "default_generation_settings.repetition_penalty",
-                )?),
-                Some("repetition_penalty".to_owned()),
-            ),
-            None => (None, None),
-        },
+        None => (None, None),
     };
     Ok(BackendSamplerDefaults {
-        temperature: optional_f64(settings, "temperature")?,
-        top_p: optional_f64(settings, "top_p")?,
-        top_k: optional_i32(settings, "top_k")?,
-        min_p: optional_f64(settings, "min_p")?,
+        temperature: optional_f64_preferred(params, settings, "temperature")?,
+        top_p: optional_f64_preferred(params, settings, "top_p")?,
+        top_k: optional_i32_preferred(params, settings, "top_k")?,
+        min_p: optional_f64_preferred(params, settings, "min_p")?,
         repetition_penalty,
-        repeat_last_n: optional_i64(settings, "repeat_last_n")?,
+        repeat_last_n: optional_i64_preferred(params, settings, "repeat_last_n")?,
         repetition_penalty_wire_key,
     })
 }
@@ -366,6 +379,19 @@ fn optional_u32_any(object: &Map<String, Value>, fields: &[&str]) -> Result<Opti
     Ok(None)
 }
 
+fn optional_u32_any_preferred(
+    preferred: Option<&Map<String, Value>>,
+    fallback: &Map<String, Value>,
+    fields: &[&str],
+) -> Result<Option<u32>, String> {
+    for object in preferred.into_iter().chain(std::iter::once(fallback)) {
+        if let Some(field) = fields.iter().find(|field| object.contains_key(**field)) {
+            return optional_u32(object, field);
+        }
+    }
+    Ok(None)
+}
+
 fn optional_u32(object: &Map<String, Value>, field: &str) -> Result<Option<u32>, String> {
     match object.get(field) {
         Some(value) => value
@@ -388,6 +414,21 @@ fn optional_i32(object: &Map<String, Value>, field: &str) -> Result<Option<i32>,
     }
 }
 
+fn optional_i32_preferred(
+    preferred: Option<&Map<String, Value>>,
+    fallback: &Map<String, Value>,
+    field: &str,
+) -> Result<Option<i32>, String> {
+    match preferred.and_then(|object| object.get(field)) {
+        Some(value) => value
+            .as_i64()
+            .and_then(|value| i32::try_from(value).ok())
+            .map(Some)
+            .ok_or_else(|| format!("default_generation_settings.{field} must be a 32-bit integer")),
+        None => optional_i32(fallback, field),
+    }
+}
+
 fn optional_i64(object: &Map<String, Value>, field: &str) -> Result<Option<i64>, String> {
     match object.get(field) {
         Some(value) => value
@@ -398,6 +439,20 @@ fn optional_i64(object: &Map<String, Value>, field: &str) -> Result<Option<i64>,
     }
 }
 
+fn optional_i64_preferred(
+    preferred: Option<&Map<String, Value>>,
+    fallback: &Map<String, Value>,
+    field: &str,
+) -> Result<Option<i64>, String> {
+    match preferred.and_then(|object| object.get(field)) {
+        Some(value) => value
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| format!("default_generation_settings.{field} must be an integer")),
+        None => optional_i64(fallback, field),
+    }
+}
+
 fn optional_f64(object: &Map<String, Value>, field: &str) -> Result<Option<f64>, String> {
     match object.get(field) {
         Some(value) => Ok(Some(number_as_f64(
@@ -405,6 +460,20 @@ fn optional_f64(object: &Map<String, Value>, field: &str) -> Result<Option<f64>,
             &format!("default_generation_settings.{field}"),
         )?)),
         None => Ok(None),
+    }
+}
+
+fn optional_f64_preferred(
+    preferred: Option<&Map<String, Value>>,
+    fallback: &Map<String, Value>,
+    field: &str,
+) -> Result<Option<f64>, String> {
+    match preferred.and_then(|object| object.get(field)) {
+        Some(value) => Ok(Some(number_as_f64(
+            value,
+            &format!("default_generation_settings.params.{field}"),
+        )?)),
+        None => optional_f64(fallback, field),
     }
 }
 
