@@ -364,6 +364,7 @@ pub async fn run_batch_translation(
             client,
             segmenter,
             history,
+            cache_enabled: true,
         };
         let outcome = translate_text(&file.text, &file.target_lang, template, opts, &tctx)
             .await

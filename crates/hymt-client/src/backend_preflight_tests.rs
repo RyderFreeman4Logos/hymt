@@ -221,10 +221,14 @@ async fn preflight_reports_profile_model_mismatch() {
         .warnings
         .iter()
         .any(|warning| warning.contains("sampler wire-key mismatch")));
-    assert!(report
-        .warnings
-        .iter()
-        .any(|warning| warning.contains("unexpected sampler state")));
+    assert!(
+        report
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("unexpected sampler state")),
+        "incomplete service-owned sampler defaults are diagnostic-only, not preflight warnings: {:?}",
+        report.warnings
+    );
 }
 
 #[tokio::test]

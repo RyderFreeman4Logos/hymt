@@ -80,6 +80,7 @@ pub async fn run_exec_command(command: &[&str], opts: &ExecCommandOpts<'_>) -> R
         client,
         segmenter,
         history,
+        cache_enabled: true,
     };
 
     // Translate stderr if configured

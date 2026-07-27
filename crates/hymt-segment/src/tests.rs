@@ -44,6 +44,96 @@ fn tokenizer_cache_is_scoped_to_the_selected_model_profile() {
     assert_eq!(crate::tokenizer_path(ModelProfile::Generic), None);
 }
 
+#[test]
+fn loads_bpe_tokenizer_json_with_fuse_unk_and_ignore_merges() {
+    // Hy-MT2 tokenizer.json uses newer BPE fields that tokenizers <0.20 reject.
+    // Keep a minimal fixture so the regression does not depend on a downloaded model.
+    let dir = std::env::temp_dir().join(format!(
+        "hymt-tokenizer-fixture-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("create fixture dir");
+    let path = dir.join("tokenizer.json");
+    let fixture = r#"{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [
+    {
+      "id": 0,
+      "content": "<unk>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    }
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {
+    "type": "ByteLevel",
+    "add_prefix_space": false,
+    "trim_offsets": true,
+    "use_regex": true
+  },
+  "post_processor": null,
+  "decoder": {
+    "type": "ByteLevel",
+    "add_prefix_space": true,
+    "trim_offsets": true,
+    "use_regex": true
+  },
+  "model": {
+    "type": "BPE",
+    "dropout": null,
+    "unk_token": "<unk>",
+    "continuing_subword_prefix": null,
+    "end_of_word_suffix": null,
+    "fuse_unk": false,
+    "byte_fallback": false,
+    "ignore_merges": true,
+    "vocab": {
+      "<unk>": 0,
+      "a": 1,
+      "b": 2,
+      "ab": 3
+    },
+    "merges": [
+      "a b"
+    ]
+  }
+}"#;
+    std::fs::write(&path, fixture).expect("write fixture");
+    let segmenter = Segmenter::new(Some(path.clone()))
+        .expect("tokenizer 0.21+ must parse fuse_unk/ignore_merges");
+    assert!(segmenter.has_exact_tokenizer());
+    assert!(segmenter.count_tokens("ab") >= 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn loads_downloaded_hy_mt2_tokenizer_when_present() {
+    // Optional live-file smoke: if the user already ran `hymt tokenizer download`,
+    // the real Hy-MT2 tokenizer.json must load under tokenizers 0.21+.
+    let candidates = [
+        std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .map(|home| home.join(".cache/hymt/tokenizer/tokenizer.json")),
+        crate::tokenizer_path(ModelProfile::HyMt2_7b),
+    ];
+    let Some(path) = candidates.into_iter().flatten().find(|path| path.exists()) else {
+        eprintln!("skipping live tokenizer load: no downloaded tokenizer.json found");
+        return;
+    };
+    let segmenter = Segmenter::new(Some(path)).expect("downloaded Hy-MT2 tokenizer.json must load");
+    assert!(segmenter.has_exact_tokenizer());
+    assert!(segmenter.count_tokens("hello") >= 1);
+}
+
 // ── paragraph splitting ───────────────────────────────────────────────────────
 
 #[test]

@@ -437,6 +437,7 @@ async fn handle_update(
                     client,
                     segmenter,
                     history,
+                    cache_enabled: true,
                 };
                 let plan = plan_translation(
                     &text,
@@ -554,6 +555,7 @@ async fn handle_document_update(
                     client,
                     segmenter,
                     history,
+                    cache_enabled: true,
                 };
                 let outcome =
                     translate_text(&source, &target_lang, &TemplateType::Default, &opts, &ctx)

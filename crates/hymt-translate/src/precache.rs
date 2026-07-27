@@ -330,6 +330,7 @@ pub async fn run_precache(
         client,
         segmenter,
         history,
+        cache_enabled: true,
     };
 
     for cmd in &commands {

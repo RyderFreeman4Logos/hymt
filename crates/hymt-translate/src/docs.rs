@@ -63,6 +63,7 @@ pub async fn run_man_command(args: &[&str], opts: &ManInfoOpts<'_>) -> Result<i3
         client: opts.client,
         segmenter: opts.segmenter,
         history: opts.history,
+        cache_enabled: true,
     };
     let translated = translate_cached(
         "man",
@@ -100,6 +101,7 @@ pub async fn run_info_command(args: &[&str], opts: &ManInfoOpts<'_>) -> Result<i
         client: opts.client,
         segmenter: opts.segmenter,
         history: opts.history,
+        cache_enabled: true,
     };
     let translated = translate_cached(
         "info",

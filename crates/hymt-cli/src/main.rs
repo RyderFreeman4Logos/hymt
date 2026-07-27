@@ -388,6 +388,9 @@ struct TranslateDocArgs {
     /// Recursively translate subdirectories
     #[arg(short = 'r', long)]
     recursive: bool,
+    /// Bypass segment-cache reads and writes for this run
+    #[arg(long = "no-cache", alias = "disable-cache")]
+    no_cache: bool,
 }
 
 // ── telegram ──────────────────────────────────────────────────────────────────
@@ -1034,6 +1037,7 @@ async fn run_translate_text(
         client: &client,
         segmenter: &segmenter,
         history: &history,
+        cache_enabled: true,
     };
     let warn_only = completeness_warn_only(config, flags.warn_only_completeness);
     if flags.stream_output {
@@ -1105,6 +1109,7 @@ async fn run_translate_stdin(
         client: &client,
         segmenter: &segmenter,
         history: &history,
+        cache_enabled: true,
     };
     let warn_only = completeness_warn_only(config, flags.warn_only_completeness);
     if flags.stream_output {
@@ -1167,6 +1172,7 @@ async fn run_translate_path(
         client: &client,
         segmenter: &segmenter,
         history: &history,
+        cache_enabled: true,
     };
     let warn_only = completeness_warn_only(config, flags.warn_only_completeness);
     if flags.stream_output {
@@ -1721,6 +1727,7 @@ async fn run_translate_doc(
         template,
         prompt_opts: opts,
         explicit_target,
+        cache_enabled: !args.no_cache,
     };
     run_doc_translation(&args.source, &doc_opts).await
 }
