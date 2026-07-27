@@ -385,31 +385,98 @@ fn placeholder_tokens(text: &str) -> HashSet<String> {
 }
 
 fn urls(text: &str) -> HashSet<String> {
-    text.split_whitespace()
-        .filter_map(|token| {
-            let start = token.find("https://").or_else(|| token.find("http://"))?;
-            let url = &token[start..];
-            let url = url.trim_matches(|character: char| {
-                matches!(
+    let mut urls = HashSet::new();
+    let mut remaining = text;
+
+    while let Some(start) = earliest_url_scheme_start(remaining) {
+        let candidate = &remaining[start..];
+        let end = url_candidate_end(candidate);
+        let candidate = &candidate[..end];
+        if let Some(url) = normalize_url(candidate) {
+            urls.insert(url);
+        }
+        remaining = &remaining[start + end..];
+    }
+
+    urls
+}
+
+fn earliest_url_scheme_start(text: &str) -> Option<usize> {
+    match (text.find("http://"), text.find("https://")) {
+        (Some(http_start), Some(https_start)) => Some(http_start.min(https_start)),
+        (Some(start), None) | (None, Some(start)) => Some(start),
+        (None, None) => None,
+    }
+}
+
+fn url_candidate_end(candidate: &str) -> usize {
+    candidate
+        .char_indices()
+        .find_map(|(index, character)| {
+            (character.is_whitespace()
+                || is_fullwidth_url_punctuation(character)
+                || is_unmatched_closing_delimiter(
+                    &candidate[..index + character.len_utf8()],
                     character,
-                    '<' | '>'
-                        | '('
-                        | ')'
-                        | '['
-                        | ']'
-                        | '{'
-                        | '}'
-                        | ','
-                        | '.'
-                        | ';'
-                        | ':'
-                        | '!'
-                        | '?'
-                )
-            });
-            (!url.is_empty()).then(|| url.to_owned())
+                ))
+            .then_some(index)
         })
-        .collect()
+        .unwrap_or(candidate.len())
+}
+
+fn normalize_url(candidate: &str) -> Option<String> {
+    let mut url = candidate;
+    while let Some((index, character)) = url.char_indices().last() {
+        if is_fullwidth_url_punctuation(character)
+            || matches!(character, ',' | '.' | ';' | ':' | '!' | '?')
+            || is_unmatched_closing_delimiter(url, character)
+        {
+            url = &url[..index];
+        } else {
+            break;
+        }
+    }
+    (!url.is_empty()).then(|| url.to_owned())
+}
+
+fn is_fullwidth_url_punctuation(character: char) -> bool {
+    matches!(
+        character,
+        '，' | '。'
+            | '；'
+            | '：'
+            | '！'
+            | '？'
+            | '）'
+            | '］'
+            | '｝'
+            | '＞'
+            | '》'
+            | '〉'
+            | '」'
+            | '』'
+            | '】'
+            | '、'
+    )
+}
+
+fn is_unmatched_closing_delimiter(url: &str, closing: char) -> bool {
+    let Some(opening) = (match closing {
+        ')' => Some('('),
+        ']' => Some('['),
+        '}' => Some('{'),
+        '>' => Some('<'),
+        _ => None,
+    }) else {
+        return false;
+    };
+    url.chars()
+        .filter(|character| *character == opening)
+        .count()
+        < url
+            .chars()
+            .filter(|character| *character == closing)
+            .count()
 }
 
 fn preserves_all(input: &HashSet<String>, output: &HashSet<String>) -> bool {
@@ -955,6 +1022,77 @@ verbatim ask --no-generate --format json \"哪些证据是相关的？\"";
         assert!(result
             .checks_failed
             .contains(&"url_preservation".to_owned()));
+    }
+
+    #[test]
+    fn url_preservation_normalizes_bare_urls_before_cjk_prose_after_delimiters() {
+        let input = "Open letter: https://example.test/open-letter）中文。";
+        let output = "公开信来源：https://example.test/open-letter";
+
+        let result = validate_completeness(input, output, "fr", None);
+
+        assert!(
+            !result
+                .checks_failed
+                .contains(&"url_preservation".to_owned()),
+            "a bare URL before a CJK delimiter and prose has the same target: {result:?}"
+        );
+    }
+
+    #[test]
+    fn url_preservation_accepts_bare_url_rewritten_as_markdown_link() {
+        let input = "文本[https://example.test/path?query=value]";
+        let output = "[翻译后的链接](https://example.test/path?query=value)";
+
+        assert_eq!(urls(input), urls(output));
+    }
+
+    #[test]
+    fn url_preservation_still_rejects_a_missing_absolute_target() {
+        let result = validate_completeness(
+            "Reference: https://example.test/required",
+            "Reference omitted.",
+            "fr",
+            None,
+        );
+
+        assert!(result
+            .checks_failed
+            .contains(&"url_preservation".to_owned()));
+    }
+
+    #[test]
+    fn url_preservation_rejects_missing_earliest_http_target() {
+        let result = validate_completeness(
+            "References: http://first.example/required and https://second.example/retained",
+            "References: https://second.example/retained",
+            "fr",
+            None,
+        );
+
+        assert!(result
+            .checks_failed
+            .contains(&"url_preservation".to_owned()));
+    }
+
+    #[test]
+    fn url_preservation_keeps_cjk_path_characters() {
+        let input = "[source](https://example.test/中文)";
+        let preserved = validate_completeness(input, input, "fr", None);
+        let truncated = validate_completeness(input, "[source](https://example.test/)", "fr", None);
+
+        assert!(
+            !preserved
+                .checks_failed
+                .contains(&"url_preservation".to_owned()),
+            "CJK path should be preserved: {preserved:?}"
+        );
+        assert!(
+            truncated
+                .checks_failed
+                .contains(&"url_preservation".to_owned()),
+            "dropping the CJK path should fail preservation: {truncated:?}"
+        );
     }
 
     #[test]

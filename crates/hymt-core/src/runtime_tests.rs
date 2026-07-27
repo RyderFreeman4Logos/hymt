@@ -98,6 +98,64 @@ fn parses_llama_props_into_normalized_runtime_info() {
 }
 
 #[test]
+fn nested_llama_props_params_attest_server_default_sampling_for_cache() {
+    let props = serde_json::json!({
+        "build_info": "b123",
+        "model_alias": "served-hy-mt2",
+        "default_generation_settings": {
+            "repeat_penalty": 1.5,
+            "params": {
+                "n_predict": 2048,
+                "temperature": 0.7,
+                "top_p": 0.6,
+                "top_k": 20,
+                "min_p": 0.1,
+                "repeat_penalty": 1.05,
+                "repeat_last_n": 64
+            }
+        }
+    });
+    let runtime =
+        BackendRuntimeInfo::from_llama_cpp_props(&props, 42).expect("nested llama.cpp props parse");
+
+    assert_eq!(runtime.default_max_generation_tokens, Some(2_048));
+    assert_eq!(runtime.sampler_defaults.temperature, Some(0.7));
+    assert_eq!(runtime.sampler_defaults.top_p, Some(0.6));
+    assert_eq!(runtime.sampler_defaults.top_k, Some(20));
+    assert_eq!(runtime.sampler_defaults.min_p, Some(0.1));
+    assert_eq!(runtime.sampler_defaults.repetition_penalty, Some(1.05));
+    assert_eq!(runtime.sampler_defaults.repeat_last_n, Some(64));
+    assert_eq!(
+        runtime
+            .sampler_defaults
+            .repetition_penalty_wire_key
+            .as_deref(),
+        Some("repeat_penalty")
+    );
+    assert!(runtime.sampler_defaults.is_complete());
+
+    with_config(
+        "nested-props-cacheable",
+        r#"
+[endpoint]
+url = "http://127.0.0.1:8401/v1"
+model = "served-hy-mt2"
+backend = "llama_cpp"
+"#,
+        |config| {
+            config.set_backend_runtime_info(runtime);
+            assert!(
+                config
+                    .inference_fingerprint("default", "")
+                    .expect("fingerprint")
+                    .is_cache_verified(),
+                "complete nested service defaults plus model identity attest cache scope"
+            );
+        },
+    );
+}
+
+#[test]
 fn older_llama_props_leave_unknown_values_unknown() {
     let info = BackendRuntimeInfo::from_llama_cpp_props(
         &serde_json::json!({"build_info": "old-server", "n_ctx": 4096}),
