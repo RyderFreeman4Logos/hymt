@@ -106,7 +106,7 @@ impl DocumentKind {
     }
 }
 
-const TELEGRAM_EDIT_INTERVAL: Duration = Duration::from_secs(1);
+const TELEGRAM_EDIT_INTERVAL: Duration = Duration::from_millis(500);
 /// Telegram chat actions expire after roughly five seconds; refresh slightly early.
 const TELEGRAM_CHAT_ACTION_INTERVAL: Duration = Duration::from_secs(4);
 const CHAT_ACTION_TYPING: &str = "typing";
@@ -232,7 +232,7 @@ impl EditRateLimiter {
 }
 
 fn should_stream_telegram(stream_enabled: bool, segment_count: usize) -> bool {
-    stream_enabled && segment_count > 1
+    stream_enabled && segment_count >= 1
 }
 
 async fn publish_stream_batch<A: TelegramMessageApi>(
@@ -1121,7 +1121,7 @@ mod tests {
     #[test]
     fn telegram_streaming_requires_opt_in_and_multiple_segments() {
         assert!(!should_stream_telegram(false, 2));
-        assert!(!should_stream_telegram(true, 1));
+        assert!(should_stream_telegram(true, 1));
         assert!(should_stream_telegram(true, 2));
     }
 
