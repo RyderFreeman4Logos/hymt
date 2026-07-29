@@ -108,6 +108,12 @@ impl DocumentKind {
 
 const TELEGRAM_EDIT_INTERVAL: Duration = Duration::from_secs(1);
 
+#[derive(Clone, Copy)]
+enum StreamPublishMode {
+    AtCadence,
+    Force,
+}
+
 /// Minimal Bot API surface used by progressive delivery. Keeping it narrow makes
 /// the ordered send/edit sequence directly testable without network traffic.
 trait TelegramMessageApi {
@@ -210,12 +216,6 @@ impl EditRateLimiter {
     fn record_edit(&mut self, now: Instant) {
         self.last_edit = Some(now);
     }
-
-    async fn wait_before_edit(&mut self) {
-        if let Some(delay) = self.remaining_delay(Instant::now()) {
-            tokio::time::sleep(delay).await;
-        }
-    }
 }
 
 fn should_stream_telegram(stream_enabled: bool, segment_count: usize) -> bool {
@@ -228,6 +228,7 @@ async fn publish_stream_batch<A: TelegramMessageApi>(
     text: &str,
     sent_message: &mut Option<(i64, String)>,
     edit_rate_limiter: &mut EditRateLimiter,
+    mode: StreamPublishMode,
 ) {
     let rendered_text = telegram_message_text(text);
     if rendered_text.is_empty() {
@@ -247,8 +248,12 @@ async fn publish_stream_batch<A: TelegramMessageApi>(
     if rendered_prefix == &rendered_text {
         return;
     }
+    if matches!(mode, StreamPublishMode::AtCadence)
+        && edit_rate_limiter.remaining_delay(Instant::now()).is_some()
+    {
+        return;
+    }
     let message_id = *message_id;
-    edit_rate_limiter.wait_before_edit().await;
     match api.edit_message(chat_id, message_id, &rendered_text).await {
         Ok(()) => {
             edit_rate_limiter.record_edit(Instant::now());
@@ -274,7 +279,18 @@ async fn deliver_stream_events<A: TelegramMessageApi>(
 
     while let Some(event) = events.recv().await {
         match event {
-            StreamEvent::Token(text) => batch.push_token(&text),
+            StreamEvent::Token(text) => {
+                batch.push_token(&text);
+                publish_stream_batch(
+                    api,
+                    chat_id,
+                    batch.text(),
+                    &mut sent_message,
+                    &mut edit_rate_limiter,
+                    StreamPublishMode::AtCadence,
+                )
+                .await;
+            }
             StreamEvent::SegmentDone(segment) => {
                 if batch.mark_segment_complete(segment) {
                     publish_stream_batch(
@@ -283,6 +299,7 @@ async fn deliver_stream_events<A: TelegramMessageApi>(
                         batch.text(),
                         &mut sent_message,
                         &mut edit_rate_limiter,
+                        StreamPublishMode::Force,
                     )
                     .await;
                 }
@@ -295,6 +312,7 @@ async fn deliver_stream_events<A: TelegramMessageApi>(
                     batch.text(),
                     &mut sent_message,
                     &mut edit_rate_limiter,
+                    StreamPublishMode::Force,
                 )
                 .await;
                 break;
@@ -1086,60 +1104,6 @@ mod tests {
         }
     }
 
-    struct RetryingEditMockTelegramApi {
-        retry_after: Duration,
-        edit_count: std::sync::Mutex<usize>,
-        retry_succeeded_at: std::sync::Mutex<Option<Instant>>,
-        next_edit_started_at: std::sync::Mutex<Option<Instant>>,
-    }
-
-    impl RetryingEditMockTelegramApi {
-        fn new(retry_after: Duration) -> Self {
-            Self {
-                retry_after,
-                edit_count: std::sync::Mutex::new(0),
-                retry_succeeded_at: std::sync::Mutex::new(None),
-                next_edit_started_at: std::sync::Mutex::new(None),
-            }
-        }
-
-        fn retry_succeeded_at(&self) -> Instant {
-            self.retry_succeeded_at
-                .lock()
-                .unwrap()
-                .expect("first edit should retry successfully")
-        }
-
-        fn next_edit_started_at(&self) -> Instant {
-            self.next_edit_started_at
-                .lock()
-                .unwrap()
-                .expect("next batch should edit the message")
-        }
-    }
-
-    impl TelegramMessageApi for RetryingEditMockTelegramApi {
-        async fn send_message(&self, _chat_id: i64, _text: &str) -> Result<i64> {
-            Ok(777)
-        }
-
-        async fn edit_message(&self, _chat_id: i64, _message_id: i64, _text: &str) -> Result<()> {
-            let edit_count = {
-                let mut edit_count = self.edit_count.lock().unwrap();
-                *edit_count += 1;
-                *edit_count
-            };
-
-            if edit_count == 1 {
-                tokio::time::sleep(self.retry_after).await;
-                *self.retry_succeeded_at.lock().unwrap() = Some(Instant::now());
-            } else {
-                *self.next_edit_started_at.lock().unwrap() = Some(Instant::now());
-            }
-            Ok(())
-        }
-    }
-
     async fn deliver_mock_events(api: &MockTelegramApi, events: Vec<StreamEvent>) -> Result<()> {
         let (tx, rx) = tokio::sync::mpsc::channel(events.len());
         for event in events {
@@ -1207,32 +1171,82 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streaming_delivery_throttles_after_a_retrying_edit_succeeds() {
-        let retry_after = Duration::from_millis(75);
-        let edit_interval = Duration::from_millis(100);
-        let api = RetryingEditMockTelegramApi::new(retry_after);
-        let (tx, rx) = tokio::sync::mpsc::channel(5);
+    async fn streaming_delivery_publishes_token_prefixes_when_the_cadence_is_due() {
+        let api = MockTelegramApi::default();
+        deliver_mock_events(
+            &api,
+            vec![
+                StreamEvent::Token("first".into()),
+                StreamEvent::Token(" second".into()),
+                StreamEvent::AllDone("first second final".into()),
+            ],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            api.calls(),
+            vec![
+                TelegramCall::Send {
+                    chat_id: 42,
+                    text: "first".into(),
+                },
+                TelegramCall::Edit {
+                    chat_id: 42,
+                    message_id: 777,
+                    text: "first second".into(),
+                },
+                TelegramCall::Edit {
+                    chat_id: 42,
+                    message_id: 777,
+                    text: "first second final".into(),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_delivery_skips_too_soon_publish_but_forces_final_output() {
+        let api = MockTelegramApi::default();
+        let (tx, rx) = tokio::sync::mpsc::channel(6);
         for event in [
             StreamEvent::Token("first".into()),
             StreamEvent::SegmentDone(0),
             StreamEvent::Token(" second".into()),
             StreamEvent::SegmentDone(1),
-            StreamEvent::AllDone("first second final".into()),
+            StreamEvent::Token(" third".into()),
+            StreamEvent::AllDone("first second third final".into()),
         ] {
             tx.send(event).await.unwrap();
         }
         drop(tx);
 
-        deliver_stream_events(&api, 42, rx, edit_interval)
+        let started = Instant::now();
+        deliver_stream_events(&api, 42, rx, Duration::from_secs(1))
             .await
             .unwrap();
-
-        let elapsed_since_retry_success = api
-            .next_edit_started_at()
-            .saturating_duration_since(api.retry_succeeded_at());
         assert!(
-            elapsed_since_retry_success >= Duration::from_millis(80),
-            "next edit started only {elapsed_since_retry_success:?} after the retried edit succeeded"
+            started.elapsed() < Duration::from_millis(500),
+            "a rate-limited partial update must be skipped instead of delaying delivery"
+        );
+        assert_eq!(
+            api.calls(),
+            vec![
+                TelegramCall::Send {
+                    chat_id: 42,
+                    text: "first".into(),
+                },
+                TelegramCall::Edit {
+                    chat_id: 42,
+                    message_id: 777,
+                    text: "first second".into(),
+                },
+                TelegramCall::Edit {
+                    chat_id: 42,
+                    message_id: 777,
+                    text: "first second third final".into(),
+                },
+            ]
         );
     }
 
