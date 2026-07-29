@@ -107,6 +107,10 @@ impl DocumentKind {
 }
 
 const TELEGRAM_EDIT_INTERVAL: Duration = Duration::from_secs(1);
+/// Telegram chat actions expire after roughly five seconds; refresh slightly early.
+const TELEGRAM_CHAT_ACTION_INTERVAL: Duration = Duration::from_secs(4);
+const CHAT_ACTION_TYPING: &str = "typing";
+const CHAT_ACTION_UPLOAD_DOCUMENT: &str = "upload_document";
 
 #[derive(Clone, Copy)]
 enum StreamPublishMode {
@@ -117,6 +121,7 @@ enum StreamPublishMode {
 /// Minimal Bot API surface used by progressive delivery. Keeping it narrow makes
 /// the ordered send/edit sequence directly testable without network traffic.
 trait TelegramMessageApi {
+    async fn send_chat_action(&self, chat_id: i64, action: &str) -> Result<()>;
     async fn send_message(&self, chat_id: i64, text: &str) -> Result<i64>;
     async fn edit_message(&self, chat_id: i64, message_id: i64, text: &str) -> Result<()>;
 }
@@ -130,34 +135,42 @@ trait TelegramDocumentApi: TelegramMessageApi {
     async fn send_document(&self, chat_id: i64, file_name: &str, text: &str) -> Result<()>;
 }
 
-struct TelegramHttpApi<'a> {
-    http: &'a Client,
-    token: &'a str,
+#[derive(Clone)]
+struct TelegramHttpApi {
+    http: Client,
+    token: String,
 }
 
-impl<'a> TelegramHttpApi<'a> {
-    const fn new(http: &'a Client, token: &'a str) -> Self {
-        Self { http, token }
+impl TelegramHttpApi {
+    fn new(http: &Client, token: &str) -> Self {
+        Self {
+            http: http.clone(),
+            token: token.to_owned(),
+        }
     }
 }
 
-impl TelegramMessageApi for TelegramHttpApi<'_> {
+impl TelegramMessageApi for TelegramHttpApi {
+    async fn send_chat_action(&self, chat_id: i64, action: &str) -> Result<()> {
+        send_chat_action(&self.http, &self.token, chat_id, action).await
+    }
+
     async fn send_message(&self, chat_id: i64, text: &str) -> Result<i64> {
-        send_message_id(self.http, self.token, chat_id, text).await
+        send_message_id(&self.http, &self.token, chat_id, text).await
     }
 
     async fn edit_message(&self, chat_id: i64, message_id: i64, text: &str) -> Result<()> {
-        edit_message(self.http, self.token, chat_id, message_id, text).await
+        edit_message(&self.http, &self.token, chat_id, message_id, text).await
     }
 }
 
-impl TelegramDocumentApi for TelegramHttpApi<'_> {
+impl TelegramDocumentApi for TelegramHttpApi {
     async fn download_document(&self, file_id: &str, max_size: u64) -> Result<Vec<u8>> {
-        download_telegram_document(self.http, self.token, file_id, max_size).await
+        download_telegram_document(&self.http, &self.token, file_id, max_size).await
     }
 
     async fn send_document(&self, chat_id: i64, file_name: &str, text: &str) -> Result<()> {
-        send_document_upload(self.http, self.token, chat_id, file_name, text).await
+        send_document_upload(&self.http, &self.token, chat_id, file_name, text).await
     }
 }
 
@@ -457,51 +470,66 @@ async fn handle_update(
                     history,
                     cache_enabled: true,
                 };
-                let plan = plan_translation(
-                    &text,
-                    &target_lang,
-                    config,
-                    segmenter,
-                    &TemplateType::Default,
-                    &opts,
-                )
-                .map_err(|e| anyhow::anyhow!("translation failed: {e}"))?;
-                let stream = should_stream_telegram(
-                    config.telegram_streaming_enabled(),
-                    plan.segment_count(),
-                );
-                let outcome = if stream {
-                    let (event_tx, event_rx) = tokio::sync::mpsc::channel(64);
-                    let api = TelegramHttpApi::new(http, token);
-                    let translate = translate_text_stream(
-                        &text,
-                        &target_lang,
-                        &TemplateType::Default,
-                        &opts,
-                        &ctx,
-                        event_tx,
-                    );
-                    let deliver = deliver_stream_events(
-                        &api,
-                        incoming.chat_id,
-                        event_rx,
-                        TELEGRAM_EDIT_INTERVAL,
-                    );
-                    let (outcome, ()) = tokio::try_join!(translate, deliver)
+                let api = TelegramHttpApi::new(http, token);
+                let chat_action_repeater =
+                    spawn_chat_action_repeater(api.clone(), incoming.chat_id, CHAT_ACTION_TYPING);
+                let translation = translate_after_chat_action(
+                    &api,
+                    incoming.chat_id,
+                    CHAT_ACTION_TYPING,
+                    || async {
+                        let plan = plan_translation(
+                            &text,
+                            &target_lang,
+                            config,
+                            segmenter,
+                            &TemplateType::Default,
+                            &opts,
+                        )
                         .map_err(|e| anyhow::anyhow!("translation failed: {e}"))?;
-                    outcome
-                } else {
-                    translate_text(&text, &target_lang, &TemplateType::Default, &opts, &ctx)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("translation failed: {e}"))?
-                };
+                        let stream = should_stream_telegram(
+                            config.telegram_streaming_enabled(),
+                            plan.segment_count(),
+                        );
+                        let outcome = if stream {
+                            let (event_tx, event_rx) = tokio::sync::mpsc::channel(64);
+                            let translate = translate_text_stream(
+                                &text,
+                                &target_lang,
+                                &TemplateType::Default,
+                                &opts,
+                                &ctx,
+                                event_tx,
+                            );
+                            let deliver = deliver_stream_events(
+                                &api,
+                                incoming.chat_id,
+                                event_rx,
+                                TELEGRAM_EDIT_INTERVAL,
+                            );
+                            let (outcome, ()) = tokio::try_join!(translate, deliver)
+                                .map_err(|e| anyhow::anyhow!("translation failed: {e}"))?;
+                            outcome
+                        } else {
+                            translate_text(&text, &target_lang, &TemplateType::Default, &opts, &ctx)
+                                .await
+                                .map_err(|e| anyhow::anyhow!("translation failed: {e}"))?
+                        };
+                        Ok((outcome, stream))
+                    },
+                )
+                .await;
+                chat_action_repeater.abort();
+                let (outcome, stream) = translation?;
                 if outcome.is_completeness_degraded() {
                     outcome.report_completeness_degraded();
                 }
                 if stream {
                     Ok(())
                 } else {
-                    send_message(http, token, incoming.chat_id, &outcome.text).await
+                    api.send_message(incoming.chat_id, &outcome.text)
+                        .await
+                        .map(|_| ())
                 }
             }
         };
@@ -557,37 +585,77 @@ async fn handle_document_update(
             .await?;
             Ok(())
         }
-        DocumentAction::Accepted(document) => process_document_message(
-            &api,
-            chat_id,
-            auth,
-            true,
-            &document,
-            config.telegram_max_document_size(),
-            |source| async move {
-                let target_lang =
-                    cn_en_target_lang(&source, &config.primary_lang(), &config.secondary_lang());
-                let opts = PromptOpts::default();
-                let ctx = TranslationCtx {
-                    config,
-                    client,
-                    segmenter,
-                    history,
-                    cache_enabled: true,
-                };
-                let outcome =
-                    translate_text(&source, &target_lang, &TemplateType::Default, &opts, &ctx)
-                        .await
-                        .map_err(|_| anyhow::anyhow!("document translation failed"))?;
-                if outcome.is_completeness_degraded() {
-                    outcome.report_completeness_degraded();
-                }
-                Ok(outcome.text)
-            },
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("document handling failed")),
+        DocumentAction::Accepted(document) => {
+            let chat_action_repeater =
+                spawn_chat_action_repeater(api.clone(), chat_id, CHAT_ACTION_UPLOAD_DOCUMENT);
+            let result = process_document_message(
+                &api,
+                chat_id,
+                auth,
+                true,
+                &document,
+                config.telegram_max_document_size(),
+                |source| async move {
+                    let target_lang = cn_en_target_lang(
+                        &source,
+                        &config.primary_lang(),
+                        &config.secondary_lang(),
+                    );
+                    let opts = PromptOpts::default();
+                    let ctx = TranslationCtx {
+                        config,
+                        client,
+                        segmenter,
+                        history,
+                        cache_enabled: true,
+                    };
+                    let outcome =
+                        translate_text(&source, &target_lang, &TemplateType::Default, &opts, &ctx)
+                            .await
+                            .map_err(|_| anyhow::anyhow!("document translation failed"))?;
+                    if outcome.is_completeness_degraded() {
+                        outcome.report_completeness_degraded();
+                    }
+                    Ok(outcome.text)
+                },
+            )
+            .await;
+            chat_action_repeater.abort();
+            result.map_err(|_| anyhow::anyhow!("document handling failed"))
+        }
     }
+}
+
+async fn translate_after_chat_action<A, F, Fut, T>(
+    api: &A,
+    chat_id: i64,
+    action: &str,
+    translate: F,
+) -> Result<T>
+where
+    A: TelegramMessageApi + ?Sized,
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    if let Err(error) = api.send_chat_action(chat_id, action).await {
+        eprintln!("hymt telegram: sendChatAction failed; continuing translation: {error:#}");
+    }
+    translate().await
+}
+
+fn spawn_chat_action_repeater(
+    api: TelegramHttpApi,
+    chat_id: i64,
+    action: &'static str,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(TELEGRAM_CHAT_ACTION_INTERVAL).await;
+            if let Err(error) = send_chat_action(&api.http, &api.token, chat_id, action).await {
+                eprintln!("hymt telegram: sendChatAction refresh failed: {error:#}");
+            }
+        }
+    })
 }
 
 async fn process_document_message<A, F, Fut>(
@@ -633,7 +701,10 @@ where
             return Ok(());
         }
     };
-    let translated = translate(source).await?;
+    let translated = translate_after_chat_action(api, chat_id, CHAT_ACTION_UPLOAD_DOCUMENT, || {
+        translate(source)
+    })
+    .await?;
     if should_send_document(&translated) {
         api.send_document(chat_id, &document.file_name, &translated)
             .await
@@ -884,6 +955,34 @@ async fn send_message(http: &Client, token: &str, chat_id: i64, text: &str) -> R
         .map(|_| ())
 }
 
+async fn send_chat_action(http: &Client, token: &str, chat_id: i64, action: &str) -> Result<()> {
+    let url = format!("{API_BASE}/bot{token}/sendChatAction");
+    let payload = json!({ "chat_id": chat_id, "action": action });
+    let response = http
+        .post(&url)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(safe_reqwest_error("sendChatAction request", token, &error))
+        })?;
+    let status = response.status();
+    let body: Value = response.json().await.map_err(|error| {
+        anyhow::anyhow!(safe_reqwest_error("sendChatAction json", token, &error))
+    })?;
+    if status.is_success() && body.get("ok").and_then(Value::as_bool) == Some(true) {
+        return Ok(());
+    }
+    let description = body
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    bail!(
+        "sendChatAction failed HTTP {status}: {}",
+        redact_token_in_text(token, description)
+    );
+}
+
 async fn send_message_id(http: &Client, token: &str, chat_id: i64, text: &str) -> Result<i64> {
     let url = format!("{API_BASE}/bot{token}/sendMessage");
     let payload = json!({
@@ -1050,6 +1149,10 @@ mod tests {
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum TelegramCall {
+        ChatAction {
+            chat_id: i64,
+            action: String,
+        },
         Send {
             chat_id: i64,
             text: String,
@@ -1081,6 +1184,14 @@ mod tests {
     }
 
     impl TelegramMessageApi for MockTelegramApi {
+        async fn send_chat_action(&self, chat_id: i64, action: &str) -> Result<()> {
+            self.calls.lock().unwrap().push(TelegramCall::ChatAction {
+                chat_id,
+                action: action.to_owned(),
+            });
+            Ok(())
+        }
+
         async fn send_message(&self, chat_id: i64, text: &str) -> Result<i64> {
             self.calls.lock().unwrap().push(TelegramCall::Send {
                 chat_id,
@@ -1102,6 +1213,25 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn typing_action_is_sent_before_translation_work() {
+        let api = MockTelegramApi::default();
+        let translated = translate_after_chat_action(&api, 42, CHAT_ACTION_TYPING, || {
+            assert_eq!(
+                api.calls(),
+                vec![TelegramCall::ChatAction {
+                    chat_id: 42,
+                    action: CHAT_ACTION_TYPING.into(),
+                }]
+            );
+            std::future::ready(Ok("translated".to_owned()))
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(translated, "translated");
     }
 
     async fn deliver_mock_events(api: &MockTelegramApi, events: Vec<StreamEvent>) -> Result<()> {
@@ -1317,6 +1447,7 @@ mod tests {
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum DocumentCall {
         Send(String),
+        ChatAction(String),
         Download(String),
         Translate(String),
         Upload { file_name: String, text: String },
@@ -1348,6 +1479,14 @@ mod tests {
     }
 
     impl TelegramMessageApi for DocumentMockApi {
+        async fn send_chat_action(&self, _chat_id: i64, action: &str) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(DocumentCall::ChatAction(action.to_owned()));
+            Ok(())
+        }
+
         async fn send_message(&self, _chat_id: i64, text: &str) -> Result<i64> {
             self.calls
                 .lock()
@@ -1380,7 +1519,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authorized_document_is_downloaded_translated_then_uploaded() {
+    async fn authorized_document_shows_upload_action_before_translation_and_uploads() {
         let api = DocumentMockApi::new("English source");
         let document = TranslationDocument {
             file_id: "file-id".into(),
@@ -1406,6 +1545,7 @@ mod tests {
             api.calls(),
             vec![
                 DocumentCall::Download("file-id".into()),
+                DocumentCall::ChatAction("upload_document".into()),
                 DocumentCall::Translate("English source".into()),
                 DocumentCall::Upload {
                     file_name: "source.md".into(),
