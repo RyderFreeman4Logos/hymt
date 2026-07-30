@@ -62,15 +62,40 @@ pub fn claim_password_matches(provided: &str, expected: &str) -> bool {
     diff == 0
 }
 
-/// Choose CN↔EN target for bot replies using CJK ratio against `primary`.
+const TELEGRAM_SHORT_MESSAGE_CHAR_LIMIT: usize = 500;
+
+/// Choose CN↔EN target using the document-level CJK confidence ratio.
 ///
 /// When the source looks predominantly like `primary` (default zh), target
 /// `secondary` (default en); otherwise target `primary`.
 pub fn cn_en_target_lang(text: &str, primary: &str, secondary: &str) -> String {
+    select_cn_en_target_lang(text, primary, secondary, false)
+}
+
+/// Choose CN↔EN target for a single Telegram text message.
+///
+/// A short message containing any CJK character is user-authored CJK text even
+/// when English names, URLs, or numbers make its ratio fall below the document
+/// confidence threshold. Document routing keeps the stricter ratio above.
+fn telegram_text_target_lang(text: &str, primary: &str, secondary: &str) -> String {
+    select_cn_en_target_lang(text, primary, secondary, true)
+}
+
+fn select_cn_en_target_lang(
+    text: &str,
+    primary: &str,
+    secondary: &str,
+    short_message_cjk_is_enough: bool,
+) -> String {
     let primary = canonical_or_default(primary, "zh");
     let secondary = canonical_or_default(secondary, "en");
     if let Some(det) = detect_target_language(text, &primary) {
-        if det.target_ratio > hymt_core::language::TARGET_PARAGRAPH_RATIO {
+        let short_message_contains_cjk = short_message_cjk_is_enough
+            && text.chars().count() < TELEGRAM_SHORT_MESSAGE_CHAR_LIMIT
+            && det.detected_lang.is_some();
+        if det.target_ratio > hymt_core::language::TARGET_PARAGRAPH_RATIO
+            || short_message_contains_cjk
+        {
             return secondary;
         }
     }
@@ -163,7 +188,7 @@ pub fn evaluate_text_message(
             if msg.chat_kind == ChatKind::Other {
                 return BotAction::Ignore;
             }
-            let target = cn_en_target_lang(text, primary_lang, secondary_lang);
+            let target = telegram_text_target_lang(text, primary_lang, secondary_lang);
             BotAction::Translate {
                 text: text.to_owned(),
                 target_lang: target,
@@ -212,6 +237,43 @@ mod tests {
             "en",
         );
         assert_eq!(target, "zh");
+    }
+
+    #[test]
+    fn telegram_short_mixed_cjk_and_english_routes_to_english() {
+        let message = IncomingTextMessage {
+            chat_id: 1,
+            chat_kind: ChatKind::Private,
+            text: "GitHub是好用的".into(),
+        };
+
+        assert_eq!(
+            evaluate_text_message(
+                &message,
+                "SECRET99",
+                TelegramMode::Owners,
+                &[1],
+                &[],
+                "zh",
+                "en",
+            ),
+            BotAction::Translate {
+                text: "GitHub是好用的".into(),
+                target_lang: "en".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn telegram_short_text_keeps_pure_language_direction() {
+        assert_eq!(
+            telegram_text_target_lang("This remains an English Telegram message.", "zh", "en"),
+            "zh"
+        );
+        assert_eq!(
+            telegram_text_target_lang("这仍然是一条中文 Telegram 消息。", "zh", "en"),
+            "en"
+        );
     }
 
     #[test]

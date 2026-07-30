@@ -27,7 +27,8 @@ use hymt_core::completeness::{
 };
 use hymt_core::config::HotConfig;
 use hymt_core::language::{
-    plan_document_translation, DocumentLanguagePlan, DocumentTranslationPolicy, SectionKind,
+    is_cjk_char, plan_document_translation, DocumentLanguagePlan, DocumentTranslationPolicy,
+    SectionKind,
 };
 use hymt_core::language_spec::{language_spec_or_none, LanguageFamily};
 use hymt_core::model_profile::ModelProfile;
@@ -1232,38 +1233,6 @@ fn approx_source_tokens(segment: &str) -> usize {
     }
 
     cjk + other.div_ceil(4)
-}
-
-const CJK_RANGES: &[(u32, u32)] = &[
-    (0x1100, 0x11FF), // Hangul Jamo
-    // CJK Radicals Supplement, Kangxi Radicals, Ideographic Description
-    // Characters, CJK Symbols and Punctuation, Hiragana, Katakana,
-    // Bopomofo, Hangul Compatibility Jamo, Kanbun, Bopomofo Extended,
-    // CJK Strokes (U+31C0..=U+31EF), Katakana Phonetic Extensions,
-    // Enclosed CJK Letters and Months, CJK Compatibility, and CJK Unified
-    // Ideographs Extension A.
-    (0x2E80, 0x4DBF),
-    (0x4E00, 0x9FFF),   // CJK Unified Ideographs
-    (0xA960, 0xA97F),   // Hangul Jamo Extended-A
-    (0xAC00, 0xD7FF),   // Hangul Syllables, Hangul Jamo Extended-B
-    (0xF900, 0xFAFF),   // CJK Compatibility Ideographs
-    (0xFE10, 0xFE1F),   // Vertical Forms
-    (0xFE30, 0xFE4F),   // CJK Compatibility Forms
-    (0xFF00, 0xFFEF),   // Halfwidth and Fullwidth Forms
-    (0x16FE0, 0x16FFF), // Ideographic Symbols and Punctuation
-    (0x1AFF0, 0x1B2FF), // Kana Extended-B, Kana Supplement, Kana Extended-A, Small Kana Extension, Nushu
-    (0x1F200, 0x1F2FF), // Enclosed Ideographic Supplement
-    (0x20000, 0x2A6DF), // CJK Unified Ideographs Extension B
-    (0x2A700, 0x2EE5F), // CJK Unified Ideographs Extensions C, D, E, F, I
-    (0x2F800, 0x2FA1F), // CJK Compatibility Ideographs Supplement
-    (0x30000, 0x3347F), // CJK Unified Ideographs Extensions G, H, J
-];
-
-fn is_cjk_char(character: char) -> bool {
-    let codepoint = character as u32;
-    CJK_RANGES
-        .iter()
-        .any(|&(start, end)| (start..=end).contains(&codepoint))
 }
 
 /// A best-effort fallback must retain enough source material to remain usable.
