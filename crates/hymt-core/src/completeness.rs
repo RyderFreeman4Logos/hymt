@@ -384,6 +384,10 @@ fn placeholder_tokens(text: &str) -> HashSet<String> {
     tokens
 }
 
+pub fn preserved_urls(text: &str) -> HashSet<String> {
+    urls(text)
+}
+
 fn urls(text: &str) -> HashSet<String> {
     let mut urls = HashSet::new();
     let mut remaining = text;

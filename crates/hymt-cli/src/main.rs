@@ -149,6 +149,10 @@ struct Cli {
     #[arg(long = "context", global = true)]
     ctx: Option<String>,
 
+    /// Bypass segment-cache reads and writes for this run
+    #[arg(long = "no-cache", alias = "disable-cache", global = true)]
+    no_cache: bool,
+
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -388,9 +392,6 @@ struct TranslateDocArgs {
     /// Recursively translate subdirectories
     #[arg(short = 'r', long)]
     recursive: bool,
-    /// Bypass segment-cache reads and writes for this run
-    #[arg(long = "no-cache", alias = "disable-cache")]
-    no_cache: bool,
 }
 
 // ── telegram ──────────────────────────────────────────────────────────────────
@@ -560,6 +561,7 @@ async fn run() -> Result<()> {
         output_path: cli.output.as_deref(),
         warn_only_completeness: cli.warn_only_completeness,
         concurrency_override,
+        no_cache: cli.no_cache,
     };
     let terms = parse_terms(&cli.term);
     let prompt_opts = PromptOpts {
@@ -677,7 +679,14 @@ async fn run() -> Result<()> {
                 &template,
                 &prompt_opts,
                 &config,
-                concurrency_override,
+                TranslateFlags {
+                    show_plan: cli.plan,
+                    stream_output: false,
+                    output_path: None,
+                    warn_only_completeness: cli.warn_only_completeness,
+                    concurrency_override,
+                    no_cache: cli.no_cache,
+                },
             )
             .await
         }
@@ -881,6 +890,7 @@ struct TranslateFlags<'a> {
     output_path: Option<&'a Path>,
     warn_only_completeness: bool,
     concurrency_override: Option<u32>,
+    no_cache: bool,
 }
 
 fn should_stream_translation(
@@ -1037,7 +1047,7 @@ async fn run_translate_text(
         client: &client,
         segmenter: &segmenter,
         history: &history,
-        cache_enabled: true,
+        cache_enabled: !flags.no_cache,
     };
     let warn_only = completeness_warn_only(config, flags.warn_only_completeness);
     if flags.stream_output {
@@ -1109,7 +1119,7 @@ async fn run_translate_stdin(
         client: &client,
         segmenter: &segmenter,
         history: &history,
-        cache_enabled: true,
+        cache_enabled: !flags.no_cache,
     };
     let warn_only = completeness_warn_only(config, flags.warn_only_completeness);
     if flags.stream_output {
@@ -1172,7 +1182,7 @@ async fn run_translate_path(
         client: &client,
         segmenter: &segmenter,
         history: &history,
-        cache_enabled: true,
+        cache_enabled: !flags.no_cache,
     };
     let warn_only = completeness_warn_only(config, flags.warn_only_completeness);
     if flags.stream_output {
@@ -1710,11 +1720,11 @@ async fn run_translate_doc(
     template: &TemplateType,
     opts: &PromptOpts,
     config: &HotConfig,
-    concurrency_override: Option<u32>,
+    flags: TranslateFlags<'_>,
 ) -> Result<()> {
     let segmenter = make_segmenter(config)?;
     let history = HistoryDB::default();
-    let client = make_client_with_concurrency(config, concurrency_override)?;
+    let client = make_client_with_concurrency(config, flags.concurrency_override)?;
     let doc_opts = DocTranslationOpts {
         target_lang,
         config,
@@ -1727,7 +1737,7 @@ async fn run_translate_doc(
         template,
         prompt_opts: opts,
         explicit_target,
-        cache_enabled: !args.no_cache,
+        cache_enabled: !flags.no_cache,
     };
     run_doc_translation(&args.source, &doc_opts).await
 }
@@ -1962,6 +1972,17 @@ Options:\n  --source-id <SOURCE_ID>\n  --context-only\n";
         let cli = Cli::try_parse_from(["hymt", "--no-streaming", "hello"]).unwrap();
         assert!(cli.no_stream);
         assert!(!should_stream_translation(cli.stream, cli.no_stream, None));
+    }
+
+    #[test]
+    fn top_level_no_cache_disables_cache_for_text_and_files() {
+        let cli = Cli::try_parse_from(["hymt", "--no-cache", "hello"]).unwrap();
+        assert!(cli.no_cache);
+        let doc = Cli::try_parse_from(["hymt", "--no-cache", "translate-doc", "doc.md"]).unwrap();
+        let Cmd::TranslateDoc(_) = doc.cmd.unwrap() else {
+            panic!("translate-doc");
+        };
+        assert!(doc.no_cache);
     }
 
     #[test]
