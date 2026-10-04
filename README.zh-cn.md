@@ -12,16 +12,16 @@ Hy-MT2是一款实用的Rust命令行工具：具备分词器感知的分段处�
 
 ## 为何选择hymt
 
-- 通过一个命令即可翻译定位的文本、标准输入内容或文件。  
-- 基于Hy-MT2分词器对长文本进行分段，而非盲目分割。  
-- 在分段层面重用缓存翻译结果，使重复内容几乎能瞬间获取。  
-- 默认以流式方式输出分词结果，从而保证`| less`、`| bat`和`| tee`等操作流程的响应速度。  
-- 使用具备结构识别能力的边界对Markdown文本进行分段；具体多语言处理限制见下文。  
-- 可批量处理整个目录树，在写入前预览缓存状态及预计完成时间。  
-- 可用`hymt exec`包裹任意shell命令，或浏览已翻译的`man`和`info`文档。  
-- 可调出之前的输出结果，并查看带有处理量统计信息的翻译历史记录。  
-- 使用`hymt translate-doc`可保持双语Markdown文档的同步。  
-- 还提供可选的Telegram机器人（`hymt telegram`），用于多用户私有场景下的内容管理，以及支持`.txt`和`.md`格式文档的中英互译。  
+- 通过一个命令即可翻译定位的文本、标准输入内容或文件。
+- 基于Hy-MT2分词器对长文本进行分段，而非盲目分割。
+- 在分段层面重用缓存翻译结果，使重复内容几乎能瞬间获取。
+- 默认以流式方式输出分词结果，从而保证`| less`、`| bat`和`| tee`等操作流程的响应速度。
+- 使用具备结构识别能力的边界对Markdown文本进行分段；具体多语言处理限制见下文。
+- 可批量处理整个目录树，在写入前预览缓存状态及预计完成时间。
+- 可用`hymt exec`包裹任意shell命令，或浏览已翻译的`man`和`info`文档。
+- 可调出之前的输出结果，并查看带有处理量统计信息的翻译历史记录。
+- 使用`hymt translate-doc`可保持双语Markdown文档的同步。
+- 还提供可选的Telegram机器人（`hymt telegram`），用于多用户私有场景下的内容管理，以及支持`.txt`和`.md`格式文档的中英互译。
 
 ## 安装
 
@@ -168,17 +168,17 @@ groups = []             # group chat ids when mode = "groups"
 mode = "owners"         # "owners" | "groups"
 ```
 
-1. 通过[@BotFather](https://t.me/BotFather)创建机器人，设置`bot_token`（或`HYMT_TELEGRAM_BOT_TOKEN`）。  
-2. 设置`enabled = true`。  
-3. 运行`hymt telegram`（持续长轮询，直到按下Ctrl+C）。首次运行时，hymt会生成一个声明密码，将其存储在配置中并显示一次。  
-4. 在与机器人的私聊中，发送该声明密码（或输入`/claim <password>`）即可成为所有者。支持多个所有者。  
-5. 经授权的所有者（当`mode = "groups"`时还包括已配置的群组）可自动实现文本消息以及UTF-8格式的`.txt`/`.md`文档的中英互译。超过`max_document_size`限制的文档或非文本文档将被拒绝处理；简短翻译会以内联形式回复，较长翻译则会以原始扩展名保存为文档返回。  
-6. 若希望关闭文档处理功能，可设置`accept_documents = false`。  
-7. 使用`hymt telegram --regenerate-claim-password`可重新生成声明密码（新密码仅显示一次）。  
+1. 通过[@BotFather](https://t.me/BotFather)创建机器人，设置`bot_token`（或`HYMT_TELEGRAM_BOT_TOKEN`）。
+2. 设置`enabled = true`。
+3. 运行`hymt telegram`（持续长轮询，直到按下Ctrl+C）。首次运行时，hymt会生成一个声明密码，将其存储在配置中并显示一次。
+4. 在与机器人的私聊中，发送该声明密码（或输入`/claim <password>`）即可成为所有者。支持多个所有者。
+5. 经授权的所有者（当`mode = "groups"`时还包括已配置的群组）可自动实现文本消息以及UTF-8格式的`.txt`/`.md`文档的中英互译。超过`max_document_size`限制的文档或非文本文档将被拒绝处理；简短翻译会以内联形式回复，较长翻译则会以原始扩展名保存为文档返回。
+6. 若希望关闭文档处理功能，可设置`accept_documents = false`。
+7. 使用`hymt telegram --regenerate-claim-password`可重新生成声明密码（新密码仅显示一次）。
 
-`bot_token`和`claim_password`这些敏感信息不会在每次运行时再次显示。  
+`bot_token`和`claim_password`这些敏感信息不会在每次运行时再次显示。
 
-## 快速开始  
+## 快速开始
 
 ### 翻译文本、标准输入内容或文件
 
@@ -371,12 +371,12 @@ hymt telegram --regenerate-claim-password
 
 ## 架构
 
-- `crates/hymt-core`：支持热重载的TOML配置、提示词模板、CJK语言处理工具以及完整性检测算法。  
-- `crates/hymt-segment`：集成Hy-MT2分词器，同时具备分层分割和Markdown兼容的分割功能。  
-- `crates/hymt-client`：异步的OpenAI兼容HTTP客户端，支持重试处理、并发限制以及SSE流式传输。  
-- `crates/hymt-cache`：SQLite格式的片段缓存与执行缓存，以及任务历史记录、召回率统计和预计完成时间数据。  
-- `crates/hymt-translate`：翻译任务协调功能、完整性检测重试机制、批量/文档处理流程以及翻译后的文档输出。  
-- `crates/hymt-cli`：基于Clap框架的`hymt`命令行工具，负责命令分发、Shell交互功能，还支持可选的Telegram子命令。  
+- `crates/hymt-core`：支持热重载的TOML配置、提示词模板、CJK语言处理工具以及完整性检测算法。
+- `crates/hymt-segment`：集成Hy-MT2分词器，同时具备分层分割和Markdown兼容的分割功能。
+- `crates/hymt-client`：异步的OpenAI兼容HTTP客户端，支持重试处理、并发限制以及SSE流式传输。
+- `crates/hymt-cache`：SQLite格式的片段缓存与执行缓存，以及任务历史记录、召回率统计和预计完成时间数据。
+- `crates/hymt-translate`：翻译任务协调功能、完整性检测重试机制、批量/文档处理流程以及翻译后的文档输出。
+- `crates/hymt-cli`：基于Clap框架的`hymt`命令行工具，负责命令分发、Shell交互功能，还支持可选的Telegram子命令。
 
 ## 开发指南
 
