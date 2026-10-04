@@ -37,6 +37,14 @@ check:
 test:
     {{_io_prefix}} cargo test --workspace
 
+# One focused test. Usage: just test-one hymt-translate omitted_link
+test-one package test:
+    {{_io_prefix}} cargo test -p {{package}} {{test}} -- --exact
+
+# Release binary used for acceptance. Same idle prefix and cargo config as tests.
+release:
+    {{_io_prefix}} cargo build --release --bin hymt
+
 # Complete reproducible benchmark suite. Default is deterministic mock mode;
 # pass runner arguments directly, for example: just benchmark --dry-run.
 benchmark *args:

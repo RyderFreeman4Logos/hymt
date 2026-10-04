@@ -15,9 +15,9 @@ const MAX_CALIBRATED_DENSITY_RATIO: f64 = 8.0;
 /// Threshold configuration for completeness checks.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompletenessThresholds {
-    /// Minimum Unicode-scalar density ratio for zh→en translations (source is zh).
+    /// Minimum approximate-token density ratio for zh→en translations (source is zh).
     pub zh_to_en_min_ratio: f64,
-    /// Minimum Unicode-scalar density ratio for en→zh translations (source is en).
+    /// Minimum approximate-token density ratio for en→zh translations (source is en).
     pub en_to_zh_min_ratio: f64,
     /// Minimum paragraph-count ratio (output / input).
     pub min_paragraph_ratio: f64,
@@ -83,7 +83,7 @@ pub enum DensityStatus {
     Unverified,
 }
 
-/// Unicode-scalar density measurement and the bounds that applied to it.
+/// Approximate-token density measurement and the bounds that applied to it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DensityCheck {
     pub status: DensityStatus,
@@ -92,11 +92,13 @@ pub struct DensityCheck {
     pub maximum_ratio: Option<f64>,
 }
 
-/// Raw structural and Unicode-scalar counts extracted from a text.
+/// Raw structural counts and the shared approximate token estimate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompletenessStats {
     /// Count of Unicode scalar values. This is intentionally not UTF-8 byte length.
     pub unicode_scalar_count: usize,
+    /// `ceil(utf8_bytes / 4)`, the same fallback `hymt-segment` uses when no tokenizer is loaded.
+    pub estimated_tokens: usize,
     pub paragraph_count: usize,
     pub heading_count: usize,
     pub fenced_code_block_count: usize,
@@ -172,8 +174,10 @@ pub fn validate_completeness_with_context(
         CompletionTermination::Unknown | CompletionTermination::Stop => {}
     }
 
-    // Layer 2: calibrated Unicode-scalar density. Other targets are explicit,
-    // actionable advisories rather than implicit passes.
+    // Layer 2: approximate token density. Calibrated targets compare the same
+    // UTF-8-byte/4 estimate the segmenter uses when its tokenizer is absent.
+    // Scalar ratios reject complete English→Chinese prose because Chinese uses
+    // fewer scalars per word. Other targets stay explicit advisories.
     let mut density_passed = None;
     match density.status {
         DensityStatus::Calibrated => {
@@ -257,6 +261,7 @@ pub fn validate_completeness_with_context(
 fn compute_stats(text: &str) -> CompletenessStats {
     CompletenessStats {
         unicode_scalar_count: text.chars().count(),
+        estimated_tokens: estimate_token_count(text),
         paragraph_count: count_paragraphs(text),
         heading_count: count_markdown_headings(text),
         fenced_code_block_count: count_fenced_code_blocks(text),
@@ -271,8 +276,8 @@ fn density_check(
     target_lang: &str,
     thresholds: &CompletenessThresholds,
 ) -> DensityCheck {
-    let ratio = (input.unicode_scalar_count > 0)
-        .then(|| output.unicode_scalar_count as f64 / input.unicode_scalar_count as f64);
+    let ratio = (input.estimated_tokens > 0)
+        .then(|| output.estimated_tokens as f64 / input.estimated_tokens as f64);
     let Some(minimum_ratio) = min_unicode_scalar_ratio(target_lang, thresholds) else {
         return DensityCheck {
             status: DensityStatus::Unverified,
@@ -382,6 +387,10 @@ fn placeholder_tokens(text: &str) -> HashSet<String> {
         remaining = &after_start[end + 1..];
     }
     tokens
+}
+
+pub fn preserved_urls(text: &str) -> HashSet<String> {
+    urls(text)
 }
 
 fn urls(text: &str) -> HashSet<String> {
@@ -519,6 +528,14 @@ fn count_paragraphs(text: &str) -> usize {
     text.split("\n\n").filter(|b| !b.trim().is_empty()).count()
 }
 
+/// Same fallback as `hymt_segment::estimate_token_count`: one token per four UTF-8 bytes.
+fn estimate_token_count(text: &str) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+    text.len().div_ceil(4).max(1)
+}
+
 fn count_markdown_headings(text: &str) -> usize {
     text.lines().filter(|line| line.starts_with('#')).count()
 }
@@ -625,7 +642,7 @@ fn generic_refusal(output_text: &str) -> bool {
     .any(|marker| lower.contains(marker))
 }
 
-/// Returns the applicable minimum Unicode-scalar density ratio for `target_lang`, or `None`.
+/// Returns the applicable minimum approximate-token density ratio for `target_lang`, or `None`.
 fn min_unicode_scalar_ratio(target_lang: &str, thresholds: &CompletenessThresholds) -> Option<f64> {
     let spec = language_spec_or_none(target_lang)?;
     if spec.canonical_code == "en" {
@@ -667,6 +684,59 @@ mod tests {
             "checks_failed={:?}",
             result.checks_failed
         );
+    }
+
+    #[test]
+    fn complete_english_to_chinese_prose_is_not_a_density_failure() {
+        let input = "The committee approved the annual operating budget after a lengthy public debate. Several members requested a written financial report before the next scheduled meeting. The chair recorded every formal objection and then scheduled a detailed follow-up discussion.";
+        let output = "委员会在长时间公开辩论后批准了年度运营预算。数名成员要求在下次预定会议前提交书面财务报告。主席记录了每一项正式异议，随后安排了详细的后续讨论。";
+        let result = validate_completeness(input, output, "zh", None);
+        assert!(
+            result.is_complete,
+            "status={:?} checks={:?} ratio={:?}",
+            result.status, result.checks_failed, result.density.ratio
+        );
+        assert!(!result.checks_failed.contains(&"token_ratio".to_owned()));
+    }
+
+    #[test]
+    fn truncated_english_to_chinese_still_fails_density() {
+        let input = "The committee approved the annual operating budget after a lengthy public debate. Several members requested a written financial report before the next scheduled meeting. The chair recorded every formal objection and then scheduled a detailed follow-up discussion.";
+        let output = "委员会批准了预算。";
+        let result = validate_completeness(input, output, "zh", None);
+        assert!(!result.is_complete);
+        assert!(result.checks_failed.contains(&"token_ratio".to_owned()));
+    }
+
+    #[test]
+    fn omitted_english_paragraph_still_fails() {
+        let input = "The committee approved the annual operating budget after a lengthy public debate.\n\nSeveral members requested a written financial report before the next scheduled meeting.\n\nThe chair recorded every formal objection and then scheduled a detailed follow-up discussion.";
+        let output = "委员会在长时间公开辩论后批准了年度运营预算。";
+        let result = validate_completeness(input, output, "zh", None);
+        assert!(!result.is_complete);
+        assert!(result.checks_failed.contains(&"paragraph_count".to_owned()));
+    }
+
+    #[test]
+    fn complete_chinese_to_english_with_protected_url_passes() {
+        let input = "请在更改生产服务之前阅读 https://example.test/docs 上的安装指南。";
+        let output = "Please read the installation guide at https://example.test/docs before changing the production service.";
+        let result = validate_completeness(input, output, "en", None);
+        assert!(result.is_complete, "{:?}", result.checks_failed);
+        assert!(!result
+            .checks_failed
+            .contains(&"url_preservation".to_owned()));
+    }
+
+    #[test]
+    fn dropped_url_in_chinese_to_english_still_fails() {
+        let input = "请在更改生产服务之前阅读 https://example.test/docs 上的安装指南。";
+        let output = "Please read the installation guide before changing the production service.";
+        let result = validate_completeness(input, output, "en", None);
+        assert_eq!(result.status, CompletenessStatus::StructurallyInvalid);
+        assert!(result
+            .checks_failed
+            .contains(&"url_preservation".to_owned()));
     }
 
     // ── Token ratio failures ─────────────────────────────────────────────────
@@ -976,12 +1046,14 @@ verbatim ask --no-generate --format json \"哪些证据是相关的？\"";
     }
 
     #[test]
-    fn zh_to_en_density_ratio_is_not_a_utf8_byte_ratio() {
-        // Scalar ratio is 1/2 = 0.5, whereas the old byte ratio was 1/6.
-        let result = validate_completeness("中文", "a", "en", None);
+    fn zh_to_en_density_ratio_uses_shared_token_estimate() {
+        // English "ab" is 1 estimated token; Chinese "中文" is 2. The old scalar ratio was 1.0.
+        let result = validate_completeness("ab", "中文", "zh", None);
 
         assert!(result.is_complete, "{:?}", result.checks_failed);
-        assert_eq!(result.density.ratio, Some(0.5));
+        assert_eq!(result.density.ratio, Some(2.0));
+        assert_eq!(result.input_stats.unicode_scalar_count, 2);
+        assert_eq!(result.output_stats.unicode_scalar_count, 2);
     }
 
     #[test]
