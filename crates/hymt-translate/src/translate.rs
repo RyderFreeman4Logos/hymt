@@ -978,13 +978,19 @@ fn split_oversized_protected_blocks(
                 true
             })
             .collect();
-        if oversized_ranges.is_empty() {
+        if oversized_ranges.is_empty() && opaque_link_ranges(&section.text).is_empty() {
             split_sections.push(section);
             continue;
         }
 
+        let mut pieces: Vec<std::ops::Range<usize>> = oversized_ranges;
+        pieces.extend(opaque_link_ranges(&section.text));
+        pieces.sort_by_key(|range| range.start);
         let mut cursor = 0;
-        for range in oversized_ranges {
+        for range in pieces {
+            if range.start < cursor {
+                continue;
+            }
             if cursor < range.start {
                 let mut before = section.clone();
                 before.text = section.text[cursor..range.start].to_owned();
@@ -1047,6 +1053,32 @@ fn protected_markdown_block_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
         }
 
         line_index += 1;
+    }
+    ranges
+}
+
+/// `(url)` after a Markdown label. The label stays translatable.
+fn opaque_link_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    let bytes = text.as_bytes();
+    let mut ranges = Vec::new();
+    let mut index = 0;
+    while index + 8 < bytes.len() {
+        if bytes[index] != b']' || bytes[index + 1] != b'(' {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        let body = &text[index + 2..];
+        let Some(close) = body.find(')') else {
+            break;
+        };
+        let destination = body[..close].trim();
+        if destination.starts_with("http://") || destination.starts_with("https://") {
+            ranges.push(start..index + 2 + close + 1);
+            index += 2 + close + 1;
+        } else {
+            index += 1;
+        }
     }
     ranges
 }
@@ -3518,6 +3550,108 @@ max_retries = 1
     fn ordinary_pipe_prose_is_not_a_protected_table() {
         let source = "Ordinary prose | with pipes | remains translatable.\n";
         assert!(protected_markdown_block_ranges(source).is_empty());
+    }
+
+    #[tokio::test]
+    async fn omitted_link_destination_is_restored_in_place() {
+        let destination = "https://example.test/opaque-keep?q=1";
+        let source = format!("Read the [report]({destination}) before the note.\n");
+        let segmenter = fallback_segmenter();
+        let server = start_capturing_mock_server(vec![
+            MockResponse::Json("阅读报告阅读报告阅读报告".to_owned()),
+            MockResponse::Json("然后再看说明然后再看说明".to_owned()),
+            MockResponse::Json("unused".to_owned()),
+        ])
+        .await;
+        let config = make_protected_block_config(&server.endpoint_url);
+        let plan = plan_translation(
+            &source,
+            "zh",
+            &config,
+            &segmenter,
+            &TemplateType::Default,
+            &PromptOpts::default(),
+        )
+        .expect("inline link planning");
+        assert!(
+            plan.segments
+                .iter()
+                .all(|segment| !segment.contains(destination)),
+            "opaque destination must not reach the model: {:?}",
+            plan.segments
+        );
+        let history = HistoryDB::new(temp_path("opaque-link-history.db"));
+        let client = TranslationClient::new(config.clone()).unwrap();
+        let ctx = TranslationCtx {
+            config: &config,
+            client: &client,
+            segmenter: &segmenter,
+            history: &history,
+            cache_enabled: false,
+        };
+        let translated = translate_text(
+            &source,
+            "zh",
+            &TemplateType::Default,
+            &PromptOpts::default(),
+            &ctx,
+        )
+        .await
+        .expect("non-stream link translation")
+        .text;
+        let label_at = translated
+            .find("报告")
+            .expect("visible label was translated");
+        let destination_at = translated
+            .find(destination)
+            .expect("omitted destination is restored");
+        let note_at = translated
+            .find("说明")
+            .expect("trailing prose was translated");
+        assert!(label_at < destination_at && destination_at < note_at);
+        assert!(translated.contains(&format!("]({destination})")));
+        let requests = server.requests.lock().unwrap();
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.contains(destination)),
+            "model request contained the opaque destination"
+        );
+        drop(requests);
+
+        let streaming_server = start_capturing_mock_server(vec![
+            MockResponse::Sse(vec!["阅读报告阅读报告阅读报告".to_owned()]),
+            MockResponse::Json("然后再看说明然后再看说明".to_owned()),
+        ])
+        .await;
+        let streaming_config = make_protected_block_config(&streaming_server.endpoint_url);
+        let streaming_history = HistoryDB::new(temp_path("opaque-link-streaming-history.db"));
+        let streaming_client = TranslationClient::new(streaming_config.clone()).unwrap();
+        let streaming_ctx = TranslationCtx {
+            config: &streaming_config,
+            client: &streaming_client,
+            segmenter: &segmenter,
+            history: &streaming_history,
+            cache_enabled: false,
+        };
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(64);
+        let prompt_opts = PromptOpts::default();
+        let streaming = translate_text_stream(
+            &source,
+            "zh",
+            &TemplateType::Default,
+            &prompt_opts,
+            &streaming_ctx,
+            event_tx,
+        );
+        let render = render_events_as_stdout(event_rx);
+        let (streaming_outcome, stdout) =
+            tokio::try_join!(streaming, render).expect("streaming link translation");
+        assert!(stdout.contains(destination) && streaming_outcome.text.contains(destination));
+        let streaming_requests = streaming_server.requests.lock().unwrap();
+        assert!(streaming_requests
+            .iter()
+            .all(|request| !request.contains(destination)));
     }
 
     #[tokio::test]
