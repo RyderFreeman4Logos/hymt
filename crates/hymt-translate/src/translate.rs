@@ -1818,6 +1818,7 @@ pub async fn translate_text(
     } else {
         missing.extend(0..plan.segment_count());
     }
+    let cache_hits = (plan.segment_count() - missing.len()) as i64;
 
     // ── Phase 2: parallel translate missing segments ───────────────────────────
 
@@ -1909,6 +1910,7 @@ pub async fn translate_text(
         profile_id: profile_id.to_owned(),
         inference_fingerprint: inference_fingerprint.hash().to_owned(),
         prompt_schema: PROMPT_SCHEMA_ID.to_owned(),
+        cache_hits: Some(cache_hits),
         tokens_per_second: tps,
         input_chars: text.chars().count() as i64,
         output_chars: translated.chars().count() as i64,
@@ -2080,6 +2082,7 @@ pub async fn translate_text_stream_with_mode(
     } else {
         missing.extend(0..plan.segment_count());
     }
+    let cache_hits = (plan.segment_count() - missing.len()) as i64;
 
     let mut degraded_segments: Vec<usize> = Vec::new();
     let mut next_section_index = 0;
@@ -2380,6 +2383,7 @@ pub async fn translate_text_stream_with_mode(
         profile_id: profile_id.to_owned(),
         inference_fingerprint: inference_fingerprint.hash().to_owned(),
         prompt_schema: PROMPT_SCHEMA_ID.to_owned(),
+        cache_hits: Some(cache_hits),
         tokens_per_second: tps,
         input_chars: text.chars().count() as i64,
         output_chars: translated.chars().count() as i64,
@@ -2509,6 +2513,107 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::Notify;
+
+    #[tokio::test]
+    async fn no_cache_translation_persists_observations_and_estimates_from_cold_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let history = HistoryDB::new(tmp.path().join("history.db"));
+        let source = "This report explains why reliable translation timing matters.";
+        let planning_config = make_stream_config("http://127.0.0.1:1/v1");
+        let segmenter = fallback_segmenter();
+        let plan = plan_translation(
+            source,
+            "zh",
+            &planning_config,
+            &segmenter,
+            &TemplateType::Default,
+            &PromptOpts::default(),
+        )
+        .unwrap();
+        assert_eq!(plan.segment_count(), 1);
+        let translation = planned_complete_zh_translations(&plan)
+            .into_iter()
+            .next()
+            .unwrap();
+        let server = start_capturing_mock_server(vec![
+            MockResponse::Json(translation.clone()),
+            MockResponse::Json(translation.clone()),
+            MockResponse::Json(translation.clone()),
+        ])
+        .await;
+        let config = make_stream_config(&server.endpoint_url);
+        let client = TranslationClient::new(config.clone()).unwrap();
+        let ctx = TranslationCtx {
+            config: &config,
+            client: &client,
+            segmenter: &segmenter,
+            history: &history,
+            cache_enabled: false,
+        };
+        let opts = PromptOpts::default();
+
+        for attempt in 0..3 {
+            let outcome = translate_text(source, "zh", &TemplateType::Default, &opts, &ctx)
+                .await
+                .unwrap();
+            assert_eq!(outcome.text, translation);
+
+            if attempt == 0 {
+                let first = history.fetch_recent(Some(1)).unwrap().remove(0);
+                assert_eq!(first.cache_hits, Some(0));
+                assert!(first.output_tokens > 0);
+                let mut warm = first.clone();
+                warm.id = None;
+                warm.cache_hits = Some(1);
+                warm.tokens_per_second = 1_000_000.0;
+                warm.duration_seconds = warm.output_tokens as f64 / warm.tokens_per_second;
+                history.insert_task(&warm).unwrap();
+                let mut unknown = first;
+                unknown.id = None;
+                unknown.cache_hits = None;
+                unknown.tokens_per_second = 2_000_000.0;
+                unknown.duration_seconds = unknown.output_tokens as f64 / unknown.tokens_per_second;
+                history.insert_task(&unknown).unwrap();
+            }
+        }
+
+        assert_eq!(server.requests.lock().unwrap().len(), 3);
+        let records = history.fetch_recent(Some(10)).unwrap();
+        assert_eq!(records.len(), 5);
+        let cache_free: Vec<_> = records
+            .iter()
+            .filter(|record| record.cache_hits == Some(0))
+            .collect();
+        assert_eq!(cache_free.len(), 3);
+        let config_version = config.config_version() as i64;
+        let segments = plan.segment_count() as i64;
+        let concurrency = client.concurrency() as i64;
+        for record in &cache_free {
+            assert_eq!(record.cache_hits, Some(0));
+            assert_eq!(record.config_version, config_version);
+            assert!(record.duration_seconds.is_finite() && record.duration_seconds > 0.0);
+            assert!(record.input_tokens > 0 && record.output_tokens > 0);
+            assert_eq!(record.segments, segments);
+            assert_eq!(record.concurrency, concurrency);
+            assert!(record.tokens_per_second.is_finite() && record.tokens_per_second > 0.0);
+        }
+        let expected_output_tokens: i64 =
+            cache_free.iter().map(|record| record.output_tokens).sum();
+        let estimate = history
+            .estimate(
+                segments,
+                concurrency,
+                Some("zh"),
+                Some("default"),
+                Some(config_version),
+                None,
+            )
+            .unwrap()
+            .expect("three persisted no-cache observations should yield an ETA");
+        assert_eq!(estimate.stats.count, 3);
+        assert_eq!(estimate.stats.total_output_tokens, expected_output_tokens);
+        assert!(estimate.seconds.is_finite() && estimate.seconds > 0.0);
+    }
 
     fn fallback_segmenter() -> Segmenter {
         Segmenter::fallback()

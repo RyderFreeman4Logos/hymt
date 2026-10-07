@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     config_version INTEGER DEFAULT 1,
     profile_id TEXT NOT NULL DEFAULT '',
     inference_fingerprint TEXT NOT NULL DEFAULT '',
-    prompt_schema TEXT NOT NULL DEFAULT ''
+    prompt_schema TEXT NOT NULL DEFAULT '',
+    cache_hits INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS segment_cache (
@@ -63,6 +64,8 @@ pub struct TaskRecord {
     pub inference_fingerprint: String,
     /// Versioned prompt contract used to render this task's model input.
     pub prompt_schema: String,
+    /// Number of segments served from cache; None is legacy/unknown history.
+    pub cache_hits: Option<i64>,
     pub tokens_per_second: f64,
     pub input_chars: i64,
     pub output_chars: i64,
@@ -100,6 +103,8 @@ pub struct TranslationPreview {
 pub struct PerformanceStats {
     pub count: usize,
     pub avg_tokens_per_second: f64,
+    /// Aggregate task throughput divided by its effective historical concurrency.
+    pub avg_tokens_per_second_per_slot: f64,
     pub median_tokens_per_second: f64,
     pub p5_tokens_per_second: f64,
     pub p95_tokens_per_second: f64,
@@ -176,8 +181,8 @@ impl HistoryDB {
                 source_lang, target_lang, template_type, model,
                 tokens_per_second, input_chars, output_chars,
                 output_text, input_hash, config_version, profile_id, inference_fingerprint,
-                prompt_schema
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+                prompt_schema, cache_hits
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
             rusqlite::params![
                 record.started_at,
                 record.finished_at,
@@ -199,6 +204,7 @@ impl HistoryDB {
                 record.profile_id,
                 record.inference_fingerprint,
                 record.prompt_schema,
+                record.cache_hits,
             ],
         )?;
         Ok(())
@@ -443,12 +449,31 @@ impl HistoryDB {
         Ok(previews)
     }
 
-    /// Return performance statistics filtered by optional dimensions.
+    /// Return performance statistics over all recorded translations.
     pub fn stats(
         &self,
         target_lang: Option<&str>,
         template_type: Option<&str>,
         config_version: Option<i64>,
+    ) -> Result<Option<PerformanceStats>, CacheError> {
+        self.stats_filtered(target_lang, template_type, config_version, false)
+    }
+
+    fn stats_for_estimate(
+        &self,
+        target_lang: Option<&str>,
+        template_type: Option<&str>,
+        config_version: Option<i64>,
+    ) -> Result<Option<PerformanceStats>, CacheError> {
+        self.stats_filtered(target_lang, template_type, config_version, true)
+    }
+
+    fn stats_filtered(
+        &self,
+        target_lang: Option<&str>,
+        template_type: Option<&str>,
+        config_version: Option<i64>,
+        cache_free_only: bool,
     ) -> Result<Option<PerformanceStats>, CacheError> {
         let conn = match self.connect_if_exists()? {
             Some(c) => c,
@@ -458,6 +483,10 @@ impl HistoryDB {
 
         let mut conditions: Vec<&str> = vec!["tokens_per_second > 0", "segments > 0"];
         let mut params: Vec<rusqlite::types::Value> = Vec::new();
+        if cache_free_only {
+            conditions.push("cache_hits = ?");
+            params.push(rusqlite::types::Value::Integer(0));
+        }
 
         if let Some(tl) = target_lang {
             conditions.push("target_lang = ?");
@@ -475,14 +504,14 @@ impl HistoryDB {
         // Re-index placeholders to ?1, ?2, ...
         let where_clause = build_where_clause(&conditions, &mut params);
         let sql = format!(
-            "SELECT duration_seconds, input_tokens, output_tokens, segments, tokens_per_second
+            "SELECT duration_seconds, input_tokens, output_tokens, segments, tokens_per_second, concurrency
              FROM tasks
              WHERE {where_clause}
              ORDER BY tokens_per_second"
         );
 
         let mut stmt = conn.prepare(&sql)?;
-        let rows: Vec<(f64, i64, i64, i64, f64)> = stmt
+        let rows: Vec<(f64, i64, i64, i64, f64, i64)> = stmt
             .query_map(rusqlite::params_from_iter(params), |row| {
                 Ok((
                     row.get::<_, f64>(0)?,
@@ -490,6 +519,7 @@ impl HistoryDB {
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
                     row.get::<_, f64>(4)?,
+                    row.get::<_, i64>(5)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -513,7 +543,7 @@ impl HistoryDB {
         let min_samples = min_samples.unwrap_or(3);
         let mut versions_used: Vec<i64> = config_version.into_iter().collect();
 
-        let stats = self.stats(target_lang, template_type, config_version)?;
+        let stats = self.stats_for_estimate(target_lang, template_type, config_version)?;
         if let Some(ref s) = stats {
             if s.count >= min_samples && s.avg_tokens_per_second > 0.0 {
                 return Ok(Some(build_estimate(
@@ -527,7 +557,7 @@ impl HistoryDB {
 
         // Fallback: broaden by dropping config_version filter
         if config_version.is_some() {
-            let broader = self.stats(target_lang, template_type, None)?;
+            let broader = self.stats_for_estimate(target_lang, template_type, None)?;
             if let Some(ref s) = broader {
                 if s.count >= min_samples && s.avg_tokens_per_second > 0.0 {
                     versions_used = self.distinct_versions()?;
@@ -543,7 +573,7 @@ impl HistoryDB {
 
         // Fallback: broaden by dropping lang/template filters
         if target_lang.is_some() || template_type.is_some() {
-            let fallback = self.stats(None, None, config_version)?;
+            let fallback = self.stats_for_estimate(None, None, config_version)?;
             if let Some(ref s) = fallback {
                 if s.count >= min_samples && s.avg_tokens_per_second > 0.0 {
                     return Ok(Some(build_estimate(
@@ -554,7 +584,7 @@ impl HistoryDB {
                     )));
                 }
             }
-            let global = self.stats(None, None, None)?;
+            let global = self.stats_for_estimate(None, None, None)?;
             if let Some(ref s) = global {
                 if s.count >= min_samples && s.avg_tokens_per_second > 0.0 {
                     versions_used = self.distinct_versions()?;
@@ -645,6 +675,9 @@ fn migrate_tasks_columns(conn: &Connection) -> Result<(), CacheError> {
     }
     if !cols.contains("prompt_schema") {
         conn.execute_batch("ALTER TABLE tasks ADD COLUMN prompt_schema TEXT NOT NULL DEFAULT ''")?;
+    }
+    if !cols.contains("cache_hits") {
+        conn.execute_batch("ALTER TABLE tasks ADD COLUMN cache_hits INTEGER")?;
     }
     Ok(())
 }
@@ -762,6 +795,7 @@ fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
         prompt_schema: row
             .get::<_, Option<String>>("prompt_schema")?
             .unwrap_or_default(),
+        cache_hits: row.get("cache_hits")?,
         tokens_per_second: row.get("tokens_per_second")?,
         input_chars: row.get("input_chars")?,
         output_chars: row.get("output_chars")?,
@@ -776,20 +810,27 @@ fn preview_text(text: &str) -> String {
     joined.chars().take(80).collect()
 }
 
-fn stats_from_rows(rows: &[(f64, i64, i64, i64, f64)]) -> Option<PerformanceStats> {
+fn stats_from_rows(rows: &[(f64, i64, i64, i64, f64, i64)]) -> Option<PerformanceStats> {
     if rows.is_empty() {
         return None;
     }
     // rows are sorted by tokens_per_second (ORDER BY in caller)
-    let rates: Vec<f64> = rows.iter().map(|(_, _, _, _, tps)| *tps).collect();
-    let total_output_tokens: i64 = rows.iter().map(|(_, _, out, _, _)| *out).sum();
-    let total_segments: i64 = rows.iter().map(|(_, _, _, seg, _)| *seg).sum();
-    let total_duration: f64 = rows.iter().map(|(dur, _, _, _, _)| *dur).sum();
-    let total_input_tokens: i64 = rows.iter().map(|(_, inp, _, _, _)| *inp).sum();
+    let rates: Vec<f64> = rows.iter().map(|(_, _, _, _, tps, _)| *tps).collect();
+    let per_slot_rate: f64 = rows
+        .iter()
+        .map(|(_, _, _, segments, tps, concurrency)| {
+            tps / (*concurrency).max(1).min((*segments).max(1)) as f64
+        })
+        .sum();
+    let total_output_tokens: i64 = rows.iter().map(|(_, _, out, _, _, _)| *out).sum();
+    let total_segments: i64 = rows.iter().map(|(_, _, _, seg, _, _)| *seg).sum();
+    let total_duration: f64 = rows.iter().map(|(dur, _, _, _, _, _)| *dur).sum();
+    let total_input_tokens: i64 = rows.iter().map(|(_, inp, _, _, _, _)| *inp).sum();
     let n = rates.len();
     Some(PerformanceStats {
         count: n,
         avg_tokens_per_second: rates.iter().sum::<f64>() / n as f64,
+        avg_tokens_per_second_per_slot: per_slot_rate / n as f64,
         median_tokens_per_second: median(&rates),
         p5_tokens_per_second: percentile(&rates, 0.05),
         p95_tokens_per_second: percentile(&rates, 0.95),
@@ -809,7 +850,10 @@ fn build_estimate(
     let effective_segments = segments.max(1) as f64;
     let effective_concurrency = concurrency.max(1).min(segments.max(1)) as f64;
     let estimated_output_tokens = stats.avg_output_tokens_per_segment * effective_segments;
-    let seconds = estimated_output_tokens / stats.avg_tokens_per_second / effective_concurrency;
+    // Stored throughput already includes the source task's parallelism; only
+    // the per-slot rate may be scaled by the requested concurrency.
+    let seconds =
+        estimated_output_tokens / stats.avg_tokens_per_second_per_slot / effective_concurrency;
     DurationEstimate {
         stats: stats.clone(),
         seconds,
@@ -891,6 +935,7 @@ mod tests {
             profile_id: "hy_mt2_7b".to_owned(),
             inference_fingerprint: "sha256:sample".to_owned(),
             prompt_schema: "hy-mt2-prompts/v2".to_owned(),
+            cache_hits: Some(0),
             tokens_per_second: tps,
             input_chars: 500,
             output_chars: 400,
@@ -1247,6 +1292,88 @@ mod tests {
         );
     }
 
+    fn set_cache_hits_for_test(db: &HistoryDB, input_hash: &str, cache_hits: Option<i64>) {
+        let conn = Connection::open(db.path()).unwrap();
+        let has_column = {
+            let mut stmt = conn.prepare("PRAGMA table_info(tasks)").unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+                .iter()
+                .any(|name| name == "cache_hits")
+        };
+        if !has_column {
+            conn.execute("ALTER TABLE tasks ADD COLUMN cache_hits INTEGER", [])
+                .unwrap();
+        }
+        conn.execute(
+            "UPDATE tasks SET cache_hits = ?1 WHERE input_hash = ?2",
+            rusqlite::params![cache_hits, input_hash],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_estimate_excludes_warm_and_unknown_cache_history() {
+        let tmp = TempDir::new().unwrap();
+        let db = HistoryDB::new(tmp.path().join("history.db"));
+
+        for (label, tps, cache_hits, count) in [
+            ("warm", 1_000.0, Some(3), 3),
+            ("legacy", 500.0, None, 3),
+            ("cold", 10.0, Some(0), 2),
+        ] {
+            let mut record = sample_record(tps, 5, 500);
+            record.input_hash = Some(label.to_owned());
+            for _ in 0..count {
+                db.insert_task(&record).unwrap();
+            }
+            set_cache_hits_for_test(&db, label, cache_hits);
+        }
+
+        assert_eq!(db.stats(None, None, None).unwrap().unwrap().count, 8);
+        let estimate = db.estimate(5, 1, None, None, None, Some(3)).unwrap();
+        assert!(
+            estimate.is_none(),
+            "only two known cache-free samples qualify; warm and legacy-unknown timing must not satisfy the minimum"
+        );
+    }
+
+    #[test]
+    fn test_estimate_normalizes_historical_concurrency_once() {
+        let tmp = TempDir::new().unwrap();
+        let db = HistoryDB::new(tmp.path().join("history.db"));
+        for _ in 0..3 {
+            let mut record = sample_record(300.0, 6, 3_000);
+            record.concurrency = 3;
+            db.insert_task(&record).unwrap();
+        }
+        let estimate = |segments, concurrency| {
+            db.estimate(segments, concurrency, None, None, None, None)
+                .unwrap()
+                .unwrap()
+                .seconds
+        };
+        assert!((estimate(6, 3) - 10.0).abs() < 1e-9);
+        assert!((estimate(6, 1) - 30.0).abs() < 1e-9);
+        assert!((estimate(1, 8) - 5.0).abs() < 1e-9);
+        assert_eq!(
+            db.stats(None, None, None)
+                .unwrap()
+                .unwrap()
+                .avg_tokens_per_second,
+            300.0
+        );
+        for (concurrency, segments) in [(1, 6), (8, 1), (0, 1)] {
+            let mut record = sample_record(100.0, segments, segments * 500);
+            record.concurrency = concurrency;
+            record.duration_seconds = record.output_tokens as f64 / record.tokens_per_second;
+            db.insert_task(&record).unwrap();
+        }
+        assert!((estimate(6, 3) - 10.0).abs() < 1e-9);
+    }
+
     #[test]
     fn test_estimate_with_data() {
         let tmp = TempDir::new().unwrap();
@@ -1275,6 +1402,40 @@ mod tests {
         db.insert_task(&sample_record(100.0, 5, 500)).unwrap();
         let est = db.estimate(5, 1, None, None, None, Some(3)).unwrap();
         assert!(est.is_none());
+    }
+
+    #[test]
+    fn test_legacy_history_migrates_as_unknown_timing() {
+        let tmp = TempDir::new().unwrap();
+        let db = HistoryDB::new(tmp.path().join("history.db"));
+        let conn = Connection::open(db.path()).unwrap();
+        let legacy_schema = SCHEMA.replace(",\n    cache_hits INTEGER", "");
+        conn.execute_batch(&legacy_schema).unwrap();
+        assert!(!table_column_names(&conn, "tasks")
+            .unwrap()
+            .contains("cache_hits"));
+        for _ in 0..3 {
+            conn.execute(
+                "INSERT INTO tasks (
+                    started_at, finished_at, duration_seconds, input_tokens,
+                    output_tokens, segments, concurrency, target_lang,
+                    template_type, tokens_per_second, input_chars, output_chars
+                 ) VALUES ('2024-01-01T00:00:00Z', '2024-01-01T00:00:10Z', 10, 100,
+                           500, 5, 1, 'en', 'default', 100, 500, 400)",
+                [],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        assert_eq!(db.stats(None, None, None).unwrap().unwrap().count, 3);
+        assert!(db
+            .estimate(5, 1, None, None, None, Some(3))
+            .unwrap()
+            .is_none());
+        let migrated = db.fetch_recent(Some(10)).unwrap();
+        assert_eq!(migrated.len(), 3);
+        assert!(migrated.iter().all(|record| record.cache_hits.is_none()));
     }
 
     #[test]
