@@ -7,7 +7,6 @@
 //!      completeness with retry, reassemble, record history.
 
 use std::collections::{HashMap, HashSet};
-use std::ops::Range;
 use std::path::Path;
 use std::time::Instant;
 
@@ -946,6 +945,11 @@ fn fit_segments_to_final_request_budget(
 
 type SegmentPlanResult = (Vec<String>, Vec<usize>, Vec<Vec<usize>>);
 
+mod markdown_ownership;
+#[cfg(test)]
+use markdown_ownership::protected_markdown_block_ranges;
+use markdown_ownership::split_oversized_protected_blocks;
+
 fn segment_document_plan(
     doc_plan: &mut DocumentLanguagePlan,
     segmenter: &Segmenter,
@@ -972,141 +976,6 @@ fn segment_document_plan(
         segments.extend(segs);
     }
     Ok((segments, indexes, groups))
-}
-
-/// Keep oversized atomic Markdown blocks out of model input while preserving
-/// translatable text around them as independently segmentable sections.
-fn split_oversized_protected_blocks(
-    doc_plan: &mut DocumentLanguagePlan,
-    segmenter: &Segmenter,
-    max_tokens: usize,
-) {
-    // Reference definitions and Setext markers can live in another section.
-    // Parse once in complete-document context, then intersect source byte ranges.
-    let source: String = doc_plan
-        .sections
-        .iter()
-        .map(|section| section.text.as_str())
-        .collect();
-    let structural_ranges = protected_markdown_structure_ranges(&source);
-    let mut offset = 0;
-    let mut split_sections = Vec::with_capacity(doc_plan.sections.len());
-    for section in std::mem::take(&mut doc_plan.sections) {
-        let start = offset;
-        offset += section.text.len();
-        if section.kind != SectionKind::Paragraph || !section.should_translate {
-            split_sections.push(section);
-            continue;
-        }
-
-        let oversized_ranges: Vec<_> = protected_markdown_block_ranges(&section.text)
-            .into_iter()
-            .filter(|range| {
-                let tokens = segmenter.count_tokens(&section.text[range.clone()]);
-                if tokens <= max_tokens {
-                    return false;
-                }
-                eprintln!(
-                    "Warning: preserved protected block untranslated ({tokens} tokens exceeds segment limit {max_tokens})"
-                );
-                true
-            })
-            .collect();
-        let structural_ranges: Vec<_> = structural_ranges
-            .iter()
-            .filter_map(|range| {
-                let left = range.start.max(start);
-                let right = range.end.min(offset);
-                (left < right).then(|| left - start..right - start)
-            })
-            .collect();
-        if oversized_ranges.is_empty() && structural_ranges.is_empty() {
-            split_sections.push(section);
-            continue;
-        }
-
-        let mut pieces: Vec<Range<usize>> = oversized_ranges;
-        pieces.extend(structural_ranges);
-        pieces.sort_by_key(|range| range.start);
-        let mut merged: Vec<Range<usize>> = Vec::with_capacity(pieces.len());
-        for range in pieces {
-            if let Some(previous) = merged.last_mut() {
-                if range.start <= previous.end {
-                    previous.end = previous.end.max(range.end);
-                    continue;
-                }
-            }
-            merged.push(range);
-        }
-        let mut cursor = 0;
-        for range in merged {
-            if range.start < cursor {
-                continue;
-            }
-            if cursor < range.start {
-                let mut before = section.clone();
-                before.text = section.text[cursor..range.start].to_owned();
-                split_sections.push(before);
-            }
-            let mut protected = section.clone();
-            protected.text = section.text[range.clone()].to_owned();
-            protected.should_translate = false;
-            split_sections.push(protected);
-            cursor = range.end;
-        }
-        if cursor < section.text.len() {
-            let mut after = section;
-            after.text = after.text[cursor..].to_owned();
-            split_sections.push(after);
-        }
-    }
-    doc_plan.sections = split_sections;
-}
-
-fn protected_markdown_block_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
-    let mut offset = 0;
-    let lines: Vec<_> = text
-        .split_inclusive('\n')
-        .map(|line| {
-            let start = offset;
-            offset += line.len();
-            (start, offset, line.trim_end_matches(['\r', '\n']))
-        })
-        .collect();
-    let mut ranges = Vec::new();
-    let mut line_index = 0;
-
-    while line_index < lines.len() {
-        let line = lines[line_index].2.trim_start();
-        if let Some(fence_width) = opening_fence_width(line) {
-            if let Some(closing_index) = lines[line_index + 1..]
-                .iter()
-                .position(|(_, _, candidate)| is_closing_fence(candidate, fence_width))
-                .map(|relative| line_index + relative + 1)
-            {
-                ranges.push(lines[line_index].0..lines[closing_index].1);
-                line_index = closing_index + 1;
-                continue;
-            }
-        }
-
-        if line_index + 2 < lines.len()
-            && is_markdown_table_line(lines[line_index].2)
-            && is_markdown_table_separator(lines[line_index + 1].2)
-            && is_markdown_table_line(lines[line_index + 2].2)
-        {
-            let mut end_index = line_index + 3;
-            while end_index < lines.len() && is_markdown_table_line(lines[end_index].2) {
-                end_index += 1;
-            }
-            ranges.push(lines[line_index].0..lines[end_index - 1].1);
-            line_index = end_index;
-            continue;
-        }
-
-        line_index += 1;
-    }
-    ranges
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1151,120 +1020,6 @@ fn ensure_markdown_structure_preserved(source: &str, translated: &str) -> Result
         anyhow::bail!("translated Markdown structure changed");
     }
     Ok(())
-}
-
-/// Translate literal inline text leaves; keep their complete syntax source-owned.
-/// Parser byte ranges preserve nested delimiters without inventing Markdown grammar.
-fn protected_markdown_structure_ranges(text: &str) -> Vec<Range<usize>> {
-    let parser = Parser::new(text);
-    let mut owned: Vec<_> = parser
-        .reference_definitions()
-        .iter()
-        .map(|(_, definition)| definition.span.clone())
-        .collect();
-    let mut opaque = owned.clone();
-    let mut editable = Vec::new();
-    for (event, range) in parser.into_offset_iter() {
-        match event {
-            Event::Start(
-                Tag::Heading { .. }
-                | Tag::Emphasis
-                | Tag::Strong
-                | Tag::Strikethrough
-                | Tag::BlockQuote(_),
-            ) => owned.push(range),
-            Event::Start(Tag::CodeBlock(_))
-            | Event::Code(_)
-            | Event::Html(_)
-            | Event::InlineHtml(_) => {
-                opaque.push(range.clone());
-                owned.push(range);
-            }
-            Event::Start(Tag::Link { link_type, .. } | Tag::Image { link_type, .. }) => {
-                if matches!(
-                    link_type,
-                    pulldown_cmark::LinkType::Autolink
-                        | pulldown_cmark::LinkType::Email
-                        | pulldown_cmark::LinkType::Shortcut
-                        | pulldown_cmark::LinkType::Collapsed
-                ) {
-                    opaque.push(range.clone());
-                }
-                owned.push(range);
-            }
-            Event::Text(content) if text[range.clone()] == *content => {
-                // Flanking whitespace belongs to syntax, not trimmed model text.
-                let literal = &text[range.clone()];
-                let start = range.start + literal.len() - literal.trim_start().len();
-                let end = range.start + literal.trim_end().len();
-                if start < end {
-                    editable.push(start..end);
-                }
-            }
-            _ => {}
-        }
-    }
-    editable.retain(|range| {
-        !opaque
-            .iter()
-            .any(|node| node.start <= range.start && range.end <= node.end)
-    });
-    let mut protected = Vec::new();
-    for mut node in owned {
-        // Syntax owns adjacent whitespace too: losing a reference definition's
-        // final newline or delimiter flanking space changes the parse.
-        node.start = text[..node.start].trim_end().len();
-        node.end = text.len() - text[node.end..].trim_start().len();
-        let mut cursor = node.start;
-        for content in &editable {
-            if content.start < node.start || content.end > node.end {
-                continue;
-            }
-            if cursor < content.start {
-                protected.push(cursor..content.start);
-            }
-            cursor = content.end;
-        }
-        if cursor < node.end {
-            protected.push(cursor..node.end);
-        }
-    }
-    protected
-}
-
-fn opening_fence_width(line: &str) -> Option<usize> {
-    let width = line
-        .chars()
-        .take_while(|character| *character == '`')
-        .count();
-    (width >= 3).then_some(width)
-}
-
-fn is_closing_fence(line: &str, opening_width: usize) -> bool {
-    let line = line.trim_start();
-    let width = line
-        .chars()
-        .take_while(|character| *character == '`')
-        .count();
-    width >= opening_width && line[width..].trim().is_empty()
-}
-
-fn is_markdown_table_line(line: &str) -> bool {
-    let line = line.trim_start();
-    line.starts_with('|') && line[1..].contains('|')
-}
-
-fn is_markdown_table_separator(line: &str) -> bool {
-    let line = line.trim();
-    if !line.starts_with('|') || !line.ends_with('|') {
-        return false;
-    }
-    let cells: Vec<_> = line[1..line.len() - 1].split('|').collect();
-    cells.len() >= 2
-        && cells.iter().all(|cell| {
-            let marker = cell.trim().trim_matches(':');
-            marker.len() >= 3 && marker.bytes().all(|byte| byte == b'-')
-        })
 }
 
 /// Groups consecutive translatable sections, absorbing intervening separators
@@ -2837,6 +2592,7 @@ pub async fn translate_file(
 #[cfg(test)]
 mod tests {
     mod cache_admission_tests;
+    pub(super) mod ownership_interval_tests;
 
     use super::*;
     use std::collections::VecDeque;
