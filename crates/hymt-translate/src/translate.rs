@@ -69,13 +69,13 @@ pub enum StreamEvent {
 #[derive(Clone)]
 enum StreamEventSink {
     Immediate(mpsc::Sender<StreamEvent>),
-    Validated(std::sync::Arc<tokio::sync::Mutex<Vec<StreamEvent>>>),
+    Validated(mpsc::Sender<StreamEvent>),
 }
 
 /// Controls when segment 0 output is emitted while first-chunk priority is active.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StreamOutputMode {
-    /// Buffer segment 0 until it passes completeness validation.
+    /// Withhold all output until the complete reconstructed document is validated.
     Validated,
     /// Emit segment 0 tokens as soon as the streaming backend returns them.
     Optimistic,
@@ -403,9 +403,9 @@ fn untranslated_text_after_segments(plan: &TranslationPlan, next_section_index: 
         .collect()
 }
 
-fn reconstruction_newline_after_segment(
+fn reconstruction_newline_after_segment<T: AsRef<str>>(
     plan: &TranslationPlan,
-    translations: &[Option<String>],
+    translations: &[Option<T>],
     segment_index: usize,
 ) -> Option<String> {
     let doc_plan = plan.document_plan.as_ref()?;
@@ -421,7 +421,7 @@ fn reconstruction_newline_after_segment(
             .is_some_and(|next| next == group)
         {
             let source_segment = plan.segments.get(segment_index)?;
-            let translated = translations.get(segment_index)?.as_deref()?;
+            let translated = translations.get(segment_index)?.as_ref()?.as_ref();
             let missing = trailing_newline_deficit(translated, source_segment);
             return (missing > 0).then(|| "\n".repeat(missing));
         }
@@ -433,7 +433,7 @@ fn reconstruction_newline_after_segment(
         let mut output = String::new();
         for (idx, candidate) in plan.segment_section_groups.iter().enumerate() {
             if candidate == group {
-                output.push_str(translations.get(idx)?.as_deref()?);
+                output.push_str(translations.get(idx)?.as_ref()?.as_ref());
             }
         }
         let missing = trailing_newline_deficit(&output, &source_text);
@@ -452,7 +452,7 @@ fn reconstruction_newline_after_segment(
     let mut output = String::new();
     for (idx, candidate) in plan.segment_section_indexes.iter().enumerate() {
         if *candidate == section_index {
-            output.push_str(translations.get(idx)?.as_deref()?);
+            output.push_str(translations.get(idx)?.as_ref()?.as_ref());
         }
     }
     let missing = trailing_newline_deficit(&output, &section.text);
@@ -1646,23 +1646,13 @@ async fn send_stream_event(tx: &StreamEventSink, event: StreamEvent) -> Result<(
             .send(event)
             .await
             .map_err(|_| anyhow!("stream event receiver dropped")),
-        StreamEventSink::Validated(events) => {
-            events.lock().await.push(event);
+        StreamEventSink::Validated(sender) => {
+            if sender.is_closed() {
+                anyhow::bail!("stream event receiver dropped");
+            }
             Ok(())
         }
     }
-}
-
-async fn flush_staged_stream_events(
-    events: &std::sync::Arc<tokio::sync::Mutex<Vec<StreamEvent>>>,
-    output_tx: &mpsc::Sender<StreamEvent>,
-) -> Result<()> {
-    let staged = std::mem::take(&mut *events.lock().await);
-    let output = StreamEventSink::Immediate(output_tx.clone());
-    for event in staged {
-        send_stream_event(&output, event).await?;
-    }
-    Ok(())
 }
 
 fn joined_segment(
@@ -1679,9 +1669,9 @@ fn joined_segment(
 ///
 /// Segments already streamed (for example priority segment 0) must advance
 /// `next_emit` past them before calling this helper so they are not re-emitted.
-async fn flush_ready_stream_prefix(
+async fn flush_ready_stream_prefix<T: AsRef<str>>(
     plan: &TranslationPlan,
-    translations: &[Option<String>],
+    translations: &[Option<T>],
     next_section_index: &mut usize,
     next_emit: &mut usize,
     event_tx: &StreamEventSink,
@@ -1693,8 +1683,9 @@ async fn flush_ready_stream_prefix(
             send_stream_event(event_tx, StreamEvent::Token(prefix)).await?;
         }
         if let Some(text) = translations[idx].as_ref() {
+            let text = text.as_ref();
             if !text.is_empty() {
-                send_stream_event(event_tx, StreamEvent::Token(text.clone())).await?;
+                send_stream_event(event_tx, StreamEvent::Token(text.to_owned())).await?;
             }
         }
         send_stream_event(event_tx, StreamEvent::SegmentDone(idx)).await?;
@@ -1753,7 +1744,6 @@ async fn translate_segment_with_completeness_streaming(
         .await
         .map_err(|e| map_segment_http_error(request.index, request.segment, e))?;
     let mut translated = String::new();
-    let mut streamed_tokens: Vec<String> = Vec::new();
     let mut first_token_tx = first_token_tx;
     let mut emitted_optimistically = false;
     let mut termination = CompletionTermination::Unknown;
@@ -1770,7 +1760,7 @@ async fn translate_segment_with_completeness_streaming(
                 }
                 translated.push_str(&token);
                 match output_mode {
-                    StreamOutputMode::Validated => streamed_tokens.push(token),
+                    StreamOutputMode::Validated => {}
                     StreamOutputMode::Optimistic => {
                         emitted_optimistically = true;
                         send_stream_event(event_tx, StreamEvent::Token(token)).await?;
@@ -1799,9 +1789,7 @@ async fn translate_segment_with_completeness_streaming(
     }
     if best.validation.is_complete {
         if output_mode == StreamOutputMode::Validated {
-            for token in streamed_tokens {
-                send_stream_event(event_tx, StreamEvent::Token(token)).await?;
-            }
+            send_stream_event(event_tx, StreamEvent::Token(best.text.clone())).await?;
         }
         send_stream_event(event_tx, StreamEvent::SegmentDone(request.index)).await?;
         timing.log(request.index, "complete");
@@ -2126,7 +2114,7 @@ pub async fn translate_text(
             if degraded {
                 degraded_segments.push(idx + 1);
             }
-            cache_candidates[idx] = true;
+            cache_candidates[idx] = !degraded;
             translations[idx] = Some(translated);
         }
     }
@@ -2249,10 +2237,10 @@ pub async fn translate_text(
 
 /// Translate `text` and emit incremental output events for the pipeline path.
 ///
-/// Segment 0 output is buffered until completeness validation passes. When
-/// first-chunk priority is disabled or segment 0 is already cached, the final
-/// translation is emitted as [`StreamEvent::AllDone`] after the normal
-/// translation completes.
+/// Validated mode withholds output until whole-document validation, then emits
+/// ordered reconstructed segment chunks under channel backpressure. It retains
+/// completed results, not a duplicate provider-token/event transcript. Receiver
+/// closure cancels pending work before cache/history publication.
 pub async fn translate_text_stream(
     text: &str,
     target_lang: &str,
@@ -2283,6 +2271,23 @@ pub async fn translate_text_stream_with_mode(
     output_mode: StreamOutputMode,
     event_tx: mpsc::Sender<StreamEvent>,
 ) -> Result<TranslationOutcome> {
+    let closed = event_tx.clone();
+    tokio::select! {
+        biased;
+        _ = closed.closed() => Err(anyhow!("stream event receiver dropped")),
+        result = translate_text_stream_inner(text, target_lang, template, opts, ctx, output_mode, event_tx) => result,
+    }
+}
+
+async fn translate_text_stream_inner(
+    text: &str,
+    target_lang: &str,
+    template: &TemplateType,
+    opts: &PromptOpts,
+    ctx: &TranslationCtx<'_>,
+    output_mode: StreamOutputMode,
+    event_tx: mpsc::Sender<StreamEvent>,
+) -> Result<TranslationOutcome> {
     if text.is_empty() {
         event_tx
             .send(StreamEvent::AllDone(String::new()))
@@ -2295,11 +2300,9 @@ pub async fn translate_text_stream_with_mode(
     }
 
     let output_event_tx = event_tx.clone();
-    let staged_events = (output_mode == StreamOutputMode::Validated)
-        .then(|| std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<StreamEvent>::new())));
-    let event_tx = match &staged_events {
-        Some(events) => StreamEventSink::Validated(std::sync::Arc::clone(events)),
-        None => StreamEventSink::Immediate(event_tx),
+    let event_tx = match output_mode {
+        StreamOutputMode::Validated => StreamEventSink::Validated(event_tx),
+        StreamOutputMode::Optimistic => StreamEventSink::Immediate(event_tx),
     };
 
     reload_config_and_preflight_strict(ctx).await?;
@@ -2436,7 +2439,8 @@ pub async fn translate_text_stream_with_mode(
                 send_stream_event(&event_tx, StreamEvent::Token(leading_prefix)).await?;
             }
 
-            let mut priority_task = tokio::spawn(async move {
+            let mut priority_tasks = JoinSet::new();
+            priority_tasks.spawn(async move {
                 let outcome = translate_segment_with_completeness_streaming(
                     SegmentTranslateRequest {
                         index: chunk_idx,
@@ -2460,8 +2464,8 @@ pub async fn translate_text_stream_with_mode(
             if !missing.is_empty() {
                 tokio::select! {
                     _ = first_token_rx.recv() => {}
-                    res = &mut priority_task => {
-                        priority_done = Some(joined_segment(res)?);
+                    res = priority_tasks.join_next() => {
+                        priority_done = Some(joined_segment(res.expect("priority task exists"))?);
                     }
                 }
 
@@ -2495,12 +2499,17 @@ pub async fn translate_text_stream_with_mode(
                 let (idx, translated, degraded) = if let Some(done) = priority_done {
                     done
                 } else {
-                    joined_segment(priority_task.await)?
+                    joined_segment(
+                        priority_tasks
+                            .join_next()
+                            .await
+                            .expect("priority task exists"),
+                    )?
                 };
                 if degraded {
                     degraded_segments.push(idx + 1);
                 }
-                cache_candidates[idx] = true;
+                cache_candidates[idx] = !degraded;
                 translations[idx] = Some(translated);
                 // Priority segment already streamed its tokens (validated or
                 // optimistic). Advance the ordered cursor past it, then flush
@@ -2528,7 +2537,7 @@ pub async fn translate_text_stream_with_mode(
                     if degraded {
                         degraded_segments.push(idx + 1);
                     }
-                    cache_candidates[idx] = true;
+                    cache_candidates[idx] = !degraded;
                     translations[idx] = Some(translated);
                     flush_ready_stream_prefix(
                         &plan,
@@ -2540,11 +2549,16 @@ pub async fn translate_text_stream_with_mode(
                     .await?;
                 }
             } else {
-                let (idx, translated, degraded) = joined_segment(priority_task.await)?;
+                let (idx, translated, degraded) = joined_segment(
+                    priority_tasks
+                        .join_next()
+                        .await
+                        .expect("priority task exists"),
+                )?;
                 if degraded {
                     degraded_segments.push(idx + 1);
                 }
-                cache_candidates[idx] = true;
+                cache_candidates[idx] = !degraded;
                 translations[idx] = Some(translated);
                 advance_stream_cursor_past_segment(
                     &plan,
@@ -2590,7 +2604,7 @@ pub async fn translate_text_stream_with_mode(
                 if degraded {
                     degraded_segments.push(idx + 1);
                 }
-                cache_candidates[idx] = true;
+                cache_candidates[idx] = !degraded;
                 translations[idx] = Some(translated);
                 flush_ready_stream_prefix(
                     &plan,
@@ -2617,6 +2631,21 @@ pub async fn translate_text_stream_with_mode(
 
     let translated = plan.reconstruct(&completed);
     ensure_markdown_structure_preserved(text, &translated)?;
+    let output = StreamEventSink::Immediate(output_event_tx.clone());
+    if output_mode == StreamOutputMode::Validated {
+        let replay: Vec<_> = completed.iter().map(|text| Some(text.as_str())).collect();
+        let mut section = 0;
+        let mut segment = 0;
+        flush_ready_stream_prefix(&plan, &replay, &mut section, &mut segment, &output).await?;
+        let suffix = untranslated_text_after_segments(&plan, section);
+        if !suffix.is_empty() {
+            send_stream_event(&output, StreamEvent::Token(suffix)).await?;
+        }
+    }
+    send_stream_event(&output, StreamEvent::AllDone(translated.clone())).await?;
+    if output_event_tx.is_closed() {
+        anyhow::bail!("stream event receiver dropped");
+    }
     if cache_enabled {
         let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
         for (index, candidate) in completed.iter().enumerate() {
@@ -2714,10 +2743,6 @@ pub async fn translate_text_stream_with_mode(
         }
     }
 
-    send_stream_event(&event_tx, StreamEvent::AllDone(translated.clone())).await?;
-    if let Some(events) = staged_events.as_ref() {
-        flush_staged_stream_events(events, &output_event_tx).await?;
-    }
     degraded_segments.sort_unstable();
     degraded_segments.dedup();
     Ok(TranslationOutcome {

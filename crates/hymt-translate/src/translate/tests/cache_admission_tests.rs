@@ -261,6 +261,209 @@ fn assert_valid_translation(translated: &str) {
     assert_eq!(markdown_structure(translated).links[0].0, LINK_URL);
 }
 
+#[tokio::test]
+async fn degraded_termination_is_not_laundered_by_warm_cache() {
+    let tmp = tempfile::tempdir().unwrap();
+    let provider = start_capturing_mock_server(
+        (0..4)
+            .map(|_| MockResponse::JsonWithFinishReason {
+                content: OTHER_TRANSLATION.to_owned(),
+                finish_reason: "length".to_owned(),
+            })
+            .collect(),
+    )
+    .await;
+    let config = make_test_config(tmp.path(), &provider.endpoint_url);
+    let opts = PromptOpts::default();
+    let segmenter = Segmenter::fallback();
+    let source = "This public guide explains the complete system clearly and accurately.";
+    assert!(
+        check_completeness(
+            source,
+            OTHER_TRANSLATION,
+            "zh",
+            &config,
+            &CompletenessContext::default()
+        )
+        .is_complete
+    );
+    let history = HistoryDB::new(tmp.path().join("history.db"));
+    let client = TranslationClient::new(config.clone()).unwrap();
+    let ctx = TranslationCtx {
+        config: &config,
+        client: &client,
+        segmenter: &segmenter,
+        history: &history,
+        cache_enabled: true,
+    };
+    let cold = translate_text(source, "zh", &TemplateType::Default, &opts, &ctx)
+        .await
+        .unwrap();
+    assert!(cold.is_completeness_degraded());
+    assert_eq!(provider.requests.lock().unwrap().len(), 2);
+    let warm = translate_text(source, "zh", &TemplateType::Default, &opts, &ctx)
+        .await
+        .unwrap();
+    assert!(
+        warm.is_completeness_degraded(),
+        "warm cache must not erase Length evidence"
+    );
+    assert_eq!(provider.requests.lock().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn validated_stream_cancels_silent_provider_on_receiver_close() {
+    let tmp = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let disconnected = Arc::new(tokio::sync::Notify::new());
+    let server_entered = entered.clone();
+    let server_disconnected = disconnected.clone();
+    let server = MockServer {
+        endpoint_url: endpoint.clone(),
+        handle: tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_http_request(&mut socket).await.unwrap();
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 100000\r\nConnection: close\r\n\r\n").await.unwrap();
+            // One backend token proves the producer consumed SSE before it stalls.
+            socket
+                .write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n")
+                .await
+                .unwrap();
+            server_entered.notify_one();
+            let mut byte = [0];
+            assert_eq!(socket.read(&mut byte).await.unwrap(), 0);
+            server_disconnected.notify_one();
+        }),
+    };
+    let config = make_test_config(tmp.path(), &server.endpoint_url);
+    let segmenter = Segmenter::fallback();
+    let history = HistoryDB::new(tmp.path().join("history.db"));
+    let client = TranslationClient::new(config.clone()).unwrap();
+    let ctx = TranslationCtx {
+        config: &config,
+        client: &client,
+        segmenter: &segmenter,
+        history: &history,
+        cache_enabled: true,
+    };
+    let (tx, mut rx) = mpsc::channel(1);
+    let opts = PromptOpts::default();
+    let translation = translate_text_stream(
+        "Public Guide",
+        "zh",
+        &TemplateType::Default,
+        &opts,
+        &ctx,
+        tx,
+    );
+    let consumer = async {
+        entered.notified().await;
+        eprintln!(
+            "fixture: provider request, SSE headers and first token observed; closing receiver"
+        );
+        rx.close();
+    };
+    let (outcome, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::join!(translation, consumer)
+    })
+    .await
+    .expect("closed consumer must interrupt a silent upstream wait");
+    assert!(outcome
+        .unwrap_err()
+        .to_string()
+        .contains("receiver dropped"));
+    tokio::time::timeout(Duration::from_secs(1), disconnected.notified())
+        .await
+        .expect("provider must observe transport cancellation");
+    assert!(history.fetch_recent(None).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn validated_stream_closed_receiver_skips_provider_and_persistence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let provider = start_link_mock_server(false).await;
+    let config = make_test_config(tmp.path(), &provider.endpoint_url);
+    let opts = PromptOpts::default();
+    let segmenter = Segmenter::fallback();
+    let history = HistoryDB::new(tmp.path().join("history.db"));
+    let client = TranslationClient::new(config.clone()).unwrap();
+    let ctx = TranslationCtx {
+        config: &config,
+        client: &client,
+        segmenter: &segmenter,
+        history: &history,
+        cache_enabled: true,
+    };
+    let (tx, rx) = mpsc::channel(1);
+    drop(rx);
+    let error = translate_text_stream(SOURCE, "zh", &TemplateType::Default, &opts, &ctx, tx)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("receiver dropped"));
+    assert_eq!(
+        provider.posts.load(Ordering::SeqCst),
+        0,
+        "closed consumer must cancel before provider work"
+    );
+    assert!(history.fetch_recent(None).unwrap().is_empty());
+    let identity = CacheIdentity::new(&config, &opts);
+    let plan = make_markdown_plan(&config, &segmenter, &opts);
+    for segment in &plan.segments {
+        assert!(history
+            .find_segment_cached(&segment_cache_hash(segment), identity.scope())
+            .unwrap()
+            .is_none());
+    }
+}
+
+#[tokio::test]
+async fn validated_stream_backpressure_precedes_persistence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let provider = start_link_mock_server(false).await;
+    let config = make_test_config(tmp.path(), &provider.endpoint_url);
+    let opts = PromptOpts::default();
+    let segmenter = Segmenter::fallback();
+    let history = HistoryDB::new(tmp.path().join("history.db"));
+    let client = TranslationClient::new(config.clone()).unwrap();
+    let ctx = TranslationCtx {
+        config: &config,
+        client: &client,
+        segmenter: &segmenter,
+        history: &history,
+        cache_enabled: true,
+    };
+    let (tx, mut rx) = mpsc::channel(1);
+    let translation = translate_text_stream(SOURCE, "zh", &TemplateType::Default, &opts, &ctx, tx);
+    let consumer = async {
+        assert!(matches!(rx.recv().await, Some(StreamEvent::Token(_))));
+        assert!(
+            history.fetch_recent(None).unwrap().is_empty(),
+            "backpressured output must not commit history"
+        );
+        rx.close();
+    };
+    let (outcome, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::join!(translation, consumer)
+    })
+    .await
+    .unwrap();
+    assert!(outcome
+        .unwrap_err()
+        .to_string()
+        .contains("receiver dropped"));
+    assert!(history.fetch_recent(None).unwrap().is_empty());
+    let identity = CacheIdentity::new(&config, &opts);
+    let plan = make_markdown_plan(&config, &segmenter, &opts);
+    for segment in &plan.segments {
+        assert!(history
+            .find_segment_cached(&segment_cache_hash(segment), identity.scope())
+            .unwrap()
+            .is_none());
+    }
+}
+
 #[test]
 fn markdown_owner_matrix_preserves_complete_inline_nodes() {
     let tmp = tempfile::tempdir().unwrap();
