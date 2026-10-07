@@ -966,8 +966,19 @@ fn split_oversized_protected_blocks(
     segmenter: &Segmenter,
     max_tokens: usize,
 ) {
+    // Reference definitions and Setext markers can live in another section.
+    // Parse once in complete-document context, then intersect source byte ranges.
+    let source: String = doc_plan
+        .sections
+        .iter()
+        .map(|section| section.text.as_str())
+        .collect();
+    let structural_ranges = protected_markdown_structure_ranges(&source);
+    let mut offset = 0;
     let mut split_sections = Vec::with_capacity(doc_plan.sections.len());
     for section in std::mem::take(&mut doc_plan.sections) {
+        let start = offset;
+        offset += section.text.len();
         if section.kind != SectionKind::Paragraph || !section.should_translate {
             split_sections.push(section);
             continue;
@@ -986,7 +997,14 @@ fn split_oversized_protected_blocks(
                 true
             })
             .collect();
-        let structural_ranges = protected_markdown_structure_ranges(&section.text);
+        let structural_ranges: Vec<_> = structural_ranges
+            .iter()
+            .filter_map(|range| {
+                let left = range.start.max(start);
+                let right = range.end.min(offset);
+                (left < right).then(|| left - start..right - start)
+            })
+            .collect();
         if oversized_ranges.is_empty() && structural_ranges.is_empty() {
             split_sections.push(section);
             continue;
@@ -1080,6 +1098,9 @@ fn protected_markdown_block_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
 struct MarkdownStructure {
     headings: Vec<pulldown_cmark::HeadingLevel>,
     links: Vec<(String, String)>,
+    images: Vec<(String, String)>,
+    inline: Vec<TagEnd>,
+    code: Vec<String>,
 }
 
 fn markdown_structure(text: &str) -> MarkdownStructure {
@@ -1092,6 +1113,18 @@ fn markdown_structure(text: &str) -> MarkdownStructure {
             }) => structure
                 .links
                 .push((dest_url.to_string(), title.to_string())),
+            Event::Start(Tag::Image {
+                dest_url, title, ..
+            }) => structure
+                .images
+                .push((dest_url.to_string(), title.to_string())),
+            Event::Start(tag @ (Tag::Emphasis | Tag::Strong | Tag::Strikethrough)) => {
+                structure.inline.push(tag.to_end())
+            }
+            Event::End(end @ (TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough)) => {
+                structure.inline.push(end)
+            }
+            Event::Code(code) => structure.code.push(code.to_string()),
             _ => {}
         }
     }
@@ -1105,57 +1138,83 @@ fn ensure_markdown_structure_preserved(source: &str, translated: &str) -> Result
     Ok(())
 }
 
-#[derive(Debug)]
-struct MarkdownNodeOffsets {
-    range: Range<usize>,
-    content: Option<Range<usize>>,
-}
-
-/// Preserve parser-owned heading and link delimiters while translating their text.
+/// Translate literal inline text leaves; keep their complete syntax source-owned.
+/// Parser byte ranges preserve nested delimiters without inventing Markdown grammar.
 fn protected_markdown_structure_ranges(text: &str) -> Vec<Range<usize>> {
-    let mut open_nodes: Vec<MarkdownNodeOffsets> = Vec::new();
-    let mut ranges = Vec::new();
-    for (event, range) in Parser::new(text).into_offset_iter() {
+    let parser = Parser::new(text);
+    let mut owned: Vec<_> = parser
+        .reference_definitions()
+        .iter()
+        .map(|(_, definition)| definition.span.clone())
+        .collect();
+    let mut opaque = owned.clone();
+    let mut editable = Vec::new();
+    for (event, range) in parser.into_offset_iter() {
         match event {
-            Event::Start(Tag::Heading { .. }) | Event::Start(Tag::Link { .. }) => {
-                open_nodes.push(MarkdownNodeOffsets {
-                    range,
-                    content: None,
-                });
+            Event::Start(
+                Tag::Heading { .. }
+                | Tag::Emphasis
+                | Tag::Strong
+                | Tag::Strikethrough
+                | Tag::BlockQuote(_),
+            ) => owned.push(range),
+            Event::Start(Tag::CodeBlock(_))
+            | Event::Code(_)
+            | Event::Html(_)
+            | Event::InlineHtml(_) => {
+                opaque.push(range.clone());
+                owned.push(range);
             }
-            Event::Text(_) => {
-                for node in &mut open_nodes {
-                    if range.start < node.range.start || range.end > node.range.end {
-                        continue;
-                    }
-                    match &mut node.content {
-                        Some(content) => {
-                            content.start = content.start.min(range.start);
-                            content.end = content.end.max(range.end);
-                        }
-                        None => node.content = Some(range.clone()),
-                    }
+            Event::Start(Tag::Link { link_type, .. } | Tag::Image { link_type, .. }) => {
+                if matches!(
+                    link_type,
+                    pulldown_cmark::LinkType::Autolink
+                        | pulldown_cmark::LinkType::Email
+                        | pulldown_cmark::LinkType::Shortcut
+                        | pulldown_cmark::LinkType::Collapsed
+                ) {
+                    opaque.push(range.clone());
                 }
+                owned.push(range);
             }
-            Event::End(TagEnd::Heading(_)) | Event::End(TagEnd::Link) => {
-                let Some(node) = open_nodes.pop() else {
-                    continue;
-                };
-                if let Some(content) = node.content {
-                    if node.range.start < content.start {
-                        ranges.push(node.range.start..content.start);
-                    }
-                    if content.end < node.range.end {
-                        ranges.push(content.end..node.range.end);
-                    }
-                } else {
-                    ranges.push(node.range);
+            Event::Text(content) if text[range.clone()] == *content => {
+                // Flanking whitespace belongs to syntax, not trimmed model text.
+                let literal = &text[range.clone()];
+                let start = range.start + literal.len() - literal.trim_start().len();
+                let end = range.start + literal.trim_end().len();
+                if start < end {
+                    editable.push(start..end);
                 }
             }
             _ => {}
         }
     }
-    ranges
+    editable.retain(|range| {
+        !opaque
+            .iter()
+            .any(|node| node.start <= range.start && range.end <= node.end)
+    });
+    let mut protected = Vec::new();
+    for mut node in owned {
+        // Syntax owns adjacent whitespace too: losing a reference definition's
+        // final newline or delimiter flanking space changes the parse.
+        node.start = text[..node.start].trim_end().len();
+        node.end = text.len() - text[node.end..].trim_start().len();
+        let mut cursor = node.start;
+        for content in &editable {
+            if content.start < node.start || content.end > node.end {
+                continue;
+            }
+            if cursor < content.start {
+                protected.push(cursor..content.start);
+            }
+            cursor = content.end;
+        }
+        if cursor < node.end {
+            protected.push(cursor..node.end);
+        }
+    }
+    protected
 }
 
 fn opening_fence_width(line: &str) -> Option<usize> {

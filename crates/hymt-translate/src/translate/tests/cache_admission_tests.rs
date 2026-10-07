@@ -261,6 +261,120 @@ fn assert_valid_translation(translated: &str) {
     assert_eq!(markdown_structure(translated).links[0].0, LINK_URL);
 }
 
+#[test]
+fn markdown_owner_matrix_preserves_complete_inline_nodes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = make_test_config(tmp.path(), "http://127.0.0.1:9/v1");
+    let segmenter = Segmenter::fallback();
+    for source in [
+        "# **Strong** rest\n", "# rest **Strong**\n",
+        "## *outer **nested** rest* and `code`\n",
+        "Read [**bold** and *soft* `code`](https://example.test/path \"title\").\n",
+        "![**bold** alt](https://example.test/image.png \"title\")\n",
+        "# Escaped \\*word\\* &amp; UTF-8 café 世界\n",
+        "A **strong** title\n==================\n",
+        "> # **quoted** heading\n> next line\n",
+        "Read [**explicit** label][id].\n\n[id]: https://example.test/ref \"title\"\n",
+        "Read [shortcut] and [collapsed][].\n\n[shortcut]: https://example.test/a\n[collapsed]: https://example.test/b\n",
+        "Visit <https://example.test/autolink>.\n",
+        "# First line\r\n\r\nText *soft* end.\r\n",
+        "Before.\n\n~~~rust\nlet x = 1;\n~~~\n\nAfter.\n",
+    ] {
+        let plan = plan_translation(source, "zh", &config, &segmenter, &TemplateType::Default, &PromptOpts::default()).unwrap();
+        for segment in &plan.segments {
+            assert!(!segment.contains("https://"), "destination leaked: source={source:?}, segment={segment:?}");
+            assert_eq!(markdown_structure(segment), MarkdownStructure::default(), "incomplete inline owner: source={source:?}, segment={segment:?}");
+        }
+        let output = plan.reconstruct(&vec!["Traduction".to_owned(); plan.segment_count()]);
+        assert_eq!(markdown_structure(&output), markdown_structure(source), "syntax mismatch: source={source:?}, output={output:?}");
+    }
+}
+
+#[tokio::test]
+async fn image_destination_is_source_owned() {
+    let tmp = tempfile::tempdir().unwrap();
+    let provider = start_link_mock_server(false).await;
+    let config = make_test_config(tmp.path(), &provider.endpoint_url);
+    let segmenter = Segmenter::fallback();
+    let history = HistoryDB::new(tmp.path().join("history.db"));
+    let client = TranslationClient::new(config.clone()).unwrap();
+    let ctx = TranslationCtx {
+        config: &config,
+        client: &client,
+        segmenter: &segmenter,
+        history: &history,
+        cache_enabled: true,
+    };
+    let source = "![A descriptive illustration of the system](https://example.test/diagram.png)";
+    let outcome = translate_text(
+        source,
+        "zh",
+        &TemplateType::Default,
+        &PromptOpts::default(),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert!(
+        outcome.text.contains("https://example.test/diagram.png"),
+        "image destination lost: {:?}",
+        outcome.text
+    );
+    assert!(outcome.text.contains(&format!("![{OTHER_TRANSLATION}]")));
+}
+
+#[tokio::test]
+async fn markdown_inline_owners_preserve_syntax_and_translate_labels() {
+    let tmp = tempfile::tempdir().unwrap();
+    let provider = start_link_mock_server(false).await;
+    let config = make_test_config(tmp.path(), &provider.endpoint_url);
+    let opts = PromptOpts::default();
+    let segmenter = Segmenter::fallback();
+    let source = "# **Strong** rest\n\n![A descriptive illustration of the system](https://example.test/diagram.png \"Figure\")\n";
+    let plan = plan_translation(
+        source,
+        "zh",
+        &config,
+        &segmenter,
+        &TemplateType::Default,
+        &opts,
+    )
+    .unwrap();
+    for segment in &plan.segments {
+        assert!(
+            !segment.contains("https://"),
+            "destinations are source-owned: {segment:?}"
+        );
+        assert_eq!(
+            markdown_structure(segment),
+            MarkdownStructure::default(),
+            "model input must be plain complete text: {segment:?}"
+        );
+        assert!(
+            !segment.contains("**"),
+            "paired markers must not be bisected: {segment:?}"
+        );
+    }
+    let history = HistoryDB::new(tmp.path().join("history.db"));
+    let client = TranslationClient::new(config.clone()).unwrap();
+    let ctx = TranslationCtx {
+        config: &config,
+        client: &client,
+        segmenter: &segmenter,
+        history: &history,
+        cache_enabled: true,
+    };
+    let outcome = translate_text(source, "zh", &TemplateType::Default, &opts, &ctx)
+        .await
+        .unwrap();
+    assert!(outcome.text.contains(&format!("**{OTHER_TRANSLATION}**")));
+    assert!(outcome.text.contains(&format!(
+        "![{OTHER_TRANSLATION}](https://example.test/diagram.png \"Figure\")"
+    )));
+    assert!(!outcome.text.contains("Strong"));
+    assert!(!outcome.text.contains("A descriptive illustration"));
+}
+
 #[tokio::test]
 async fn multi_hit_cache_recovery_makes_progress() {
     let tmp = tempfile::tempdir().unwrap();
