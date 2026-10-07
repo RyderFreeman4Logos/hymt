@@ -464,6 +464,151 @@ async fn validated_stream_backpressure_precedes_persistence() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn terminal_receiver_exit_preserves_success_cache_and_history() {
+    for mode in [StreamOutputMode::Validated, StreamOutputMode::Optimistic] {
+        for source in [SOURCE, "```rust\nlet x = 1;\n```\n", ""] {
+            let tmp = tempfile::tempdir().unwrap();
+            let provider = start_link_mock_server(false).await;
+            let config = make_test_config(tmp.path(), &provider.endpoint_url);
+            let opts = PromptOpts::default();
+            let segmenter = Segmenter::fallback();
+            let history = HistoryDB::new(tmp.path().join("history.db"));
+            let client = TranslationClient::new(config.clone()).unwrap();
+            let ctx = TranslationCtx {
+                config: &config,
+                client: &client,
+                segmenter: &segmenter,
+                history: &history,
+                cache_enabled: true,
+            };
+            let plan = plan_translation(
+                source,
+                "zh",
+                &config,
+                &segmenter,
+                &TemplateType::Default,
+                &opts,
+            )
+            .unwrap();
+            let identity = CacheIdentity::new(&config, &opts);
+            let mut cold_text = None;
+            for run in 0..2 {
+                let posts_before = provider.posts.load(Ordering::SeqCst);
+                let (tx, mut rx) = mpsc::channel(1);
+                let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+                let consumer_history = HistoryDB::new(tmp.path().join("history.db"));
+                let consumer = tokio::spawn(async move {
+                    let mut events = Vec::new();
+                    while let Some(event) = rx.recv().await {
+                        let terminal = matches!(event, StreamEvent::AllDone(_));
+                        events.push(event);
+                        if terminal {
+                            let records = consumer_history.fetch_recent(None).unwrap();
+                            drop(rx);
+                            ack_tx.send(()).unwrap();
+                            return (events, records.len());
+                        }
+                    }
+                    panic!("producer must emit AllDone");
+                });
+                let outcome = TERMINAL_SENT_ACK
+                    .scope(
+                        ack_rx,
+                        translate_text_stream_with_mode(
+                            source,
+                            "zh",
+                            &TemplateType::Default,
+                            &opts,
+                            &ctx,
+                            mode,
+                            tx,
+                        ),
+                    )
+                    .await;
+                let (events, records_at_terminal) = consumer.await.unwrap();
+                if outcome.is_err() {
+                    let cached = plan
+                        .segments
+                        .iter()
+                        .filter(|segment| {
+                            history
+                                .find_segment_cached(&segment_cache_hash(segment), identity.scope())
+                                .unwrap()
+                                .is_some()
+                        })
+                        .count();
+                    eprintln!("terminal observed and receiver dropped: history_at_terminal={records_at_terminal}, history_after={}, cached_segments={cached}", history.fetch_recent(None).unwrap().len());
+                }
+                let outcome =
+                    outcome.expect("normal receiver exit after AllDone must not cancel success");
+                assert!(!outcome.is_completeness_degraded());
+                assert_eq!(
+                    events.last(),
+                    Some(&StreamEvent::AllDone(outcome.text.clone()))
+                );
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, StreamEvent::AllDone(_)))
+                        .count(),
+                    1
+                );
+                let tokens: String = events
+                    .iter()
+                    .filter_map(|event| match event {
+                        StreamEvent::Token(text) => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(tokens, outcome.text);
+                let segments: Vec<_> = events
+                    .iter()
+                    .filter_map(|event| match event {
+                        StreamEvent::SegmentDone(index) => Some(*index),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(segments, (0..plan.segment_count()).collect::<Vec<_>>());
+                let expected_records = if source.is_empty() { 0 } else { run + 1 };
+                assert_eq!(
+                    records_at_terminal, expected_records,
+                    "history must precede AllDone"
+                );
+                let records = history.fetch_recent(None).unwrap();
+                assert_eq!(
+                    records.len(),
+                    expected_records,
+                    "one history row per completed nonempty run"
+                );
+                if !source.is_empty() {
+                    assert_eq!(
+                        records[0].cache_hits,
+                        Some(if run == 0 {
+                            0
+                        } else {
+                            plan.segment_count() as i64
+                        })
+                    );
+                }
+                for segment in &plan.segments {
+                    assert!(history
+                        .find_segment_cached(&segment_cache_hash(segment), identity.scope())
+                        .unwrap()
+                        .is_some());
+                }
+                let posts = provider.posts.load(Ordering::SeqCst) - posts_before;
+                assert_eq!(posts, if run == 0 { plan.segment_count() } else { 0 });
+                if let Some(cold_text) = &cold_text {
+                    assert_eq!(&outcome.text, cold_text);
+                } else {
+                    cold_text = Some(outcome.text);
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn markdown_owner_matrix_preserves_complete_inline_nodes() {
     let tmp = tempfile::tempdir().unwrap();

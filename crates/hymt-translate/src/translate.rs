@@ -62,8 +62,23 @@ pub enum StreamEvent {
     ///
     /// Segment indexes are zero-based and match [`TranslationPlan::segments`].
     SegmentDone(usize),
-    /// The complete reconstructed translation.
+    /// The complete reconstructed translation, emitted after cache/history admission.
+    /// Closing the receiver after this event does not cancel the completed run.
     AllDone(String),
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    // A separate consumer acknowledges its normal exit at the terminal boundary.
+    static TERMINAL_SENT_ACK: std::sync::mpsc::Receiver<()>;
+}
+
+#[cfg(test)]
+fn acknowledge_terminal_consumer_exit() {
+    let _ = TERMINAL_SENT_ACK.try_with(|ack| {
+        ack.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("consumer must close after AllDone");
+    });
 }
 
 #[derive(Clone)]
@@ -2240,7 +2255,9 @@ pub async fn translate_text(
 /// Validated mode withholds output until whole-document validation, then emits
 /// ordered reconstructed segment chunks under channel backpressure. It retains
 /// completed results, not a duplicate provider-token/event transcript. Receiver
-/// closure cancels pending work before cache/history publication.
+/// closure cancels pending work before finalization. After bounded output delivery,
+/// an open receiver and a reserved terminal slot admit synchronous cache/history
+/// publication; AllDone follows it. Closure after admission cannot undo completion.
 pub async fn translate_text_stream(
     text: &str,
     target_lang: &str,
@@ -2271,11 +2288,15 @@ pub async fn translate_text_stream_with_mode(
     output_mode: StreamOutputMode,
     event_tx: mpsc::Sender<StreamEvent>,
 ) -> Result<TranslationOutcome> {
+    if event_tx.is_closed() {
+        anyhow::bail!("stream event receiver dropped");
+    }
     let closed = event_tx.clone();
     tokio::select! {
         biased;
-        _ = closed.closed() => Err(anyhow!("stream event receiver dropped")),
+        // A ready completion wins over the consumer closing after AllDone.
         result = translate_text_stream_inner(text, target_lang, template, opts, ctx, output_mode, event_tx) => result,
+        _ = closed.closed() => Err(anyhow!("stream event receiver dropped")),
     }
 }
 
@@ -2293,6 +2314,8 @@ async fn translate_text_stream_inner(
             .send(StreamEvent::AllDone(String::new()))
             .await
             .map_err(|_| anyhow!("stream event receiver dropped"))?;
+        #[cfg(test)]
+        acknowledge_terminal_consumer_exit();
         return Ok(TranslationOutcome {
             text: String::new(),
             completeness_degraded_segments: Vec::new(),
@@ -2642,7 +2665,12 @@ async fn translate_text_stream_inner(
             send_stream_event(&output, StreamEvent::Token(suffix)).await?;
         }
     }
-    send_stream_event(&output, StreamEvent::AllDone(translated.clone())).await?;
+    // Respect terminal backpressure before admitting persistence. No await after
+    // this open-receiver check: completion is irreversible once admitted.
+    let terminal = output_event_tx
+        .reserve()
+        .await
+        .map_err(|_| anyhow!("stream event receiver dropped"))?;
     if output_event_tx.is_closed() {
         anyhow::bail!("stream event receiver dropped");
     }
@@ -2745,6 +2773,9 @@ async fn translate_text_stream_inner(
 
     degraded_segments.sort_unstable();
     degraded_segments.dedup();
+    terminal.send(StreamEvent::AllDone(translated.clone()));
+    #[cfg(test)]
+    acknowledge_terminal_consumer_exit();
     Ok(TranslationOutcome {
         text: translated,
         completeness_degraded_segments: degraded_segments,
