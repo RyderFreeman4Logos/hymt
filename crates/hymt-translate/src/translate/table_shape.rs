@@ -23,6 +23,8 @@ pub(super) fn table_shapes(text: &str) -> Vec<(usize, Vec<usize>)> {
 }
 
 /// GFM separates cells at unescaped literal pipes, even inside code/HTML.
+/// pulldown-cmark's table lexer treats any backslash-preceded pipe as literal,
+/// unlike inline escaping, which uses backslash parity.
 /// Entities are not separators. Optional edge pipes are not empty cells.
 /// Scan each parser-owned row once; do not rescan the document per table.
 fn raw_row_width(row: &str) -> usize {
@@ -35,7 +37,7 @@ fn raw_row_width(row: &str) -> usize {
         if trailing_pipe {
             separators += 1;
         }
-        escaped = byte == b'\\' && !escaped;
+        escaped = byte == b'\\';
     }
     separators + 1 - usize::from(row.starts_with('|')) - usize::from(trailing_pipe)
 }

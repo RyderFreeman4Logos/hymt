@@ -1,6 +1,41 @@
 use super::*;
 
 #[test]
+fn table_shape_matches_parser_pipe_grammar() {
+    use pulldown_cmark::{Options, Parser};
+
+    for slashes in 1..=4 {
+        let slash = "\\".repeat(slashes);
+        for cells in [
+            format!("first{slash}|literal | last"),
+            format!("first | last{slash}|"),
+            format!("{slash}|first | last"),
+            format!("`first{slash}|literal` | last"),
+            format!("甲{slash}|乙 | 丙"),
+        ] {
+            let plain = format!("A | B\n--- | ---\n{cells}\n");
+            let edged = format!("| A | B |\r\n|---|---|\r\n  | {cells} | \t\r\n");
+            // Independent parser oracle: optional edges leave every cell event unchanged.
+            assert_eq!(
+                Parser::new_ext(&plain, Options::ENABLE_TABLES).collect::<Vec<_>>(),
+                Parser::new_ext(&edged, Options::ENABLE_TABLES).collect::<Vec<_>>()
+            );
+            for (source, output) in [(&plain, &edged), (&edged, &plain)] {
+                assert_eq!(markdown_structure(source).tables, vec![(2, vec![2])]);
+                assert!(ensure_markdown_structure_preserved(source, output).is_ok());
+            }
+        }
+    }
+    // Parser events pad/drop cells: raw-width admission must still distinguish them.
+    for (row, width) in [("first", 1), ("`first|literal` | last", 3)] {
+        let source = format!("A | B\n--- | ---\n{row}\n");
+        let changed = "A | B\n--- | ---\nfirst | last\n";
+        assert_eq!(markdown_structure(&source).tables, vec![(2, vec![width])]);
+        assert!(ensure_markdown_structure_preserved(&source, changed).is_err());
+    }
+}
+
+#[test]
 fn table_shape_rejects_lost_rows_cells_and_changed_columns() {
     let source = "| Name | Meaning |\n|---|---|\n| Alpha | First |\n| Beta | Second |\n";
     for invalid in [
