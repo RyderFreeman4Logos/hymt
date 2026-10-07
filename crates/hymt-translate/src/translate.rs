@@ -66,6 +66,12 @@ pub enum StreamEvent {
     AllDone(String),
 }
 
+#[derive(Clone)]
+enum StreamEventSink {
+    Immediate(mpsc::Sender<StreamEvent>),
+    Validated(std::sync::Arc<tokio::sync::Mutex<Vec<StreamEvent>>>),
+}
+
 /// Controls when segment 0 output is emitted while first-chunk priority is active.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StreamOutputMode {
@@ -1289,6 +1295,96 @@ fn check_completeness(
     validate_completeness_with_context(segment, translated, target_lang, Some(&thresholds), context)
 }
 
+fn cached_segment_preserves_source_owned_structure(
+    source: &str,
+    plan: &TranslationPlan,
+    index: usize,
+    translated: &str,
+) -> bool {
+    let mut candidate_segments = plan.segments.clone();
+    let Some(candidate) = candidate_segments.get_mut(index) else {
+        return false;
+    };
+    *candidate = translated.to_owned();
+    ensure_markdown_structure_preserved(source, &plan.reconstruct(&candidate_segments)).is_ok()
+}
+
+fn evict_invalid_cached_segment(
+    history: &HistoryDB,
+    hash: &str,
+    scope: SegmentCacheScope<'_>,
+    translated: &str,
+) {
+    if let Err(error) = history.delete_segment_cached_if_matches(hash, scope, translated) {
+        eprintln!("Warning: invalid cached segment eviction failed: {error}");
+    }
+}
+
+fn recover_structurally_invalid_cache_candidates(
+    source: &str,
+    plan: &TranslationPlan,
+    hashes: &[String],
+    scope: SegmentCacheScope<'_>,
+    history: &HistoryDB,
+    translations: &mut [Option<String>],
+    missing: &mut Vec<usize>,
+) {
+    if translations.iter().all(Option::is_none) {
+        return;
+    }
+    for _ in 0..translations.len() {
+        let candidate_segments: Vec<String> = translations
+            .iter()
+            .zip(&plan.segments)
+            .map(|(translated, source_segment)| {
+                translated.as_ref().unwrap_or(source_segment).to_owned()
+            })
+            .collect();
+        if ensure_markdown_structure_preserved(source, &plan.reconstruct(&candidate_segments))
+            .is_ok()
+        {
+            return;
+        }
+
+        let mut invalid = Vec::new();
+        for (index, translated) in translations.iter().enumerate() {
+            let Some(translated) = translated else {
+                continue;
+            };
+            if !cached_segment_preserves_source_owned_structure(source, plan, index, translated) {
+                invalid.push(index);
+            }
+        }
+        if invalid.is_empty() {
+            for (index, translated) in translations.iter().enumerate() {
+                if translated.is_none() {
+                    continue;
+                }
+                let mut repaired_segments = candidate_segments.clone();
+                repaired_segments[index] = plan.segments[index].clone();
+                if ensure_markdown_structure_preserved(
+                    source,
+                    &plan.reconstruct(&repaired_segments),
+                )
+                .is_ok()
+                {
+                    invalid.push(index);
+                }
+            }
+        }
+        if invalid.is_empty() {
+            return;
+        }
+
+        for index in invalid {
+            if let Some(translated) = translations[index].take() {
+                evict_invalid_cached_segment(history, &hashes[index], scope, &translated);
+                missing.push(index);
+            }
+        }
+    }
+}
+
 fn cached_segment_is_complete(
     index: usize,
     segment: &str,
@@ -1485,10 +1581,29 @@ async fn translate_segment_with_completeness(
     })
 }
 
-async fn send_stream_event(tx: &mpsc::Sender<StreamEvent>, event: StreamEvent) -> Result<()> {
-    tx.send(event)
-        .await
-        .map_err(|_| anyhow!("stream event receiver dropped"))
+async fn send_stream_event(tx: &StreamEventSink, event: StreamEvent) -> Result<()> {
+    match tx {
+        StreamEventSink::Immediate(sender) => sender
+            .send(event)
+            .await
+            .map_err(|_| anyhow!("stream event receiver dropped")),
+        StreamEventSink::Validated(events) => {
+            events.lock().await.push(event);
+            Ok(())
+        }
+    }
+}
+
+async fn flush_staged_stream_events(
+    events: &std::sync::Arc<tokio::sync::Mutex<Vec<StreamEvent>>>,
+    output_tx: &mpsc::Sender<StreamEvent>,
+) -> Result<()> {
+    let staged = std::mem::take(&mut *events.lock().await);
+    let output = StreamEventSink::Immediate(output_tx.clone());
+    for event in staged {
+        send_stream_event(&output, event).await?;
+    }
+    Ok(())
 }
 
 fn joined_segment(
@@ -1510,7 +1625,7 @@ async fn flush_ready_stream_prefix(
     translations: &[Option<String>],
     next_section_index: &mut usize,
     next_emit: &mut usize,
-    event_tx: &mpsc::Sender<StreamEvent>,
+    event_tx: &StreamEventSink,
 ) -> Result<()> {
     while *next_emit < translations.len() && translations[*next_emit].is_some() {
         let idx = *next_emit;
@@ -1544,7 +1659,7 @@ async fn advance_stream_cursor_past_segment(
     segment_index: usize,
     next_section_index: &mut usize,
     next_emit: &mut usize,
-    event_tx: &mpsc::Sender<StreamEvent>,
+    event_tx: &StreamEventSink,
 ) -> Result<()> {
     if *next_emit != segment_index {
         return Ok(());
@@ -1559,7 +1674,7 @@ async fn advance_stream_cursor_past_segment(
 
 async fn translate_segment_with_completeness_streaming(
     request: SegmentTranslateRequest<'_>,
-    event_tx: &mpsc::Sender<StreamEvent>,
+    event_tx: &StreamEventSink,
     first_token_tx: Option<mpsc::Sender<()>>,
     output_mode: StreamOutputMode,
     timing: ChunkTiming,
@@ -1878,18 +1993,24 @@ pub async fn translate_text(
     if cache_enabled {
         for (i, hash) in seg_hashes.iter().enumerate() {
             match ctx.history.find_segment_cached(hash, cache_scope) {
-                Ok(Some(cached))
+                Ok(Some(cached)) => {
                     if cached_segment_is_complete(
                         i,
                         &plan.segments[i],
                         &cached,
                         target_lang,
                         ctx.config,
-                    ) =>
-                {
-                    translations[i] = Some(cached);
+                    ) {
+                        translations[i] = Some(cached);
+                    } else {
+                        if ensure_markdown_structure_preserved(&plan.segments[i], &cached).is_err()
+                        {
+                            evict_invalid_cached_segment(ctx.history, hash, cache_scope, &cached);
+                        }
+                        missing.push(i);
+                    }
                 }
-                Ok(_) => missing.push(i),
+                Ok(None) => missing.push(i),
                 Err(e) => {
                     eprintln!("Warning: cache lookup error: {e}");
                     missing.push(i);
@@ -1899,7 +2020,17 @@ pub async fn translate_text(
     } else {
         missing.extend(0..plan.segment_count());
     }
+    recover_structurally_invalid_cache_candidates(
+        text,
+        &plan,
+        &seg_hashes,
+        cache_scope,
+        ctx.history,
+        &mut translations,
+        &mut missing,
+    );
     let cache_hits = (plan.segment_count() - missing.len()) as i64;
+    let mut cache_candidates = vec![false; plan.segment_count()];
 
     // ── Phase 2: parallel translate missing segments ───────────────────────────
 
@@ -1936,17 +2067,7 @@ pub async fn translate_text(
             if degraded {
                 degraded_segments.push(idx + 1);
             }
-            let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-            if cache_enabled {
-                if let Err(e) = ctx.history.store_segment_cache(
-                    &seg_hashes[idx],
-                    cache_scope,
-                    &translated,
-                    &now,
-                ) {
-                    eprintln!("Warning: cache store error: {e}");
-                }
-            }
+            cache_candidates[idx] = true;
             translations[idx] = Some(translated);
         }
     }
@@ -1961,6 +2082,21 @@ pub async fn translate_text(
 
     let translated = plan.reconstruct(&completed);
     ensure_markdown_structure_preserved(text, &translated)?;
+    if cache_enabled {
+        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+        for (index, candidate) in completed.iter().enumerate() {
+            if cache_candidates[index] {
+                if let Err(error) = ctx.history.store_segment_cache(
+                    &seg_hashes[index],
+                    cache_scope,
+                    candidate,
+                    &now,
+                ) {
+                    eprintln!("Warning: cache store error: {error}");
+                }
+            }
+        }
+    }
     let duration = wall_start.elapsed().as_secs_f64();
     let output_tokens = ctx.segmenter.count_tokens(&translated);
     let tps = if duration > 0.0 {
@@ -2089,12 +2225,23 @@ pub async fn translate_text_stream_with_mode(
     event_tx: mpsc::Sender<StreamEvent>,
 ) -> Result<TranslationOutcome> {
     if text.is_empty() {
-        send_stream_event(&event_tx, StreamEvent::AllDone(String::new())).await?;
+        event_tx
+            .send(StreamEvent::AllDone(String::new()))
+            .await
+            .map_err(|_| anyhow!("stream event receiver dropped"))?;
         return Ok(TranslationOutcome {
             text: String::new(),
             completeness_degraded_segments: Vec::new(),
         });
     }
+
+    let output_event_tx = event_tx.clone();
+    let staged_events = (output_mode == StreamOutputMode::Validated)
+        .then(|| std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<StreamEvent>::new())));
+    let event_tx = match &staged_events {
+        Some(events) => StreamEventSink::Validated(std::sync::Arc::clone(events)),
+        None => StreamEventSink::Immediate(event_tx),
+    };
 
     reload_config_and_preflight_strict(ctx).await?;
     let template_name = template.as_str();
@@ -2143,18 +2290,24 @@ pub async fn translate_text_stream_with_mode(
     if cache_enabled {
         for (i, hash) in seg_hashes.iter().enumerate() {
             match ctx.history.find_segment_cached(hash, cache_scope) {
-                Ok(Some(cached))
+                Ok(Some(cached)) => {
                     if cached_segment_is_complete(
                         i,
                         &plan.segments[i],
                         &cached,
                         target_lang,
                         ctx.config,
-                    ) =>
-                {
-                    translations[i] = Some(cached);
+                    ) {
+                        translations[i] = Some(cached);
+                    } else {
+                        if ensure_markdown_structure_preserved(&plan.segments[i], &cached).is_err()
+                        {
+                            evict_invalid_cached_segment(ctx.history, hash, cache_scope, &cached);
+                        }
+                        missing.push(i);
+                    }
                 }
-                Ok(_) => missing.push(i),
+                Ok(None) => missing.push(i),
                 Err(e) => {
                     eprintln!("Warning: cache lookup error: {e}");
                     missing.push(i);
@@ -2164,7 +2317,17 @@ pub async fn translate_text_stream_with_mode(
     } else {
         missing.extend(0..plan.segment_count());
     }
+    recover_structurally_invalid_cache_candidates(
+        text,
+        &plan,
+        &seg_hashes,
+        cache_scope,
+        ctx.history,
+        &mut translations,
+        &mut missing,
+    );
     let cache_hits = (plan.segment_count() - missing.len()) as i64;
+    let mut cache_candidates = vec![false; plan.segment_count()];
 
     let mut degraded_segments: Vec<usize> = Vec::new();
     let mut next_section_index = 0;
@@ -2278,17 +2441,7 @@ pub async fn translate_text_stream_with_mode(
                 if degraded {
                     degraded_segments.push(idx + 1);
                 }
-                let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-                if cache_enabled {
-                    if let Err(e) = ctx.history.store_segment_cache(
-                        &seg_hashes[idx],
-                        cache_scope,
-                        &translated,
-                        &now,
-                    ) {
-                        eprintln!("Warning: cache store error: {e}");
-                    }
-                }
+                cache_candidates[idx] = true;
                 translations[idx] = Some(translated);
                 // Priority segment already streamed its tokens (validated or
                 // optimistic). Advance the ordered cursor past it, then flush
@@ -2316,17 +2469,7 @@ pub async fn translate_text_stream_with_mode(
                     if degraded {
                         degraded_segments.push(idx + 1);
                     }
-                    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-                    if cache_enabled {
-                        if let Err(e) = ctx.history.store_segment_cache(
-                            &seg_hashes[idx],
-                            cache_scope,
-                            &translated,
-                            &now,
-                        ) {
-                            eprintln!("Warning: cache store error: {e}");
-                        }
-                    }
+                    cache_candidates[idx] = true;
                     translations[idx] = Some(translated);
                     flush_ready_stream_prefix(
                         &plan,
@@ -2342,17 +2485,7 @@ pub async fn translate_text_stream_with_mode(
                 if degraded {
                     degraded_segments.push(idx + 1);
                 }
-                let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-                if cache_enabled {
-                    if let Err(e) = ctx.history.store_segment_cache(
-                        &seg_hashes[idx],
-                        cache_scope,
-                        &translated,
-                        &now,
-                    ) {
-                        eprintln!("Warning: cache store error: {e}");
-                    }
-                }
+                cache_candidates[idx] = true;
                 translations[idx] = Some(translated);
                 advance_stream_cursor_past_segment(
                     &plan,
@@ -2398,17 +2531,7 @@ pub async fn translate_text_stream_with_mode(
                 if degraded {
                     degraded_segments.push(idx + 1);
                 }
-                let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-                if cache_enabled {
-                    if let Err(e) = ctx.history.store_segment_cache(
-                        &seg_hashes[idx],
-                        cache_scope,
-                        &translated,
-                        &now,
-                    ) {
-                        eprintln!("Warning: cache store error: {e}");
-                    }
-                }
+                cache_candidates[idx] = true;
                 translations[idx] = Some(translated);
                 flush_ready_stream_prefix(
                     &plan,
@@ -2435,6 +2558,21 @@ pub async fn translate_text_stream_with_mode(
 
     let translated = plan.reconstruct(&completed);
     ensure_markdown_structure_preserved(text, &translated)?;
+    if cache_enabled {
+        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+        for (index, candidate) in completed.iter().enumerate() {
+            if cache_candidates[index] {
+                if let Err(error) = ctx.history.store_segment_cache(
+                    &seg_hashes[index],
+                    cache_scope,
+                    candidate,
+                    &now,
+                ) {
+                    eprintln!("Warning: cache store error: {error}");
+                }
+            }
+        }
+    }
     let duration = wall_start.elapsed().as_secs_f64();
     let output_tokens = ctx.segmenter.count_tokens(&translated);
     let tps = if duration > 0.0 {
@@ -2518,6 +2656,9 @@ pub async fn translate_text_stream_with_mode(
     }
 
     send_stream_event(&event_tx, StreamEvent::AllDone(translated.clone())).await?;
+    if let Some(events) = staged_events.as_ref() {
+        flush_staged_stream_events(events, &output_event_tx).await?;
+    }
     degraded_segments.sort_unstable();
     degraded_segments.dedup();
     Ok(TranslationOutcome {
@@ -2580,6 +2721,8 @@ pub async fn translate_file(
 
 #[cfg(test)]
 mod tests {
+    mod cache_admission_tests;
+
     use super::*;
     use std::collections::VecDeque;
     use std::path::PathBuf;

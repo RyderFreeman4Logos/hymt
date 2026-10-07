@@ -243,6 +243,39 @@ impl HistoryDB {
         }
     }
 
+    /// Remove one invalid cache row only while it still contains the value read.
+    ///
+    /// The expected value makes structural-cache recovery safe against a
+    /// concurrent writer replacing the row with a newer translation.
+    pub fn delete_segment_cached_if_matches(
+        &self,
+        content_hash: &str,
+        scope: SegmentCacheScope<'_>,
+        expected_translation: &str,
+    ) -> Result<bool, CacheError> {
+        let conn = match self.connect_if_exists()? {
+            Some(c) => c,
+            None => return Ok(false),
+        };
+        ensure_schema(&conn)?;
+        let removed = conn.execute(
+            "DELETE FROM segment_cache
+             WHERE content_hash = ?1 AND target_lang = ?2
+               AND template_type = ?3 AND options_hash = ?4 AND profile_id = ?5
+               AND inference_fingerprint = ?6 AND translated_text = ?7",
+            rusqlite::params![
+                content_hash,
+                scope.target_lang,
+                scope.template_type,
+                scope.options_hash,
+                scope.profile_id,
+                scope.inference_fingerprint,
+                expected_translation,
+            ],
+        )?;
+        Ok(removed > 0)
+    }
+
     /// Return the subset of `content_hashes` that exist in the segment cache.
     pub fn find_cached_segment_hashes(
         &self,
