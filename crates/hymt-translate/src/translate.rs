@@ -946,6 +946,7 @@ fn fit_segments_to_final_request_budget(
 type SegmentPlanResult = (Vec<String>, Vec<usize>, Vec<Vec<usize>>);
 
 mod markdown_ownership;
+mod table_shape;
 #[cfg(test)]
 use markdown_ownership::protected_markdown_block_ranges;
 use markdown_ownership::split_oversized_protected_blocks;
@@ -985,10 +986,14 @@ struct MarkdownStructure {
     images: Vec<(String, String)>,
     inline: Vec<TagEnd>,
     code: Vec<String>,
+    tables: Vec<(usize, Vec<usize>)>,
 }
 
 fn markdown_structure(text: &str) -> MarkdownStructure {
-    let mut structure = MarkdownStructure::default();
+    let mut structure = MarkdownStructure {
+        tables: table_shape::table_shapes(text),
+        ..MarkdownStructure::default()
+    };
     for event in Parser::new(text) {
         match event {
             Event::Start(Tag::Heading { level, .. }) => structure.headings.push(level),
@@ -2593,6 +2598,7 @@ pub async fn translate_file(
 mod tests {
     mod cache_admission_tests;
     pub(super) mod ownership_interval_tests;
+    mod table_shape_tests;
 
     use super::*;
     use std::collections::VecDeque;
