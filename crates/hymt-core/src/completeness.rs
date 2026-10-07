@@ -537,7 +537,107 @@ fn estimate_token_count(text: &str) -> usize {
 }
 
 fn count_markdown_headings(text: &str) -> usize {
-    text.lines().filter(|line| line.starts_with('#')).count()
+    // The workspace has no CommonMark parser in hymt-core. Keep counting top-level
+    // ATX/Setext headings while excluding fenced code rather than trusting markers.
+    // ponytail: nested containers/HTML need a parser; add one only if required.
+    let mut heading_count = 0;
+    let mut fence = None;
+    let mut in_paragraph = false;
+
+    for line in text.lines() {
+        if let Some((marker, length)) = fence {
+            if is_markdown_fence_closing(line, marker, length) {
+                fence = None;
+            }
+            continue;
+        }
+
+        if let Some(opening) = markdown_fence_opening(line) {
+            fence = Some(opening);
+            in_paragraph = false;
+            continue;
+        }
+
+        if is_atx_heading(line) || (in_paragraph && is_setext_underline(line)) {
+            heading_count += 1;
+            in_paragraph = false;
+        } else {
+            in_paragraph = is_markdown_paragraph_line(line);
+        }
+    }
+
+    heading_count
+}
+
+fn markdown_line_content(line: &str) -> Option<&str> {
+    let indent = line.bytes().take_while(|byte| *byte == b' ').count();
+    (indent <= 3).then(|| &line[indent..])
+}
+
+fn is_atx_heading(line: &str) -> bool {
+    let Some(content) = markdown_line_content(line) else {
+        return false;
+    };
+    let bytes = content.as_bytes();
+    let hashes = content.bytes().take_while(|byte| *byte == b'#').count();
+    (1..=6).contains(&hashes) && (hashes == bytes.len() || matches!(bytes[hashes], b' ' | b'\t'))
+}
+
+fn is_setext_underline(line: &str) -> bool {
+    let Some(content) = markdown_line_content(line) else {
+        return false;
+    };
+    let underline = content.trim_end_matches([' ', '\t']);
+    let Some(marker) = underline.as_bytes().first().copied() else {
+        return false;
+    };
+    matches!(marker, b'=' | b'-') && underline.bytes().all(|byte| byte == marker)
+}
+
+fn markdown_fence_opening(line: &str) -> Option<(u8, usize)> {
+    let content = markdown_line_content(line)?;
+    let marker = *content.as_bytes().first()?;
+    if !matches!(marker, b'`' | b'~') {
+        return None;
+    }
+    let length = content.bytes().take_while(|byte| *byte == marker).count();
+    let info = &content[length..];
+    (length >= 3 && !(marker == b'`' && info.contains('`'))).then_some((marker, length))
+}
+
+fn is_markdown_fence_closing(line: &str, marker: u8, minimum_length: usize) -> bool {
+    let Some(content) = markdown_line_content(line) else {
+        return false;
+    };
+    let length = content.bytes().take_while(|byte| *byte == marker).count();
+    length >= minimum_length
+        && content.as_bytes()[length..]
+            .iter()
+            .all(|byte| matches!(byte, b' ' | b'\t'))
+}
+
+fn is_thematic_break(line: &str) -> bool {
+    let Some(content) = markdown_line_content(line) else {
+        return false;
+    };
+    let Some(marker) = content.bytes().find(|byte| !matches!(*byte, b' ' | b'\t')) else {
+        return false;
+    };
+    matches!(marker, b'*' | b'-' | b'_')
+        && content.bytes().filter(|byte| *byte == marker).count() >= 3
+        && content
+            .bytes()
+            .all(|byte| byte == marker || matches!(byte, b' ' | b'\t'))
+}
+
+fn is_markdown_paragraph_line(line: &str) -> bool {
+    let Some(content) = markdown_line_content(line) else {
+        return false;
+    };
+    content.bytes().any(|byte| !matches!(byte, b' ' | b'\t'))
+        && !content.starts_with('\t')
+        && !content.starts_with('>')
+        && !is_thematic_break(line)
 }
 
 fn cli_help_translation_is_complete(
@@ -817,6 +917,26 @@ mod tests {
     }
 
     #[test]
+    fn equivalent_setext_h1_and_h2_preserve_heading_count() {
+        let result = validate_completeness(
+            "# H1\n\n## H2\n\nBody.",
+            "H1\n===\n\nH2\n---\n\nBody.",
+            "fr",
+            None,
+        );
+        assert_eq!(
+            (
+                result.input_stats.heading_count,
+                result.output_stats.heading_count
+            ),
+            (2, 2)
+        );
+        assert!(!result
+            .checks_failed
+            .contains(&"heading_preservation".to_owned()));
+    }
+
+    #[test]
     fn additional_headings_in_output_is_ok() {
         let input = "# H1\n\nBody.";
         let output = "# H1\n\n## Extra\n\nBody.";
@@ -855,6 +975,20 @@ mod tests {
     fn count_headings_basic() {
         assert_eq!(count_markdown_headings("# H1\n## H2\ntext\n### H3"), 3);
         assert_eq!(count_markdown_headings("no headings here"), 0);
+        let markdown = concat!(
+            "# ATX H1\n   ## ATX H2\n\n",
+            "Setext H1\n===\n\nSetext H2\n---\n\n",
+            "#not heading\n####### invalid\n\n",
+            "    # indented code\n\n",
+            "```md\n# fenced\nFake Setext\n---\n```\n\n",
+            "~~~md\n## fenced\n~~~\n\nInline # marker."
+        );
+        assert_eq!(count_markdown_headings(markdown), 4);
+
+        let dropped_setext = validate_completeness("Title\n---\n\nBody", "Body", "fr", None);
+        assert!(dropped_setext
+            .checks_failed
+            .contains(&"heading_preservation".to_owned()));
     }
 
     // ── Edge cases ───────────────────────────────────────────────────────────
