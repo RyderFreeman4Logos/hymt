@@ -1362,11 +1362,11 @@ fn recover_structurally_invalid_cache_candidates(
                 }
                 let mut repaired_segments = candidate_segments.clone();
                 repaired_segments[index] = plan.segments[index].clone();
-                if ensure_markdown_structure_preserved(
-                    source,
-                    &plan.reconstruct(&repaired_segments),
-                )
-                .is_ok()
+                // Several independent interactions may remain after replacing
+                // one owner. Retranslate owners that change the invalid syntax,
+                // not only those that repair the entire document in one step.
+                if markdown_structure(&plan.reconstruct(&repaired_segments))
+                    != markdown_structure(&plan.reconstruct(&candidate_segments))
                 {
                     invalid.push(index);
                 }

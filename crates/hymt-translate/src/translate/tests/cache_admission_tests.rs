@@ -262,6 +262,94 @@ fn assert_valid_translation(translated: &str) {
 }
 
 #[tokio::test]
+async fn multi_hit_cache_recovery_makes_progress() {
+    let tmp = tempfile::tempdir().unwrap();
+    let provider = start_link_mock_server(false).await;
+    let config = make_test_config(tmp.path(), &provider.endpoint_url);
+    let opts = PromptOpts::default();
+    let segmenter = Segmenter::fallback();
+    let source = (0..32)
+        .map(|i| format!("Public sentence number {i} explains the complete system clearly. "))
+        .collect::<String>();
+    let plan = plan_translation(
+        &source,
+        "zh",
+        &config,
+        &segmenter,
+        &TemplateType::Default,
+        &opts,
+    )
+    .unwrap();
+    assert!(plan.segment_count() >= 5);
+    let history = HistoryDB::new(tmp.path().join("history.db"));
+    let identity = CacheIdentity::new(&config, &opts);
+    let sentinel = seed_unrelated_cache_entry(&history, &identity);
+    let mut cached = Vec::new();
+    for (i, segment) in plan.segments.iter().enumerate() {
+        let reply = match i {
+            0 | 2 => format!("{OTHER_TRANSLATION}["),
+            1 | 3 => format!("](https://example.test/poison-{i}){OTHER_TRANSLATION}"),
+            _ => OTHER_TRANSLATION.to_owned(),
+        };
+        assert!(cached_segment_is_complete(
+            i, segment, &reply, "zh", &config
+        ));
+        assert!(cached_segment_preserves_source_owned_structure(
+            &source, &plan, i, &reply
+        ));
+        history
+            .store_segment_cache(
+                &segment_cache_hash(segment),
+                identity.scope(),
+                &reply,
+                CACHE_TIME,
+            )
+            .unwrap();
+        cached.push(reply);
+    }
+    assert_eq!(
+        markdown_structure(&plan.reconstruct(&cached)).links.len(),
+        2
+    );
+    let client = TranslationClient::new(config.clone()).unwrap();
+    let ctx = TranslationCtx {
+        config: &config,
+        client: &client,
+        segmenter: &segmenter,
+        history: &history,
+        cache_enabled: true,
+    };
+    let result = translate_text(&source, "zh", &TemplateType::Default, &opts, &ctx)
+        .await
+        .expect("interacting poisoned hits must be refetched");
+    assert!(provider.posts.load(Ordering::SeqCst) > 0);
+    assert_eq!(
+        markdown_structure(&result.text),
+        markdown_structure(&source)
+    );
+    for segment in &plan.segments[4..] {
+        assert_eq!(
+            history
+                .find_segment_cached(&segment_cache_hash(segment), identity.scope())
+                .unwrap(),
+            Some(OTHER_TRANSLATION.to_owned())
+        );
+    }
+    assert_eq!(
+        history
+            .find_segment_cached(&sentinel, identity.scope())
+            .unwrap(),
+        Some("preserve this cache row".to_owned())
+    );
+    let posts = provider.posts.load(Ordering::SeqCst);
+    let warm = translate_text(&source, "zh", &TemplateType::Default, &opts, &ctx)
+        .await
+        .unwrap();
+    assert_eq!(warm.text, result.text);
+    assert_eq!(provider.posts.load(Ordering::SeqCst), posts);
+}
+
+#[tokio::test]
 async fn buffered_structure_rejection_does_not_cache_fresh_segments() {
     let tmp = tempfile::tempdir().unwrap();
     let provider = start_link_mock_server(true).await;
