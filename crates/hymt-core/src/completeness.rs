@@ -6,6 +6,7 @@
 
 use std::collections::HashSet;
 
+use pulldown_cmark::{Event, Parser, Tag};
 use serde::{Deserialize, Serialize};
 
 use crate::language_spec::{language_spec_or_none, LanguageFamily};
@@ -537,107 +538,9 @@ fn estimate_token_count(text: &str) -> usize {
 }
 
 fn count_markdown_headings(text: &str) -> usize {
-    // The workspace has no CommonMark parser in hymt-core. Keep counting top-level
-    // ATX/Setext headings while excluding fenced code rather than trusting markers.
-    // ponytail: nested containers/HTML need a parser; add one only if required.
-    let mut heading_count = 0;
-    let mut fence = None;
-    let mut in_paragraph = false;
-
-    for line in text.lines() {
-        if let Some((marker, length)) = fence {
-            if is_markdown_fence_closing(line, marker, length) {
-                fence = None;
-            }
-            continue;
-        }
-
-        if let Some(opening) = markdown_fence_opening(line) {
-            fence = Some(opening);
-            in_paragraph = false;
-            continue;
-        }
-
-        if is_atx_heading(line) || (in_paragraph && is_setext_underline(line)) {
-            heading_count += 1;
-            in_paragraph = false;
-        } else {
-            in_paragraph = is_markdown_paragraph_line(line);
-        }
-    }
-
-    heading_count
-}
-
-fn markdown_line_content(line: &str) -> Option<&str> {
-    let indent = line.bytes().take_while(|byte| *byte == b' ').count();
-    (indent <= 3).then(|| &line[indent..])
-}
-
-fn is_atx_heading(line: &str) -> bool {
-    let Some(content) = markdown_line_content(line) else {
-        return false;
-    };
-    let bytes = content.as_bytes();
-    let hashes = content.bytes().take_while(|byte| *byte == b'#').count();
-    (1..=6).contains(&hashes) && (hashes == bytes.len() || matches!(bytes[hashes], b' ' | b'\t'))
-}
-
-fn is_setext_underline(line: &str) -> bool {
-    let Some(content) = markdown_line_content(line) else {
-        return false;
-    };
-    let underline = content.trim_end_matches([' ', '\t']);
-    let Some(marker) = underline.as_bytes().first().copied() else {
-        return false;
-    };
-    matches!(marker, b'=' | b'-') && underline.bytes().all(|byte| byte == marker)
-}
-
-fn markdown_fence_opening(line: &str) -> Option<(u8, usize)> {
-    let content = markdown_line_content(line)?;
-    let marker = *content.as_bytes().first()?;
-    if !matches!(marker, b'`' | b'~') {
-        return None;
-    }
-    let length = content.bytes().take_while(|byte| *byte == marker).count();
-    let info = &content[length..];
-    (length >= 3 && !(marker == b'`' && info.contains('`'))).then_some((marker, length))
-}
-
-fn is_markdown_fence_closing(line: &str, marker: u8, minimum_length: usize) -> bool {
-    let Some(content) = markdown_line_content(line) else {
-        return false;
-    };
-    let length = content.bytes().take_while(|byte| *byte == marker).count();
-    length >= minimum_length
-        && content.as_bytes()[length..]
-            .iter()
-            .all(|byte| matches!(byte, b' ' | b'\t'))
-}
-
-fn is_thematic_break(line: &str) -> bool {
-    let Some(content) = markdown_line_content(line) else {
-        return false;
-    };
-    let Some(marker) = content.bytes().find(|byte| !matches!(*byte, b' ' | b'\t')) else {
-        return false;
-    };
-    matches!(marker, b'*' | b'-' | b'_')
-        && content.bytes().filter(|byte| *byte == marker).count() >= 3
-        && content
-            .bytes()
-            .all(|byte| byte == marker || matches!(byte, b' ' | b'\t'))
-}
-
-fn is_markdown_paragraph_line(line: &str) -> bool {
-    let Some(content) = markdown_line_content(line) else {
-        return false;
-    };
-    content.bytes().any(|byte| !matches!(byte, b' ' | b'\t'))
-        && !content.starts_with('\t')
-        && !content.starts_with('>')
-        && !is_thematic_break(line)
+    Parser::new(text)
+        .filter(|event| matches!(event, Event::Start(Tag::Heading { .. })))
+        .count()
 }
 
 fn cli_help_translation_is_complete(
@@ -991,7 +894,41 @@ mod tests {
             .contains(&"heading_preservation".to_owned()));
     }
 
-    // ── Edge cases ───────────────────────────────────────────────────────────
+    #[test]
+    fn count_headings_respects_commonmark_block_structure() {
+        let cases = [
+            ("list plus thematic break", "- List item\n---\n", 0),
+            (
+                "list continuation plus thematic break",
+                "- List item\n  continued\n---\n",
+                0,
+            ),
+            ("HTML block", "<div>\nBody translated.\n---\n</div>", 0),
+            ("HTML comment", "<!--\nTitle\n---\n-->\n", 0),
+            ("CDATA block", "<![CDATA[\nTitle\n---\n]]>", 0),
+            ("blockquote Setext heading", "> Quoted heading\n> ---\n", 1),
+            ("fenced code", "```md\nTitle\n---\n```\n", 0),
+            ("indented code", "    Title\n    ---\n", 0),
+            ("thematic break", "---\n", 0),
+            (
+                "pipe table",
+                "| Name | Value |\n| --- | --- |\n| A | B |",
+                0,
+            ),
+            ("escaped markers", "\\# not a heading\n\\---\n", 0),
+            (
+                "indented Setext continuation",
+                "Main title\n    continued\n---\n",
+                1,
+            ),
+        ];
+
+        for (case, markdown, expected) in cases {
+            assert_eq!(count_markdown_headings(markdown), expected, "{case}");
+        }
+    }
+
+    // ── Edge cases ────────────────────────────────────────────────────────────
 
     #[test]
     fn empty_input_skips_ratio_check() {
