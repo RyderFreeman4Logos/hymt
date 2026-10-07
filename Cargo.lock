@@ -866,6 +866,7 @@ dependencies = [
  "hymt-client",
  "hymt-core",
  "hymt-segment",
+ "pulldown-cmark",
  "serde_json",
  "sha2",
  "tempfile",

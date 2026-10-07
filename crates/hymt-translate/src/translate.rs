@@ -7,6 +7,7 @@
 //!      completeness with retry, reassemble, record history.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::path::Path;
 use std::time::Instant;
 
@@ -34,6 +35,7 @@ use hymt_core::language_spec::{language_spec_or_none, LanguageFamily};
 use hymt_core::model_profile::ModelProfile;
 use hymt_core::templates::{build_prompt, PromptOpts, TemplateType, PROMPT_SCHEMA_ID};
 use hymt_segment::Segmenter;
+use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 
 // ── TranslationCtx ────────────────────────────────────────────────────────────
 
@@ -978,16 +980,27 @@ fn split_oversized_protected_blocks(
                 true
             })
             .collect();
-        if oversized_ranges.is_empty() && opaque_link_ranges(&section.text).is_empty() {
+        let structural_ranges = protected_markdown_structure_ranges(&section.text);
+        if oversized_ranges.is_empty() && structural_ranges.is_empty() {
             split_sections.push(section);
             continue;
         }
 
-        let mut pieces: Vec<std::ops::Range<usize>> = oversized_ranges;
-        pieces.extend(opaque_link_ranges(&section.text));
+        let mut pieces: Vec<Range<usize>> = oversized_ranges;
+        pieces.extend(structural_ranges);
         pieces.sort_by_key(|range| range.start);
-        let mut cursor = 0;
+        let mut merged: Vec<Range<usize>> = Vec::with_capacity(pieces.len());
         for range in pieces {
+            if let Some(previous) = merged.last_mut() {
+                if range.start <= previous.end {
+                    previous.end = previous.end.max(range.end);
+                    continue;
+                }
+            }
+            merged.push(range);
+        }
+        let mut cursor = 0;
+        for range in merged {
             if range.start < cursor {
                 continue;
             }
@@ -1057,27 +1070,83 @@ fn protected_markdown_block_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
     ranges
 }
 
-/// `(url)` after a Markdown label. The label stays translatable.
-fn opaque_link_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
-    let bytes = text.as_bytes();
-    let mut ranges = Vec::new();
-    let mut index = 0;
-    while index + 8 < bytes.len() {
-        if bytes[index] != b']' || bytes[index + 1] != b'(' {
-            index += 1;
-            continue;
+#[derive(Debug, Default, PartialEq, Eq)]
+struct MarkdownStructure {
+    headings: Vec<pulldown_cmark::HeadingLevel>,
+    links: Vec<(String, String)>,
+}
+
+fn markdown_structure(text: &str) -> MarkdownStructure {
+    let mut structure = MarkdownStructure::default();
+    for event in Parser::new(text) {
+        match event {
+            Event::Start(Tag::Heading { level, .. }) => structure.headings.push(level),
+            Event::Start(Tag::Link {
+                dest_url, title, ..
+            }) => structure
+                .links
+                .push((dest_url.to_string(), title.to_string())),
+            _ => {}
         }
-        let start = index;
-        let body = &text[index + 2..];
-        let Some(close) = body.find(')') else {
-            break;
-        };
-        let destination = body[..close].trim();
-        if destination.starts_with("http://") || destination.starts_with("https://") {
-            ranges.push(start..index + 2 + close + 1);
-            index += 2 + close + 1;
-        } else {
-            index += 1;
+    }
+    structure
+}
+
+fn ensure_markdown_structure_preserved(source: &str, translated: &str) -> Result<()> {
+    if markdown_structure(source) != markdown_structure(translated) {
+        anyhow::bail!("translated Markdown structure changed");
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct MarkdownNodeOffsets {
+    range: Range<usize>,
+    content: Option<Range<usize>>,
+}
+
+/// Preserve parser-owned heading and link delimiters while translating their text.
+fn protected_markdown_structure_ranges(text: &str) -> Vec<Range<usize>> {
+    let mut open_nodes: Vec<MarkdownNodeOffsets> = Vec::new();
+    let mut ranges = Vec::new();
+    for (event, range) in Parser::new(text).into_offset_iter() {
+        match event {
+            Event::Start(Tag::Heading { .. }) | Event::Start(Tag::Link { .. }) => {
+                open_nodes.push(MarkdownNodeOffsets {
+                    range,
+                    content: None,
+                });
+            }
+            Event::Text(_) => {
+                for node in &mut open_nodes {
+                    if range.start < node.range.start || range.end > node.range.end {
+                        continue;
+                    }
+                    match &mut node.content {
+                        Some(content) => {
+                            content.start = content.start.min(range.start);
+                            content.end = content.end.max(range.end);
+                        }
+                        None => node.content = Some(range.clone()),
+                    }
+                }
+            }
+            Event::End(TagEnd::Heading(_)) | Event::End(TagEnd::Link) => {
+                let Some(node) = open_nodes.pop() else {
+                    continue;
+                };
+                if let Some(content) = node.content {
+                    if node.range.start < content.start {
+                        ranges.push(node.range.start..content.start);
+                    }
+                    if content.end < node.range.end {
+                        ranges.push(content.end..node.range.end);
+                    }
+                } else {
+                    ranges.push(node.range);
+                }
+            }
+            _ => {}
         }
     }
     ranges
@@ -1227,6 +1296,13 @@ fn cached_segment_is_complete(
     target_lang: &str,
     config: &HotConfig,
 ) -> bool {
+    if let Err(error) = ensure_markdown_structure_preserved(segment, cached) {
+        eprintln!(
+            "Warning: cached segment {} changed Markdown structure, retranslating: {error}",
+            index + 1
+        );
+        return false;
+    }
     let result = check_completeness(
         segment,
         cached,
@@ -1367,6 +1443,7 @@ async fn translate_segment_with_completeness(
             );
         }
         if candidate.validation.is_complete {
+            ensure_markdown_structure_preserved(segment, &candidate.text)?;
             return Ok(SegmentTranslateOutcome {
                 text: candidate.text,
                 completeness_degraded: false,
@@ -1391,6 +1468,7 @@ async fn translate_segment_with_completeness(
 
     let best = best.expect("a retry loop always has at least one attempt");
     reject_unrecoverably_incomplete_best_attempt(index, segment, &best.text)?;
+    ensure_markdown_structure_preserved(segment, &best.text)?;
     eprintln!(
         "Warning: segment {} exceeded {} retries, selected attempt {}/{} \
          (score={}, reason={})",
@@ -1529,6 +1607,7 @@ async fn translate_segment_with_completeness_streaming(
         }
     }
 
+    ensure_markdown_structure_preserved(request.segment, &translated)?;
     let validation = check_completeness(
         request.segment,
         &translated,
@@ -1627,6 +1706,7 @@ async fn translate_segment_with_completeness_streaming(
         }
 
         if candidate.validation.is_complete {
+            ensure_markdown_structure_preserved(request.segment, &candidate.text)?;
             if !candidate.text.is_empty()
                 && (output_mode == StreamOutputMode::Validated || !emitted_optimistically)
             {
@@ -1661,6 +1741,7 @@ async fn translate_segment_with_completeness_streaming(
     }
 
     reject_unrecoverably_incomplete_best_attempt(request.index, request.segment, &best.text)?;
+    ensure_markdown_structure_preserved(request.segment, &best.text)?;
     eprintln!(
         "Warning: segment {} exceeded {} retries, selected attempt {}/{} \
          (score={}, reason={})",
@@ -1879,6 +1960,7 @@ pub async fn translate_text(
         .collect::<Result<_>>()?;
 
     let translated = plan.reconstruct(&completed);
+    ensure_markdown_structure_preserved(text, &translated)?;
     let duration = wall_start.elapsed().as_secs_f64();
     let output_tokens = ctx.segmenter.count_tokens(&translated);
     let tps = if duration > 0.0 {
@@ -2352,6 +2434,7 @@ pub async fn translate_text_stream_with_mode(
         .collect::<Result<_>>()?;
 
     let translated = plan.reconstruct(&completed);
+    ensure_markdown_structure_preserved(text, &translated)?;
     let duration = wall_start.elapsed().as_secs_f64();
     let output_tokens = ctx.segmenter.count_tokens(&translated);
     let tps = if duration > 0.0 {
@@ -2752,15 +2835,15 @@ mod tests {
     }
 
     async fn start_segment_identifying_mock_server(
-        base_reply: String,
-        segment_markers: Vec<(String, String)>,
-    ) -> MockServer {
+        segment_replies: Vec<(String, String)>,
+        retry_segment: String,
+    ) -> (MockServer, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let segment_markers = Arc::new(
-            segment_markers
+        let segment_replies = Arc::new(
+            segment_replies
                 .into_iter()
-                .map(|(segment, marker)| {
+                .map(|(segment, reply)| {
                     let escaped_segment = serde_json::to_string(&segment)
                         .expect("serialize segment for request matching");
                     (
@@ -2769,26 +2852,34 @@ mod tests {
                             .and_then(|value| value.strip_suffix('"'))
                             .expect("quoted serialized segment")
                             .to_owned(),
-                        marker,
+                        reply,
                     )
                 })
                 .collect::<Vec<_>>(),
         );
-        let first_response = Arc::new(AtomicBool::new(true));
+        let retry_segment = serde_json::to_string(&retry_segment)
+            .expect("serialize retry segment for request matching");
+        let retry_segment = retry_segment
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .expect("quoted serialized retry segment")
+            .to_owned();
+        let retry_responses = Arc::new(AtomicUsize::new(0));
         let handle = tokio::spawn({
-            let segment_markers = Arc::clone(&segment_markers);
-            let first_response = Arc::clone(&first_response);
+            let segment_replies = Arc::clone(&segment_replies);
+            let retry_segment = retry_segment.clone();
+            let retry_responses = Arc::clone(&retry_responses);
             async move {
                 while let Ok((socket, _)) = listener.accept().await {
-                    let segment_markers = Arc::clone(&segment_markers);
-                    let first_response = Arc::clone(&first_response);
-                    let base_reply = base_reply.clone();
+                    let segment_replies = Arc::clone(&segment_replies);
+                    let retry_segment = retry_segment.clone();
+                    let retry_responses = Arc::clone(&retry_responses);
                     tokio::spawn(async move {
                         let _ = serve_segment_identifying_connection(
                             socket,
-                            base_reply,
-                            segment_markers,
-                            first_response,
+                            segment_replies,
+                            retry_segment,
+                            retry_responses,
                         )
                         .await;
                     });
@@ -2796,10 +2887,13 @@ mod tests {
             }
         });
 
-        MockServer {
-            endpoint_url: format!("http://{addr}/v1"),
-            handle,
-        }
+        (
+            MockServer {
+                endpoint_url: format!("http://{addr}/v1"),
+                handle,
+            },
+            retry_responses,
+        )
     }
 
     async fn start_document_batch_mock_server(
@@ -2939,29 +3033,27 @@ mod tests {
 
     async fn serve_segment_identifying_connection(
         mut socket: TcpStream,
-        base_reply: String,
-        segment_markers: Arc<Vec<(String, String)>>,
-        first_response: Arc<AtomicBool>,
+        segment_replies: Arc<Vec<(String, String)>>,
+        retry_segment: String,
+        retry_responses: Arc<AtomicUsize>,
     ) -> std::io::Result<()> {
         let request = read_http_request(&mut socket).await?;
-        if first_response.swap(false, Ordering::SeqCst) {
-            return write_mock_response(socket, MockResponse::Json("too short".to_owned())).await;
-        }
-
         let request = std::str::from_utf8(&request)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        let marker = segment_markers
+        let (segment, reply) = segment_replies
             .iter()
             .filter(|(segment, _)| request.contains(segment))
             .max_by_key(|(segment, _)| segment.len())
-            .map(|(_, marker)| marker)
             .ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "request did not contain a planned segment",
                 )
             })?;
-        write_mock_response(socket, MockResponse::Json(format!("{base_reply} {marker}"))).await
+        if segment == &retry_segment && retry_responses.fetch_add(1, Ordering::SeqCst) == 0 {
+            return write_mock_response(socket, MockResponse::Json("too short".to_owned())).await;
+        }
+        write_mock_response(socket, MockResponse::Json(reply.clone())).await
     }
 
     async fn start_counted_mock_server(
@@ -3660,13 +3752,14 @@ max_retries = 1
     #[tokio::test]
     async fn omitted_link_destination_is_restored_in_place() {
         let destination = "https://example.test/opaque-keep?q=1";
-        let source = format!("Read the [report]({destination}) before the note.\n");
+        let source = format!("##### Read the [report]({destination}) before the note.\n");
+        let mock_translation = "完整翻译文本保留上下文并覆盖相关步骤内容";
         let segmenter = fallback_segmenter();
-        let server = start_capturing_mock_server(vec![
-            MockResponse::Json("阅读报告阅读报告阅读报告".to_owned()),
-            MockResponse::Json("然后再看说明然后再看说明".to_owned()),
-            MockResponse::Json("unused".to_owned()),
-        ])
+        let server = start_capturing_mock_server(
+            (0..6)
+                .map(|_| MockResponse::Json(mock_translation.to_owned()))
+                .collect(),
+        )
         .await;
         let config = make_protected_block_config(&server.endpoint_url);
         let plan = plan_translation(
@@ -3704,17 +3797,16 @@ max_retries = 1
         .await
         .expect("non-stream link translation")
         .text;
-        let label_at = translated
-            .find("报告")
-            .expect("visible label was translated");
-        let destination_at = translated
-            .find(destination)
-            .expect("omitted destination is restored");
-        let note_at = translated
-            .find("说明")
-            .expect("trailing prose was translated");
-        assert!(label_at < destination_at && destination_at < note_at);
-        assert!(translated.contains(&format!("]({destination})")));
+        assert!(translated.starts_with("##### "), "H5 marker was lost");
+        assert!(translated.contains(&format!("[{mock_translation}]({destination})")));
+        let structure = markdown_structure(&translated);
+        assert_eq!(structure.headings, vec![pulldown_cmark::HeadingLevel::H5]);
+        assert_eq!(
+            structure.links,
+            vec![(destination.to_owned(), String::new())]
+        );
+        let destination_at = translated.find(destination).expect("link destination");
+        assert!(translated[destination_at + destination.len()..].contains(mock_translation));
         let requests = server.requests.lock().unwrap();
         assert!(
             requests
@@ -3722,11 +3814,16 @@ max_retries = 1
                 .all(|request| !request.contains(destination)),
             "model request contained the opaque destination"
         );
+        assert!(requests.iter().any(|request| request.contains("report")));
         drop(requests);
 
         let streaming_server = start_capturing_mock_server(vec![
-            MockResponse::Sse(vec!["阅读报告阅读报告阅读报告".to_owned()]),
-            MockResponse::Json("然后再看说明然后再看说明".to_owned()),
+            MockResponse::Sse(vec![mock_translation.to_owned()]),
+            MockResponse::Json(mock_translation.to_owned()),
+            MockResponse::Json(mock_translation.to_owned()),
+            MockResponse::Json(mock_translation.to_owned()),
+            MockResponse::Json(mock_translation.to_owned()),
+            MockResponse::Json(mock_translation.to_owned()),
         ])
         .await;
         let streaming_config = make_protected_block_config(&streaming_server.endpoint_url);
@@ -3752,7 +3849,14 @@ max_retries = 1
         let render = render_events_as_stdout(event_rx);
         let (streaming_outcome, stdout) =
             tokio::try_join!(streaming, render).expect("streaming link translation");
-        assert!(stdout.contains(destination) && streaming_outcome.text.contains(destination));
+        let preserved_link = format!("[{mock_translation}]({destination})");
+        assert!(stdout.starts_with("##### ") && stdout.contains(&preserved_link));
+        assert!(streaming_outcome.text.starts_with("##### "));
+        assert!(streaming_outcome.text.contains(&preserved_link));
+        assert_eq!(
+            markdown_structure(&streaming_outcome.text).headings,
+            vec![pulldown_cmark::HeadingLevel::H5]
+        );
         let streaming_requests = streaming_server.requests.lock().unwrap();
         assert!(streaming_requests
             .iter()
@@ -3938,19 +4042,29 @@ After ordinary prose must also be translated in document order.\n"
         );
 
         let complete = planned_complete_zh_translations(&plan);
-        let base_reply = complete.first().expect("planned translation").clone();
         let segment_markers: Vec<_> = (0..plan.segment_count())
             .map(|index| format!("[SEG-{index}]"))
             .collect();
-        let server = start_segment_identifying_mock_server(
-            base_reply,
-            plan.segments
-                .iter()
-                .cloned()
-                .zip(segment_markers.iter().cloned())
-                .collect(),
-        )
-        .await;
+        let segment_replies: Vec<_> = plan
+            .segments
+            .iter()
+            .cloned()
+            .zip(complete)
+            .zip(segment_markers.iter())
+            .map(|((segment, translation), marker)| (segment, format!("{translation} {marker}")))
+            .collect();
+        let expected_replies: Vec<_> = segment_replies
+            .iter()
+            .map(|(_, reply)| reply.clone())
+            .collect();
+        let retry_segment = plan
+            .segments
+            .iter()
+            .find(|segment| segment.starts_with("Run the documented validation commands"))
+            .expect("retry source must be the validation prose segment")
+            .clone();
+        let (server, retry_responses) =
+            start_segment_identifying_mock_server(segment_replies, retry_segment).await;
         let config = make_stream_config(&server.endpoint_url);
         let client = TranslationClient::new(config.clone()).expect("client");
         let dir = tempfile::tempdir().expect("temporary document directory");
@@ -3984,6 +4098,13 @@ After ordinary prose must also be translated in document order.\n"
             .expect("complete Markdown pipeline");
 
         let written = std::fs::read_to_string(&output).expect("translated output");
+        assert_eq!(retry_responses.load(Ordering::SeqCst), 2);
+        for reply in &expected_replies {
+            assert!(
+                written.contains(reply),
+                "missing source-owned reply: {reply}"
+            );
+        }
         let marker_positions: Vec<_> = segment_markers
             .iter()
             .map(|marker| {
@@ -4016,6 +4137,300 @@ After ordinary prose must also be translated in document order.\n"
             previous_output_contents,
             "atomic rename must not mutate the old output inode; direct fs::write would corrupt it"
         );
+    }
+
+    #[test]
+    fn markdown_structure_contract_tracks_levels_occurrences_and_plain_urls() {
+        let source =
+            "##### Title\n\nRead [one](https://example.test/repeat) and [two](https://example.test/repeat).";
+        let translated =
+            "##### 标题\n\n阅读 [一](https://example.test/repeat) 和 [二](https://example.test/repeat)。";
+        assert!(ensure_markdown_structure_preserved(source, translated).is_ok());
+        assert!(ensure_markdown_structure_preserved("# Title", "## 标题").is_err());
+        assert!(ensure_markdown_structure_preserved(
+            source,
+            "##### 标题\n\n阅读 [一](https://example.test/repeat)。"
+        )
+        .is_err());
+        assert!(ensure_markdown_structure_preserved(
+            "See https://example.test/plain for details.",
+            "详情请看 https://example.test/plain 了解更多信息。"
+        )
+        .is_ok());
+
+        let config = make_protected_block_config("http://127.0.0.1:1/v1");
+        assert!(!cached_segment_is_complete(
+            0,
+            "ordinary source words without a Markdown link",
+            "普通翻译并添加[虚构链接](https://example.test/fabricated)",
+            "zh",
+            &config
+        ));
+    }
+
+    #[tokio::test]
+    async fn document_translation_preserves_heading_and_inline_link_structure() {
+        let source = concat!(
+            "##### Preserve complete heading structure through a translated title.\n\n",
+            "Read the detailed public example guide with practical steps and explanations ",
+            "[the public reference guide](https://example.test/structure) before continuing ",
+            "to validate every translated section.\n"
+        );
+        let segmenter = fallback_segmenter();
+        let prompt_opts = PromptOpts::default();
+        let planning_config = make_stream_config("http://127.0.0.1:1/v1");
+        let plan = plan_translation(
+            source,
+            "zh",
+            &planning_config,
+            &segmenter,
+            &TemplateType::Default,
+            &prompt_opts,
+        )
+        .expect("document plan");
+        assert!(
+            plan.segment_count() > 0,
+            "fixture must exercise translation"
+        );
+
+        let mock_translation = "本段提供完整准确的翻译说明，并保留所有上下文细节以及后续步骤要求。";
+        let response_count =
+            plan.segment_count() * (planning_config.completeness_max_retries() as usize + 1);
+        let server = start_capturing_mock_server(
+            (0..response_count)
+                .map(|_| MockResponse::Json(mock_translation.to_owned()))
+                .collect(),
+        )
+        .await;
+        let config = make_stream_config(&server.endpoint_url);
+        assert!(config
+            .inference_fingerprint(TemplateType::Default.as_str(), "")
+            .expect("fixture inference identity")
+            .is_cache_verified());
+        let client = TranslationClient::new(config.clone()).expect("client");
+        let dir = tempfile::tempdir().expect("temporary document directory");
+        let input = dir.path().join("guide.md");
+        let output = dir.path().join("guide.zh-cn.md");
+        let previous_output = dir.path().join("previous-guide.zh-cn.md");
+        let previous_output_contents = "previous complete document";
+        std::fs::write(&previous_output, previous_output_contents)
+            .expect("write previous document");
+        std::fs::hard_link(&previous_output, &output)
+            .expect("make output path a hard link to the previous document");
+        std::fs::write(&input, source).expect("write source document");
+        let history = HistoryDB::new(dir.path().join("history.db"));
+        let doc_opts = crate::doc_translate::DocTranslationOpts {
+            target_lang: "zh",
+            config: &config,
+            client: &client,
+            segmenter: &segmenter,
+            history: &history,
+            output_path: Some(&output),
+            output_dir: None,
+            recursive: false,
+            template: &TemplateType::Default,
+            prompt_opts: &prompt_opts,
+            explicit_target: true,
+            cache_enabled: true,
+        };
+
+        crate::doc_translate::run_doc_translation(&input, &doc_opts)
+            .await
+            .expect("complete Markdown pipeline");
+
+        let written = std::fs::read_to_string(&output).expect("translated output");
+        assert!(
+            written.starts_with("##### "),
+            "H5 marker was lost: {written:?}"
+        );
+        assert_eq!(written.matches("#####").count(), 1);
+        assert!(
+            written.contains(&format!(
+                "[{mock_translation}](https://example.test/structure)"
+            )),
+            "translated link label must retain balanced Markdown structure: {written:?}"
+        );
+        assert_eq!(written.matches("https://example.test/structure").count(), 1);
+        let structure = markdown_structure(&written);
+        assert_eq!(structure.headings, vec![pulldown_cmark::HeadingLevel::H5]);
+        assert_eq!(
+            structure.links,
+            vec![("https://example.test/structure".to_owned(), String::new())]
+        );
+        assert!(!written.contains("Preserve complete heading structure"));
+        assert!(!written.contains("the public reference guide"));
+        assert_eq!(
+            std::fs::read_to_string(&previous_output).expect("previous output through hard link"),
+            previous_output_contents,
+            "atomic rename must not mutate the old output inode"
+        );
+        let requests = server.requests.lock().unwrap();
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.contains("Preserve complete heading structure")),
+            "heading title must remain translatable"
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.contains("the public reference guide")),
+            "link label must remain translatable"
+        );
+        assert!(requests
+            .iter()
+            .all(|request| !request.contains("https://example.test/structure")));
+        let first_request_count = requests.len();
+        drop(requests);
+
+        crate::doc_translate::run_doc_translation(&input, &doc_opts)
+            .await
+            .expect("cached Markdown pipeline");
+        assert_eq!(
+            server.requests.lock().unwrap().len(),
+            first_request_count,
+            "cache hit must not issue new model requests"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&output).expect("cached translated output"),
+            written
+        );
+    }
+
+    #[tokio::test]
+    async fn document_translation_rejects_added_link_without_overwriting_previous_output() {
+        let source = "This source paragraph has enough words to produce a complete translation without links.";
+        let mock_translation = "这是完整的翻译内容，并附加一个[虚构链接](https://example.test/fabricated)，不应覆盖已有结果。";
+        let segmenter = fallback_segmenter();
+        let prompt_opts = PromptOpts::default();
+        let planning_config = make_protected_block_config("http://127.0.0.1:1/v1");
+        let plan = plan_translation(
+            source,
+            "zh",
+            &planning_config,
+            &segmenter,
+            &TemplateType::Default,
+            &prompt_opts,
+        )
+        .expect("document plan");
+        let response_count =
+            plan.segment_count() * (planning_config.completeness_max_retries() as usize + 1);
+        let server = start_capturing_mock_server(
+            (0..response_count)
+                .map(|_| MockResponse::Json(mock_translation.to_owned()))
+                .collect(),
+        )
+        .await;
+        let config = make_protected_block_config(&server.endpoint_url);
+        let client = TranslationClient::new(config.clone()).expect("client");
+        let dir = tempfile::tempdir().expect("temporary document directory");
+        let input = dir.path().join("source.md");
+        let output = dir.path().join("translated.md");
+        let previous_output = dir.path().join("previous-translated.md");
+        let previous_contents = "previous valid document";
+        let previous_hash = format!("{:x}", Sha256::digest(previous_contents.as_bytes()));
+        std::fs::write(&input, source).expect("write source document");
+        std::fs::write(&previous_output, previous_contents).expect("write previous output");
+        std::fs::hard_link(&previous_output, &output).expect("preserve previous output inode");
+        let history = HistoryDB::new(dir.path().join("history.db"));
+        let doc_opts = crate::doc_translate::DocTranslationOpts {
+            target_lang: "zh",
+            config: &config,
+            client: &client,
+            segmenter: &segmenter,
+            history: &history,
+            output_path: Some(&output),
+            output_dir: None,
+            recursive: false,
+            template: &TemplateType::Default,
+            prompt_opts: &prompt_opts,
+            explicit_target: true,
+            cache_enabled: false,
+        };
+
+        let result = crate::doc_translate::run_doc_translation(&input, &doc_opts).await;
+        if result.is_ok() {
+            let published = std::fs::read_to_string(&output).expect("published output");
+            let published_hash = format!("{:x}", Sha256::digest(published.as_bytes()));
+            assert_ne!(
+                published_hash, previous_hash,
+                "baseline returned Ok without overwriting the previous output"
+            );
+            panic!("structurally invalid translation was accepted and overwrote the prior output");
+        }
+        let error = result.expect_err("structurally invalid translation must not be published");
+        let error_chain = format!("{error:#}");
+        assert!(
+            error_chain.contains("Markdown structure"),
+            "unexpected error chain: {error_chain}"
+        );
+        let output_hash = format!(
+            "{:x}",
+            Sha256::digest(std::fs::read(&output).expect("previous output remains available"))
+        );
+        assert_eq!(output_hash, previous_hash, "prior output hash changed");
+        assert_eq!(
+            std::fs::read_to_string(&previous_output).expect("previous inode contents"),
+            previous_contents
+        );
+        assert!(server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| !request.contains("https://example.test/fabricated")));
+
+        let stream_server =
+            start_capturing_mock_server(vec![MockResponse::Sse(vec![mock_translation.to_owned()])])
+                .await;
+        let stream_config = make_protected_block_config(&stream_server.endpoint_url);
+        let stream_client = TranslationClient::new(stream_config.clone()).expect("stream client");
+        let stream_history = HistoryDB::new(dir.path().join("stream-history.db"));
+        let stream_ctx = TranslationCtx {
+            config: &stream_config,
+            client: &stream_client,
+            segmenter: &segmenter,
+            history: &stream_history,
+            cache_enabled: false,
+        };
+        let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel(64);
+        let stream_result = translate_text_stream(
+            source,
+            "zh",
+            &TemplateType::Default,
+            &prompt_opts,
+            &stream_ctx,
+            stream_tx,
+        )
+        .await;
+        let stream_error = match stream_result {
+            Err(error) => error,
+            Ok(_) => panic!("structurally invalid streamed translation was accepted"),
+        };
+        let stream_error_chain = format!("{stream_error:#}");
+        assert!(
+            stream_error_chain.contains("translated Markdown structure changed"),
+            "stream did not reach structural validation: {stream_error_chain}"
+        );
+        assert_eq!(
+            stream_server.requests.lock().unwrap().len(),
+            1,
+            "stream must make one SSE request"
+        );
+        let mut streamed_tokens = String::new();
+        let mut saw_all_done = false;
+        while let Ok(event) = stream_rx.try_recv() {
+            match event {
+                StreamEvent::Token(token) => streamed_tokens.push_str(&token),
+                StreamEvent::AllDone(_) => saw_all_done = true,
+                StreamEvent::SegmentDone(_) => {}
+            }
+        }
+        assert!(
+            streamed_tokens.is_empty(),
+            "invalid output escaped to the stream"
+        );
+        assert!(!saw_all_done, "invalid output must not emit AllDone");
     }
 
     #[tokio::test]
