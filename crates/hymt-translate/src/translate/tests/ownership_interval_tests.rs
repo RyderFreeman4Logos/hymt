@@ -230,3 +230,181 @@ fn unmatched_fence_scan_visits_scale_without_changing_ranges() {
         eprintln!("actual fence scans n={n} visits={visits:?}");
     }
 }
+
+#[tokio::test]
+async fn malformed_multiline_link_repair_is_rejected_atomically_in_both_modes() {
+    let source = "[broken\nlabel]](/unclosed";
+    let destination = "/unclosed";
+    let source_structure = markdown_structure(source);
+    assert!(
+        source_structure.links.is_empty(),
+        "malformed CommonMark must remain literal"
+    );
+
+    let opts = PromptOpts {
+        document_translation_policy: Some(DocumentTranslationPolicy::TranslateAll),
+        ..PromptOpts::default()
+    };
+    let segmenter = fallback_segmenter();
+    let planning_config = make_stream_config("http://127.0.0.1:9/v1");
+    let plan = plan_translation(
+        source,
+        "zh",
+        &planning_config,
+        &segmenter,
+        &TemplateType::Default,
+        &opts,
+    )
+    .unwrap();
+    let planned_inputs = plan.segments.clone();
+    let boundary_segment = planned_inputs
+        .iter()
+        .position(|segment| segment.contains("]("))
+        .expect("malformed link delimiter must reach a planned model segment");
+    let mock_replies: Vec<_> = planned_inputs
+        .iter()
+        .enumerate()
+        .map(|(index, segment)| {
+            let translation = "译".repeat((segment.len() / 3).max(1));
+            if index == boundary_segment {
+                format!("{translation} [修复后的链接]({destination})")
+            } else {
+                translation
+            }
+        })
+        .collect();
+    let expected_output = plan.reconstruct(&mock_replies);
+    assert_eq!(
+        markdown_structure(&expected_output).links,
+        vec![(destination.to_owned(), String::new())],
+        "adversarial mock must turn the literal into a parsed link"
+    );
+
+    for streaming in [false, true] {
+        // Match the existing validated-stream fixture: only the prioritized first request streams.
+        let responses = mock_replies
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, response)| {
+                if streaming && index == 0 {
+                    MockResponse::Sse(vec![response])
+                } else {
+                    MockResponse::Json(response)
+                }
+            })
+            .collect();
+        let server = start_capturing_mock_server(responses).await;
+        let config = make_stream_config(&server.endpoint_url);
+        let runtime_plan = plan_translation(
+            source,
+            "zh",
+            &config,
+            &segmenter,
+            &TemplateType::Default,
+            &opts,
+        )
+        .unwrap();
+        assert_eq!(runtime_plan.segments, planned_inputs);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let history = HistoryDB::new(tmp.path().join("history.db"));
+        let client = TranslationClient::new(config.clone()).unwrap();
+        let ctx = TranslationCtx {
+            config: &config,
+            client: &client,
+            segmenter: &segmenter,
+            history: &history,
+            cache_enabled: false,
+        };
+
+        if streaming {
+            let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
+            let error = translate_text_stream_with_mode(
+                source,
+                "zh",
+                &TemplateType::Default,
+                &opts,
+                &ctx,
+                StreamOutputMode::Validated,
+                event_tx,
+            )
+            .await
+            .expect_err("malformed literal repair must be rejected");
+            assert!(format!("{error:#}").contains("translated Markdown structure changed"));
+            let mut events = Vec::new();
+            while let Some(event) = event_rx.recv().await {
+                events.push(event);
+            }
+            assert!(
+                events.is_empty(),
+                "unvalidated stream output leaked: {events:?}"
+            );
+        } else {
+            let input_path = tmp.path().join("malformed.md");
+            let output_path = tmp.path().join("existing.md");
+            std::fs::write(&input_path, source).unwrap();
+            std::fs::write(&output_path, "existing translation\n").unwrap();
+            let error = translate_file(
+                &input_path,
+                Some(&output_path),
+                "zh",
+                &TemplateType::Default,
+                &opts,
+                &ctx,
+            )
+            .await
+            .expect_err("malformed literal repair must be rejected");
+            assert!(format!("{error:#}").contains("translated Markdown structure changed"));
+            assert_eq!(
+                std::fs::read(&output_path).unwrap(),
+                b"existing translation\n",
+                "rejection must preserve the existing output file"
+            );
+        }
+
+        let requests = server.requests.lock().unwrap().clone();
+        assert_eq!(
+            requests.len(),
+            planned_inputs.len(),
+            "one mock response per planned segment"
+        );
+        let captured_inputs: Vec<_> = requests
+            .iter()
+            .enumerate()
+            .map(|(index, request)| {
+                let (_, body) = request.split_once("\r\n\r\n").expect("captured HTTP body");
+                let payload: serde_json::Value = serde_json::from_str(body).unwrap();
+                assert_eq!(
+                    payload["stream"].as_bool() == Some(true),
+                    streaming && index == 0
+                );
+                let prompt = payload["messages"]
+                    .as_array()
+                    .and_then(|messages| messages.last())
+                    .and_then(|message| message["content"].as_str())
+                    .unwrap();
+                prompt
+                    .split_once("\n\n")
+                    .expect("default prompt source boundary")
+                    .1
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(captured_inputs.len(), planned_inputs.len());
+        for planned in &planned_inputs {
+            assert!(
+                captured_inputs
+                    .iter()
+                    .any(|captured| captured.contains(planned.trim())),
+                "planned input was not captured: {planned:?}"
+            );
+        }
+        assert!(
+            captured_inputs
+                .iter()
+                .any(|input| input.contains("]](/unclosed")),
+            "malformed multiline syntax must reach the mock provider"
+        );
+    }
+}
