@@ -800,6 +800,11 @@ impl TranslationClient {
         let is_sse = is_event_stream(&response);
         tokio::spawn(async move {
             let _permit = permit; // held for the entire stream duration
+            let closed = tx.clone();
+            tokio::select! {
+                biased;
+                _ = closed.closed() => {},
+                _ = async {
             if is_sse {
                 parse_sse(response, tx).await;
             } else {
@@ -811,6 +816,8 @@ impl TranslationClient {
                 }
                 .await;
                 let _ = tx.send(result).await;
+            }
+                } => {},
             }
         });
 
@@ -845,6 +852,11 @@ impl TranslationClient {
         let is_sse = is_event_stream(&response);
         tokio::spawn(async move {
             let _permit = permit; // held for the entire stream duration
+            let closed = tx.clone();
+            tokio::select! {
+                biased;
+                _ = closed.closed() => {},
+                _ = async {
             if is_sse {
                 parse_sse_with_completion(response, tx).await;
             } else {
@@ -873,6 +885,8 @@ impl TranslationClient {
                         let _ = tx.send(Err(error)).await;
                     }
                 }
+            }
+                } => {},
             }
         });
 

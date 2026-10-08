@@ -6,6 +6,7 @@
 
 use std::collections::HashSet;
 
+use pulldown_cmark::{Event, Parser, Tag};
 use serde::{Deserialize, Serialize};
 
 use crate::language_spec::{language_spec_or_none, LanguageFamily};
@@ -537,7 +538,9 @@ fn estimate_token_count(text: &str) -> usize {
 }
 
 fn count_markdown_headings(text: &str) -> usize {
-    text.lines().filter(|line| line.starts_with('#')).count()
+    Parser::new(text)
+        .filter(|event| matches!(event, Event::Start(Tag::Heading { .. })))
+        .count()
 }
 
 fn cli_help_translation_is_complete(
@@ -817,6 +820,26 @@ mod tests {
     }
 
     #[test]
+    fn equivalent_setext_h1_and_h2_preserve_heading_count() {
+        let result = validate_completeness(
+            "# H1\n\n## H2\n\nBody.",
+            "H1\n===\n\nH2\n---\n\nBody.",
+            "fr",
+            None,
+        );
+        assert_eq!(
+            (
+                result.input_stats.heading_count,
+                result.output_stats.heading_count
+            ),
+            (2, 2)
+        );
+        assert!(!result
+            .checks_failed
+            .contains(&"heading_preservation".to_owned()));
+    }
+
+    #[test]
     fn additional_headings_in_output_is_ok() {
         let input = "# H1\n\nBody.";
         let output = "# H1\n\n## Extra\n\nBody.";
@@ -855,9 +878,57 @@ mod tests {
     fn count_headings_basic() {
         assert_eq!(count_markdown_headings("# H1\n## H2\ntext\n### H3"), 3);
         assert_eq!(count_markdown_headings("no headings here"), 0);
+        let markdown = concat!(
+            "# ATX H1\n   ## ATX H2\n\n",
+            "Setext H1\n===\n\nSetext H2\n---\n\n",
+            "#not heading\n####### invalid\n\n",
+            "    # indented code\n\n",
+            "```md\n# fenced\nFake Setext\n---\n```\n\n",
+            "~~~md\n## fenced\n~~~\n\nInline # marker."
+        );
+        assert_eq!(count_markdown_headings(markdown), 4);
+
+        let dropped_setext = validate_completeness("Title\n---\n\nBody", "Body", "fr", None);
+        assert!(dropped_setext
+            .checks_failed
+            .contains(&"heading_preservation".to_owned()));
     }
 
-    // ── Edge cases ───────────────────────────────────────────────────────────
+    #[test]
+    fn count_headings_respects_commonmark_block_structure() {
+        let cases = [
+            ("list plus thematic break", "- List item\n---\n", 0),
+            (
+                "list continuation plus thematic break",
+                "- List item\n  continued\n---\n",
+                0,
+            ),
+            ("HTML block", "<div>\nBody translated.\n---\n</div>", 0),
+            ("HTML comment", "<!--\nTitle\n---\n-->\n", 0),
+            ("CDATA block", "<![CDATA[\nTitle\n---\n]]>", 0),
+            ("blockquote Setext heading", "> Quoted heading\n> ---\n", 1),
+            ("fenced code", "```md\nTitle\n---\n```\n", 0),
+            ("indented code", "    Title\n    ---\n", 0),
+            ("thematic break", "---\n", 0),
+            (
+                "pipe table",
+                "| Name | Value |\n| --- | --- |\n| A | B |",
+                0,
+            ),
+            ("escaped markers", "\\# not a heading\n\\---\n", 0),
+            (
+                "indented Setext continuation",
+                "Main title\n    continued\n---\n",
+                1,
+            ),
+        ];
+
+        for (case, markdown, expected) in cases {
+            assert_eq!(count_markdown_headings(markdown), expected, "{case}");
+        }
+    }
+
+    // ── Edge cases ────────────────────────────────────────────────────────────
 
     #[test]
     fn empty_input_skips_ratio_check() {
