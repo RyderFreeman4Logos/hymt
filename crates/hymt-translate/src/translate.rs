@@ -34,7 +34,7 @@ use hymt_core::language_spec::{language_spec_or_none, LanguageFamily};
 use hymt_core::model_profile::ModelProfile;
 use hymt_core::templates::{build_prompt, PromptOpts, TemplateType, PROMPT_SCHEMA_ID};
 use hymt_segment::Segmenter;
-use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
 // ── TranslationCtx ────────────────────────────────────────────────────────────
 
@@ -92,8 +92,9 @@ pub enum StreamOutputMode {
     /// Withhold all output until the complete reconstructed document is validated.
     Validated,
     /// Emit segment 0 tokens as soon as the streaming backend returns them,
-    /// except when source text contains an unparsed `](` delimiter that could
-    /// be repaired into a link. That input is held for validation before output.
+    /// except when source text contains an unparsed inline-link delimiter or
+    /// unresolved reference candidate that could be repaired into a link. Such
+    /// input is held for validation before output.
     Optimistic,
 }
 
@@ -1030,19 +1031,31 @@ fn ensure_markdown_structure_preserved(source: &str, translated: &str) -> Result
 }
 
 fn has_unparsed_link_syntax(text: &str) -> bool {
+    let unresolved_reference = std::cell::Cell::new(false);
+    let parser = Parser::new_with_broken_link_callback(
+        text,
+        Options::empty(),
+        Some(|_| {
+            unresolved_reference.set(true);
+            None
+        }),
+    );
     let mut trailing_bracket = false;
-    for event in Parser::new(text) {
+    for event in parser {
         match event {
             Event::Text(text) => {
-                if text.contains("](") || (trailing_bracket && text.starts_with('(')) {
+                if text.contains("](") || (trailing_bracket && text.trim_start().starts_with('(')) {
                     return true;
                 }
-                trailing_bracket = text.ends_with(']');
+                if !text.trim().is_empty() {
+                    trailing_bracket = text.trim_end().ends_with(']');
+                }
             }
+            Event::SoftBreak | Event::HardBreak if trailing_bracket => {}
             _ => trailing_bracket = false,
         }
     }
-    false
+    unresolved_reference.get()
 }
 
 /// Groups consecutive translatable sections, absorbing intervening separators

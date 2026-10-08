@@ -419,3 +419,77 @@ async fn malformed_multiline_link_repair_is_rejected_atomically_in_all_publicati
         );
     }
 }
+
+#[test]
+fn malformed_inline_link_softbreak_is_guarded_before_optimistic_publication() {
+    let source =
+        "Translate the malformed link [broken]\n(unclosed destination with enough surrounding words to explain the literal.";
+    assert!(markdown_structure(source).links.is_empty());
+    assert!(
+        has_unparsed_link_syntax(source),
+        "a parser soft break must not hide an unparsed inline-link candidate"
+    );
+}
+
+#[test]
+fn unresolved_reference_link_is_guarded_before_optimistic_publication() {
+    let source =
+        "Translate this unresolved reference [broken][missing] with enough surrounding words to explain the literal.";
+    assert!(markdown_structure(source).links.is_empty());
+    assert!(
+        has_unparsed_link_syntax(source),
+        "an unresolved parser reference must be recognized before Optimistic publication"
+    );
+}
+
+#[test]
+fn markdown_link_classification_preserves_valid_ownership_and_guards_unresolved_forms() {
+    for source in [
+        "[inline](https://example.test)",
+        "[multi\nline](https://example.test)",
+        "[label][ref]\n\n[ref]: /target",
+        "[label][]\n\n[label]: /target",
+        "[label]\n\n[label]: /target",
+        "![image](https://example.test/image.png)",
+        "![image][ref]\n\n[ref]: /image.png",
+        "![image][]\n\n[image]: /image.png",
+        "![image]\n\n[image]: /image.png",
+    ] {
+        let structure = markdown_structure(source);
+        assert!(
+            structure.links.len() + structure.images.len() > 0,
+            "valid parser control was not a link: {source:?}"
+        );
+        assert!(
+            !has_unparsed_link_syntax(source),
+            "valid parser-owned syntax must stay Optimistic: {source:?}"
+        );
+    }
+    for source in [
+        "[broken][missing]",
+        "[broken][]",
+        "[broken]",
+        "![broken][missing]",
+        "![broken][]",
+        "![broken]",
+    ] {
+        let structure = markdown_structure(source);
+        assert!(
+            structure.links.is_empty() && structure.images.is_empty(),
+            "unresolved syntax must remain literal at the CommonMark layer: {source:?}"
+        );
+        assert!(
+            has_unparsed_link_syntax(source),
+            "unresolved parser reference must select Validated mode: {source:?}"
+        );
+    }
+    assert!(has_unparsed_link_syntax("[broken]\n(unclosed destination)"));
+    assert!(has_unparsed_link_syntax(
+        r"\[escaped\]\(https://example.test\)"
+    ));
+    assert!(!has_unparsed_link_syntax("`literal ]( code`"));
+    assert!(!has_unparsed_link_syntax("```\n[broken][missing]\n```"));
+    assert!(!has_unparsed_link_syntax(
+        "ordinary Optimistic text without Markdown links"
+    ));
+}
