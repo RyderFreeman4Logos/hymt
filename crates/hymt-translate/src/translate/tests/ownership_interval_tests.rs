@@ -230,3 +230,266 @@ fn unmatched_fence_scan_visits_scale_without_changing_ranges() {
         eprintln!("actual fence scans n={n} visits={visits:?}");
     }
 }
+
+#[tokio::test]
+async fn malformed_multiline_link_repair_is_rejected_atomically_in_all_publication_modes() {
+    let source = "[broken\nlabel]](/unclosed";
+    let destination = "/unclosed";
+    let source_structure = markdown_structure(source);
+    assert!(
+        source_structure.links.is_empty(),
+        "malformed CommonMark must remain literal"
+    );
+    assert!(
+        has_unparsed_link_syntax(source),
+        "CommonMark literal must be recognized before Optimistic publication"
+    );
+    assert!(!has_unparsed_link_syntax("[valid](https://example.test)"));
+    assert!(!has_unparsed_link_syntax("`literal ]( code`"));
+
+    let opts = PromptOpts {
+        document_translation_policy: Some(DocumentTranslationPolicy::TranslateAll),
+        ..PromptOpts::default()
+    };
+    let segmenter = fallback_segmenter();
+    let planning_config = make_stream_config("http://127.0.0.1:9/v1");
+    let plan = plan_translation(
+        source,
+        "zh",
+        &planning_config,
+        &segmenter,
+        &TemplateType::Default,
+        &opts,
+    )
+    .unwrap();
+    let planned_inputs = plan.segments.clone();
+    let boundary_segment = planned_inputs
+        .iter()
+        .position(|segment| segment.contains("]("))
+        .expect("malformed link delimiter must reach a planned model segment");
+    let mock_replies: Vec<_> = planned_inputs
+        .iter()
+        .enumerate()
+        .map(|(index, segment)| {
+            let translation = "译".repeat((segment.len() / 3).max(1));
+            if index == boundary_segment {
+                format!("{translation} [修复后的链接]({destination})")
+            } else {
+                translation
+            }
+        })
+        .collect();
+    let expected_output = plan.reconstruct(&mock_replies);
+    assert_eq!(
+        markdown_structure(&expected_output).links,
+        vec![(destination.to_owned(), String::new())],
+        "adversarial mock must turn the literal into a parsed link"
+    );
+
+    for output_mode in [
+        None,
+        Some(StreamOutputMode::Validated),
+        Some(StreamOutputMode::Optimistic),
+    ] {
+        let streaming = output_mode.is_some();
+        // Match the existing validated-stream fixture: only the prioritized first request streams.
+        let responses = mock_replies
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, response)| {
+                if streaming && index == 0 {
+                    MockResponse::Sse(vec![response])
+                } else {
+                    MockResponse::Json(response)
+                }
+            })
+            .collect();
+        let server = start_capturing_mock_server(responses).await;
+        let config = make_stream_config(&server.endpoint_url);
+        let runtime_plan = plan_translation(
+            source,
+            "zh",
+            &config,
+            &segmenter,
+            &TemplateType::Default,
+            &opts,
+        )
+        .unwrap();
+        assert_eq!(runtime_plan.segments, planned_inputs);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let history = HistoryDB::new(tmp.path().join("history.db"));
+        let client = TranslationClient::new(config.clone()).unwrap();
+        let ctx = TranslationCtx {
+            config: &config,
+            client: &client,
+            segmenter: &segmenter,
+            history: &history,
+            cache_enabled: false,
+        };
+
+        if let Some(output_mode) = output_mode {
+            let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
+            let error = translate_text_stream_with_mode(
+                source,
+                "zh",
+                &TemplateType::Default,
+                &opts,
+                &ctx,
+                output_mode,
+                event_tx,
+            )
+            .await
+            .expect_err("malformed literal repair must be rejected");
+            assert!(format!("{error:#}").contains("translated Markdown structure changed"));
+            let mut events = Vec::new();
+            while let Some(event) = event_rx.recv().await {
+                events.push(event);
+            }
+            assert!(
+                events.is_empty(),
+                "unvalidated stream output leaked: {events:?}"
+            );
+        } else {
+            let input_path = tmp.path().join("malformed.md");
+            let output_path = tmp.path().join("existing.md");
+            std::fs::write(&input_path, source).unwrap();
+            std::fs::write(&output_path, "existing translation\n").unwrap();
+            let error = translate_file(
+                &input_path,
+                Some(&output_path),
+                "zh",
+                &TemplateType::Default,
+                &opts,
+                &ctx,
+            )
+            .await
+            .expect_err("malformed literal repair must be rejected");
+            assert!(format!("{error:#}").contains("translated Markdown structure changed"));
+            assert_eq!(
+                std::fs::read(&output_path).unwrap(),
+                b"existing translation\n",
+                "rejection must preserve the existing output file"
+            );
+        }
+
+        let requests = server.requests.lock().unwrap().clone();
+        assert_eq!(
+            requests.len(),
+            planned_inputs.len(),
+            "one mock response per planned segment"
+        );
+        let captured_inputs: Vec<_> = requests
+            .iter()
+            .enumerate()
+            .map(|(index, request)| {
+                let (_, body) = request.split_once("\r\n\r\n").expect("captured HTTP body");
+                let payload: serde_json::Value = serde_json::from_str(body).unwrap();
+                assert_eq!(
+                    payload["stream"].as_bool() == Some(true),
+                    streaming && index == 0
+                );
+                let prompt = payload["messages"]
+                    .as_array()
+                    .and_then(|messages| messages.last())
+                    .and_then(|message| message["content"].as_str())
+                    .unwrap();
+                prompt
+                    .split_once("\n\n")
+                    .expect("default prompt source boundary")
+                    .1
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(captured_inputs.len(), planned_inputs.len());
+        for planned in &planned_inputs {
+            assert!(
+                captured_inputs
+                    .iter()
+                    .any(|captured| captured.contains(planned.trim())),
+                "planned input was not captured: {planned:?}"
+            );
+        }
+        assert!(
+            captured_inputs
+                .iter()
+                .any(|input| input.contains("]](/unclosed")),
+            "malformed multiline syntax must reach the mock provider"
+        );
+    }
+}
+
+#[test]
+fn malformed_inline_link_softbreak_is_guarded_before_optimistic_publication() {
+    let source =
+        "Translate the malformed link [broken]\n(unclosed destination with enough surrounding words to explain the literal.";
+    assert!(markdown_structure(source).links.is_empty());
+    assert!(
+        has_unparsed_link_syntax(source),
+        "a parser soft break must not hide an unparsed inline-link candidate"
+    );
+}
+
+#[test]
+fn unresolved_reference_link_is_guarded_before_optimistic_publication() {
+    let source =
+        "Translate this unresolved reference [broken][missing] with enough surrounding words to explain the literal.";
+    assert!(markdown_structure(source).links.is_empty());
+    assert!(
+        has_unparsed_link_syntax(source),
+        "an unresolved parser reference must be recognized before Optimistic publication"
+    );
+}
+
+#[test]
+fn markdown_link_classification_preserves_valid_ownership_and_guards_unresolved_forms() {
+    for source in [
+        "[inline](https://example.test)",
+        "[multi\nline](https://example.test)",
+        "[label][ref]\n\n[ref]: /target",
+        "[label][]\n\n[label]: /target",
+        "[label]\n\n[label]: /target",
+        "![image](https://example.test/image.png)",
+        "![image][ref]\n\n[ref]: /image.png",
+        "![image][]\n\n[image]: /image.png",
+        "![image]\n\n[image]: /image.png",
+    ] {
+        let structure = markdown_structure(source);
+        assert!(
+            structure.links.len() + structure.images.len() > 0,
+            "valid parser control was not a link: {source:?}"
+        );
+        assert!(
+            !has_unparsed_link_syntax(source),
+            "valid parser-owned syntax must stay Optimistic: {source:?}"
+        );
+    }
+    for source in [
+        "[broken][missing]",
+        "[broken][]",
+        "[broken]",
+        "![broken][missing]",
+        "![broken][]",
+        "![broken]",
+    ] {
+        let structure = markdown_structure(source);
+        assert!(
+            structure.links.is_empty() && structure.images.is_empty(),
+            "unresolved syntax must remain literal at the CommonMark layer: {source:?}"
+        );
+        assert!(
+            has_unparsed_link_syntax(source),
+            "unresolved parser reference must select Validated mode: {source:?}"
+        );
+    }
+    assert!(has_unparsed_link_syntax("[broken]\n(unclosed destination)"));
+    assert!(has_unparsed_link_syntax(
+        r"\[escaped\]\(https://example.test\)"
+    ));
+    assert!(!has_unparsed_link_syntax("`literal ]( code`"));
+    assert!(!has_unparsed_link_syntax("```\n[broken][missing]\n```"));
+    assert!(!has_unparsed_link_syntax(
+        "ordinary Optimistic text without Markdown links"
+    ));
+}
