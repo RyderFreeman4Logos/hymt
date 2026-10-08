@@ -91,7 +91,9 @@ enum StreamEventSink {
 pub enum StreamOutputMode {
     /// Withhold all output until the complete reconstructed document is validated.
     Validated,
-    /// Emit segment 0 tokens as soon as the streaming backend returns them.
+    /// Emit segment 0 tokens as soon as the streaming backend returns them,
+    /// except when source text contains an unparsed `](` delimiter that could
+    /// be repaired into a link. That input is held for validation before output.
     Optimistic,
 }
 
@@ -1025,6 +1027,22 @@ fn ensure_markdown_structure_preserved(source: &str, translated: &str) -> Result
         anyhow::bail!("translated Markdown structure changed");
     }
     Ok(())
+}
+
+fn has_unparsed_link_syntax(text: &str) -> bool {
+    let mut trailing_bracket = false;
+    for event in Parser::new(text) {
+        match event {
+            Event::Text(text) => {
+                if text.contains("](") || (trailing_bracket && text.starts_with('(')) {
+                    return true;
+                }
+                trailing_bracket = text.ends_with(']');
+            }
+            _ => trailing_bracket = false,
+        }
+    }
+    false
 }
 
 /// Groups consecutive translatable sections, absorbing intervening separators
@@ -2051,6 +2069,13 @@ pub async fn translate_text_stream_with_mode(
     if event_tx.is_closed() {
         anyhow::bail!("stream event receiver dropped");
     }
+    // Keep a provider repair of literal link syntax behind the document guard.
+    let output_mode =
+        if output_mode == StreamOutputMode::Optimistic && has_unparsed_link_syntax(text) {
+            StreamOutputMode::Validated
+        } else {
+            output_mode
+        };
     let closed = event_tx.clone();
     tokio::select! {
         biased;

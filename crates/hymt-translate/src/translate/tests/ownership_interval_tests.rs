@@ -232,7 +232,7 @@ fn unmatched_fence_scan_visits_scale_without_changing_ranges() {
 }
 
 #[tokio::test]
-async fn malformed_multiline_link_repair_is_rejected_atomically_in_both_modes() {
+async fn malformed_multiline_link_repair_is_rejected_atomically_in_all_publication_modes() {
     let source = "[broken\nlabel]](/unclosed";
     let destination = "/unclosed";
     let source_structure = markdown_structure(source);
@@ -240,6 +240,12 @@ async fn malformed_multiline_link_repair_is_rejected_atomically_in_both_modes() 
         source_structure.links.is_empty(),
         "malformed CommonMark must remain literal"
     );
+    assert!(
+        has_unparsed_link_syntax(source),
+        "CommonMark literal must be recognized before Optimistic publication"
+    );
+    assert!(!has_unparsed_link_syntax("[valid](https://example.test)"));
+    assert!(!has_unparsed_link_syntax("`literal ]( code`"));
 
     let opts = PromptOpts {
         document_translation_policy: Some(DocumentTranslationPolicy::TranslateAll),
@@ -280,7 +286,12 @@ async fn malformed_multiline_link_repair_is_rejected_atomically_in_both_modes() 
         "adversarial mock must turn the literal into a parsed link"
     );
 
-    for streaming in [false, true] {
+    for output_mode in [
+        None,
+        Some(StreamOutputMode::Validated),
+        Some(StreamOutputMode::Optimistic),
+    ] {
+        let streaming = output_mode.is_some();
         // Match the existing validated-stream fixture: only the prioritized first request streams.
         let responses = mock_replies
             .iter()
@@ -318,7 +329,7 @@ async fn malformed_multiline_link_repair_is_rejected_atomically_in_both_modes() 
             cache_enabled: false,
         };
 
-        if streaming {
+        if let Some(output_mode) = output_mode {
             let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
             let error = translate_text_stream_with_mode(
                 source,
@@ -326,7 +337,7 @@ async fn malformed_multiline_link_repair_is_rejected_atomically_in_both_modes() 
                 &TemplateType::Default,
                 &opts,
                 &ctx,
-                StreamOutputMode::Validated,
+                output_mode,
                 event_tx,
             )
             .await
