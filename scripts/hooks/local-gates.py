@@ -257,24 +257,25 @@ def _interrupt(signum: int, _frame: FrameType | None) -> NoReturn:
     raise InterruptedError(f"local gate interrupted by signal {signum}")
 
 
+def _nonblocking_write(fd: int, data: bytes) -> int:
+    was_blocking = os.get_blocking(fd)
+    os.set_blocking(fd, False)
+    try:
+        return os.write(fd, data)
+    finally:
+        os.set_blocking(fd, was_blocking)
+
+
 def _diagnostic(message: str) -> None:
     """Report a failure without blocking a completed cancellation on stderr."""
     try:
-        fd = sys.stderr.fileno()
-        was_blocking = os.get_blocking(fd)
-        os.set_blocking(fd, False)
+        if sys.stderr is not None:
+            _nonblocking_write(
+                sys.stderr.fileno(),
+                (message + "\n").encode("utf-8", errors="backslashreplace"),
+            )
     except (OSError, ValueError):
-        return
-    try:
-        try:
-            os.write(fd, (message + "\n").encode("utf-8", errors="backslashreplace"))
-        except OSError:
-            pass  # Full or closed diagnostic sinks cannot mask the primary failure.
-    finally:
-        try:
-            os.set_blocking(fd, was_blocking)
-        except OSError:
-            pass
+        pass  # Full or closed diagnostic sinks cannot mask the primary failure.
 
 
 class _ChildIdentity:
@@ -388,13 +389,28 @@ def run(target: str) -> None:
         raise _GateError("the gate target must be head")
     before = _identity()
     _private_path(ARTIFACT_ROOT, directory=True)
-    leaf = Path(tempfile.mkdtemp(prefix="hymt-local-gate-", dir=ARTIFACT_ROOT))
+    parent = ARTIFACT_ROOT
+    requested = os.environ.get("TMPDIR")
+    if requested:
+        candidate = Path(requested)
+        if candidate == ARTIFACT_ROOT or ARTIFACT_ROOT in candidate.parents:
+            parent = _private_path(candidate, directory=True)
+    leaf = Path(tempfile.mkdtemp(prefix="hymt-local-gate-", dir=parent))
     log = leaf / "gate.log"
-    print(f"local-gates: log: {log}", flush=True)
+    try:
+        if sys.stdout is None:
+            raise BrokenPipeError("gate output is unavailable")
+        announcement = f"local-gates: log: {log}\n".encode("utf-8")
+        if _nonblocking_write(sys.stdout.fileno(), announcement) != len(announcement):
+            raise BrokenPipeError("incomplete gate log announcement")
+    except (OSError, ValueError) as error:
+        try:
+            leaf.rmdir()  # No gate was launched; retain nonempty leaves.
+        except OSError as cleanup_error:
+            error.add_note(f"unannounced leaf cleanup: {cleanup_error}")
+        raise
     env = os.environ.copy()
-    env.update(
-        TMPDIR=str(ARTIFACT_ROOT), TMP=str(ARTIFACT_ROOT), TEMP=str(ARTIFACT_ROOT)
-    )
+    env.update(TMPDIR=str(parent), TMP=str(parent), TEMP=str(parent))
     # Runner options may not skip commands or select a different justfile.
     for key in list(env):
         if key.startswith("JUST_"):

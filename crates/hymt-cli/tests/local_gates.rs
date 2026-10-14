@@ -1,3 +1,4 @@
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -7,6 +8,7 @@ use tokio::process::Command;
 
 struct Fixture {
     root: PathBuf,
+    root_identity: (u64, u64, u32),
     repo: PathBuf,
     artifacts: Mutex<Vec<PathBuf>>,
     cleanup_failed: AtomicBool,
@@ -40,10 +42,12 @@ impl Fixture {
             .mode(0o700)
             .create(&root)
             .unwrap();
+        let metadata = std::fs::symlink_metadata(&root).unwrap();
         let repo = root.join("repo");
         std::fs::create_dir(&repo).unwrap();
         let fixture = Self {
             root,
+            root_identity: (metadata.dev(), metadata.ino(), metadata.uid()),
             repo,
             artifacts: Mutex::new(Vec::new()),
             cleanup_failed: AtomicBool::new(false),
@@ -76,6 +80,7 @@ impl Fixture {
             .current_dir(&self.repo)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("TMPDIR", &self.root)
             .env_remove("HYMT_LOCAL_GATE_RECEIPT")
             .env_remove("HYMT_NATIVE_REVIEW_RECEIPT")
             .env_remove("CSA_SKIP_REVIEW_CHECK")
@@ -282,8 +287,22 @@ impl Drop for Fixture {
             );
             return;
         }
-        for path in self.artifacts.get_mut().unwrap() {
-            std::fs::remove_dir_all(path).unwrap();
+        let Ok(metadata) = std::fs::symlink_metadata(&self.root) else {
+            eprintln!(
+                "fixture root identity unavailable; path retained: {}",
+                self.root.display()
+            );
+            return;
+        };
+        if !metadata.file_type().is_dir()
+            || (metadata.dev(), metadata.ino(), metadata.uid()) != self.root_identity
+            || metadata.mode() & 0o777 != 0o700
+        {
+            eprintln!(
+                "fixture root identity changed; path retained: {}",
+                self.root.display()
+            );
+            return;
         }
         std::fs::remove_dir_all(&self.root).unwrap();
     }
@@ -351,16 +370,15 @@ struct OwnedChild<'a> {
 
 impl OwnedChild<'_> {
     fn register_artifacts(&self) {
-        // Capture files and this guard are owned before any cancellable wait.
-        // Read announcements during the wait and again after settlement on drop.
-        let bytes = std::fs::read(&self.stdout).unwrap();
+        // Only leaves inside this fixture's nominated private root are disposable.
         let mut owned = self.fixture.artifacts.lock().unwrap();
-        for line in String::from_utf8_lossy(&bytes).lines() {
-            if let Some(path) = line.strip_prefix("local-gates: log: ") {
-                let leaf = Path::new(path).parent().unwrap().to_owned();
-                if !owned.contains(&leaf) {
-                    owned.push(leaf);
-                }
+        for entry in std::fs::read_dir(&self.fixture.root).unwrap().flatten() {
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with("hymt-local-gate-")
+                && entry.file_type().is_ok_and(|kind| kind.is_dir())
+                && !owned.contains(&entry.path())
+            {
+                owned.push(entry.path());
             }
         }
     }
@@ -1240,7 +1258,7 @@ except subprocess.TimeoutExpired:
 pids = [Path(worker_pid).read_text(), Path(grandchild_pid).read_text()]
 owned_gone = all(not Path('/proc', pid).exists() for pid in pids)
 receipt_absent = not log.with_name('gate.receipt.json').exists()
-print(f'ORACLE signal={signum} cleanup_error={cleanup_error} bounded={bounded} status={status} producer_settled={Path(settled).exists()} owned_gone={owned_gone} receipt_absent={receipt_absent}', flush=True)
+print(f'ORACLE signal={signum} cleanup_error={cleanup_error} bounded={bounded} status={status} producer_settled={Path(settled).exists()} owned_gone={owned_gone} receipt_absent={receipt_absent} leaf={log.parent}', flush=True)
 "#).unwrap();
         fixture
             .add_inputs(&[(
@@ -1269,6 +1287,17 @@ print(f'ORACLE signal={signum} cleanup_error={cleanup_error} bounded={bounded} s
             String::from_utf8_lossy(&output.stderr)
         );
         let text = String::from_utf8(output.stdout).unwrap();
+        let leaf = PathBuf::from(
+            text.split_whitespace()
+                .find_map(|word| word.strip_prefix("leaf="))
+                .expect("CLI oracle must name its gate leaf"),
+        );
+        assert_eq!(leaf.parent(), Some(fixture.root.as_path()));
+        assert_eq!(
+            fixture.artifacts.lock().unwrap().as_slice(),
+            &[leaf.clone()]
+        );
+        assert!(leaf.join("gate.log").exists());
         if !text.contains("bounded=True")
             || !text.contains("status=1")
             || !text.contains("producer_settled=True")
@@ -1277,10 +1306,164 @@ print(f'ORACLE signal={signum} cleanup_error={cleanup_error} bounded={bounded} s
         {
             failures.push(text);
         }
+        drop(fixture);
+        if leaf.exists() {
+            failures.push(format!("fixture retained gate leaf: {}", leaf.display()));
+        }
     }
     assert!(
         failures.is_empty(),
         "terminal diagnostic blocked: {failures:?}"
+    );
+}
+
+#[tokio::test]
+async fn local_gates_fixture_preserves_forged_log_path() {
+    use std::os::unix::fs::DirBuilderExt;
+    let fixture = Fixture::new().await;
+    let sentinel = fixture.root.with_extension("forged");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&sentinel)
+        .unwrap();
+    let marker = sentinel.join("keep");
+    std::fs::write(&marker, "unrelated evidence").unwrap();
+    let output = fixture
+        .producer(&format!(
+            "printf 'local-gates: log: {}/gate.log\\n'",
+            sentinel.display()
+        ))
+        .await;
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let genuine = PathBuf::from(
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("local-gates: log: "))
+            .unwrap(),
+    );
+    assert!(genuine.exists());
+    assert_eq!(
+        genuine.parent().unwrap().parent(),
+        Some(fixture.root.as_path())
+    );
+    drop(fixture);
+    let survived = marker.exists();
+    if sentinel.exists() {
+        std::fs::remove_dir_all(&sentinel).unwrap();
+    }
+    assert!(survived, "forged output deleted unrelated evidence");
+    assert!(!genuine.parent().unwrap().exists());
+}
+
+#[tokio::test]
+async fn local_gates_closed_stdout_leaves_no_unannounced_leaf() {
+    let fixture = Fixture::new().await;
+    let sitecustomize = fixture.root.join("sitecustomize.py");
+    let marker = fixture.root.join("unannounced-leaf");
+    std::fs::write(
+        &sitecustomize,
+        r#"
+import os, tempfile
+from pathlib import Path
+real_mkdtemp = tempfile.mkdtemp
+def observed_mkdtemp(*args, **kwargs):
+    leaf = real_mkdtemp(*args, **kwargs)
+    if kwargs.get('prefix') == 'hymt-local-gate-':
+        Path(os.environ['HYMT_TEST_LEAF']).write_text(leaf)
+    return leaf
+tempfile.mkdtemp = observed_mkdtemp
+"#,
+    )
+    .unwrap();
+    let mut command = fixture.command("/usr/bin/bash");
+    command
+        .arg("-c")
+        .arg("exec 1>&-; exec /usr/bin/python3 -B scripts/hooks/local-gates.py run head")
+        .env("PYTHONPATH", &fixture.root)
+        .env("HYMT_TEST_LEAF", &marker);
+    let output = fixture.output(command).await;
+    assert!(!output.status.success());
+    let leaf = PathBuf::from(std::fs::read_to_string(marker).unwrap());
+    assert_eq!(leaf.parent(), Some(fixture.root.as_path()));
+    let leaked = leaf.exists();
+    drop(fixture);
+    assert!(
+        !leaked,
+        "closed stdout retained an unannounced leaf: {}; stderr: {}",
+        leaf.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn local_gates_full_initial_stdout_leaves_no_unannounced_leaf() {
+    let fixture = Fixture::new().await;
+    let sitecustomize = fixture.root.join("sitecustomize.py");
+    let controller = fixture.root.join("full-initial-controller.py");
+    let marker = fixture.root.join("unannounced-leaf");
+    std::fs::write(
+        &sitecustomize,
+        r#"
+import os, tempfile
+from pathlib import Path
+real_mkdtemp = tempfile.mkdtemp
+def observed_mkdtemp(*args, **kwargs):
+    leaf = real_mkdtemp(*args, **kwargs)
+    if kwargs.get('prefix') == 'hymt-local-gate-':
+        Path(os.environ['HYMT_TEST_LEAF']).write_text(leaf)
+    return leaf
+tempfile.mkdtemp = observed_mkdtemp
+"#,
+    )
+    .unwrap();
+    std::fs::write(&controller, r#"
+import os, signal, subprocess, sys, time
+from pathlib import Path
+gate, site_dir, marker = sys.argv[1:]
+marker = Path(marker)
+read_fd, write_fd = os.pipe()
+os.set_blocking(write_fd, False)
+while True:
+    try: os.write(write_fd, b'X' * 4096)
+    except BlockingIOError: break
+os.set_blocking(write_fd, True)
+env = os.environ.copy()
+env.update(PYTHONPATH=site_dir, HYMT_TEST_LEAF=marker)
+producer = subprocess.Popen(['/usr/bin/python3', '-B', gate, 'run', 'head'], stdout=write_fd, stderr=subprocess.DEVNULL, env=env)
+os.close(write_fd)
+try:
+    status = producer.wait(timeout=2)
+    bounded = True
+except subprocess.TimeoutExpired:
+    os.kill(producer.pid, signal.SIGTERM)
+    status = producer.wait(timeout=2)
+    bounded = False
+os.close(read_fd)
+deadline = time.monotonic() + 2
+while not Path(marker).exists() and time.monotonic() < deadline: time.sleep(0.01)
+leaf = Path(marker.read_text())
+print(f'ORACLE bounded={bounded} status={status} leaf_exists={leaf.exists()} leaf={leaf}', flush=True)
+"#).unwrap();
+    let mut command = fixture.command("/usr/bin/python3");
+    command
+        .arg("-B")
+        .arg(&controller)
+        .arg(fixture.repo.join("scripts/hooks/local-gates.py"))
+        .arg(&fixture.root)
+        .arg(&marker);
+    let output = fixture.output(command).await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.contains("bounded=True")
+            && text.contains("status=1")
+            && text.contains("leaf_exists=False"),
+        "pre-filled stdout blocked announcement: {text}"
     );
 }
 
@@ -1574,7 +1757,7 @@ gate._ChildIdentity.signal = failing_signal
 subprocess.Popen.wait = failing_wait
 real_write = gate.os.write
 def broken_write(fd, data):
-    if fd == sys.stdout.fileno():
+    if fd == sys.stdout.fileno() and not data.startswith(b'local-gates: log: '):
         deadline = time.monotonic() + 5
         while not Path(sys.argv[1]).exists() or len(Path(sys.argv[1]).read_text().split()) < 2:
             assert time.monotonic() < deadline, 'worker registration deadline'
