@@ -1168,6 +1168,123 @@ print(f'ORACLE mode={mode} signal={signum} bounded={bounded} status={status} pro
 }
 
 #[tokio::test]
+async fn local_gates_cli_diagnostics_do_not_block_settlement() {
+    let mut failures = Vec::new();
+    for (signum, cleanup_error) in [(2, false), (15, false), (14, false), (15, true)] {
+        let fixture = Fixture::new().await;
+        let worker = fixture.root.join("diagnostic-worker.py");
+        let controller = fixture.root.join("diagnostic-controller.py");
+        let sitecustomize = fixture.root.join("sitecustomize.py");
+        let worker_pid = fixture.root.join("worker.pid");
+        let grandchild_pid = fixture.root.join("grandchild.pid");
+        let settled = fixture.root.join("producer-settled");
+        std::fs::write(
+            &worker,
+            r#"
+import os, sys, time
+from pathlib import Path
+worker_pid, grandchild_pid = map(Path, sys.argv[1:])
+if os.fork() == 0:
+    os.setsid()
+    grandchild_pid.write_text(str(os.getpid()))
+    while True: time.sleep(1)
+worker_pid.write_text(str(os.getpid()))
+os.write(1, b'X' * 1048576)
+while True: time.sleep(1)
+"#,
+        )
+        .unwrap();
+        std::fs::write(&sitecustomize, r#"
+import os, sys
+from pathlib import Path
+def observe(frame, event, _arg):
+    if event == 'call' and frame.f_code.co_name == 'run' and frame.f_code.co_filename.endswith('/scripts/hooks/local-gates.py'):
+        real_settle = frame.f_globals['_settle']
+        def settle(child, root):
+            status = real_settle(child, root)
+            Path(os.environ['HYMT_TEST_SETTLED']).touch(mode=0o600)
+            if os.environ['HYMT_TEST_CLEANUP_ERROR'] == '1':
+                raise OSError('injected cleanup diagnostic')
+            return status
+        frame.f_globals['_settle'] = settle
+        sys.setprofile(None)
+sys.setprofile(observe)
+"#).unwrap();
+        std::fs::write(&controller, r#"
+import os, select, signal, subprocess, sys, time
+from pathlib import Path
+gate, site_dir, settled, worker_pid, grandchild_pid, signum, cleanup_error = sys.argv[1:]
+env = os.environ.copy()
+env.update(PYTHONPATH=site_dir, HYMT_TEST_SETTLED=settled, HYMT_TEST_CLEANUP_ERROR=cleanup_error)
+producer = subprocess.Popen(['/usr/bin/python3', '-B', gate, 'run', 'head'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
+assert select.select([producer.stdout], [], [], 5)[0], 'CLI did not announce log'
+announcement = producer.stdout.readline().decode()
+assert announcement.startswith('local-gates: log: '), announcement
+log = Path(announcement.removeprefix('local-gates: log: ').strip())
+deadline = time.monotonic() + 5
+while True:
+    assert time.monotonic() < deadline, 'CLI did not reach full output pipe'
+    ready = log.exists() and log.stat().st_size >= 4096 and 'pipe_write' in Path(f'/proc/{producer.pid}/wchan').read_text()
+    if ready and Path(worker_pid).exists() and Path(grandchild_pid).exists():
+        break
+    time.sleep(0.01)
+os.kill(producer.pid, int(signum))
+try:
+    status = producer.wait(timeout=6)
+    bounded = True
+except subprocess.TimeoutExpired:
+    producer.kill()
+    producer.wait()
+    status = -9
+    bounded = False
+pids = [Path(worker_pid).read_text(), Path(grandchild_pid).read_text()]
+owned_gone = all(not Path('/proc', pid).exists() for pid in pids)
+receipt_absent = not log.with_name('gate.receipt.json').exists()
+print(f'ORACLE signal={signum} cleanup_error={cleanup_error} bounded={bounded} status={status} producer_settled={Path(settled).exists()} owned_gone={owned_gone} receipt_absent={receipt_absent}', flush=True)
+"#).unwrap();
+        fixture
+            .add_inputs(&[(
+                "justfile",
+                &format!(
+            "set shell := [\"bash\", \"-c\"]\n_full-gate:\n    /usr/bin/python3 '{}' '{}' '{}'\n",
+            worker.display(), worker_pid.display(), grandchild_pid.display()
+        ),
+            )])
+            .await;
+        let mut command = fixture.command("/usr/bin/python3");
+        command
+            .arg("-B")
+            .arg(&controller)
+            .arg(fixture.repo.join("scripts/hooks/local-gates.py"))
+            .arg(&fixture.root)
+            .arg(&settled)
+            .arg(&worker_pid)
+            .arg(&grandchild_pid)
+            .arg(signum.to_string())
+            .arg(if cleanup_error { "1" } else { "0" });
+        let output = fixture.output(command).await;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        if !text.contains("bounded=True")
+            || !text.contains("status=1")
+            || !text.contains("producer_settled=True")
+            || !text.contains("owned_gone=True")
+            || !text.contains("receipt_absent=True")
+        {
+            failures.push(text);
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "terminal diagnostic blocked: {failures:?}"
+    );
+}
+
+#[tokio::test]
 async fn local_gates_launch_and_repeated_interrupts_settle_own_child() {
     let fixture = Fixture::new().await;
     fixture

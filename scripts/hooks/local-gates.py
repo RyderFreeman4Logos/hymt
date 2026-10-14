@@ -257,6 +257,26 @@ def _interrupt(signum: int, _frame: FrameType | None) -> NoReturn:
     raise InterruptedError(f"local gate interrupted by signal {signum}")
 
 
+def _diagnostic(message: str) -> None:
+    """Report a failure without blocking a completed cancellation on stderr."""
+    try:
+        fd = sys.stderr.fileno()
+        was_blocking = os.get_blocking(fd)
+        os.set_blocking(fd, False)
+    except (OSError, ValueError):
+        return
+    try:
+        try:
+            os.write(fd, (message + "\n").encode("utf-8", errors="backslashreplace"))
+        except OSError:
+            pass  # Full or closed diagnostic sinks cannot mask the primary failure.
+    finally:
+        try:
+            os.set_blocking(fd, was_blocking)
+        except OSError:
+            pass
+
+
 class _ChildIdentity:
     """A kernel handle validated against this dedicated owner's child custody."""
 
@@ -448,7 +468,7 @@ def run(target: str) -> None:
                     ) as cleanup_error:
                         if original_error is None:
                             raise
-                        print(f"local-gates cleanup: {cleanup_error}", file=sys.stderr)
+                        _diagnostic(f"local-gates cleanup: {cleanup_error}")
                     finally:
                         if child.stdout is not None:
                             current_error = sys.exception() or original_error
@@ -457,9 +477,7 @@ def run(target: str) -> None:
                             except OSError as close_error:
                                 if current_error is None:
                                     raise
-                                print(
-                                    f"local-gates cleanup: {close_error}", file=sys.stderr
-                                )
+                                _diagnostic(f"local-gates cleanup: {close_error}")
     finally:
         original_error = sys.exception()
         restore_errors: list[str] = []
@@ -480,7 +498,7 @@ def run(target: str) -> None:
             detail = "; ".join(restore_errors)
             if original_error is None:
                 raise _GateError(detail)
-            print(f"local-gates cleanup: {detail}", file=sys.stderr)
+            _diagnostic(f"local-gates cleanup: {detail}")
     if pending:
         _interrupt(pending[0], None)
     if status:
@@ -581,5 +599,5 @@ if __name__ == "__main__":
     try:
         main()
     except (ValueError, OSError, subprocess.SubprocessError) as error:
-        print(f"local-gates: {error}", file=sys.stderr)
+        _diagnostic(f"local-gates: {error}")
         sys.exit(1)
