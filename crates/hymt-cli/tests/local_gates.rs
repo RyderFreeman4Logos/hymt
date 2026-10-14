@@ -942,9 +942,25 @@ async fn local_gates_fixed_aggregate_uses_all_locked_linux_checks() {
     )
     .unwrap();
     std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let tests = fixture.repo.join("scripts/tests");
+    std::fs::create_dir_all(&tests).unwrap();
+    std::fs::copy(
+        source_root().join("scripts/hymt-inference-cache.py"),
+        fixture.repo.join("scripts/hymt-inference-cache.py"),
+    )
+    .unwrap();
+    std::fs::copy(
+        source_root().join("scripts/tests/test_inference_cache.py"),
+        tests.join("test_inference_cache.py"),
+    )
+    .unwrap();
     let services = fixture.repo.join("services");
     std::fs::create_dir(&services).unwrap();
-    for name in ["hy-mt2-quality.service", "hy-mt2-throughput.service"] {
+    for name in [
+        "hy-mt2-quality.service",
+        "hy-mt2-throughput.service",
+        "hy-mt2-cache.service",
+    ] {
         std::fs::copy(
             source_root().join("services").join(name),
             services.join(name),
@@ -1033,6 +1049,11 @@ async fn local_gates_service_executable_and_library_paths_are_coherent() {
         );
         std::fs::copy(source, services.join(name)).unwrap();
     }
+    std::fs::copy(
+        source_root().join("services/hy-mt2-cache.service"),
+        services.join("hy-mt2-cache.service"),
+    )
+    .unwrap();
     // The real systemd parser checks the complete source units, including every
     // option beyond these paths. This never starts or reloads a service.
     let output = fixture.helper("service-verify").await;

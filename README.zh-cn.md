@@ -369,6 +369,14 @@ hymt telegram --regenerate-claim-password
 
 两个服务配置均明确设置了`--temp 0.7`、`--top-k 20`、`--top-p 0.6`以及`--repeat-penalty 1.05`，这些均为Hy-MT2的推荐参数。同时，它们还设置了`--min-p 0`（禁用该仅适用于llama.cpp的扩展功能）和`--repeat-last-n 64`（这是为适配1.05版本的重复惩罚机制而特意采用的llama.cpp兼容设置，并非Hy-MT2的原始推荐值）。因此，这些参数不会从已安装的llama.cpp版本中随机继承任何采样配置。除非有`[inference.override]`指令明确指定替代值，否则HymT会忽略所有采样相关字段，所以修改服务默认参数也会改变默认的翻译结果。在启动时，llama.cpp客户端会发送`GET /props`请求，并输出其报告的原始`default_generation_settings`值；如果该接口不可用或版本过旧，系统会发出警告并仅忽略相关请求，不会报错。
 
+### 可选的共享推理缓存
+
+独立的明文缓存跨客户端和 API/VK 凭据保存完整的原始推理响应，包括 usage。缓存身份使用观测到的上游模型、构建、默认采样、模板和上下文元数据；身份检查仍需上游服务。它不替代 hymt 的译文验证或片段缓存。
+
+`just install-inference-cache` 将脚本与用户 unit 安装到稳定路径，重载 systemd，并在缓存已运行时重启它。首次启动执行 `systemctl --user enable --now hy-mt2-cache.service`。附带的 unit 绑定特定宿主机：监听 Tailscale 的 `100.78.159.38:8402`，并转发到 `100.78.159.38:8401` 的模型服务。需要使用缓存的客户端可设置 `[endpoint].url = "http://100.78.159.38:8402/v1"`，保留 `backend = "llama_cpp"`，并将 `[endpoint].model` 设为上游 `/v1/models` 公布的实际 ID 或别名。示例配置中的空 `model` 会使请求省略该字段，无法产生缓存命中。
+
+若在观测元数据不变的情况下替换了模型内容，执行 `python3 "$HOME/.local/share/hymt/inference-cache.py" clear --database "$HOME/.local/state/hymt/inference-cache.sqlite3"`；清理操作会使持久化条目及正在进行的写入失效。该缓存独立于 hymt 的翻译历史，且不提供离线重放。
+
 ## 架构
 
 - `crates/hymt-core`：支持热重载的TOML配置、提示词模板、CJK语言处理工具以及完整性检测算法。
@@ -393,7 +401,7 @@ just pre-commit
 just pre-push-gate head
 ```
 
-快速提交钩子检查格式和锁定依赖的工作区Clippy。完整门禁还包括锁定依赖的工作区测试与编译检查、不启用Telegram的CLI检查和测试、每个受Git跟踪的Shell脚本的语法与ShellCheck检查、两个systemd服务单元的静态验证，以及所有受Git跟踪的TOML文件解析。所有诊断都会显示，仅允许未部署宿主机上两个已知服务单元的规范持久化可执行文件缺失诊断。
+快速提交钩子检查格式和锁定依赖的工作区Clippy。完整门禁还包括锁定依赖的工作区测试与编译检查、推理缓存的 Python 契约测试、不启用Telegram的CLI检查和测试、每个受Git跟踪的Shell脚本的语法与ShellCheck检查、三个systemd服务单元的静态验证，以及所有受Git跟踪的TOML文件解析。所有诊断都会显示，仅允许未部署宿主机上两个已知模型服务单元的规范持久化可执行文件缺失诊断。
 
 随后取得覆盖整个`main...HEAD`范围、结论为PASS且可处理问题数为零的独立原生审查。将`HYMT_LOCAL_GATE_RECEIPT`设为门禁打印的私有凭据路径，将`HYMT_NATIVE_REVIEW_RECEIPT`设为[原生审查回执格式](#原生审查回执格式)中说明的独立审查凭据。Lefthook会结合实际待推送的功能分支更新，验证凭据的精确HEAD/tree、审查范围及日志和报告内容；推送不会重复执行未变化的检查。源码变更后必须重新取得凭据。运行产物位于私有SSD任务目录`/mnt/ssd/mirror-rootfs/home/obj/tmp/hymt-stop-ai-20261012`；仓库不使用托管GitHub Actions工作流。
 

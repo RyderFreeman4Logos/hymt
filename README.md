@@ -372,6 +372,14 @@ Both bind only to `100.78.159.38:8401` on Tailscale, not `0.0.0.0`. They use CUD
 
 Both service profiles explicitly set `--temp 0.7`, `--top-k 20`, `--top-p 0.6`, and `--repeat-penalty 1.05`, the Hy-MT2 deployment recommendation. They also explicitly set `--min-p 0` (disable this llama.cpp-only extension) and `--repeat-last-n 64` (a deliberate llama.cpp compatibility choice for the 1.05 repeat penalty, not an upstream Hy-MT2 recommendation). The units therefore do not inherit an accidental sampler profile from the installed llama.cpp version. hymt omits sampling fields unless `[inference.override]` explicitly replaces a value, so changing a service default changes default translations. At startup, a llama.cpp client requests `GET /props` and prints the literal `default_generation_settings` it reports; an unavailable or older `/props` fails open with a warning and requests remain omission-only.
 
+### Optional shared inference cache
+
+The separate plaintext cache stores complete raw inference responses, including usage, across clients and API/VK credentials. Its identity uses observed upstream model, build, defaults, template, and context metadata; it requires the upstream for identity checks. It does not replace hymt's translation validation or segment cache.
+
+`just install-inference-cache` copies the script and user unit to stable paths, reloads systemd, and restarts the cache if it is active. To start it for the first time, run `systemctl --user enable --now hy-mt2-cache.service`. The supplied unit is host-specific: it listens on Tailscale `100.78.159.38:8402` and forwards to the model at `100.78.159.38:8401`. To opt a client into this service, set `[endpoint].url = "http://100.78.159.38:8402/v1"`, keep `backend = "llama_cpp"`, and set `[endpoint].model` to an actual ID or alias advertised by the upstream `/v1/models`. The example config's empty `model` omits that request field and cannot produce cache hits.
+
+Run `python3 "$HOME/.local/share/hymt/inference-cache.py" clear --database "$HOME/.local/state/hymt/inference-cache.sqlite3"` after replacing model bytes without changing the observed metadata; clear invalidates persisted entries and in-flight admission. The cache is independent of hymt's translation history and does not provide offline replay.
+
 ## Architecture
 
 - `crates/hymt-core`: hot-reloadable TOML configuration, prompt templates, CJK language utilities, and completeness heuristics.
@@ -396,7 +404,7 @@ After committing, run the complete local acceptance gate once on the clean HEAD:
 just pre-push-gate head
 ```
 
-The fast commit hook checks formatting and locked workspace Clippy. The full gate adds locked workspace tests/checks, the CLI check and tests without Telegram, every tracked shell script's syntax and ShellCheck checks, both systemd units' static validation, and every tracked TOML file's parsing. All diagnostics remain visible; only a missing canonical persistent executable for either known service unit is allowed on unprovisioned hosts.
+The fast commit hook checks formatting and locked workspace Clippy. The full gate adds locked workspace tests/checks, the inference cache's Python contract tests, the CLI check and tests without Telegram, every tracked shell script's syntax and ShellCheck checks, all three systemd units' static validation, and every tracked TOML file's parsing. All diagnostics remain visible; only a missing canonical persistent executable for either known model service unit is allowed on unprovisioned hosts.
 
 Then obtain an independent whole `main...HEAD` native review with PASS and zero actionable findings. Set `HYMT_LOCAL_GATE_RECEIPT` to the gate's printed private receipt path and `HYMT_NATIVE_REVIEW_RECEIPT` to the independent review receipt described in [native review receipt format](#native-review-receipt-format). Lefthook validates their exact HEAD/tree, range, and log/report contents against the actual outgoing feature-branch update; pushing does not rerun unchanged checks. Source changes require fresh receipts. Artifacts use the private SSD task root `/mnt/ssd/mirror-rootfs/home/obj/tmp/hymt-stop-ai-20261012`; there is no hosted GitHub Actions workflow.
 
