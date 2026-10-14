@@ -5,7 +5,6 @@ import hashlib
 import json
 import os
 import re
-import select
 import signal
 import stat
 import subprocess
@@ -382,11 +381,15 @@ def run(target: str) -> None:
             del env[key]
     previous_subreaper = _subreaper(1)
     pending: list[int] = []
-    wake_read, wake_write = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
-    previous_wakeup = signal.set_wakeup_fd(wake_write)
+    armed = False
+
     def record_interrupt(signum: int, _frame: FrameType | None) -> None:
+        nonlocal armed
         if not pending:
             pending.append(signum)
+        if armed:
+            armed = False
+            _interrupt(pending[0], _frame)
 
     previous_handlers = {
         sig: signal.signal(sig, record_interrupt)
@@ -418,25 +421,21 @@ def run(target: str) -> None:
                 stream = child.stdout
                 if stream is None:
                     raise _GateError("gate output pipe is unavailable")
-                while True:
+                armed = True
+                try:
                     if pending:
                         _interrupt(pending[0], None)
-                    ready, _, _ = select.select((stream, wake_read), (), ())
-                    if pending:
-                        _interrupt(pending[0], None)
-                    if wake_read in ready:
-                        os.read(wake_read, 4096)
-                        continue
-                    chunk = os.read(stream.fileno(), 65536)
-                    if not chunk:
-                        break
-                    log_output.write(chunk)
-                    log_output.flush()
-                    sys.stdout.buffer.write(chunk)
-                    sys.stdout.buffer.flush()
-                # Observe exit without reaping: cleanup retains root identity.
-                assert root.fd is not None
-                os.waitid(os.P_PIDFD, root.fd, os.WEXITED | os.WNOWAIT)
+                    for chunk in iter(lambda: os.read(stream.fileno(), 65536), b""):
+                        log_output.write(chunk)
+                        log_output.flush()
+                        offset = 0
+                        while offset < len(chunk):
+                            offset += os.write(sys.stdout.fileno(), chunk[offset:])
+                    # Observe exit without reaping: cleanup retains root identity.
+                    assert root.fd is not None
+                    os.waitid(os.P_PIDFD, root.fd, os.WEXITED | os.WNOWAIT)
+                finally:
+                    armed = False
             finally:
                 original_error = sys.exception()
                 if child is not None:
@@ -473,9 +472,6 @@ def run(target: str) -> None:
                 signal.signal(sig, handler)
             except OSError as error:
                 restore_errors.append(str(error))
-        signal.set_wakeup_fd(previous_wakeup)
-        os.close(wake_read)
-        os.close(wake_write)
         try:
             _subreaper(previous_subreaper)
         except OSError as error:

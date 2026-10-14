@@ -1024,6 +1024,150 @@ if other.stat().st_dev != Path('/mnt/ssd').stat().st_dev:
 }
 
 #[tokio::test]
+async fn local_gates_blocked_output_and_wait_are_interruptible() {
+    let mut failures = Vec::new();
+    for (mode, signum) in [
+        ("pipe", 2),
+        ("pipe", 15),
+        ("pipe", 14),
+        ("eof", 2),
+        ("eof", 14),
+    ] {
+        let fixture = Fixture::new().await;
+        let worker = fixture.root.join("blocked-worker.py");
+        let producer = fixture.root.join("blocked-producer.py");
+        let controller = fixture.root.join("blocked-controller.py");
+        let worker_pid = fixture.root.join("worker.pid");
+        let grandchild_pid = fixture.root.join("grandchild.pid");
+        let settled = fixture.root.join("producer-settled");
+        let waiting = fixture.root.join("producer-waiting");
+        std::fs::write(
+            &worker,
+            r#"
+import os, sys, time
+from pathlib import Path
+mode, worker_pid, grandchild_pid = sys.argv[1:]
+if os.fork() == 0:
+    os.setsid()
+    Path(grandchild_pid).write_text(str(os.getpid()))
+    if mode == 'eof':
+        os.close(1); os.close(2)
+    while True: time.sleep(1)
+Path(worker_pid).write_text(str(os.getpid()))
+if mode == 'eof':
+    os.close(1); os.close(2)
+else:
+    os.write(1, b'X' * 1048576)
+while True: time.sleep(1)
+"#,
+        )
+        .unwrap();
+        std::fs::write(&producer, r#"
+import importlib.util, os, subprocess, sys
+from pathlib import Path
+gate_path, settled, waiting, worker, mode, worker_pid, grandchild_pid = sys.argv[1:]
+spec = importlib.util.spec_from_file_location('gate', gate_path)
+gate = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(gate)
+real_settle = gate._settle
+def settle(child, root):
+    status = real_settle(child, root)
+    Path(settled).write_text('producer completed settlement')
+    return status
+gate._settle = settle
+if mode == 'eof':
+    real_popen = subprocess.Popen
+    def spawn(argv, **kwargs):
+        if argv[0] == 'just':
+            return real_popen(['/usr/bin/python3', worker, mode, worker_pid, grandchild_pid], **kwargs)
+        return real_popen(argv, **kwargs)
+    gate.subprocess.Popen = spawn
+    real_waitid = os.waitid
+    def marked_waitid(*args):
+        if args[0] == os.P_PIDFD and not args[2] & os.WNOHANG:
+            Path(waiting).write_text('blocking wait entered')
+        return real_waitid(*args)
+    gate.os.waitid = marked_waitid
+try:
+    gate.run('head')
+except BaseException as error:
+    print(f'producer rejected: {type(error).__name__}: {error}', file=sys.stderr)
+    sys.exit(1)
+raise AssertionError('interrupted producer emitted success')
+"#).unwrap();
+        std::fs::write(&controller, r#"
+import os, signal, subprocess, sys, time
+from pathlib import Path
+producer, gate_path, settled, waiting, worker, mode, worker_pid, grandchild_pid, signum = sys.argv[1:]
+child = subprocess.Popen(['/usr/bin/python3', '-B', producer, gate_path, settled, waiting, worker, mode, worker_pid, grandchild_pid], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+announcement = child.stdout.readline().decode()
+assert announcement.startswith('local-gates: log: '), announcement
+print(announcement, end='', flush=True)
+log = Path(announcement.removeprefix('local-gates: log: ').strip())
+deadline = time.monotonic() + 5
+while True:
+    assert time.monotonic() < deadline, 'producer did not reach blocked boundary'
+    if mode == 'pipe':
+        ready = log.exists() and log.stat().st_size >= 4096 and 'pipe_write' in Path(f'/proc/{child.pid}/wchan').read_text()
+    else:
+        ready = Path(waiting).exists()
+    if ready and Path(worker_pid).exists() and Path(grandchild_pid).exists():
+        break
+    time.sleep(0.01)
+os.kill(child.pid, int(signum))
+try:
+    status = child.wait(timeout=6)
+    bounded = True
+except subprocess.TimeoutExpired:
+    child.kill()
+    child.wait()
+    status = -9
+    bounded = False
+pids = [Path(worker_pid).read_text(), Path(grandchild_pid).read_text()]
+owned_gone = all(not Path('/proc', pid).exists() for pid in pids)
+receipt_absent = not log.with_name('gate.receipt.json').exists()
+print(f'ORACLE mode={mode} signal={signum} bounded={bounded} status={status} producer_settled={Path(settled).exists()} owned_gone={owned_gone} receipt_absent={receipt_absent}', flush=True)
+"#).unwrap();
+        fixture.add_inputs(&[("justfile", &format!(
+            "set shell := [\"bash\", \"-c\"]\n_full-gate:\n    /usr/bin/python3 '{}' pipe '{}' '{}'\n",
+            worker.display(), worker_pid.display(), grandchild_pid.display()
+        ))]).await;
+        let mut command = fixture.command("/usr/bin/python3");
+        command
+            .arg("-B")
+            .arg(&controller)
+            .arg(&producer)
+            .arg(source_root().join("scripts/hooks/local-gates.py"))
+            .arg(&settled)
+            .arg(&waiting)
+            .arg(&worker)
+            .arg(mode)
+            .arg(&worker_pid)
+            .arg(&grandchild_pid)
+            .arg(signum.to_string());
+        let output = fixture.output(command).await;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        if !text.contains("bounded=True")
+            || !text.contains("producer_settled=True")
+            || !text.contains("owned_gone=True")
+            || !text.contains("receipt_absent=True")
+            || !text.contains("status=1")
+        {
+            failures.push(text);
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "blocked cancellation failed: {failures:?}"
+    );
+}
+
+#[tokio::test]
 async fn local_gates_launch_and_repeated_interrupts_settle_own_child() {
     let fixture = Fixture::new().await;
     fixture
@@ -1054,9 +1198,10 @@ def launch(*args, **kwargs):
         os.kill(os.getpid(), signal.SIGTERM)
     return child
 def settle(child, root):
-    Path(sys.argv[2]).write_text('producer entered settlement')
     os.kill(os.getpid(), signal.SIGALRM)
-    return real_settle(child, root)
+    status = real_settle(child, root)
+    Path(sys.argv[2]).write_text('producer completed settlement')
+    return status
 subprocess.Popen = launch
 gate._settle = settle
 try:
@@ -1076,7 +1221,7 @@ raise AssertionError('interrupted gate emitted success')
     );
     assert!(
         settlement.exists(),
-        "outer custodian must not hide skipped producer settlement"
+        "outer custodian must not hide incomplete producer settlement"
     );
     let pid = std::fs::read_to_string(child_pid).unwrap();
     assert!(!Path::new("/proc").join(pid).exists());
@@ -1310,22 +1455,16 @@ def failing_wait(self, *args, **kwargs):
     return real_wait(self, *args, **kwargs)
 gate._ChildIdentity.signal = failing_signal
 subprocess.Popen.wait = failing_wait
-original_stdout = sys.stdout
-class BrokenOutput:
-    buffer = None
-    def __init__(self):
-        self.buffer = self
-    def write(self, data):
-        if isinstance(data, str):
-            return original_stdout.write(data)
+real_write = gate.os.write
+def broken_write(fd, data):
+    if fd == sys.stdout.fileno():
         deadline = time.monotonic() + 5
         while not Path(sys.argv[1]).exists() or len(Path(sys.argv[1]).read_text().split()) < 2:
             assert time.monotonic() < deadline, 'worker registration deadline'
             time.sleep(0.01)
         raise OSError('primary output failure')
-    def flush(self):
-        original_stdout.flush()
-sys.stdout = BrokenOutput()
+    return real_write(fd, data)
+gate.os.write = broken_write
 try:
     gate.run('head')
 except OSError as error:
