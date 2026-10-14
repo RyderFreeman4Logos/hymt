@@ -368,7 +368,7 @@ This repo includes two mutually exclusive sample systemd user services under [`s
 | `hy-mt2-quality.service` | Q6_K | Q8 (`q8_0`) | 24,576 | 3 | 8,192 |
 | `hy-mt2-throughput.service` | Q4_K_M | Q4 (`q4_0`) | 65,536 | 8 | 8,192 |
 
-Both bind only to `100.78.159.38:8401` on Tailscale, not `0.0.0.0`. They use CUDA `llama-server`; the quality unit points at a persistent local build, while the throughput example pins a mise `llama-cpp/9294-cuda` build. Those absolute executable and model paths are host-specific, but a replacement backend must support the shown `llama-server` context, parallel-slot, and KV-cache flags.
+Both bind only to `100.78.159.38:8401` on Tailscale, not `0.0.0.0`. They use CUDA `llama-server`; both units use the persistent local build at `/home/obj/.local/share/llama-cpp-cuda/llama-server` and its matching library directory. Those absolute executable and model paths are host-specific, but a replacement backend must support the shown `llama-server` context, parallel-slot, and KV-cache flags.
 
 Both service profiles explicitly set `--temp 0.7`, `--top-k 20`, `--top-p 0.6`, and `--repeat-penalty 1.05`, the Hy-MT2 deployment recommendation. They also explicitly set `--min-p 0` (disable this llama.cpp-only extension) and `--repeat-last-n 64` (a deliberate llama.cpp compatibility choice for the 1.05 repeat penalty, not an upstream Hy-MT2 recommendation). The units therefore do not inherit an accidental sampler profile from the installed llama.cpp version. hymt omits sampling fields unless `[inference.override]` explicitly replaces a value, so changing a service default changes default translations. At startup, a llama.cpp client requests `GET /props` and prints the literal `default_generation_settings` it reports; an unavailable or older `/props` fails open with a warning and requests remain omission-only.
 
@@ -390,10 +390,59 @@ just install-hooks
 just pre-commit
 ```
 
-Verify the binary still builds without Telegram deps:
+After committing, run the complete local acceptance gate once on the clean HEAD:
 
 ```bash
-just check-no-telegram
+just pre-push-gate head
 ```
 
-Lefthook runs `just pre-commit` before commits and provides README translation synchronization. GitHub Actions CI runs on pull requests and pushes to `main`, covering formatting, Clippy, workspace tests/checks, the no-default-features CLI check, shell checks, service-unit validation, and TOML parsing.
+The fast commit hook checks formatting and locked workspace Clippy. The full gate adds locked workspace tests/checks, the CLI check and tests without Telegram, every tracked shell script's syntax and ShellCheck checks, both systemd units' static validation, and every tracked TOML file's parsing. All diagnostics remain visible; only a missing canonical persistent executable for either known service unit is allowed on unprovisioned hosts.
+
+Then obtain an independent whole `main...HEAD` native review with PASS and zero actionable findings. Set `HYMT_LOCAL_GATE_RECEIPT` to the gate's printed private receipt path and `HYMT_NATIVE_REVIEW_RECEIPT` to the independent review receipt described in [native review receipt format](#native-review-receipt-format). Lefthook validates their exact HEAD/tree, range, and log/report contents against the actual outgoing feature-branch update; pushing does not rerun unchanged checks. Source changes require fresh receipts. Artifacts use the private SSD task root `/mnt/ssd/mirror-rootfs/home/obj/tmp/hymt-stop-ai-20261012`; there is no hosted GitHub Actions workflow.
+
+### Native review receipt format
+
+The independent reviewer must perform the strongest available review of the entire `main...HEAD` range, confirm a clean checkout before and after, and write the actual report and receipt under the private SSD root above (directories `0700`, regular non-symlink files `0600`). The source author must not manufacture a PASS verdict or copy synthetic fixture evidence. Keep the checkout frozen at the reviewed HEAD through push. The gate producer writes the genuine gate receipt; it is not assembled from this example.
+
+The following JSON is a schematic field layout, not a usable receipt. The native receipt has exactly these 13 fields, without extras or duplicates. Use actual `git symbolic-ref --short HEAD`, `git rev-parse HEAD`, `git rev-parse 'HEAD^{tree}'`, and `git merge-base main HEAD` values; `outgoing_oid` is the same HEAD. `report_sha256` is the SHA256 of the actual report bytes, for example from `sha256sum -- "$report"`. The `command` field is the exact metadata literal shown, not a receipt-generating command.
+
+```json
+{
+  "version": 1,
+  "status": "PASS",
+  "branch": "<checked-out-feature-branch>",
+  "head": "<actual-HEAD>",
+  "tree": "<actual-HEAD-tree>",
+  "base": "<actual-main-HEAD-merge-base>",
+  "range": "main...HEAD",
+  "outgoing_oid": "<same-actual-HEAD>",
+  "clean_before": true,
+  "clean_after": true,
+  "command": "native review main...HEAD",
+  "report": "<absolute-private-SSD-report-path>",
+  "report_sha256": "<SHA256-of-that-actual-report>"
+}
+```
+
+The actual report must have exactly one matching `HEAD`, `TREE`, `BASE`, and `RANGE` metadata row. Its first two and last two nonblank rows must be `VERDICT: PASS` and `ACTIONABLE_COUNT: 0`; every verdict/count row must agree. This schematic report is valid evidence only when replaced by the independent reviewer's real whole-range findings and actual Git identity:
+
+```text
+VERDICT: PASS
+ACTIONABLE_COUNT: 0
+HEAD: <actual-HEAD>
+TREE: <actual-HEAD-tree>
+BASE: <actual-main-HEAD-merge-base>
+RANGE: main...HEAD
+<independent whole-range review evidence>
+VERDICT: PASS
+ACTIONABLE_COUNT: 0
+```
+
+Replace the quoted path placeholders below with the real receipts. Push exactly one nondeletion update from the checked-out feature branch to the same remote branch name; this explicit refspec carries its current HEAD. Multiple updates, tags, deletes, protected branches, mismatched refs/OIDs, detached HEAD, dirty state, and stale or tampered receipts are rejected.
+
+```bash
+export HYMT_LOCAL_GATE_RECEIPT="<gate producer's actual printed receipt path>"
+export HYMT_NATIVE_REVIEW_RECEIPT="<independent reviewer's actual receipt path>"
+branch="$(git symbolic-ref --short HEAD)" &&
+    git push origin "refs/heads/$branch:refs/heads/$branch"
+```
