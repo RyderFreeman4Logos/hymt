@@ -1,12 +1,14 @@
 """Causal cache contracts against a local fake llama.cpp server; stdlib only."""
 
 import concurrent.futures
+import hashlib
 import http.client
 import importlib.util
 import json
 import os
 import socket
 import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
@@ -66,6 +68,8 @@ class _Upstream(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(raw)))
         self.send_header("X-Original", "retained")
+        for name, value in self.server.state.get("extra_headers", ()):
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(raw)
 
@@ -121,6 +125,8 @@ class _Upstream(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Connection", "close")
+            for name, value in state.get("extra_headers", ()):
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(_SSE_FIRST)
             self.wfile.flush()
@@ -132,7 +138,7 @@ class _Upstream(BaseHTTPRequestHandler):
                 pass
             self.close_connection = True
         else:
-            self._reply(200, _JSON)
+            self._reply(200, _JSON + b" " * state.get("padding", 0))
 
 
 class CacheContracts(unittest.TestCase):
@@ -196,6 +202,16 @@ class CacheContracts(unittest.TestCase):
             return response.status, dict(response.getheaders()), response.read()
         finally:
             conn.close()
+
+    def raw_post(self, payload: dict[str, object]) -> bytes:
+        raw = json.dumps(payload).encode()
+        with socket.create_connection(("127.0.0.1", self.port), timeout=4) as conn:
+            conn.settimeout(4)
+            conn.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: " + str(len(raw)).encode() + b"\r\nConnection: close\r\n\r\n" + raw)
+            chunks = []
+            while chunk := conn.recv(65536):
+                chunks.append(chunk)
+        return b"".join(chunks)
 
     def test_timeout_limits_reject_before_database_creation(self) -> None:
         upstream = f"http://127.0.0.1:{self.upstream.server_port}"
@@ -344,6 +360,162 @@ class CacheContracts(unittest.TestCase):
             conn.execute("DROP TABLE entries")
         self.assertEqual("UNKNOWN", self.request()[1]["X-Hymt-Cache"])
         self.assertEqual(0o600, self.db.stat().st_mode & 0o777)
+
+    def test_reopened_limit_and_poisoned_rows_regenerate(self) -> None:
+        self.state["padding"] = 4096
+        self.assertEqual("MISS", self.request()[1]["X-Hymt-Cache"])
+        self.stop_cache()
+        self.start_cache(response_limit=1024)
+        self.state["padding"] = 0
+        reply = self.request()
+        self.assertEqual((200, "MISS", _JSON), (reply[0], reply[1]["X-Hymt-Cache"], reply[2]))
+        self.stop_cache()
+        self.start_cache()
+        good_headers = json.dumps([["Content-Type", "application/json"], ["X-Original", "retained"]])
+        for column, value in (("request", b"x" * (2 * 1024 * 1024 + 1)),
+                              ("request", "not a blob"),
+                              ("response", _JSON.decode()),
+                              ("canonical", "x" * (2 * 1024 * 1024 + 1)),
+                              ("identity", "x" * (2 * 1024 * 1024 + 1)),
+                              ("digest", b"x" * 64),
+                              ("headers", good_headers.encode()),
+                              ("headers", json.dumps([["Content-Type", "application/json"], ["X-Pad", "x" * (1024 * 1024)]])),
+                              ("headers", json.dumps([["Content-Type", "application/json"]] + [["X-Extra", "v"]] * 100))):
+            with self.subTest(column=column, size=len(value)):
+                with sqlite3.connect(self.db) as conn:
+                    conn.execute(f"UPDATE entries SET {column}=?", (value,))
+                raw = self.raw_post({"model": "Hy-MT2-7B", "messages": [{"role": "user", "content": "same text"}]})
+                self.assertEqual(1, raw.count(b"HTTP/1.1 "))
+                self.assertIn(b"X-Hymt-Cache: MISS\r\n", raw)
+                self.assertEqual(_JSON, raw.split(b"\r\n\r\n", 1)[1])
+
+        too_large = _JSON + b" " * (8 * 1024 * 1024)
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("UPDATE entries SET response=?, digest=?", (too_large, hashlib.sha256(too_large).hexdigest()))
+        reply = self.request()
+        self.assertEqual((200, "MISS", _JSON), (reply[0], reply[1]["X-Hymt-Cache"], reply[2]))
+
+    def test_poisoned_stored_headers_never_start_a_bad_response(self) -> None:
+        payload = {"model": "Hy-MT2-7B", "messages": [{"role": "user", "content": "same text"}]}
+        for headers in ([['Content-Type', 'application/json'], ['X-Note', '\u0100']],
+                        [['Content-Type', 'application/json'], ['Bad(Name', 'value']],
+                        [['Content-Type', 'application/json'], ['X-Note', 'bad\x00value']],
+                        [['Content-Type', 'application/json'], ['X-Note', 'bad\x7fvalue']],
+                        [['Content-Type', 'application/json'], ['Content-Type', 'text/event-stream']],
+                        [['Connection', 'Content-Type'], ['Content-Type', 'application/json']],
+                        [['Content-Type', 'application/json'], ['Content-Encoding', 'gzip']]):
+            with self.subTest(headers=headers):
+                self.request(payload)
+                with sqlite3.connect(self.db) as conn:
+                    conn.execute("UPDATE entries SET headers=?", (json.dumps(headers),))
+                before = self.state["posts"]
+                raw = self.raw_post(payload)
+                self.assertEqual(1, raw.count(b"HTTP/1.1 "))
+                self.assertTrue(raw.startswith(b"HTTP/1.1 200 "), raw[:200])
+                self.assertIn(b"X-Hymt-Cache: MISS\r\n", raw)
+                self.assertEqual(_JSON, raw.split(b"\r\n\r\n", 1)[1])
+                self.assertEqual(before + 1, self.state["posts"])
+
+        streaming = {**payload, "stream": True}
+        self.request(streaming)
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("UPDATE entries SET headers=? WHERE response=?", (json.dumps([["Content-Type", "text/event-stream"], ["X-Note", "bad\x00value"]]), _SSE_FIRST + _SSE_LAST))
+        before = self.state["posts"]
+        raw = self.raw_post(streaming)
+        self.assertEqual(1, raw.count(b"HTTP/1.1 "))
+        self.assertIn(b"X-Hymt-Cache: MISS\r\n", raw)
+        self.assertEqual(_SSE_FIRST + _SSE_LAST, raw.split(b"\r\n\r\n", 1)[1])
+        self.assertEqual(before + 1, self.state["posts"])
+
+    def test_bad_upstream_fields_fail_before_http_delivery(self) -> None:
+        try:
+            for extra in (("X-Note", "bad\x00value"), ("X-Note", "bad\x7fvalue"), ("Bad(Name", "value")):
+                with self.subTest(extra=extra):
+                    self.state["extra_headers"] = [extra]
+                    for payload in ({"model": "Hy-MT2-7B"}, {"model": "Hy-MT2-7B", "stream": True}):
+                        raw = self.raw_post(payload)
+                        self.assertEqual(1, raw.count(b"HTTP/1.1 "))
+                        self.assertTrue(raw.startswith(b"HTTP/1.1 502 "), raw[:200])
+                    self.assertEqual(502, self.request({"content": "."}, path="/tokenize")[0])
+                    conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=4)
+                    try:
+                        conn.request("GET", "/props")
+                        self.assertEqual(502, conn.getresponse().status)
+                    finally:
+                        conn.close()
+        finally:
+            self.state.pop("extra_headers", None)
+
+    def test_valid_wire_fields_and_large_metadata_admission(self) -> None:
+        self.state["extra_headers"] = [("X-Empty", ""), ("X-Note!", "caf\xe9\tok"), ("X-Repeat", "a"), ("X-Repeat", "b"), ("Connection", "X-Hop"), ("X-Hop", "omit")]
+        try:
+            self.assertEqual("MISS", self.request()[1]["X-Hymt-Cache"])
+            raw = self.raw_post({"model": "Hy-MT2-7B", "messages": [{"role": "user", "content": "same text"}]})
+            self.assertIn(b"X-Hymt-Cache: HIT\r\n", raw)
+            self.assertIn(b"X-Empty: \r\n", raw)
+            self.assertIn(b"X-Note!: caf\xe9\tok\r\n", raw)
+            self.assertEqual(2, raw.count(b"X-Repeat:"))
+            self.assertNotIn(b"X-Hop:", raw)
+            self.assertEqual(1, self.state["posts"])
+            self.cache.store.clear()
+            self.state["extra_headers"] = [(f"X-Large-{i}", "x" * 60000) for i in range(18)]
+            for _ in range(2):
+                raw = self.raw_post({"model": "Hy-MT2-7B"})
+                self.assertIn(b"X-Hymt-Cache: MISS\r\n", raw)
+                self.assertEqual(_JSON, raw.split(b"\r\n\r\n", 1)[1])
+            self.assertEqual(3, self.state["posts"])
+        finally:
+            self.state.pop("extra_headers", None)
+
+    def test_slow_optional_read_does_not_block_unrelated_flight(self) -> None:
+        first = {"model": "Hy-MT2-7B", "messages": ["first"]}
+        second = {"model": "Hy-MT2-7B", "messages": ["second"]}
+        entered = threading.Event()
+        release = threading.Event()
+        original = self.cache.store.read
+        def paused_read(*args, **kwargs):
+            if not entered.is_set():
+                entered.set()
+                release.wait(2)
+            return original(*args, **kwargs)
+        try:
+            with patch.object(self.cache.store, "read", paused_read), concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+                blocked = pool.submit(self.request, first)
+                self.assertTrue(entered.wait(1))
+                same_key = pool.submit(self.request, first)
+                unrelated = pool.submit(self.request, second)
+                self.assertTrue(self.state["entered"].wait(1), "unrelated key must reach upstream during optional read")
+                release.set()
+                first_reply = blocked.result(4)
+                shared_reply = same_key.result(4)
+                self.assertEqual(("MISS", _JSON), (first_reply[1]["X-Hymt-Cache"], first_reply[2]))
+                self.assertEqual(("HIT", _JSON), (shared_reply[1]["X-Hymt-Cache"], shared_reply[2]))
+                self.assertEqual(_JSON, unrelated.result(4)[2])
+        finally:
+            release.set()
+        self.assertEqual(2, self.state["posts"])
+
+    def test_disconnected_cache_hit_never_regenerates(self) -> None:
+        self.stop_cache()
+        self.start_cache(timeout=3)
+        self.state["padding"] = 6 * 1024 * 1024
+        self.assertEqual("MISS", self.request()[1]["X-Hymt-Cache"])
+        self.state["padding"] = 0
+        raw = json.dumps({"model": "Hy-MT2-7B", "messages": [{"role": "user", "content": "same text"}]}).encode()
+        conn = socket.create_connection(("127.0.0.1", self.port), timeout=3)
+        try:
+            conn.settimeout(3)
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
+            conn.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: " + str(len(raw)).encode() + b"\r\n\r\n" + raw)
+            headers = b""
+            while b"\r\n\r\n" not in headers and len(headers) < 65536:
+                headers += conn.recv(4096)
+            self.assertIn(b"X-Hymt-Cache: HIT", headers.split(b"\r\n\r\n", 1)[0])
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        finally:
+            conn.close()
+        self.stop_cache()
+        self.assertEqual(1, self.state["posts"], "a broken HIT must not start another upstream request")
 
     @unittest.skipUnless(_MODULE, "shared service not implemented yet")
     def test_recursive_optional_identity_and_stored_headers_preserve_generation(self) -> None:

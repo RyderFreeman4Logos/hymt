@@ -24,6 +24,30 @@ __all__ = ["CacheServer", "main"]
 _SCHEMA = "hymt-inference-cache-v2"
 _PROMPT_SCHEMA = "llama.cpp-chat-template-v1"
 _HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "content-length", "x-hymt-cache"}
+_HEADER_LIMIT = 1024 * 1024
+_TOKEN_CHARS = frozenset("!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
+
+
+def _valid_headers(headers: object) -> bool:
+    if not isinstance(headers, list) or len(headers) > 100:
+        return False
+    for item in headers:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            return False
+        name, value = item
+        if not isinstance(name, str) or not name or any(char not in _TOKEN_CHARS for char in name):
+            return False
+        if not isinstance(value, str) or any(ord(char) > 255 or ord(char) < 32 and char != "\t" or ord(char) == 127 for char in value):
+            return False
+    return True
+
+
+def _cacheable_headers(headers: list[tuple[str, str]] | list[list[str]]) -> bool:
+    if not _valid_headers(headers) or len(json.dumps(headers).encode()) > _HEADER_LIMIT:
+        return False
+    connection_tokens = {token.strip().lower() for name, value in headers if name.lower() == "connection" for token in value.split(",")}
+    effective = [(name.lower(), value) for name, value in headers if name.lower() not in _HOP_HEADERS | connection_tokens]
+    return sum(name == "content-type" for name, _ in effective) == 1 and all(name != "content-encoding" or value.strip().lower() == "identity" for name, value in effective)
 
 
 class _Invalid(ValueError):
@@ -210,21 +234,33 @@ class _Store:
                 raise _Invalid("invalid database epoch")
             return row[0]
 
-    def read(self, key: str, epoch: int, canonical: str, identity: str) -> tuple[list[tuple[str, str]], bytes] | None:
+    def read(self, key: str, epoch: int, canonical: str, identity: str, request_limit: int, response_limit: int) -> tuple[list[tuple[str, str]], bytes] | None:
         with self.connect() as conn:
-            row = conn.execute("SELECT canonical, identity, response, headers, digest, complete FROM entries WHERE key=? AND epoch=?", (key, epoch)).fetchone()
-        if row is None or row[0] != canonical or row[1] != identity or row[5] != 1:
+            row = conn.execute("""SELECT response, headers, digest FROM entries WHERE key=? AND epoch=?
+                AND typeof(epoch)='integer' AND typeof(request)='blob' AND length(request)<=?
+                AND typeof(canonical)='text' AND canonical=? AND length(CAST(canonical AS BLOB))<=?
+                AND typeof(identity)='text' AND identity=? AND length(CAST(identity AS BLOB))<=?
+                AND typeof(response)='blob' AND length(response)<=?
+                AND typeof(headers)='text' AND length(CAST(headers AS BLOB))<=?
+                AND typeof(digest)='text' AND length(CAST(digest AS BLOB))=64
+                AND typeof(complete)='integer' AND complete=1""",
+                (key, epoch, request_limit, canonical, len(canonical.encode()), identity, len(identity.encode()), response_limit, _HEADER_LIMIT)).fetchone()
+        if row is None:
             return None
-        raw = row[2]
-        headers = json.loads(row[3])
-        if not isinstance(raw, bytes) or not isinstance(headers, list) or not all(isinstance(item, list) and len(item) == 2 and all(isinstance(value, str) and "\r" not in value and "\n" not in value for value in item) for item in headers):
+        raw, serialized, digest = row
+        if hashlib.sha256(raw).hexdigest() != digest:
+            return None
+        headers = json.loads(serialized)
+        if not _cacheable_headers(headers):
             return None
         content_type = next((value for name, value in headers if name.lower() == "content-type"), "")
-        if hashlib.sha256(raw).hexdigest() != row[4] or not _complete(raw, content_type):
+        if not _complete(raw, content_type):
             return None
         return headers, raw
 
-    def write(self, key: str, epoch: int, request: bytes, canonical: str, identity: str, headers: list[tuple[str, str]], raw: bytes) -> bool:
+    def write(self, key: str, epoch: int, request: bytes, canonical: str, identity: str, headers: list[tuple[str, str]], raw: bytes, request_limit: int, response_limit: int) -> bool:
+        if len(request) > request_limit or len(raw) > response_limit or not _cacheable_headers(headers):
+            return False
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             if conn.execute("SELECT value FROM epoch WHERE id=1").fetchone()[0] != epoch:
@@ -431,6 +467,8 @@ class _Handler(BaseHTTPRequestHandler):
         pass
 
     def _headers(self, status: int, headers: list[tuple[str, str]], provenance: str, length: int | None) -> None:
+        if not _valid_headers(headers):
+            raise _Invalid("invalid upstream response headers")
         self.close_connection = True
         self.started = True
         self.send_response_only(status)
@@ -472,6 +510,7 @@ class _Handler(BaseHTTPRequestHandler):
         flight = None
         leader = False
         key = ""
+        hit = None
         provenance = "UNKNOWN"
         try:
             lengths = self.headers.get_all("Content-Length", [])
@@ -508,21 +547,23 @@ class _Handler(BaseHTTPRequestHandler):
                     epoch = self.server.store.epoch()
                     key = hashlib.sha256((identity + "\n" + str(epoch) + "\n" + canonical).encode()).hexdigest()
                     with self.server.flight_lock:
-                        hit = self.server.store.read(key, epoch, canonical, identity)
-                        if hit is None:
-                            flight = self.server.flights.get(key)
-                            if flight is None:
-                                flight = _Flight()
-                                self.server.flights[key] = flight
-                                leader = True
+                        flight = self.server.flights.get(key)
+                        if flight is None:
+                            flight = _Flight()
+                            self.server.flights[key] = flight
+                            leader = True
+                    hit = self.server.store.read(key, epoch, canonical, identity, self.server.request_limit, self.server.response_limit) if leader else None
                     if hit is not None:
-                        self._headers(200, hit[0], "HIT", len(hit[1]))
-                        self.wfile.write(hit[1])
-                        return
+                        flight.reply = (200, hit[0], hit[1])
+                        flight.admitted = True
                     provenance = "MISS" if leader else "HIT"
                 except (OSError, sqlite3.Error, ValueError, http.client.HTTPException, TypeError, RecursionError):
                     identity = None
                     provenance = "UNKNOWN"
+            if hit is not None:
+                self._headers(200, hit[0], "HIT", len(hit[1]))
+                self.wfile.write(hit[1])
+                return
             if flight is not None and not leader:
                 if not flight.done.wait(self.budget.remaining()) or flight.reply is None:
                     self._reply(502, "UNKNOWN")
@@ -566,7 +607,7 @@ class _Handler(BaseHTTPRequestHandler):
             if identity is not None and epoch is not None and status == 200 and _complete(response_body, content_type):
                 try:
                     if self.server.observe(payload.get("model"), authorization, self.budget) == identity:
-                        admitted = self.server.store.write(key, epoch, raw, canonical, identity, headers, response_body)
+                        admitted = self.server.store.write(key, epoch, raw, canonical, identity, headers, response_body, self.server.request_limit, self.server.response_limit)
                         if flight is not None:
                             flight.admitted = admitted
                 except (OSError, sqlite3.Error, ValueError, http.client.HTTPException, TypeError, RecursionError):
