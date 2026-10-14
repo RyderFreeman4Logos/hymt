@@ -325,9 +325,8 @@ Useful commands:
 
 ```bash
 hymt history
-hymt history --stats
+hymt history stats
 hymt recall
-hymt recall --list
 hymt estimate 10000 -l zh
 ```
 
