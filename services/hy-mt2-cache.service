@@ -1,0 +1,13 @@
+[Unit]
+Description=Hy-MT2 shared plaintext inference cache
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/obj/.local/share/hymt/inference-cache.py serve --database /home/obj/.local/state/hymt/inference-cache.sqlite3 --upstream http://100.78.159.38:8401 --host 100.78.159.38 --port 8402
+UMask=0077
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

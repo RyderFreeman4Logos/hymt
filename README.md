@@ -184,9 +184,9 @@ Secrets (`bot_token`, `claim_password`) are not re-printed on every run.
 ### Translate text, stdin, or a file
 
 ```bash
-hymt "Hello world" -t zh
-printf 'Release notes go here.\n' | hymt -t ja
-hymt -f CHANGELOG.md -t fr -o CHANGELOG.fr.md
+hymt "Hello world" -l zh
+printf 'Release notes go here.\n' | hymt -l ja
+hymt CHANGELOG.md -l fr -o CHANGELOG.fr.md
 ```
 
 ### Target language codes
@@ -202,9 +202,9 @@ Codes are case-insensitive and normalize `_` to `-`: `zh-CN`/`zh_CN` resolve to 
 Streaming is enabled by default. That means you can keep normal shell pipes:
 
 ```bash
-hymt -f article.md -t zh | less
-hymt -f notes.txt -t ja | bat -l markdown
-hymt -f report.md -t zh | tee report.zh.preview.md
+hymt article.md -l zh | less
+hymt notes.txt -l ja | bat -l markdown
+hymt report.md -l zh | tee report.zh.preview.md
 ```
 
 Use `--no-stream` if you need a fully buffered response.
@@ -221,7 +221,7 @@ Use either a one-run override or configuration to translate every non-code parag
 
 ```bash
 hymt --force-translate-all -l zh "English text\n\n已有中文段落"
-hymt --no-language-detection -l zh -f article.md
+hymt --no-language-detection -l zh article.md
 ```
 
 ```toml
@@ -241,8 +241,9 @@ force_translate_all = false    # default: false; set true to translate all non-c
 - template type
 - template options
 - `profile_id` (canonical profile ID)
+- verified inference fingerprint
 
-Profile isolation is therefore provided. The segment-cache key does **not** yet include endpoint/model identity, tokenizer revision, quantization or backend build, or inference sampling settings (see #115). Changes to those settings can therefore reuse entries from an older inference profile; `config_version` is recorded in task history, not the segment-cache key. Inference fingerprinting is required before those settings are isolated automatically.
+The fingerprint includes the configured endpoint, backend and model, profile model/tokenizer sources, explicit sampling settings, and observed runtime metadata when available. Segment-cache reuse requires caching to be enabled and the inference identity to be verified; translation can continue without segment caching when identity is unverified. The fingerprint cannot attest to model bytes or quantization absent from observed metadata. After an invisible in-place model replacement, run `hymt history --clear` to remove segment entries and task history before reuse. `config_version` is recorded in task history, not the segment-cache key.
 
 That enables:
 
@@ -262,8 +263,8 @@ Progress is always reported on `stderr` in the same format:
 
 ```bash
 hymt translate-doc README.md
-hymt translate-doc README.md -t ja
-hymt translate-doc README.md -t zh -o README.zh-cn.md
+hymt translate-doc README.md -l ja
+hymt translate-doc README.md -l zh --output README.zh-cn.md
 hymt translate-doc docs/ --recursive
 ```
 
@@ -279,12 +280,12 @@ Behavior:
 
 ## Batch translate directory trees
 
-Use `batch` when you want a preview-first workflow across `.md` and `.txt` files:
+Use `batch` for `.md` and `.txt` files. Add `--dry-run` to preview without writing; otherwise it previews and writes the selected outputs:
 
 ```bash
-hymt batch docs -t zh
-hymt batch docs -t zh --write --yes
-hymt batch docs -t zh --write --output-dir translated-docs
+hymt batch docs -l zh --dry-run
+hymt batch docs -l zh --yes
+hymt batch docs -l zh --output-dir translated-docs
 ```
 
 Batch preview reports:
@@ -302,7 +303,7 @@ Batch preview reports:
 ```bash
 hymt exec -- cargo test
 hymt exec -- git status
-hymt exec precache --recursive
+hymt exec precache
 ```
 
 `hymt exec` preserves the original command output while adding translated output afterward. It is useful for unfamiliar CLIs, build failures, and long help text.
@@ -313,7 +314,7 @@ hymt exec precache --recursive
 hymt man git-rebase
 hymt man --original git-rebase
 hymt info coreutils
-hymt info --refresh bash
+hymt info bash
 ```
 
 ## Recall, history, and ETA estimation
@@ -324,9 +325,8 @@ Useful commands:
 
 ```bash
 hymt history
-hymt history --stats
+hymt history stats
 hymt recall
-hymt recall --list
 hymt estimate 10000 -l zh
 ```
 
@@ -370,7 +370,17 @@ This repo includes two mutually exclusive sample systemd user services under [`s
 
 Both bind only to `100.78.159.38:8401` on Tailscale, not `0.0.0.0`. They use CUDA `llama-server`; both units use the persistent local build at `/home/obj/.local/share/llama-cpp-cuda/llama-server` and its matching library directory. Those absolute executable and model paths are host-specific, but a replacement backend must support the shown `llama-server` context, parallel-slot, and KV-cache flags.
 
-Both service profiles explicitly set `--temp 0.7`, `--top-k 20`, `--top-p 0.6`, and `--repeat-penalty 1.05`, the Hy-MT2 deployment recommendation. They also explicitly set `--min-p 0` (disable this llama.cpp-only extension) and `--repeat-last-n 64` (a deliberate llama.cpp compatibility choice for the 1.05 repeat penalty, not an upstream Hy-MT2 recommendation). The units therefore do not inherit an accidental sampler profile from the installed llama.cpp version. hymt omits sampling fields unless `[inference.override]` explicitly replaces a value, so changing a service default changes default translations. At startup, a llama.cpp client requests `GET /props` and prints the literal `default_generation_settings` it reports; an unavailable or older `/props` fails open with a warning and requests remain omission-only.
+Both service profiles explicitly set `--temp 0.7`, `--top-k 20`, `--top-p 0.6`, and `--repeat-penalty 1.05`, the Hy-MT2 deployment recommendation. They also explicitly set `--min-p 0` (disable this llama.cpp-only extension) and `--repeat-last-n 64` (a deliberate llama.cpp compatibility choice for the 1.05 repeat penalty, not an upstream Hy-MT2 recommendation). The units therefore do not inherit an accidental sampler profile from the installed llama.cpp version. hymt omits sampling fields unless `[inference.override]` explicitly replaces a value, so changing a service default changes default translations. Ordinary translation preflights llama.cpp with `GET /props` and prints relevant warnings; `hymt backend inspect` shows normalized configured and resolved sampler fields. An unavailable or older `/props` leaves identity unverified and conservative planning continues unless strict backend preflight is enabled.
+
+### Optional shared inference cache
+
+The separate plaintext cache stores complete raw inference responses, including usage, across clients and API/VK credentials. Its identity uses observed upstream model, build, defaults, template, and context metadata; it requires the upstream for identity checks. It does not replace hymt's translation validation or segment cache.
+
+Restrict direct cache access to trusted Tailnet callers, or place it behind the existing authenticating gateway. API/VK credentials do not partition cache hits.
+
+`just install-inference-cache` copies the script and user unit to stable paths, reloads systemd, and restarts the cache if it is active. To start it for the first time, run `systemctl --user enable --now hy-mt2-cache.service`. The supplied unit is host-specific: it listens on Tailscale `100.78.159.38:8402` and forwards to the model at `100.78.159.38:8401`. To opt a client into this service, set `[endpoint].url = "http://100.78.159.38:8402/v1"`, keep `backend = "llama_cpp"`, and set `[endpoint].model` to an actual ID or alias advertised by the upstream `/v1/models`. The example config's empty `model` omits that request field and cannot produce cache hits.
+
+Run `python3 "$HOME/.local/share/hymt/inference-cache.py" clear --database "$HOME/.local/state/hymt/inference-cache.sqlite3"` after replacing model bytes without changing the observed metadata; clear invalidates persisted entries and in-flight admission. The cache is independent of hymt's translation history and does not provide offline replay.
 
 ## Architecture
 
@@ -396,7 +406,7 @@ After committing, run the complete local acceptance gate once on the clean HEAD:
 just pre-push-gate head
 ```
 
-The fast commit hook checks formatting and locked workspace Clippy. The full gate adds locked workspace tests/checks, the CLI check and tests without Telegram, every tracked shell script's syntax and ShellCheck checks, both systemd units' static validation, and every tracked TOML file's parsing. All diagnostics remain visible; only a missing canonical persistent executable for either known service unit is allowed on unprovisioned hosts.
+The fast commit hook checks formatting and locked workspace Clippy. The full gate adds locked workspace tests/checks, the inference cache's Python contract tests, the CLI check and tests without Telegram, every tracked shell script's syntax and ShellCheck checks, all three systemd units' static validation, and every tracked TOML file's parsing. All diagnostics remain visible; only a missing canonical persistent executable for either known model service unit is allowed on unprovisioned hosts.
 
 Then obtain an independent whole `main...HEAD` native review with PASS and zero actionable findings. Set `HYMT_LOCAL_GATE_RECEIPT` to the gate's printed private receipt path and `HYMT_NATIVE_REVIEW_RECEIPT` to the independent review receipt described in [native review receipt format](#native-review-receipt-format). Lefthook validates their exact HEAD/tree, range, and log/report contents against the actual outgoing feature-branch update; pushing does not rerun unchanged checks. Source changes require fresh receipts. Artifacts use the private SSD task root `/mnt/ssd/mirror-rootfs/home/obj/tmp/hymt-stop-ai-20261012`; there is no hosted GitHub Actions workflow.
 

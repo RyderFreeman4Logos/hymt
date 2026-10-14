@@ -564,6 +564,7 @@ def _service_verify() -> None:
             "verify",
             "services/hy-mt2-quality.service",
             "services/hy-mt2-throughput.service",
+            "services/hy-mt2-cache.service",
         ],
         check=False,
         stdout=subprocess.PIPE,
@@ -600,6 +601,15 @@ def main() -> None:
         )
     elif action == ["service-verify"]:
         _service_verify()
+    elif action == ["test-inference-cache"]:
+        parent = _private_path(ARTIFACT_ROOT, directory=True)
+        env = os.environ.copy()
+        env.update(TMPDIR=str(parent), TMP=str(parent), TEMP=str(parent))
+        subprocess.run(
+            ["python3", "-B", "-m", "unittest", "discover", "-s", "scripts/tests", "-p", "test_inference_cache.py"],
+            check=True,
+            env=env,
+        )
     elif action == ["toml-parse"]:
         for path in _tracked(b".toml"):
             with open(path, "rb") as source:
@@ -607,7 +617,7 @@ def main() -> None:
             print(f"Parsed {path}")
     else:
         raise _GateError(
-            "usage: local-gates.py run head|verify|shell-syntax|shellcheck|service-verify|toml-parse"
+            "usage: local-gates.py run head|verify|shell-syntax|shellcheck|service-verify|test-inference-cache|toml-parse"
         )
 
 

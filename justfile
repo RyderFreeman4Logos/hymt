@@ -57,6 +57,10 @@ check:
 
 test:
     {{_io_prefix}} cargo test --workspace --locked
+    just test-inference-cache
+
+test-inference-cache:
+    python3 scripts/hooks/local-gates.py test-inference-cache
 
 # One focused test. Usage: just test-one hymt-translate omitted_link
 test-one package test:
@@ -104,6 +108,21 @@ install:
     fi
     {{_io_prefix}} cargo "${toolchain[@]}" install --path "{{_repo_root}}/crates/hymt-cli" --locked --force
     echo "hymt (Rust) installed from {{_repo_root}}"
+
+# Install the shared inference cache independently of the Rust CLI.
+install-inference-cache:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p "$HOME/.local/share/hymt" "$HOME/.config/systemd/user"
+    script_tmp="$(mktemp "$HOME/.local/share/hymt/.inference-cache.XXXXXXXX")"
+    trap '[[ ! -e "$script_tmp" ]] || unlink "$script_tmp"; [[ ! -e "${unit_tmp:-}" ]] || unlink "$unit_tmp"' EXIT
+    unit_tmp="$(mktemp "$HOME/.config/systemd/user/.hy-mt2-cache.XXXXXXXX")"
+    install -m 600 "{{_repo_root}}/scripts/hymt-inference-cache.py" "$script_tmp"
+    install -m 600 "{{_repo_root}}/services/hy-mt2-cache.service" "$unit_tmp"
+    mv -f -- "$script_tmp" "$HOME/.local/share/hymt/inference-cache.py"
+    mv -f -- "$unit_tmp" "$HOME/.config/systemd/user/hy-mt2-cache.service"
+    systemctl --user daemon-reload
+    systemctl --user try-restart hy-mt2-cache.service
 
 # Install without the default `telegram` feature (drops Bot API deps).
 install-no-telegram:
