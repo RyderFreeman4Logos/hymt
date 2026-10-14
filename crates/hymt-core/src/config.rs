@@ -86,6 +86,11 @@ max_retries = 2
 # written, even with warn_only = true.
 warn_only = false
 
+[cache]
+# Application segment and whole-output caches are opt-in.
+# This does not disable task history/timing or the service inference cache.
+enabled = false
+
 [exec]
 shared_cache_path = "/usr/local/share/hymt/cache.db"
 translate_stderr = true
@@ -1324,6 +1329,12 @@ impl HotConfig {
         self.get_bool("completeness", "warn_only", false)
     }
 
+    /// Whether ordinary callers may reuse/store application translation outputs.
+    /// Missing settings default to false; service HTTP caching is independent.
+    pub fn application_cache_enabled(&self) -> bool {
+        self.get_bool("cache", "enabled", false)
+    }
+
     // ── exec ────────────────────────────────────────────────────────────────
 
     pub fn exec_shared_cache_path(&self) -> PathBuf {
@@ -1795,6 +1806,21 @@ mod tests {
         assert_eq!(cfg.completeness_max_retries(), 2);
         assert!(!cfg.completeness_warn_only());
         assert!(!cfg.strict_token_budget());
+        assert!(!cfg.application_cache_enabled());
+    }
+
+    #[test]
+    fn application_cache_is_opt_in_for_existing_and_explicit_configs() {
+        for (tag, contents, expected) in [
+            ("cache_missing", "[translation]\nconcurrency = 1\n", false),
+            ("cache_disabled", "[cache]\nenabled = false\n", false),
+            ("cache_enabled", "[cache]\nenabled = true\n", true),
+        ] {
+            let path = temp_config_path(tag);
+            fs::write(&path, contents).unwrap();
+            let config = HotConfig::from_path(&path).unwrap();
+            assert_eq!(config.application_cache_enabled(), expected, "{tag}");
+        }
     }
 
     #[test]

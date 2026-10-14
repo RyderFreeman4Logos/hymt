@@ -149,7 +149,7 @@ struct Cli {
     #[arg(long = "context", global = true)]
     ctx: Option<String>,
 
-    /// Bypass segment-cache reads and writes for this run
+    /// Bypass application segment and whole-output cache reads and writes
     #[arg(long = "no-cache", alias = "disable-cache", global = true)]
     no_cache: bool,
 
@@ -512,6 +512,18 @@ async fn run() -> Result<()> {
         Cli::parse_from(reordered)
     };
 
+    if cli.no_cache
+        && matches!(
+            cli.cmd.as_ref(),
+            Some(Cmd::Exec(ExecArgs {
+                action: Some(ExecAction::Precache),
+                ..
+            }))
+        )
+    {
+        anyhow::bail!("--no-cache conflicts with exec precache");
+    }
+
     let config = HotConfig::new()?;
     eprintln!("{}", profile_startup_diagnostic(config.model_profile()?));
     if config.uses_legacy_generation_scalars() {
@@ -619,6 +631,7 @@ async fn run() -> Result<()> {
                 &config,
                 &prompt_opts,
                 concurrency_override,
+                cli.no_cache,
             )
             .await
         }
@@ -630,6 +643,7 @@ async fn run() -> Result<()> {
                 &config,
                 &prompt_opts,
                 concurrency_override,
+                cli.no_cache,
             )
             .await
         }
@@ -641,6 +655,7 @@ async fn run() -> Result<()> {
                 &config,
                 &prompt_opts,
                 concurrency_override,
+                cli.no_cache,
             )
             .await
         }
@@ -666,6 +681,7 @@ async fn run() -> Result<()> {
                 cli.plan,
                 &config,
                 concurrency_override,
+                cli.no_cache,
             )
             .await
         }
@@ -690,7 +706,7 @@ async fn run() -> Result<()> {
             )
             .await
         }
-        Some(Cmd::Telegram(args)) => run_telegram(args, &config).await,
+        Some(Cmd::Telegram(args)) => run_telegram(args, &config, cli.no_cache).await,
     }
 }
 
@@ -1047,7 +1063,7 @@ async fn run_translate_text(
         client: &client,
         segmenter: &segmenter,
         history: &history,
-        cache_enabled: !flags.no_cache,
+        cache_enabled: config.application_cache_enabled() && !flags.no_cache,
     };
     let warn_only = completeness_warn_only(config, flags.warn_only_completeness);
     if flags.stream_output {
@@ -1119,7 +1135,7 @@ async fn run_translate_stdin(
         client: &client,
         segmenter: &segmenter,
         history: &history,
-        cache_enabled: !flags.no_cache,
+        cache_enabled: config.application_cache_enabled() && !flags.no_cache,
     };
     let warn_only = completeness_warn_only(config, flags.warn_only_completeness);
     if flags.stream_output {
@@ -1182,7 +1198,7 @@ async fn run_translate_path(
         client: &client,
         segmenter: &segmenter,
         history: &history,
-        cache_enabled: !flags.no_cache,
+        cache_enabled: config.application_cache_enabled() && !flags.no_cache,
     };
     let warn_only = completeness_warn_only(config, flags.warn_only_completeness);
     if flags.stream_output {
@@ -1313,7 +1329,7 @@ fn run_config(args: ConfigArgs, config: &HotConfig) -> Result<()> {
 
 // ── telegram ──────────────────────────────────────────────────────────────────
 
-async fn run_telegram(args: TelegramArgs, config: &HotConfig) -> Result<()> {
+async fn run_telegram(args: TelegramArgs, config: &HotConfig, no_cache: bool) -> Result<()> {
     if args.regenerate_claim_password {
         let password = config.regenerate_telegram_claim_password()?;
         // Print once to stdout so the user can store it; not re-printed later.
@@ -1327,11 +1343,11 @@ async fn run_telegram(args: TelegramArgs, config: &HotConfig) -> Result<()> {
 
     #[cfg(feature = "telegram")]
     {
-        telegram::run_telegram_bot(config).await
+        telegram::run_telegram_bot(config, no_cache).await
     }
     #[cfg(not(feature = "telegram"))]
     {
-        let _ = config;
+        let _ = (config, no_cache);
         anyhow::bail!(
             "hymt was built without the `telegram` cargo feature. \
              Rebuild with default features, or `cargo install --path crates/hymt-cli --features telegram`."
@@ -1348,6 +1364,7 @@ async fn run_man(
     config: &HotConfig,
     opts: &PromptOpts,
     concurrency_override: Option<u32>,
+    no_cache: bool,
 ) -> Result<()> {
     if args.args.is_empty() {
         anyhow::bail!("man page name is required");
@@ -1365,6 +1382,7 @@ async fn run_man(
         prompt_opts: opts,
         original: args.original,
         explicit_target,
+        no_cache,
     };
     let code = run_man_command(&str_args, &opts).await?;
     std::process::exit(code);
@@ -1379,6 +1397,7 @@ async fn run_info(
     config: &HotConfig,
     opts: &PromptOpts,
     concurrency_override: Option<u32>,
+    no_cache: bool,
 ) -> Result<()> {
     if args.args.is_empty() {
         anyhow::bail!("info topic is required");
@@ -1396,6 +1415,7 @@ async fn run_info(
         prompt_opts: opts,
         original: args.original,
         explicit_target,
+        no_cache,
     };
     let code = run_info_command(&str_args, &opts).await?;
     std::process::exit(code);
@@ -1410,6 +1430,7 @@ async fn run_exec(
     config: &HotConfig,
     opts: &PromptOpts,
     concurrency_override: Option<u32>,
+    no_cache: bool,
 ) -> Result<()> {
     match args.action {
         Some(ExecAction::Install(install_args)) => {
@@ -1468,6 +1489,7 @@ async fn run_exec(
                 history: &history,
                 explicit_target,
                 prompt_opts: opts,
+                no_cache,
             };
             let code = run_exec_command(&command, &exec_opts).await?;
             std::process::exit(code);
@@ -1621,6 +1643,7 @@ async fn run_batch(
     show_plan: bool,
     config: &HotConfig,
     concurrency_override: Option<u32>,
+    no_cache: bool,
 ) -> Result<()> {
     let segmenter = make_segmenter(config)?;
     let history = HistoryDB::default();
@@ -1631,6 +1654,7 @@ async fn run_batch(
         prompt_opts: opts,
         recursive: args.recursive,
         explicit_target,
+        no_cache,
     };
     let plan = build_batch_plan(&args.directory, config, &segmenter, &history, &plan_opts)?;
     show_batch_preview(&plan);
@@ -1737,7 +1761,7 @@ async fn run_translate_doc(
         template,
         prompt_opts: opts,
         explicit_target,
-        cache_enabled: !flags.no_cache,
+        cache_enabled: config.application_cache_enabled() && !flags.no_cache,
     };
     run_doc_translation(&args.source, &doc_opts).await
 }

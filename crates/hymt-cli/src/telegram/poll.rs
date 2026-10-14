@@ -336,7 +336,7 @@ async fn deliver_stream_events<A: TelegramMessageApi>(
 }
 
 /// Run the Telegram long-poll loop until SIGINT / process exit.
-pub async fn run_telegram_bot(config: &HotConfig) -> Result<()> {
+pub async fn run_telegram_bot(config: &HotConfig, no_cache: bool) -> Result<()> {
     config.maybe_reload()?;
     if !config.telegram_enabled() {
         bail!(
@@ -397,10 +397,13 @@ pub async fn run_telegram_bot(config: &HotConfig) -> Result<()> {
             }
         };
 
+        let api = TelegramHttpApi::new(&http, &token);
         for update in updates {
             offset = update.update_id + 1;
-            if let Err(e) =
-                handle_update(config, &http, &token, &client, &segmenter, &history, update).await
+            if let Err(e) = handle_update(
+                config, &api, &client, &segmenter, &history, no_cache, update,
+            )
+            .await
             {
                 eprintln!("hymt telegram: update error: {e:#}");
             }
@@ -409,15 +412,21 @@ pub async fn run_telegram_bot(config: &HotConfig) -> Result<()> {
     Ok(())
 }
 
+fn telegram_cache_enabled(config: &HotConfig, no_cache: bool) -> bool {
+    config.application_cache_enabled() && !no_cache
+}
+
 async fn handle_update(
     config: &HotConfig,
-    http: &Client,
-    token: &str,
+    api: &TelegramHttpApi,
     client: &TranslationClient,
     segmenter: &Segmenter,
     history: &HistoryDB,
+    no_cache: bool,
     update: Update,
 ) -> Result<()> {
+    let http = &api.http;
+    let token = api.token.as_str();
     let Some(message) = update.message else {
         return Ok(());
     };
@@ -468,13 +477,12 @@ async fn handle_update(
                     client,
                     segmenter,
                     history,
-                    cache_enabled: true,
+                    cache_enabled: telegram_cache_enabled(config, no_cache),
                 };
-                let api = TelegramHttpApi::new(http, token);
                 let chat_action_repeater =
                     spawn_chat_action_repeater(api.clone(), incoming.chat_id, CHAT_ACTION_TYPING);
                 let translation = translate_after_chat_action(
-                    &api,
+                    api,
                     incoming.chat_id,
                     CHAT_ACTION_TYPING,
                     || async {
@@ -502,7 +510,7 @@ async fn handle_update(
                                 event_tx,
                             );
                             let deliver = deliver_stream_events(
-                                &api,
+                                api,
                                 incoming.chat_id,
                                 event_rx,
                                 TELEGRAM_EDIT_INTERVAL,
@@ -539,7 +547,7 @@ async fn handle_update(
         return Ok(());
     };
     handle_document_update(
-        config, http, token, client, segmenter, history, chat_id, chat_kind, document,
+        config, http, token, client, segmenter, history, no_cache, chat_id, chat_kind, document,
     )
     .await
 }
@@ -552,6 +560,7 @@ async fn handle_document_update(
     client: &TranslationClient,
     segmenter: &Segmenter,
     history: &HistoryDB,
+    no_cache: bool,
     chat_id: i64,
     chat_kind: ChatKind,
     document: Document,
@@ -607,7 +616,7 @@ async fn handle_document_update(
                         client,
                         segmenter,
                         history,
-                        cache_enabled: true,
+                        cache_enabled: telegram_cache_enabled(config, no_cache),
                     };
                     let outcome =
                         translate_text(&source, &target_lang, &TemplateType::Default, &opts, &ctx)
@@ -1107,6 +1116,25 @@ fn redact_token_in_text(token: &str, text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn telegram_cache_policy_is_opt_in_and_global_no_cache_overrides_it() {
+        for (tag, config_body, expected) in [
+            ("missing", "", false),
+            ("disabled", "[cache]\nenabled = false\n", false),
+            ("enabled", "[cache]\nenabled = true\n", true),
+        ] {
+            let path = std::env::temp_dir().join(format!(
+                "hymt-telegram-cache-policy-{}-{tag}.toml",
+                std::process::id()
+            ));
+            std::fs::write(&path, config_body).unwrap();
+            let config = HotConfig::from_path(&path).unwrap();
+            assert_eq!(telegram_cache_enabled(&config, false), expected);
+            assert!(!telegram_cache_enabled(&config, true));
+            std::fs::remove_file(path).unwrap();
+        }
+    }
 
     #[test]
     fn redact_token_in_text_strips_secret() {

@@ -2634,6 +2634,7 @@ pub async fn translate_file(
 
 #[cfg(test)]
 mod tests {
+    mod app_cache_policy_tests;
     mod cache_admission_tests;
     pub(super) mod ownership_interval_tests;
     mod table_shape_tests;

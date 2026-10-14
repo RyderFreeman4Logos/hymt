@@ -310,7 +310,8 @@ fn capture_help(cmd: &str) -> Option<String> {
 // ── run_precache ──────────────────────────────────────────────────────────────
 
 /// Discover recently-used commands from shell history and pre-translate their
-/// man pages and `--help` output into `target_lang`.
+/// man pages and `--help` output into `target_lang`. This explicit cache
+/// population request opts in even when ordinary application caching is disabled.
 pub async fn run_precache(
     target_lang: &str,
     config: &HotConfig,
@@ -330,6 +331,7 @@ pub async fn run_precache(
         client,
         segmenter,
         history,
+        // The user explicitly requested cache population.
         cache_enabled: true,
     };
 

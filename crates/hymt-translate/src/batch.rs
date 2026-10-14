@@ -69,6 +69,8 @@ pub struct BatchPlan {
     pub root: PathBuf,
     pub files: Vec<BatchFilePlan>,
     pub skipped: Vec<BatchSkippedFile>,
+    /// Invocation cache policy, shared by preview and execution.
+    pub cache_enabled: bool,
 }
 
 impl BatchPlan {
@@ -106,6 +108,8 @@ pub struct BatchPlanOpts<'a> {
     pub prompt_opts: &'a PromptOpts,
     pub recursive: bool,
     pub explicit_target: bool,
+    /// Bypass application cache reads and writes even when config enables them.
+    pub no_cache: bool,
 }
 
 // ── build_batch_plan ──────────────────────────────────────────────────────────
@@ -144,7 +148,8 @@ pub fn build_batch_plan(
     let inference_fingerprint = config.inference_fingerprint(template_name, &options_hash)?;
     // Incomplete Generic/server-default identities can change across a server
     // restart, so they are never eligible for segment-cache reuse.
-    let cache_enabled = inference_fingerprint.is_cache_verified();
+    let application_cache_enabled = config.application_cache_enabled() && !opts.no_cache;
+    let cache_enabled = application_cache_enabled && inference_fingerprint.is_cache_verified();
     let mut files = Vec::new();
     let mut skipped = Vec::new();
 
@@ -285,6 +290,7 @@ pub fn build_batch_plan(
         root,
         files,
         skipped,
+        cache_enabled: application_cache_enabled,
     })
 }
 
@@ -364,7 +370,7 @@ pub async fn run_batch_translation(
             client,
             segmenter,
             history,
-            cache_enabled: true,
+            cache_enabled: plan.cache_enabled,
         };
         let outcome = translate_text(&file.text, &file.target_lang, template, opts, &tctx)
             .await
@@ -392,8 +398,20 @@ mod tests {
         format!(
             r#"[endpoint]
 url = "http://127.0.0.1:8401/v1"
+backend = "llama_cpp"
 profile = "hy_mt2_7b"
 model = "{model}"
+
+[inference.override]
+temperature = 0.7
+top_p = 0.6
+top_k = 20
+repetition_penalty = 1.05
+min_p = 0.0
+repeat_last_n = 64
+
+[cache]
+enabled = true
 
 [translation]
 context_window = 512
@@ -408,6 +426,84 @@ min_paragraph_ratio = 0.5
 max_retries = 1
 "#,
         )
+    }
+
+    #[test]
+    fn batch_preview_ignores_warm_cache_by_default_and_honors_opt_in_and_no_cache() {
+        for (setting, no_cache, expected_cached) in [
+            (None, false, 0),
+            (Some(true), false, 1),
+            (Some(true), true, 0),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let source_dir = tmp.path().join("source");
+            std::fs::create_dir(&source_dir).unwrap();
+            let source =
+                "A source paragraph long enough to produce one cached translation segment.";
+            std::fs::write(source_dir.join("input.md"), source).unwrap();
+            let contents = cache_config("same-model");
+            let contents = if setting.is_none() {
+                contents.replace("[cache]\nenabled = true\n", "")
+            } else {
+                contents
+            };
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(&config_path, contents).unwrap();
+            let config = HotConfig::from_path(&config_path).unwrap();
+            let segmenter = Segmenter::fallback();
+            let template = TemplateType::Default;
+            let prompt_opts = PromptOpts::default();
+            let plan = plan_translation(source, "zh", &config, &segmenter, &template, &prompt_opts)
+                .unwrap();
+            assert_eq!(plan.segment_count(), 1);
+            let options_hash = template_options_hash(
+                &prompt_opts,
+                effective_document_translation_policy(&prompt_opts, &config),
+            );
+            let fingerprint = config
+                .inference_fingerprint(template.as_str(), &options_hash)
+                .unwrap();
+            assert!(
+                fingerprint.is_cache_verified(),
+                "fixture must exercise the cache gate, not an unverified-identity miss"
+            );
+            let scope = SegmentCacheScope {
+                target_lang: "zh",
+                template_type: template.as_str(),
+                options_hash: &options_hash,
+                profile_id: config.model_profile().unwrap().id(),
+                inference_fingerprint: fingerprint.hash(),
+            };
+            let history = HistoryDB::new(tmp.path().join("history.db"));
+            history
+                .store_segment_cache(
+                    &segment_cache_hash(&plan.segments[0]),
+                    scope,
+                    "existing translation",
+                    "2024-01-01T00:00:00Z",
+                )
+                .unwrap();
+            let opts = BatchPlanOpts {
+                output_dir: None,
+                target_lang: "zh",
+                template: &template,
+                prompt_opts: &prompt_opts,
+                recursive: false,
+                explicit_target: true,
+                no_cache,
+            };
+            let batch =
+                build_batch_plan(&source_dir, &config, &segmenter, &history, &opts).unwrap();
+            assert_eq!(batch.total_cached_segments(), expected_cached);
+            assert_eq!(batch.cache_enabled, expected_cached == 1);
+            assert!(
+                history
+                    .find_segment_cached(&segment_cache_hash(&plan.segments[0]), scope)
+                    .unwrap()
+                    .is_some(),
+                "disabled use must not delete old cache entries"
+            );
+        }
     }
 
     #[test]
@@ -459,6 +555,7 @@ max_retries = 1
             prompt_opts: &prompt_opts,
             recursive: false,
             explicit_target: true,
+            no_cache: false,
         };
         let batch = build_batch_plan(&source_dir, &config, &segmenter, &history, &opts).unwrap();
 
