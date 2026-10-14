@@ -98,7 +98,11 @@ install:
     if command -v uv >/dev/null 2>&1; then
         uv tool uninstall hymt 2>/dev/null || true
     fi
-    {{_io_prefix}} cargo install --path "{{_repo_root}}/crates/hymt-cli" --force
+    toolchain=()
+    if [[ -n "${RUSTUP_TOOLCHAIN:-}" ]]; then
+        toolchain=("+${RUSTUP_TOOLCHAIN}")
+    fi
+    {{_io_prefix}} cargo "${toolchain[@]}" install --path "{{_repo_root}}/crates/hymt-cli" --locked --force
     echo "hymt (Rust) installed from {{_repo_root}}"
 
 # Install without the default `telegram` feature (drops Bot API deps).
@@ -109,7 +113,11 @@ install-no-telegram:
     if command -v uv >/dev/null 2>&1; then
         uv tool uninstall hymt 2>/dev/null || true
     fi
-    {{_io_prefix}} cargo install --path "{{_repo_root}}/crates/hymt-cli" --no-default-features --force
+    toolchain=()
+    if [[ -n "${RUSTUP_TOOLCHAIN:-}" ]]; then
+        toolchain=("+${RUSTUP_TOOLCHAIN}")
+    fi
+    {{_io_prefix}} cargo "${toolchain[@]}" install --path "{{_repo_root}}/crates/hymt-cli" --locked --no-default-features --force
     echo "hymt (Rust, no telegram) installed from {{_repo_root}}"
 
 # Compile-check CLI with telegram feature disabled.

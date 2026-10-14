@@ -539,6 +539,83 @@ fn source_root() -> PathBuf {
 }
 
 #[tokio::test]
+async fn install_recipes_pin_lockfile_and_inherited_toolchain() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new().await;
+    std::fs::copy(
+        source_root().join("justfile"),
+        fixture.repo.join("justfile"),
+    )
+    .unwrap();
+    let bin = fixture.root.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    for (name, script) in [
+        (
+            "cargo",
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > \"$CAPTURE\"\nexit \"${CARGO_EXIT:-0}\"\n",
+        ),
+        ("uv", "#!/usr/bin/env bash\nexit 0\n"),
+    ] {
+        let path = bin.join(name);
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let capture = fixture.root.join("cargo-args");
+    for (recipe, features) in [
+        ("install", ""),
+        ("install-no-telegram", "--no-default-features\n"),
+    ] {
+        for toolchain in [None, Some(""), Some("1.99.0-x86_64-unknown-linux-gnu")] {
+            let mut command = fixture.command("/usr/local/bin/just");
+            command
+                .args(["--no-dotenv", recipe])
+                .env("PATH", &path)
+                .env("CAPTURE", &capture);
+            match toolchain {
+                Some(value) => {
+                    command.env("RUSTUP_TOOLCHAIN", value);
+                }
+                None => {
+                    command.env_remove("RUSTUP_TOOLCHAIN");
+                }
+            }
+            let output = fixture.output(command).await;
+            assert!(
+                output.status.success(),
+                "{recipe} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let expected = format!(
+                "{}install\n--path\n{}/crates/hymt-cli\n--locked\n{}--force\n",
+                toolchain
+                    .filter(|value| !value.is_empty())
+                    .map_or(String::new(), |value| format!("+{value}\n")),
+                fixture.repo.display(),
+                features,
+            );
+            assert_eq!(
+                std::fs::read_to_string(&capture).unwrap(),
+                expected,
+                "{recipe} with {toolchain:?}"
+            );
+        }
+        let mut command = fixture.command("/usr/local/bin/just");
+        command
+            .args(["--no-dotenv", recipe])
+            .env("PATH", &path)
+            .env("CAPTURE", &capture)
+            .env("CARGO_EXIT", "42");
+        assert_eq!(
+            fixture.output(command).await.status.code(),
+            Some(42),
+            "{recipe} hid cargo failure"
+        );
+    }
+}
+
+#[tokio::test]
 async fn local_gates_missing_receipts_are_rejected() {
     let fixture = Fixture::new().await;
     let bin = fixture.root.join("bin");
