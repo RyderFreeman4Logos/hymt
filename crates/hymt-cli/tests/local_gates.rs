@@ -369,6 +369,41 @@ struct OwnedChild<'a> {
 }
 
 impl OwnedChild<'_> {
+    fn output_tail(&self, path: &Path) -> String {
+        use std::io::{Read, Seek, SeekFrom};
+        const LIMIT: u64 = 1024;
+        let Ok(before) = std::fs::symlink_metadata(path) else {
+            return "[unavailable]".to_owned();
+        };
+        if !before.file_type().is_file()
+            || (before.dev(), before.uid())
+                != (self.fixture.root_identity.0, self.fixture.root_identity.2)
+            || before.mode() & 0o777 != 0o600
+        {
+            return "[invalid private output]".to_owned();
+        }
+        let Ok(mut file) = std::fs::File::open(path) else {
+            return "[unavailable]".to_owned();
+        };
+        let Ok(after) = file.metadata() else {
+            return "[unavailable]".to_owned();
+        };
+        if (after.dev(), after.ino(), after.uid()) != (before.dev(), before.ino(), before.uid()) {
+            return "[output identity changed]".to_owned();
+        }
+        if file
+            .seek(SeekFrom::Start(before.len().saturating_sub(LIMIT)))
+            .is_err()
+        {
+            return "[unavailable]".to_owned();
+        }
+        let mut bytes = Vec::new();
+        if file.take(LIMIT).read_to_end(&mut bytes).is_err() {
+            return "[unavailable]".to_owned();
+        }
+        String::from_utf8_lossy(&bytes).escape_debug().to_string()
+    }
+
     fn register_artifacts(&self) {
         // Only leaves inside this fixture's nominated private root are disposable.
         let mut owned = self.fixture.artifacts.lock().unwrap();
@@ -410,7 +445,11 @@ impl OwnedChild<'_> {
             if began.elapsed() >= limit {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
-                    "fixture process deadline",
+                    format!(
+                        "fixture process deadline; stdout tail: {}; stderr tail: {}",
+                        self.output_tail(&self.stdout),
+                        self.output_tail(&self.stderr)
+                    ),
                 ));
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -944,14 +983,19 @@ async fn local_gates_fixed_aggregate_uses_all_locked_linux_checks() {
     std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o700)).unwrap();
     let tests = fixture.repo.join("scripts/tests");
     std::fs::create_dir_all(&tests).unwrap();
-    std::fs::copy(
-        source_root().join("scripts/hymt-inference-cache.py"),
-        fixture.repo.join("scripts/hymt-inference-cache.py"),
+    let cache_test = tests.join("test_inference_cache.py");
+    let cache_marker = fixture.root.join("cache-recipe-ran");
+    std::fs::write(
+        &cache_test,
+        format!(
+            "import unittest\nfrom pathlib import Path\n\nclass CacheRecipe(unittest.TestCase):\n    def test_recipe(self):\n        Path({:?}).write_text('ran')\n",
+            cache_marker.to_str().unwrap()
+        ),
     )
     .unwrap();
     std::fs::copy(
-        source_root().join("scripts/tests/test_inference_cache.py"),
-        tests.join("test_inference_cache.py"),
+        source_root().join("scripts/hymt-inference-cache.py"),
+        fixture.repo.join("scripts/hymt-inference-cache.py"),
     )
     .unwrap();
     let services = fixture.repo.join("services");
@@ -998,6 +1042,36 @@ async fn local_gates_fixed_aggregate_uses_all_locked_linux_checks() {
     assert!(stdout.contains("Parsed fixture.toml"));
     assert!(stdout.contains("Only the two established host-specific"));
     assert!(stdout.contains("HYMT_LOCAL_GATE_RECEIPT="));
+    assert_eq!(std::fs::read_to_string(&cache_marker).unwrap(), "ran");
+    std::fs::write(
+        &cache_test,
+        "import unittest\n\nclass CacheRecipe(unittest.TestCase):\n    def test_failure(self):\n        self.fail('synthetic cache suite failure')\n",
+    )
+    .unwrap();
+    fixture
+        .git(&["add", "scripts/tests/test_inference_cache.py"])
+        .await;
+    fixture
+        .git(&["commit", "-m", "broken synthetic cache suite"])
+        .await;
+    let mut command = fixture.command("/home/obj/.local/share/mise/shims/just");
+    command.args(["--no-dotenv", "pre-push-gate", "head"]).env(
+        "PATH",
+        format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+    );
+    let failed = fixture.output(command).await;
+    rejected(&failed, "full local gate failed with exit");
+    let failed_stdout = String::from_utf8_lossy(&failed.stdout);
+    assert!(failed_stdout.contains("synthetic cache suite failure"));
+    let failed_log = failed_stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("local-gates: log: "))
+        .unwrap();
+    assert!(!Path::new(failed_log)
+        .parent()
+        .unwrap()
+        .join("gate.receipt.json")
+        .exists());
     // A non-ExecStart warning, even alongside the allowed host diagnostic,
     // must fail and may not mint a new PASS receipt.
     std::fs::write(&verify, "#!/bin/bash\nprintf '%s\\n' 'hy-mt2-throughput.service: Command /home/obj/.local/share/llama-cpp-cuda/llama-server is not executable: No such file or directory' 'unrelated warning'\nexit 1\n").unwrap();
@@ -1637,7 +1711,7 @@ async fn local_gates_interrupt_and_fixture_timeout_settle_descendants() {
         let parent_pid = fixture.root.join("parent.pid");
         let grandchild_pid = fixture.root.join("grandchild.pid");
         std::fs::write(&worker, format!(
-            "import os,signal,time\nfrom pathlib import Path\nsignal.signal(signal.SIGTERM,signal.SIG_IGN)\nif os.fork()==0:\n os.setsid()\n Path('{}').write_text(str(os.getpid()))\nelse:\n Path('{}').write_text(str(os.getpid()))\nwhile True:time.sleep(1)\n",
+            "import os,signal,time\nfrom pathlib import Path\nsignal.signal(signal.SIGTERM,signal.SIG_IGN)\nif os.fork()==0:\n os.setsid()\n Path('{}').write_text(str(os.getpid()))\nelse:\n print('x'*4096,flush=True)\n print('fixture timeout marker',flush=True)\n Path('{}').write_text(str(os.getpid()))\nwhile True:time.sleep(1)\n",
             grandchild_pid.display(), parent_pid.display()
         )).unwrap();
         fixture
@@ -1706,6 +1780,8 @@ async fn local_gates_interrupt_and_fixture_timeout_settle_descendants() {
         } else {
             let timeout = result.unwrap_err();
             assert_eq!(timeout.kind(), std::io::ErrorKind::TimedOut);
+            assert!(timeout.to_string().contains("fixture timeout marker"));
+            assert!(timeout.to_string().len() < 2300, "unbounded timeout output");
             let qualified = !fixture.cleanup_failed.load(Ordering::Relaxed);
             if block_ack {
                 assert!(!qualified, "missing ACK must reject timeout cleanup");
