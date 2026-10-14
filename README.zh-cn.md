@@ -113,7 +113,7 @@ warn_only = false
 divergence_threshold = 2.0
 ```
 
-该配置支持热重载，但`[endpoint].profile`除外，它在启动时会被固定（详见[模型配置](#模型配置文件-endpointprofile)）。长时间运行的工作流无需重启即可应用其他更改。
+该配置支持热重载，但`[endpoint].profile`除外，它在启动时会被固定（详见[模型配置](#模型配置文件endpointprofile)）。长时间运行的工作流无需重启即可应用其他更改。
 
 ### 后端特定采样设置（`[endpoint].backend`）
 
