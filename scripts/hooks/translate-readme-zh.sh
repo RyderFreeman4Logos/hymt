@@ -15,14 +15,65 @@ remember_readme_path() {
 
 readme_source_is_current() {
   local commit ref
-  commit="$(git rev-parse HEAD)" || return $?
-  ref="$(git rev-parse --symbolic-full-name HEAD)" || return $?
+  commit="$(git -C "${repo_root}" rev-parse HEAD)" || return $?
+  ref="$(git -C "${repo_root}" rev-parse --symbolic-full-name HEAD)" || return $?
   [ "${commit}" = "${readme_trigger_commit:-}" ] && [ "${ref}" = "${readme_trigger_ref:-}" ]
+}
+
+stop_readme_consumer() {
+  local pid="${readme_consumer_pid:-}" reaped="$1" attempt
+  [ -n "${pid}" ] || return 0
+  if kill -0 -- "-${pid}" 2>/dev/null; then
+    kill -TERM -- "-${pid}" 2>/dev/null || :
+  elif [ "${reaped}" -eq 0 ]; then
+    kill -TERM "${pid}" 2>/dev/null || :
+  fi
+  for ((attempt=0; attempt<20; attempt++)); do
+    if ! kill -0 -- "-${pid}" 2>/dev/null &&
+      { [ "${reaped}" -eq 1 ] || ! kill -0 "${pid}" 2>/dev/null; }; then
+      break
+    fi
+    /usr/bin/sleep 0.1
+  done
+  if kill -0 -- "-${pid}" 2>/dev/null; then
+    kill -KILL -- "-${pid}" 2>/dev/null || :
+  fi
+  if [ "${reaped}" -eq 0 ]; then
+    kill -KILL "${pid}" 2>/dev/null || :
+    wait "${pid}" 2>/dev/null || :
+  fi
+  readme_consumer_pid=""
+}
+
+cancel_readme() {
+  trap '' HUP INT TERM
+  stop_readme_consumer 0
+  exit "$1"
+}
+
+run_readme_consumer() {
+  local status=0
+  # Record signals during fork before the owned process group PID is available.
+  trap 'readme_cancel_status=129' HUP
+  trap 'readme_cancel_status=130' INT
+  trap 'readme_cancel_status=143' TERM
+  /usr/bin/setsid -- "$@" &
+  readme_consumer_pid=$!
+  trap 'cancel_readme 129' HUP
+  trap 'cancel_readme 130' INT
+  trap 'cancel_readme 143' TERM
+  [ "${readme_cancel_status}" -eq 0 ] || cancel_readme "${readme_cancel_status}"
+  wait "${readme_consumer_pid}" || status=$?
+  stop_readme_consumer 1
+  return "${status}"
 }
 
 cleanup_readme_workspace() {
   local status=$? index preserve=0
   trap - EXIT
+  trap 'status=129' HUP
+  trap 'status=130' INT
+  trap 'status=143' TERM
   set +e
   if [ -n "${publication_temp}" ] && [ "$(readme_identity "${publication_temp}" 2>/dev/null)" = "${publication_identity}" ]; then
     rm -f -- "${publication_temp}"
@@ -51,6 +102,8 @@ initialize_readme_lifecycle() {
   publication_temp=""
   publication_identity=""
   published_readme_hash=""
+  readme_consumer_pid=""
+  readme_cancel_status=0
   owned_readme_paths=()
   owned_readme_identities=()
 }
@@ -78,9 +131,9 @@ prepare_readme_workspace() {
   done
   readme_workspace="$(mktemp -d "${root}/hymt-readme-XXXXXXXX")" || return $?
   trap cleanup_readme_workspace EXIT
-  trap 'exit 129' HUP
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
+  trap 'cancel_readme 129' HUP
+  trap 'cancel_readme 130' INT
+  trap 'cancel_readme 143' TERM
   workspace_identity="$(readme_identity "${readme_workspace}")" || return $?
   runtime_home="${readme_workspace}/hymt-home"
 }
@@ -101,18 +154,22 @@ prepare_runtime_home() {
 }
 
 run_hymt() {
-  local status
+  local status probe="${readme_workspace}/hymt-help"
   prepare_runtime_home || {
     status=$?
     echo "WARNING doc-translate-sync: runtime preparation failed (exit ${status})." >&2
     return "${status}"
   }
-  if command -v hymt >/dev/null 2>&1 && hymt --help 2>/dev/null | grep -q "translate-doc"; then
-    HOME="${runtime_home}" TMPDIR="${readme_workspace}" TMP="${readme_workspace}" TEMP="${readme_workspace}" hymt "$@"
+  (set -o noclobber; : > "${probe}") || return $?
+  remember_readme_path "${probe}" || return $?
+  if command -v hymt >/dev/null 2>&1 &&
+    HOME="${runtime_home}" TMPDIR="${readme_workspace}" TMP="${readme_workspace}" TEMP="${readme_workspace}" \
+      run_readme_consumer hymt --help > "${probe}" 2>/dev/null && grep -q "translate-doc" "${probe}"; then
+    HOME="${runtime_home}" TMPDIR="${readme_workspace}" TMP="${readme_workspace}" TEMP="${readme_workspace}" run_readme_consumer hymt "$@"
     status=$?
   elif [ -x "${repo_root}/.venv/bin/python" ]; then
     HOME="${runtime_home}" TMPDIR="${readme_workspace}" TMP="${readme_workspace}" TEMP="${readme_workspace}" \
-      PYTHONPATH="${repo_root}/src" "${repo_root}/.venv/bin/python" -m hymt "$@"
+      PYTHONPATH="${repo_root}/src" run_readme_consumer "${repo_root}/.venv/bin/python" -m hymt "$@"
     status=$?
   else
     echo "WARNING doc-translate-sync: compatible translator unavailable in PATH or repo .venv." >&2
@@ -155,7 +212,7 @@ publish_readme_candidate() {
     [ "$(stat -c %a -- "${readme_zh}")" = "$(printf '%o' "${output_mode}")" ] || return 1
   fi
   [ "${current}" = "${output_identity}" ] && [ "${current_hash}" = "${output_hash}" ] || return 1
-  [ -z "$(git diff --cached -- README.zh-cn.md)" ] || return 1
+  [ -z "$(git -C "${repo_root}" diff --cached -- README.zh-cn.md)" ] || return 1
   [ "$(readme_identity "${publication_temp}")" = "${publication_identity}" ] || return 1
   if [ -n "${readme_trigger_commit:-}" ]; then
     readme_source_is_current || return 1

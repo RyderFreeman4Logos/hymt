@@ -1,4 +1,5 @@
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -9,6 +10,7 @@ const OLD_CHINESE: &str = "Original Chinese README.\n";
 const NEW_CHINESE: &str = "Updated Chinese README.\n";
 
 const GIT: &str = r#"#!/bin/bash
+if [ "$1" = -C ]; then shift 2; fi
 printf 'git' >> "$FIXTURE_LOG"
 printf '\t%s' "$@" >> "$FIXTURE_LOG"
 printf '\n' >> "$FIXTURE_LOG"
@@ -48,8 +50,13 @@ case "$1" in
     fi
     if [ "$FIXTURE_CANCEL" = commit ]; then
       printf 'commit-cancel\n' >> "$FIXTURE_LOG"
+      /usr/bin/sleep 30 &
+      descendant=$!
+      printf '%s %s %s\n' "$BASHPID" "$(/usr/bin/awk '{print $22}' /proc/$BASHPID/stat)" "$descendant" > "$FIXTURE_ROOT/consumer-process"
+      trap 'wait "$descendant" 2>/dev/null; printf settled > "$FIXTURE_ROOT/consumer-settled"; exit 143' TERM
       kill -TERM "$PPID"
-      exit 0
+      wait "$descendant"
+      exit 98
     fi
     [ "$FIXTURE_COMMIT_EXIT" = 0 ] || exit "$FIXTURE_COMMIT_EXIT"
     /usr/bin/cp "$FIXTURE_ROOT/README.zh-cn.md" "$FIXTURE_ROOT/chinese-baseline"
@@ -61,8 +68,20 @@ exit 0
 "#;
 
 const TRANSLATOR: &str = r#"#!/bin/bash
+cancel_if_requested() {
+  [ "$FIXTURE_CANCEL" = "$1" ] || return 0
+  printf '%s-cancel\n' "$1" >> "$FIXTURE_LOG"
+  /usr/bin/sleep 30 &
+  descendant=$!
+  printf '%s %s %s\n' "$BASHPID" "$(/usr/bin/awk '{print $22}' /proc/$BASHPID/stat)" "$descendant" > "$FIXTURE_ROOT/consumer-process"
+  trap 'wait "$descendant" 2>/dev/null; printf settled > "$FIXTURE_ROOT/consumer-settled"; exit 143' TERM
+  kill -TERM "$PPID"
+  wait "$descendant"
+  exit 98
+}
 if [ "$1" = --help ]; then
   printf 'help\n' >> "$FIXTURE_LOG"
+  cancel_if_requested probe
   if [ "$FIXTURE_CAPABLE" = 1 ]; then printf 'translate-doc\n'; else printf 'legacy help\n'; fi
   exit 0
 fi
@@ -99,11 +118,7 @@ case "$FIXTURE_REPLACE" in
     /usr/bin/mv "$FIXTURE_ROOT/README.zh-cn.md" "$FIXTURE_ROOT/old-output"
     printf foreign > "$FIXTURE_ROOT/README.zh-cn.md" ;;
 esac
-if [ "$FIXTURE_CANCEL" = translation ]; then
-  printf 'translation-cancel\n' >> "$FIXTURE_LOG"
-  kill -TERM "$PPID"
-  exit 0
-fi
+cancel_if_requested translation
 if [ "$FIXTURE_PARTIAL" = 1 ]; then
   printf partial > "$6"
   printf 'partial-written\n' >> "$FIXTURE_LOG"
@@ -201,7 +216,7 @@ exec /usr/bin/mv "$@"
 "#;
 
 const STAT: &str = r#"#!/bin/bash
-if [ "${@: -1}" = "$FIXTURE_ROOT" ]; then
+if [ "$(/usr/bin/readlink -f -- "${@: -1}")" = "$(/usr/bin/readlink -f -- "$FIXTURE_ROOT")" ]; then
   if [ "$FIXTURE_ROOT_FAULT" = device ] && [ "$2" = %d ]; then printf 'root-fault\tdevice\n' >> "$FIXTURE_LOG"; printf '0\n'; exit 0; fi
   if [ "$FIXTURE_ROOT_FAULT" = owner ] && [ "$2" = %u ]; then printf 'root-fault\towner\n' >> "$FIXTURE_LOG"; printf '999999\n'; exit 0; fi
 fi
@@ -302,6 +317,10 @@ impl Fixture {
     }
 
     async fn run(&self, wrapper: bool, changes: &[(&str, &str)]) -> Output {
+        self.run_from(wrapper, changes, &self.root).await
+    }
+
+    async fn run_from(&self, wrapper: bool, changes: &[(&str, &str)], cwd: &Path) -> Output {
         let mut command = tokio::process::Command::new("/usr/bin/bash");
         command
             .arg("-c")
@@ -338,22 +357,63 @@ impl Fixture {
             .env("FIXTURE_COMMIT_EXIT", "0")
             .env("FIXTURE_RESULT", NEW_CHINESE)
             .envs(changes.iter().copied())
-            .current_dir(&self.root)
+            .current_dir(cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        command.as_std_mut().process_group(0);
         let mut child = command.spawn().unwrap();
-        let status = match tokio::time::timeout(Duration::from_secs(15), child.wait()).await {
+        let hook_pid = child.id().unwrap();
+        let status = match tokio::time::timeout(Duration::from_secs(8), child.wait()).await {
             Ok(status) => status.unwrap(),
             Err(_) => {
-                child.kill().await.unwrap();
-                panic!("hook child killed and reaped after deadline");
+                self.kill_owned_consumer();
+                Self::kill_group(hook_pid);
+                tokio::time::timeout(Duration::from_secs(2), child.wait())
+                    .await
+                    .expect("hook did not reap after kill")
+                    .unwrap();
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(2), child.wait_with_output()).await;
+                panic!("hook exceeded cancellation deadline");
             }
         };
-        let output = child.wait_with_output().await.unwrap();
+        let output =
+            match tokio::time::timeout(Duration::from_secs(2), child.wait_with_output()).await {
+                Ok(output) => output.unwrap(),
+                Err(_) => {
+                    self.kill_owned_consumer();
+                    Self::kill_group(hook_pid);
+                    panic!("hook output remained open after shell exit");
+                }
+            };
         assert_eq!(output.status, status);
         output
+    }
+
+    fn kill_group(pid: u32) {
+        let _ = std::process::Command::new("/usr/bin/kill")
+            .args(["-KILL", "--", &format!("-{pid}")])
+            .status();
+    }
+
+    fn kill_owned_consumer(&self) {
+        let Ok(record) = std::fs::read_to_string(self.root.join("consumer-process")) else {
+            return;
+        };
+        let mut fields = record.split_whitespace();
+        let (Some(pid), Some(start)) = (fields.next(), fields.next()) else {
+            return;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return;
+        };
+        if stat.split_whitespace().nth(21) == Some(start) {
+            if let Ok(pid) = pid.parse() {
+                Self::kill_group(pid);
+            }
+        }
     }
 
     fn events(&self) -> String {
@@ -684,6 +744,41 @@ async fn readme_hook_preserves_real_git_index_staged_during_translation() {
 }
 
 #[tokio::test]
+async fn readme_helper_from_subdirectory_preserves_staged_root_destination() {
+    let fixture = Fixture::new(true, false);
+    fixture.use_real_git();
+    std::fs::write(
+        fixture.root.join("README.zh-cn.md"),
+        "Staged Chinese update.\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "README.zh-cn.md"]);
+    std::fs::create_dir_all(fixture.root.join("crates/example")).unwrap();
+    let result = fixture
+        .run_from(false, &[], &fixture.root.join("crates/example"))
+        .await;
+    assert!(
+        !result.status.success(),
+        "staged destination must block publication: {result:?}"
+    );
+    assert_eq!(fixture.translated(), 1);
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("README.zh-cn.md")).unwrap(),
+        "Staged Chinese update.\n"
+    );
+    assert_eq!(
+        fixture.git(&["show", ":README.zh-cn.md"]),
+        b"Staged Chinese update.\n"
+    );
+    assert_eq!(
+        fixture.git(&["show", "HEAD:README.zh-cn.md"]),
+        OLD_CHINESE.as_bytes()
+    );
+    assert_eq!(fixture.git(&["rev-list", "--count", "HEAD"]), b"2\n");
+    assert!(!fixture.workspace().exists());
+}
+
+#[tokio::test]
 async fn readme_hook_rejects_head_advance_and_same_commit_branch_switch() {
     for change in ["switch", "advance"] {
         let fixture = Fixture::new(true, false);
@@ -909,13 +1004,17 @@ async fn readme_hook_failure_and_cancellation_clean_owned_resources() {
         );
         fixture.assert_clean();
     }
-    for phase in ["translation", "commit"] {
+    for phase in ["probe", "translation", "commit"] {
         let fixture = Fixture::new(true, false);
         let result = fixture.run(true, &[("FIXTURE_CANCEL", phase)]).await;
         assert!(fixture.events().contains(&format!("{phase}-cancel\n")));
         assert_eq!(result.status.code(), Some(143), "{result:?}");
-        assert_eq!(fixture.translated(), 1);
+        assert_eq!(fixture.translated(), usize::from(phase != "probe"));
         assert_eq!(fixture.commits(), usize::from(phase == "commit"));
+        assert!(
+            fixture.root.join("consumer-settled").exists(),
+            "{phase}: consumer did not settle"
+        );
         assert_eq!(
             std::fs::read_to_string(fixture.root.join("README.zh-cn.md")).unwrap(),
             if phase == "commit" {
@@ -1043,7 +1142,7 @@ async fn readme_hook_admits_directory_symlinks_and_rejects_unsafe_paths() {
         }
         let result = fixture.run(true, &changes).await;
         assert!(result.status.success(), "{fault}: {result:?}");
-        assert_eq!(fixture.translated(), 0);
+        assert_eq!(fixture.translated(), 0, "{fault}");
         assert!(!fixture.events().contains("mktemp\n"));
         if fault == "device" || fault == "owner" {
             assert!(fixture.events().contains(&format!("root-fault\t{fault}\n")));

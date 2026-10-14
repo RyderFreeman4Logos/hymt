@@ -73,5 +73,5 @@ if [ -n "$(git diff --cached -- README.zh-cn.md)" ] ||
   echo "post-commit: README.zh-cn.md changed during translation; skipping auto-translation commit." >&2
   exit 0
 fi
-env JUST_TEMPDIR="${readme_workspace}/just-tmp" \
+run_readme_consumer env JUST_TEMPDIR="${readme_workspace}/just-tmp" \
   git commit --only -m "docs(readme): auto-translate README.zh-cn.md" -- README.zh-cn.md
