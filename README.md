@@ -314,7 +314,7 @@ hymt exec precache
 hymt man git-rebase
 hymt man --original git-rebase
 hymt info coreutils
-hymt info --refresh bash
+hymt info bash
 ```
 
 ## Recall, history, and ETA estimation

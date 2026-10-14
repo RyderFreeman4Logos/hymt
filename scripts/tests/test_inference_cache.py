@@ -197,6 +197,25 @@ class CacheContracts(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_timeout_limits_reject_before_database_creation(self) -> None:
+        upstream = f"http://127.0.0.1:{self.upstream.server_port}"
+        for index, timeout in enumerate((float("nan"), float("inf"), float("-inf"), 1e100, 0, -1)):
+            database = Path(self.tmp.name) / f"invalid-timeout-{index}.sqlite3"
+            with self.subTest(timeout=timeout):
+                try:
+                    server = _MODULE.CacheServer(("127.0.0.1", 0), upstream, database, timeout=timeout)
+                except ValueError:
+                    pass
+                else:
+                    server.server_close()
+                    self.fail("invalid timeout was accepted")
+                self.assertFalse(database.exists())
+        database = Path(self.tmp.name) / "valid-timeout.sqlite3"
+        for timeout in (0.1, threading.TIMEOUT_MAX):
+            with self.subTest(timeout=timeout):
+                server = _MODULE.CacheServer(("127.0.0.1", 0), upstream, database, timeout=timeout)
+                server.server_close()
+
     def test_two_credentials_share_exact_bytes(self) -> None:
         first = self.request(headers={"Authorization": "Bearer first"})
         second = self.request(headers={"Authorization": "Bearer second"})

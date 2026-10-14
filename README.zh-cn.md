@@ -311,7 +311,7 @@ hymt exec precache
 hymt man git-rebase
 hymt man --original git-rebase
 hymt info coreutils
-hymt info --refresh bash
+hymt info bash
 ```
 
 ## 回忆、历史记录及预计到达时间估算
@@ -358,7 +358,7 @@ hymt telegram --regenerate-claim-password
 
 ## 通过Tailscale实现远程Hy-MT2运行
 
-该仓库的`[services/`](services)目录下包含两个互不兼容的systemd用户服务示例。`-c`用于定义整个服务的上下文池；`--parallel`参数则用于将上下文分配给多个并发请求：
+该仓库的[`services/`](services)目录下包含两个互不兼容的systemd用户服务示例。`-c`用于定义整个服务的上下文池；`--parallel`参数则用于将上下文分配给多个并发请求：
 
 | 服务名称 | 模型量化级别 | KV缓存大小 | 总上下文容量 | 并发槽位数 | 每个槽位的上下文容量 |
 |---|---|---|---:|---:|---:|

@@ -260,7 +260,7 @@ class CacheServer(ThreadingMixIn, HTTPServer):
             raise _Invalid("upstream must be an HTTP origin without credentials")
         # shortcut: numeric upstream addresses bound connection setup, add bounded DNS only when required.
         ipaddress.ip_address(parsed.hostname)
-        if timeout <= 0 or min(max_clients, max_upstream, request_limit, response_limit) <= 0:
+        if not 0 < timeout <= threading.TIMEOUT_MAX or min(max_clients, max_upstream, request_limit, response_limit) <= 0:
             raise _Invalid("limits must be positive")
         self.upstream = parsed
         self.request_timeout = timeout
