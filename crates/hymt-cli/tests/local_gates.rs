@@ -16,11 +16,26 @@ impl Fixture {
     async fn new() -> Self {
         use std::os::unix::fs::DirBuilderExt;
         static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
-            "hymt-gates-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
+        let validated = std::process::Command::new("/usr/bin/python3")
+            .args([
+                "-B",
+                "-c",
+                "import runpy,sys; gate=runpy.run_path(sys.argv[1]); gate['_private_path'](gate['ARTIFACT_ROOT'], directory=True); print(gate['ARTIFACT_ROOT'])",
+            ])
+            .arg(source_root().join("scripts/hooks/local-gates.py"))
+            .output()
+            .unwrap();
+        assert!(
+            validated.status.success(),
+            "invalid private fixture root: {}",
+            String::from_utf8_lossy(&validated.stderr)
+        );
+        let root =
+            PathBuf::from(String::from_utf8(validated.stdout).unwrap().trim()).join(format!(
+                "hymt-gates-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
         std::fs::DirBuilder::new()
             .mode(0o700)
             .create(&root)
@@ -282,12 +297,21 @@ from pathlib import Path
 helper = runpy.run_path(sys.argv[1])
 control, failed, settled = map(Path, sys.argv[2:5])
 helper['_subreaper'](1)
-child = subprocess.Popen(sys.argv[5:], start_new_session=True)
+pending = []
+def record_interrupt(signum, _frame):
+    if not pending:
+        pending.append(signum)
+for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGALRM):
+    signal.signal(signum, record_interrupt)
+child = None
 root = None
 status = 1
 try:
+    child = subprocess.Popen(sys.argv[5:], start_new_session=True)
     root = helper['_ChildIdentity'](child.pid)
     while not root.exited():
+        if pending:
+            raise InterruptedError(f'fixture interrupted by signal {pending[0]}')
         if control.exists():
             action = control.read_text()
             control.unlink()
@@ -296,19 +320,20 @@ try:
             root.signal(int(action))
         time.sleep(0.01)
 finally:
-    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGALRM):
-        signal.signal(signum, signal.SIG_IGN)
     original = sys.exception()
-    try:
-        status = helper['_settle'](child, root)
-        with os.fdopen(os.open(settled, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'w') as output:
-            output.write('settled\n')
-    except BaseException as error:
-        with os.fdopen(os.open(failed, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'w') as output:
-            output.write(str(error))
-        if original is None:
-            raise
-        print(f'fixture cleanup: {error}', file=sys.stderr)
+    if child is not None:
+        try:
+            status = helper['_settle'](child, root)
+            with os.fdopen(os.open(settled, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'w') as output:
+                output.write('settled\n')
+        except BaseException as error:
+            with os.fdopen(os.open(failed, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'w') as output:
+                output.write(str(error))
+            if original is None:
+                raise
+            print(f'fixture cleanup: {error}', file=sys.stderr)
+if pending and status == 0:
+    status = 1
 sys.exit(status if status >= 0 else 128 - status)
 "#;
 
@@ -996,6 +1021,69 @@ if other.stat().st_dev != Path('/mnt/ssd').stat().st_dev:
         "root boundary fixture failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[tokio::test]
+async fn local_gates_launch_and_repeated_interrupts_settle_own_child() {
+    let fixture = Fixture::new().await;
+    fixture
+        .add_inputs(&[(
+            "justfile",
+            "set shell := [\"bash\", \"-c\"]\n_full-gate:\n    sleep 30\n",
+        )])
+        .await;
+    let child_pid = fixture.root.join("gate-child.pid");
+    let settlement = fixture.root.join("producer-settled");
+    let mut command = fixture.command("/usr/bin/python3");
+    command.args([
+        "-B",
+        "-c",
+        r#"
+import importlib.util, os, signal, subprocess, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('gate', 'scripts/hooks/local-gates.py')
+gate = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(gate)
+real_popen = subprocess.Popen
+real_settle = gate._settle
+def launch(*args, **kwargs):
+    child = real_popen(*args, **kwargs)
+    if args[0][0] == 'just':
+        Path(sys.argv[1]).write_text(str(child.pid))
+        os.kill(os.getpid(), signal.SIGINT)
+        os.kill(os.getpid(), signal.SIGTERM)
+    return child
+def settle(child, root):
+    Path(sys.argv[2]).write_text('producer entered settlement')
+    os.kill(os.getpid(), signal.SIGALRM)
+    return real_settle(child, root)
+subprocess.Popen = launch
+gate._settle = settle
+try:
+    gate.run('head')
+except InterruptedError as error:
+    assert 'signal 2' in str(error), error
+    print(f'producer interrupted: {error}', file=sys.stderr)
+    sys.exit(1)
+raise AssertionError('interrupted gate emitted success')
+"#,
+    ]);
+    command.arg(&child_pid).arg(&settlement);
+    let output = fixture.output(command).await;
+    rejected(
+        &output,
+        "producer interrupted: local gate interrupted by signal 2",
+    );
+    assert!(
+        settlement.exists(),
+        "outer custodian must not hide skipped producer settlement"
+    );
+    let pid = std::fs::read_to_string(child_pid).unwrap();
+    assert!(!Path::new("/proc").join(pid).exists());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("HYMT_LOCAL_GATE_RECEIPT="));
+    let artifacts = fixture.artifacts.lock().unwrap();
+    assert_eq!(artifacts.len(), 1);
+    assert!(!artifacts[0].join("gate.receipt.json").exists());
 }
 
 #[tokio::test]

@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import select
 import signal
 import stat
 import subprocess
@@ -13,7 +14,6 @@ import tempfile
 import time
 import tomllib
 from collections.abc import Mapping
-from io import BufferedReader
 from pathlib import Path
 from types import FrameType
 from typing import NoReturn, TypedDict, overload
@@ -381,8 +381,15 @@ def run(target: str) -> None:
         if key.startswith("JUST_"):
             del env[key]
     previous_subreaper = _subreaper(1)
+    pending: list[int] = []
+    wake_read, wake_write = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+    previous_wakeup = signal.set_wakeup_fd(wake_write)
+    def record_interrupt(signum: int, _frame: FrameType | None) -> None:
+        if not pending:
+            pending.append(signum)
+
     previous_handlers = {
-        sig: signal.signal(sig, _interrupt)
+        sig: signal.signal(sig, record_interrupt)
         for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGALRM)
     }
     # Bound the read loop even if a descendant retains its output pipe.
@@ -391,26 +398,38 @@ def run(target: str) -> None:
         with os.fdopen(
             os.open(log, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb"
         ) as log_output:
-            child = subprocess.Popen(
-                [
-                    "just",
-                    "--no-dotenv",
-                    "--justfile",
-                    str(Path.cwd() / "justfile"),
-                    "_full-gate",
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                env=env,
-                start_new_session=True,
-            )
+            child: subprocess.Popen[bytes] | None = None
             root = None
             try:
+                child = subprocess.Popen(
+                    [
+                        "just",
+                        "--no-dotenv",
+                        "--justfile",
+                        str(Path.cwd() / "justfile"),
+                        "_full-gate",
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    env=env,
+                    start_new_session=True,
+                )
                 root = _ChildIdentity(child.pid)
                 stream = child.stdout
-                if not isinstance(stream, BufferedReader):
+                if stream is None:
                     raise _GateError("gate output pipe is unavailable")
-                for chunk in iter(lambda: stream.read1(65536), b""):
+                while True:
+                    if pending:
+                        _interrupt(pending[0], None)
+                    ready, _, _ = select.select((stream, wake_read), (), ())
+                    if pending:
+                        _interrupt(pending[0], None)
+                    if wake_read in ready:
+                        os.read(wake_read, 4096)
+                        continue
+                    chunk = os.read(stream.fileno(), 65536)
+                    if not chunk:
+                        break
                     log_output.write(chunk)
                     log_output.flush()
                     sys.stdout.buffer.write(chunk)
@@ -419,31 +438,29 @@ def run(target: str) -> None:
                 assert root.fd is not None
                 os.waitid(os.P_PIDFD, root.fd, os.WEXITED | os.WNOWAIT)
             finally:
-                # A second interrupt cannot cancel the bounded cleanup fence.
-                for sig in previous_handlers:
-                    signal.signal(sig, signal.SIG_IGN)
                 original_error = sys.exception()
-                try:
-                    status = _settle(child, root)
-                except (
-                    OSError,
-                    subprocess.SubprocessError,
-                    _GateError,
-                ) as cleanup_error:
-                    if original_error is None:
-                        raise
-                    print(f"local-gates cleanup: {cleanup_error}", file=sys.stderr)
-                finally:
-                    if child.stdout is not None:
-                        pending = sys.exception() or original_error
-                        try:
-                            child.stdout.close()
-                        except OSError as close_error:
-                            if pending is None:
-                                raise
-                            print(
-                                f"local-gates cleanup: {close_error}", file=sys.stderr
-                            )
+                if child is not None:
+                    try:
+                        status = _settle(child, root)
+                    except (
+                        OSError,
+                        subprocess.SubprocessError,
+                        _GateError,
+                    ) as cleanup_error:
+                        if original_error is None:
+                            raise
+                        print(f"local-gates cleanup: {cleanup_error}", file=sys.stderr)
+                    finally:
+                        if child.stdout is not None:
+                            current_error = sys.exception() or original_error
+                            try:
+                                child.stdout.close()
+                            except OSError as close_error:
+                                if current_error is None:
+                                    raise
+                                print(
+                                    f"local-gates cleanup: {close_error}", file=sys.stderr
+                                )
     finally:
         original_error = sys.exception()
         restore_errors: list[str] = []
@@ -456,6 +473,9 @@ def run(target: str) -> None:
                 signal.signal(sig, handler)
             except OSError as error:
                 restore_errors.append(str(error))
+        signal.set_wakeup_fd(previous_wakeup)
+        os.close(wake_read)
+        os.close(wake_write)
         try:
             _subreaper(previous_subreaper)
         except OSError as error:
@@ -465,6 +485,8 @@ def run(target: str) -> None:
             if original_error is None:
                 raise _GateError(detail)
             print(f"local-gates cleanup: {detail}", file=sys.stderr)
+    if pending:
+        _interrupt(pending[0], None)
     if status:
         raise _GateError(f"full local gate failed with exit {status}; log: {log}")
     if _identity() != before:
