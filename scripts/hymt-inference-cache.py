@@ -520,7 +520,7 @@ class _Handler(BaseHTTPRequestHandler):
                         self.wfile.write(hit[1])
                         return
                     provenance = "MISS" if leader else "HIT"
-                except (OSError, sqlite3.Error, ValueError, http.client.HTTPException, TypeError):
+                except (OSError, sqlite3.Error, ValueError, http.client.HTTPException, TypeError, RecursionError):
                     identity = None
                     provenance = "UNKNOWN"
             if flight is not None and not leader:
@@ -533,7 +533,7 @@ class _Handler(BaseHTTPRequestHandler):
                     try:
                         if self.server.store.epoch() == epoch and self.server.observe(payload.get("model"), authorization, self.budget) == identity:
                             shared_status = "HIT"
-                    except (OSError, sqlite3.Error, ValueError, http.client.HTTPException, TypeError):
+                    except (OSError, sqlite3.Error, ValueError, http.client.HTTPException, TypeError, RecursionError):
                         pass
                 self._headers(status, headers, shared_status, len(body))
                 self.wfile.write(body)
@@ -569,7 +569,7 @@ class _Handler(BaseHTTPRequestHandler):
                         admitted = self.server.store.write(key, epoch, raw, canonical, identity, headers, response_body)
                         if flight is not None:
                             flight.admitted = admitted
-                except (OSError, sqlite3.Error, ValueError, http.client.HTTPException, TypeError):
+                except (OSError, sqlite3.Error, ValueError, http.client.HTTPException, TypeError, RecursionError):
                     pass
             if not streamed:
                 self._headers(status, headers, provenance, len(response_body))

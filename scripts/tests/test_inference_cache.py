@@ -55,7 +55,7 @@ class _Upstream(BaseHTTPRequestHandler):
         if state["unknown"]:
             self._reply(503, b'{"error":"unavailable"}')
         elif self.path == "/props":
-            self._reply(200, json.dumps(state["props"]).encode())
+            self._reply(200, state.get("props_raw") or json.dumps(state["props"]).encode())
         elif self.path == "/v1/models":
             self._reply(200, json.dumps({"data": [{"id": "Hy-MT2-7B", "aliases": ["Hy-MT2-7B"], "created": state["generation"], "meta": state["meta"]}, *state["models_extra"]]}).encode())
         else:
@@ -325,6 +325,99 @@ class CacheContracts(unittest.TestCase):
             conn.execute("DROP TABLE entries")
         self.assertEqual("UNKNOWN", self.request()[1]["X-Hymt-Cache"])
         self.assertEqual(0o600, self.db.stat().st_mode & 0o777)
+
+    @unittest.skipUnless(_MODULE, "shared service not implemented yet")
+    def test_recursive_optional_identity_and_stored_headers_preserve_generation(self) -> None:
+        deep = b"[" * 1100 + b"0" + b"]" * 1100
+        props = json.dumps(self.state["props"]).encode()
+        for raw in (deep, props[:-1] + b',"chat_template_caps":' + b"[" * 400 + b"0" + b"]" * 400 + b"}"):
+            with self.subTest(identity=raw[:20]):
+                self.state["props_raw"] = raw
+                reply = self.request()
+                self.assertEqual((200, "UNKNOWN", _JSON), (reply[0], reply[1]["X-Hymt-Cache"], reply[2]))
+        self.state["props_raw"] = None
+        self.assertEqual("MISS", self.request()[1]["X-Hymt-Cache"])
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("UPDATE entries SET headers = ?", (deep.decode(),))
+        reply = self.request()
+        self.assertEqual((200, "UNKNOWN", _JSON), (reply[0], reply[1]["X-Hymt-Cache"], reply[2]))
+        self.assertEqual(4, self.state["posts"])
+        client_deep = b'{"model":"Hy-MT2-7B","nested":' + deep + b"}"
+        self.assertEqual(400, self.request(client_deep)[0])
+        self.assertEqual(4, self.state["posts"], "invalid client JSON must not reach generation")
+
+    @unittest.skipUnless(_MODULE, "shared service not implemented yet")
+    def test_recursive_post_generation_identity_preserves_json_and_sse_flights(self) -> None:
+        deep = b"[" * 1100 + b"0" + b"]" * 1100
+        joined = threading.Event()
+        original = _MODULE._Flight
+        class ObservedEvent(threading.Event):
+            def wait(inner, timeout=None):
+                joined.set()
+                return super().wait(timeout)
+        class ObservedFlight(original):
+            def __init__(inner):
+                super().__init__()
+                inner.done = ObservedEvent()
+        for stream, expected in ((False, _JSON), (True, _SSE_FIRST + _SSE_LAST)):
+            with self.subTest(stream=stream):
+                self.cache.store.clear()
+                self.state["props_raw"] = None
+                self.state["entered"].clear()
+                self.state["release"].clear()
+                joined.clear()
+                payload = {"model": "Hy-MT2-7B", "stream": stream}
+                try:
+                    with patch.object(_MODULE, "_Flight", ObservedFlight), concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                        leader = pool.submit(self.request, payload)
+                        self.assertTrue(self.state["entered"].wait(1))
+                        follower = pool.submit(self.request, payload)
+                        self.assertTrue(joined.wait(1), "follower must join the active flight")
+                        self.state["props_raw"] = deep
+                        self.state["release"].set()
+                        first, second = leader.result(4), follower.result(4)
+                    self.assertEqual((200, expected), (first[0], first[2]))
+                    self.assertEqual((200, "UNKNOWN", expected), (second[0], second[1]["X-Hymt-Cache"], second[2]))
+                    with sqlite3.connect(self.db) as conn:
+                        self.assertEqual(0, conn.execute("SELECT count(*) FROM entries").fetchone()[0])
+                finally:
+                    self.state["release"].set()
+
+    @unittest.skipUnless(_MODULE, "shared service not implemented yet")
+    def test_recursive_follower_revalidation_preserves_completed_reply(self) -> None:
+        deep = b"[" * 1100 + b"0" + b"]" * 1100
+        joined = threading.Event()
+        resume = threading.Event()
+        original = _MODULE._Flight
+        class PausedEvent(threading.Event):
+            def wait(inner, timeout=None):
+                joined.set()
+                done = super().wait(timeout)
+                resume.wait(2)
+                return done
+        class PausedFlight(original):
+            def __init__(inner):
+                super().__init__()
+                inner.done = PausedEvent()
+        self.state["entered"].clear()
+        self.state["release"].clear()
+        try:
+            with patch.object(_MODULE, "_Flight", PausedFlight), concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                leader = pool.submit(self.request)
+                self.assertTrue(self.state["entered"].wait(1))
+                follower = pool.submit(self.request)
+                self.assertTrue(joined.wait(1), "follower must await the completed leader")
+                self.state["release"].set()
+                first = leader.result(4)
+                self.assertEqual((200, "MISS", _JSON), (first[0], first[1]["X-Hymt-Cache"], first[2]))
+                self.state["props_raw"] = deep
+                resume.set()
+                second = follower.result(4)
+            self.assertEqual((200, "UNKNOWN", _JSON), (second[0], second[1]["X-Hymt-Cache"], second[2]))
+            self.assertEqual(1, self.state["posts"])
+        finally:
+            self.state["release"].set()
+            resume.set()
 
     @unittest.skipUnless(_MODULE, "shared service not implemented yet")
     def test_body_response_deadline_and_follower_limits(self) -> None:
