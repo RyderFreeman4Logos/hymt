@@ -365,7 +365,7 @@ hymt telegram --regenerate-claim-password
 | `hy-mt2-quality.service` | Q6_K | Q8 (`q8_0`) | 24,576 | 3 | 8,192 |
 | `hy-mt2-throughput.service` | Q4_K_M | Q4 (`q4_0`) | 65,536 | 8 | 8,192 |
 
-这两个服务都仅绑定到Tailscale上的`100.78.159.38:8401`端口，而非`0.0.0.0`。它们均使用CUDA版本的`llama-server`；质量优化版本对应的是本地持久化构建的版本，而高处理效率版本则对应`llama-cpp/9294-cuda`构建版本。这些绝对路径是特定于宿主机的，但替代的后端必须支持所指定的`llama-server`上下文配置、并行槽位设置以及KV缓存功能。
+这两个服务都仅绑定到Tailscale上的`100.78.159.38:8401`端口，而非`0.0.0.0`。它们均使用CUDA版本的`llama-server`；两个服务都使用`/home/obj/.local/share/llama-cpp-cuda/llama-server`处的本地持久化构建及其对应的库目录。这些绝对路径是特定于宿主机的，但替代的后端必须支持所指定的`llama-server`上下文配置、并行槽位设置以及KV缓存功能。
 
 两个服务配置均明确设置了`--temp 0.7`、`--top-k 20`、`--top-p 0.6`以及`--repeat-penalty 1.05`，这些均为Hy-MT2的推荐参数。同时，它们还设置了`--min-p 0`（禁用该仅适用于llama.cpp的扩展功能）和`--repeat-last-n 64`（这是为适配1.05版本的重复惩罚机制而特意采用的llama.cpp兼容设置，并非Hy-MT2的原始推荐值）。因此，这些参数不会从已安装的llama.cpp版本中随机继承任何采样配置。除非有`[inference.override]`指令明确指定替代值，否则HymT会忽略所有采样相关字段，所以修改服务默认参数也会改变默认的翻译结果。在启动时，llama.cpp客户端会发送`GET /props`请求，并输出其报告的原始`default_generation_settings`值；如果该接口不可用或版本过旧，系统会发出警告并仅忽略相关请求，不会报错。
 
@@ -387,10 +387,59 @@ just install-hooks
 just pre-commit
 ```
 
-验证在没有Telegram依赖的情况下该二进制文件仍能构建：
+提交后，在干净的HEAD上运行一次完整本地验收：
 
 ```bash
-just check-no-telegram
+just pre-push-gate head
 ```
 
-Lefthook在提交代码前会执行“just pre-commit”操作，并同步更新README文件的翻译内容。GitHub Actions CI则在拉取请求以及代码推送到`main`分支时运行，负责处理格式检查、Clippy工具检测、工作区测试/检查、禁止默认功能的CLI检查、Shell脚本检查、服务单元验证以及TOML格式解析等工作。
+快速提交钩子检查格式和锁定依赖的工作区Clippy。完整门禁还包括锁定依赖的工作区测试与编译检查、不启用Telegram的CLI检查和测试、每个受Git跟踪的Shell脚本的语法与ShellCheck检查、两个systemd服务单元的静态验证，以及所有受Git跟踪的TOML文件解析。所有诊断都会显示，仅允许未部署宿主机上两个已知服务单元的规范持久化可执行文件缺失诊断。
+
+随后取得覆盖整个`main...HEAD`范围、结论为PASS且可处理问题数为零的独立原生审查。将`HYMT_LOCAL_GATE_RECEIPT`设为门禁打印的私有凭据路径，将`HYMT_NATIVE_REVIEW_RECEIPT`设为[原生审查回执格式](#原生审查回执格式)中说明的独立审查凭据。Lefthook会结合实际待推送的功能分支更新，验证凭据的精确HEAD/tree、审查范围及日志和报告内容；推送不会重复执行未变化的检查。源码变更后必须重新取得凭据。运行产物位于私有SSD任务目录`/mnt/ssd/mirror-rootfs/home/obj/tmp/hymt-stop-ai-20261012`；仓库不使用托管GitHub Actions工作流。
+
+### 原生审查回执格式
+
+独立审查者必须使用当前可用的最强审查方式检查整个`main...HEAD`范围，确认审查前后检出均干净，并在上述私有SSD目录写入真实报告和回执（目录`0700`，普通非符号链接文件`0600`）。源码作者不得编造PASS结论或复制合成测试证据。从审查结束到推送都必须固定在已审查的HEAD。门禁回执由真实门禁执行器生成，不应根据下面的示例组装。
+
+以下JSON仅示意字段布局，不能作为实际回执。原生回执必须恰好包含这13个字段，不得额外添加或重复字段。分支、HEAD、tree和base分别取自真实的`git symbolic-ref --short HEAD`、`git rev-parse HEAD`、`git rev-parse 'HEAD^{tree}'`和`git merge-base main HEAD`；`outgoing_oid`与HEAD相同。`report_sha256`取自真实报告字节的SHA256，例如`sha256sum -- "$report"`。`command`字段必须使用示例中的精确元数据字面量，它不是生成回执的命令。
+
+```json
+{
+  "version": 1,
+  "status": "PASS",
+  "branch": "<checked-out-feature-branch>",
+  "head": "<actual-HEAD>",
+  "tree": "<actual-HEAD-tree>",
+  "base": "<actual-main-HEAD-merge-base>",
+  "range": "main...HEAD",
+  "outgoing_oid": "<same-actual-HEAD>",
+  "clean_before": true,
+  "clean_after": true,
+  "command": "native review main...HEAD",
+  "report": "<absolute-private-SSD-report-path>",
+  "report_sha256": "<SHA256-of-that-actual-report>"
+}
+```
+
+真实报告必须恰好各包含一行匹配的`HEAD`、`TREE`、`BASE`和`RANGE`元数据。最前和最后两行非空行都必须为`VERDICT: PASS`及`ACTIONABLE_COUNT: 0`，报告中所有结论和问题数行必须一致。以下布局必须由独立审查者的真实全范围审查结果和Git身份替换，才能构成有效证据：
+
+```text
+VERDICT: PASS
+ACTIONABLE_COUNT: 0
+HEAD: <actual-HEAD>
+TREE: <actual-HEAD-tree>
+BASE: <actual-main-HEAD-merge-base>
+RANGE: main...HEAD
+<independent whole-range review evidence>
+VERDICT: PASS
+ACTIONABLE_COUNT: 0
+```
+
+将下面引号内的路径占位符替换为真实回执。每次只能将当前检出的功能分支推送到同名远端分支，且不能删除分支；这个显式refspec携带当前HEAD。多项更新、标签、删除、受保护分支、不匹配的refs/OIDs、分离HEAD、脏工作区以及过期或篡改的回执都会被拒绝。
+
+```bash
+export HYMT_LOCAL_GATE_RECEIPT="<gate producer's actual printed receipt path>"
+export HYMT_NATIVE_REVIEW_RECEIPT="<independent reviewer's actual receipt path>"
+branch="$(git symbolic-ref --short HEAD)" &&
+    git push origin "refs/heads/$branch:refs/heads/$branch"
+```

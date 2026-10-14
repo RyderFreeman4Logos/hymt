@@ -1,5 +1,5 @@
 # Justfile for hymt (Rust)
-# AI AGENT: Do NOT modify this file or use `git commit -n`/`--no-verify` to bypass pre-commit.
+# Keep local acceptance gates enforced; never bypass commit or push hooks.
 
 set shell := ["bash", "-c"]
 # IO scheduling: run cargo at idle priority to avoid starving interactive processes
@@ -22,24 +22,49 @@ pre-commit:
         set -euo pipefail
         just fmt
         just lint
+    '
+
+# Run once after committing, on a clean HEAD; prints the private gate receipt path.
+pre-push-gate target="head":
+    python3 scripts/hooks/local-gates.py run {{target}}
+
+# Fixed aggregate owned by the receipt producer; alone this emits no receipt.
+_full-gate:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    timeout --kill-after=5 {{_timeout}} bash -c '
+        set -euo pipefail
+        just fmt
+        just lint
         just test
+        just check
+        just check-no-telegram
+        just test-cli-no-telegram
+        just shell-syntax
+        just shellcheck
+        just service-verify
+        just toml-parse
     '
 
 fmt:
     {{_io_prefix}} cargo fmt --all -- --check
 
 lint:
-    {{_io_prefix}} cargo clippy --workspace -- -D warnings
+    {{_io_prefix}} cargo clippy --workspace --locked -- -D warnings
 
 check:
-    {{_io_prefix}} cargo check --workspace
+    {{_io_prefix}} cargo check --workspace --locked
 
 test:
-    {{_io_prefix}} cargo test --workspace
+    {{_io_prefix}} cargo test --workspace --locked
 
 # One focused test. Usage: just test-one hymt-translate omitted_link
 test-one package test:
-    {{_io_prefix}} cargo test -p {{package}} {{test}} -- --exact
+    {{_io_prefix}} cargo test -p {{package}} --locked {{test}} -- --exact
+
+# Focused trust-boundary and real hook/transport fixtures.
+test-local-gates:
+    {{_io_prefix}} cargo test -p hymt-cli --locked --test local_gates -- --nocapture
 
 # Release binary used for acceptance. Same idle prefix and cargo config as tests.
 release:
@@ -89,7 +114,24 @@ install-no-telegram:
 
 # Compile-check CLI with telegram feature disabled.
 check-no-telegram:
-    {{_io_prefix}} cargo check -p hymt-cli --no-default-features
+    {{_io_prefix}} cargo check -p hymt-cli --locked --no-default-features
+
+# Test the CLI without the optional Telegram feature.
+test-cli-no-telegram:
+    {{_io_prefix}} cargo test -p hymt-cli --locked --no-default-features
+
+# Check every tracked shell file, one bash parse per file.
+shell-syntax:
+    python3 scripts/hooks/local-gates.py shell-syntax
+
+shellcheck:
+    python3 scripts/hooks/local-gates.py shellcheck
+
+service-verify:
+    python3 scripts/hooks/local-gates.py service-verify
+
+toml-parse:
+    python3 scripts/hooks/local-gates.py toml-parse
 
 # =============================================================================
 # Misc

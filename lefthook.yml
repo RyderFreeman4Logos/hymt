@@ -10,11 +10,13 @@ pre-commit:
       run: just pre-commit
 
 pre-push:
+  piped: true
   commands:
     branch-protection:
       run: scripts/hooks/branch-protection.sh
     review-check:
       run: scripts/hooks/review-check.sh
+      use_stdin: true
 
 post-commit:
   commands:
