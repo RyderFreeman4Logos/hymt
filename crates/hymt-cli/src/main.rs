@@ -405,27 +405,51 @@ struct TelegramArgs {
 
 // ── Smart arg routing ─────────────────────────────────────────────────────────
 
+/// Whether a top-level option consumes the next argv token, according to Clap's
+/// own argument declarations (including hidden aliases and short clusters).
+fn option_takes_next(command: &clap::Command, token: &str) -> bool {
+    if let Some(long) = token.strip_prefix("--") {
+        let (name, attached) = match long.split_once('=') {
+            Some((name, _)) => (name, true),
+            None => (long, false),
+        };
+        return !attached
+            && command.get_arguments().any(|arg| {
+                (arg.get_long() == Some(name)
+                    || arg
+                        .get_all_aliases()
+                        .is_some_and(|aliases| aliases.contains(&name)))
+                    && arg.get_action().takes_values()
+            });
+    }
+    if let Some(shorts) = token.strip_prefix('-') {
+        for (index, short) in shorts.char_indices() {
+            let value_option = command.get_arguments().any(|arg| {
+                (arg.get_short() == Some(short)
+                    || arg
+                        .get_all_short_aliases()
+                        .is_some_and(|aliases| aliases.contains(&short)))
+                    && arg.get_action().takes_values()
+            });
+            if value_option {
+                return index + short.len_utf8() == shorts.len();
+            }
+        }
+    }
+    false
+}
+
 /// Return the first positional argument from `args` (skip flags and flag values).
 fn find_first_positional(args: &[String]) -> Option<&str> {
-    let mut skip_next = false;
-    for arg in args {
-        if skip_next {
-            skip_next = false;
-            continue;
-        }
+    let command = Cli::command();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
         if arg == "--" {
             return None;
         }
-        if arg.starts_with("--") {
-            // Long option: --foo or --foo=val
-            if !arg.contains('=') {
-                skip_next = true;
-            }
-            continue;
-        }
         if arg.starts_with('-') && arg.len() > 1 {
-            // Short option cluster; may or may not take value — skip conservatively
-            skip_next = true;
+            i += 1 + usize::from(option_takes_next(&command, arg));
             continue;
         }
         return Some(arg.as_str());
@@ -433,34 +457,25 @@ fn find_first_positional(args: &[String]) -> Option<&str> {
     None
 }
 
-/// Reorder `args` so that all flags/options come before positional text.
+/// Reorder `args` so that top-level flags/options come before positional text.
 ///
 /// This mirrors Python's `_option_args_first` and ensures that clap sees
 /// `hymt -l zh some text` the same as `hymt some text -l zh`.
 fn reorder_for_translation(args: &[String]) -> Vec<String> {
+    let command = Cli::command();
     let mut flags: Vec<String> = Vec::new();
     let mut positional: Vec<String> = Vec::new();
+    let mut after_delimiter: Option<&[String]> = None;
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
         if arg == "--" {
-            // Everything after -- is positional
-            positional.extend_from_slice(&args[i + 1..]);
+            after_delimiter = Some(&args[i + 1..]);
             break;
         }
-        if arg.starts_with("--") {
-            if arg.contains('=') {
-                flags.push(arg.clone());
-            } else {
-                flags.push(arg.clone());
-                if i + 1 < args.len() && !args[i + 1].starts_with('-') {
-                    i += 1;
-                    flags.push(args[i].clone());
-                }
-            }
-        } else if arg.starts_with('-') && arg.len() > 1 {
+        if arg.starts_with('-') && arg.len() > 1 {
             flags.push(arg.clone());
-            if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+            if option_takes_next(&command, arg) && i + 1 < args.len() {
                 i += 1;
                 flags.push(args[i].clone());
             }
@@ -470,6 +485,10 @@ fn reorder_for_translation(args: &[String]) -> Vec<String> {
         i += 1;
     }
     flags.extend(positional);
+    if let Some(rest) = after_delimiter {
+        flags.push("--".to_owned());
+        flags.extend_from_slice(rest);
+    }
     flags
 }
 
@@ -1801,6 +1820,56 @@ mod tests {
                 .as_nanos(),
             suffix
         )
+    }
+
+    #[test]
+    fn startup_routing_recognizes_subcommands_after_global_flags() {
+        for flag in [
+            "--no-cache",
+            "--disable-cache",
+            "--no-stream",
+            "--no-streaming",
+        ] {
+            let args = vec![
+                flag.to_owned(),
+                "--lang".to_owned(),
+                "zh".to_owned(),
+                "batch".to_owned(),
+                "dir".to_owned(),
+                "--dry-run".to_owned(),
+            ];
+            assert_eq!(find_first_positional(&args), Some("batch"), "{flag}");
+        }
+        let exec = vec![
+            "--no-cache".to_owned(),
+            "exec".to_owned(),
+            "/usr/bin/printf".to_owned(),
+            "-n".to_owned(),
+            "hello".to_owned(),
+        ];
+        assert_eq!(find_first_positional(&exec), Some("exec"));
+    }
+
+    #[test]
+    fn startup_routing_honors_value_options_clusters_and_delimiter() {
+        for (args, expected) in [
+            (vec!["-ylzh", "batch"], Some("batch")),
+            (vec!["-yl", "zh", "batch"], Some("batch")),
+            (vec!["--lang=zh", "batch"], Some("batch")),
+            (vec!["--term", "a=b", "batch"], Some("batch")),
+            (vec!["--", "batch"], None),
+        ] {
+            let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+            assert_eq!(find_first_positional(&args), expected, "{args:?}");
+        }
+        let args: Vec<String> = ["hello", "--no-cache", "--lang", "zh"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            reorder_for_translation(&args),
+            ["--no-cache", "--lang", "zh", "hello"]
+        );
     }
 
     #[test]

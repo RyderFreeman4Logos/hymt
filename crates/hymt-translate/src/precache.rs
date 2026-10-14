@@ -2,7 +2,8 @@
 //!
 //! Reads bash, zsh, and fish history files to discover recently-used commands,
 //! then translates their man pages and `--help` output into the target language
-//! so that subsequent `hymt exec` invocations hit the cache immediately.
+//! so that subsequent `hymt exec` invocations can reuse them when
+//! `[cache].enabled = true` and `--no-cache` is absent.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
