@@ -82,6 +82,8 @@ pub struct PromptOpts {
     pub context: Option<String>,
     /// Optional document-planning override; `None` uses the translation config.
     pub document_translation_policy: Option<DocumentTranslationPolicy>,
+    /// Explicit best-effort override; `None` uses the completeness config.
+    pub warn_only_completeness: Option<bool>,
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────

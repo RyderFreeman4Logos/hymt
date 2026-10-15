@@ -195,6 +195,10 @@ fn translation_for(segment: &str, broken: bool) -> String {
         } else {
             VALID_LABEL.to_owned()
         }
+    } else if segment.trim() == "Strong" {
+        "强调".to_owned()
+    } else if segment.trim() == "rest" {
+        "其余".to_owned()
     } else if segment.trim() == "Public Guide" {
         "公共指南".to_owned()
     } else if segment.trim() == "Read" {
@@ -298,16 +302,18 @@ async fn degraded_termination_is_not_laundered_by_warm_cache() {
     };
     let cold = translate_text(source, "zh", &TemplateType::Default, &opts, &ctx)
         .await
-        .unwrap();
-    assert!(cold.is_completeness_degraded());
+        .unwrap_err();
+    assert!(format!("{cold:#}").contains("finish_reason_length"));
+    assert!(history.fetch_recent(None).unwrap().is_empty());
     assert_eq!(provider.requests.lock().unwrap().len(), 2);
     let warm = translate_text(source, "zh", &TemplateType::Default, &opts, &ctx)
         .await
-        .unwrap();
+        .unwrap_err();
     assert!(
-        warm.is_completeness_degraded(),
+        format!("{warm:#}").contains("finish_reason_length"),
         "warm cache must not erase Length evidence"
     );
+    assert!(history.fetch_recent(None).unwrap().is_empty());
     assert_eq!(provider.requests.lock().unwrap().len(), 4);
 }
 
@@ -715,7 +721,7 @@ async fn markdown_inline_owners_preserve_syntax_and_translate_labels() {
     let outcome = translate_text(source, "zh", &TemplateType::Default, &opts, &ctx)
         .await
         .unwrap();
-    assert!(outcome.text.contains(&format!("**{OTHER_TRANSLATION}**")));
+    assert!(outcome.text.contains("**强调**"));
     assert!(outcome.text.contains(&format!(
         "![{OTHER_TRANSLATION}](https://example.test/diagram.png \"Figure\")"
     )));

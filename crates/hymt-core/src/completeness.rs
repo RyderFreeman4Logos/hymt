@@ -179,18 +179,13 @@ pub fn validate_completeness_with_context(
     // UTF-8-byte/4 estimate the segmenter uses when its tokenizer is absent.
     // Scalar ratios reject complete English→Chinese prose because Chinese uses
     // fewer scalars per word. Other targets stay explicit advisories.
-    let mut density_passed = None;
     match density.status {
         DensityStatus::Calibrated => {
             if let Some(ratio) = density.ratio {
                 if ratio < density.minimum_ratio.unwrap_or_default() {
                     checks_failed.push("token_ratio".to_owned());
-                    density_passed = Some(false);
                 } else if ratio > density.maximum_ratio.unwrap_or(f64::INFINITY) {
                     checks_failed.push("density_upper_bound".to_owned());
-                    density_passed = Some(false);
-                } else {
-                    density_passed = Some(true);
                 }
             }
         }
@@ -201,11 +196,7 @@ pub fn validate_completeness_with_context(
     if input_stats.paragraph_count > 0 {
         let ratio = output_stats.paragraph_count as f64 / input_stats.paragraph_count as f64;
         if ratio < thresholds.min_paragraph_ratio {
-            if density_passed == Some(true) {
-                advisory_warnings.push("paragraph_count".to_owned());
-            } else {
-                checks_failed.push("paragraph_count".to_owned());
-            }
+            checks_failed.push("paragraph_count".to_owned());
         }
     }
 
@@ -215,22 +206,7 @@ pub fn validate_completeness_with_context(
     if input_stats.fenced_code_block_count > output_stats.fenced_code_block_count {
         checks_failed.push("fenced_code_preservation".to_owned());
     }
-    if !preserves_all(
-        &placeholder_tokens(input_text),
-        &placeholder_tokens(output_text),
-    ) {
-        checks_failed.push("placeholder_preservation".to_owned());
-    }
-    if !preserves_all(&urls(input_text), &urls(output_text)) {
-        checks_failed.push("url_preservation".to_owned());
-    }
-    if let Some(input_json) = parse_json_document(input_text) {
-        match serde_json::from_str::<serde_json::Value>(output_text.trim()) {
-            Ok(output_json) if preserves_json_object_keys(&input_json, &output_json) => {}
-            Ok(_) => checks_failed.push("json_key_preservation".to_owned()),
-            Err(_) => checks_failed.push("json_validity".to_owned()),
-        }
-    }
+    checks_failed.extend(identity_preservation_failures(input_text, output_text));
     if generic_refusal(output_text) {
         checks_failed.push("generic_refusal".to_owned());
     }
@@ -267,7 +243,7 @@ fn compute_stats(text: &str) -> CompletenessStats {
         heading_count: count_markdown_headings(text),
         fenced_code_block_count: count_fenced_code_blocks(text),
         url_count: urls(text).len(),
-        placeholder_count: placeholder_tokens(text).len(),
+        placeholder_count: preserved_placeholders(text).len(),
     }
 }
 
@@ -356,7 +332,31 @@ fn count_fenced_code_blocks(text: &str) -> usize {
         .div_ceil(2)
 }
 
-fn placeholder_tokens(text: &str) -> HashSet<String> {
+/// Identity failures independent of translation density and transport termination.
+/// Suitable for validating a reconstructed document with source-owned syntax.
+pub fn identity_preservation_failures(input_text: &str, output_text: &str) -> Vec<String> {
+    let mut checks_failed = Vec::new();
+    if !preserves_all(
+        &preserved_placeholders(input_text),
+        &preserved_placeholders(output_text),
+    ) {
+        checks_failed.push("placeholder_preservation".to_owned());
+    }
+    if !preserves_all(&urls(input_text), &urls(output_text)) {
+        checks_failed.push("url_preservation".to_owned());
+    }
+    if let Some(input_json) = parse_json_document(input_text) {
+        match serde_json::from_str::<serde_json::Value>(output_text.trim()) {
+            Ok(output_json) if preserves_json_object_keys(&input_json, &output_json) => {}
+            Ok(_) => checks_failed.push("json_key_preservation".to_owned()),
+            Err(_) => checks_failed.push("json_validity".to_owned()),
+        }
+    }
+    checks_failed
+}
+
+/// Complete placeholder identities recognized by the completeness validator.
+pub fn preserved_placeholders(text: &str) -> HashSet<String> {
     let mut tokens = HashSet::new();
     let mut remaining = text;
     while let Some(start) = remaining.find("{{") {
@@ -523,7 +523,8 @@ fn preserves_all(input: &HashSet<String>, output: &HashSet<String>) -> bool {
     input.iter().all(|token| output.contains(token))
 }
 
-fn parse_json_document(text: &str) -> Option<serde_json::Value> {
+/// Parse a complete JSON object or array using the completeness contract.
+pub fn parse_json_document(text: &str) -> Option<serde_json::Value> {
     let trimmed = text.trim();
     (trimmed.starts_with('{') || trimmed.starts_with('['))
         .then(|| serde_json::from_str::<serde_json::Value>(trimmed).ok())
@@ -978,28 +979,23 @@ mod tests {
     // ── Advisory warnings ────────────────────────────────────────────────────
 
     #[test]
-    fn zh_to_en_paragraph_merge_is_advisory() {
+    fn zh_to_en_paragraph_loss_is_rejected_despite_length() {
         // 3 paras in zh, 1 in en. Ratio = 0.33 < 0.5 (threshold)
         let input = "第一段。\n\n第二段。\n\n第三段。";
         let output = "Para one and two and three merged into one single paragraph that is long enough to pass ratio.";
         let result = validate_completeness(input, output, "en", None);
-        // Should be complete because char_ratio passed (output is long enough)
-        assert!(result.is_complete);
-        assert!(result
-            .advisory_warnings
-            .contains(&"paragraph_count".to_owned()));
-        assert!(!result.checks_failed.contains(&"paragraph_count".to_owned()));
+        // Length cannot establish that all three source paragraphs survived.
+        assert!(!result.is_complete);
+        assert!(result.checks_failed.contains(&"paragraph_count".to_owned()));
     }
 
     #[test]
-    fn en_to_zh_paragraph_merge_is_advisory() {
+    fn en_to_zh_paragraph_loss_is_rejected_despite_length() {
         let input = "Para one.\n\nPara two.\n\nPara three.";
         let output = "第一段、第二段和第三段被合并成了一个足够长的段落。";
         let result = validate_completeness(input, output, "zh", None);
-        assert!(result.is_complete);
-        assert!(result
-            .advisory_warnings
-            .contains(&"paragraph_count".to_owned()));
+        assert!(!result.is_complete);
+        assert!(result.checks_failed.contains(&"paragraph_count".to_owned()));
     }
 
     #[test]

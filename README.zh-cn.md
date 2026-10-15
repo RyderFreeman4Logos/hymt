@@ -102,11 +102,10 @@ zh_to_en_min_ratio = 0.3
 en_to_zh_min_ratio = 0.3
 min_paragraph_ratio = 0.5
 max_retries = 2
-# After retries are exhausted, a non-empty best attempt meeting the 33% completeness
-# floor is written. Set true (or pass --warn-only-completeness) to keep exit 0 with
-# warnings for this degraded best-effort result.
-# Empty or below-33% candidates are unrecoverably incomplete: they are rejected as
-# errors and are not written, even when warn_only is true.
+# Failed completeness retries are rejected before output, cache, or success history.
+# Set true (or pass --warn-only-completeness) to explicitly allow eligible degraded
+# best attempts with warnings. Empty or below-33% candidates remain errors even
+# in this opt-in mode.
 warn_only = false
 
 [timing]
@@ -272,7 +271,7 @@ hymt translate-doc docs/ --recursive
 - 默认目标语言为`zh`，Markdown输出文件会自动转换为`.zh-cn.md`格式。
 - 当使用`--output-dir`参数时，目录模式会翻译Markdown文件并保留相对路径。
 - 完整性验证采用快速的分层截断/结构检测机制——**并非**翻译质量评估或语义正确性验证。对于已校准的英语/中文目标语言，密度指的是输出内容与输入内容的比例，该比例采用分段工具在缺少分词器时的相同计算方式，即`ceil(utf8_bytes / 4)`。由于中文每个单词对应的Unicode标量值更少，因此这种基于标量值的比率无法用于判断完整的英语到中文文本转换结果。其他目标语言会明确标注`unverified_density`，而不会默认认为密度验证已通过。该机制还会检查调用方提供的空响应或终止响应、段落、Markdown标题和代码块、占位符、URL以及有效的JSON模板。缓存的分段内容在再次使用前会通过当前的验证机制进行重新检查。
-- 失败的片段会最多重试 `[completeness].max_retries` 次；普通模式、流式处理、批处理以及 `translate-doc` 模式下的片段验证均适用此规则。当所有重试次数用尽后，系统会保留验证得分最高的尝试结果（该得分基于可观察的防护信号，而非 QE 分数），并记录 `reason=highest_validation_score`。若存在符合 33% 源文本token最低要求且非空的最佳尝试结果，则视为普通降级处理：`hymt` 会将其保存，并在标准错误流中输出 `completeness_status=degraded_best_effort` 以及 `completeness_degraded_segments=…`。若不存在此类最佳尝试结果，或其得分低于最低要求，则表示该结果已无法修复，系统会直接拒绝并报错，而不会将其保存。对于 `translate-doc` 模式，被拒绝的文档不会影响任何已存在的输出文件；目录级翻译会继续处理后续文档，但只要有任何文档处理失败，整体任务就会以非零状态退出。顶级文本/文件/标准输入命令及其流式处理版本在出现普通降级结果时也会以非零状态退出，以便脚本能够检测到这些情况；若希望仅针对符合条件的降级结果发出警告而保持退出码为 0，可传递 `--warn-only-completeness` 参数或设置 `[completeness].warn_only = true`。默认情况下，`batch`、`translate-doc` 和 `exec` 模式会输出相同的标准错误标记，但不会因存在符合条件的降级片段而导致整个任务失败。验证通过后，流式处理会暂存该片段直至其通过验证；而乐观流式处理无法撤回已输出的无效token，因此会报告降级处理结果而非重新尝试。
+- 失败的片段最多重试 `[completeness].max_retries` 次；普通、流式、批处理和 `translate-doc` 使用相同设置。如果没有任何尝试通过验证，默认会在输出、写入片段缓存或成功历史记录前报错。已有文档输出保持不变；目录翻译继续处理后续文档并报告失败。段落分隔、表格行列边界和 URL 由源文保留；响应长度足够不能抵消段落丢失。显式传入 `--warn-only-completeness` 或设置 `[completeness].warn_only = true`，才允许使用符合最低要求且验证评分最高的降级结果，并输出 `completeness_status=degraded_best_effort` 和 `completeness_degraded_segments=…` 警告。即使选择此模式，空结果或低于约 33% 源 token 下限的结果仍会被拒绝。验证模式不会输出失败内容；乐观流式模式无法撤回已输出的字节，但失败尝试不会被记录为文档成功。这些检查检测结构和完整性问题，并不能证明翻译语义准确。 exec 的整篇输出缓存命中也会先重新检查完整性、文档标识及源文本所属的 Markdown 内容；无效条目会重新翻译，降级最佳结果不会写入整篇输出缓存。
 - 源文本段受扩展量/上下文预算以及`[translation].max_source_tokens_per_segment`（默认值为384，设为0则禁用该限制）的约束。这一保守的默认设置可避免7B模型在达到预设输出长度前就结束长文本翻译；只有在确认部署后的接口能生成完整输出后，才可提高该限制值。对于已下载对应分词器的固定Hy-MT2配置文件，规划器会在预留输出令牌之前，先处理并统计完整的聊天请求内容（角色设定、提示语/上下文、助手标识以及完整性重试相关信息）。「--plan」选项会显示统计来源、配置文件/分词器/模板信息、各字段容量、输入/输出数据分布，以及任何文本段修改情况。
 - 若当前使用的配置文件/模板或分词器不可用，hymt会输出明确的标准错误警告，并采用保守的2倍输入量估算值，同时额外预留64个令牌用于聊天内容格式处理。如需拒绝这种近似处理方式，可设置`[translation].strict_token_budget = true`；若需本地进行预算控制，则需配置`[endpoint].profile`并运行`hymt tokenizer download`命令。
 - 尺寸过大的代码块或受Markdown表格保护的块，在提交任何HTTP请求之前就会因`ProtectedBlockTooLarge`错误而无法处理；此类内容需拆分处理，或移出模型处理范围。

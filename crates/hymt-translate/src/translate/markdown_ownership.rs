@@ -99,6 +99,96 @@ fn clipped_ranges(
         .collect()
 }
 
+/// Admit whole-output cache entries only when their source-owned payloads align.
+/// Candidate language and token size never decide what the source preserved.
+pub(super) fn cached_owned_payloads_match(
+    plan: &super::TranslationPlan,
+    candidate: &str,
+    segmenter: &Segmenter,
+) -> bool {
+    let Some(document) = &plan.document_plan else {
+        return candidate.is_empty();
+    };
+    let source: String = document
+        .sections
+        .iter()
+        .map(|section| section.text.as_str())
+        .collect();
+    let source_layout =
+        hymt_core::language::build_document_translation_plan(&source, &document.target_lang);
+    let candidate_layout =
+        hymt_core::language::build_document_translation_plan(candidate, &document.target_lang);
+    if source_layout.sections.len() != candidate_layout.sections.len() {
+        return false;
+    }
+    let translated_paragraphs: std::collections::HashSet<_> = document
+        .sections
+        .iter()
+        .filter(|section| section.should_translate)
+        .filter_map(|section| section.paragraph_index)
+        .collect();
+    let source_ranges = merge_ranges(protected_markdown_structure_ranges(&source));
+    let candidate_ranges = merge_ranges(protected_markdown_structure_ranges(candidate));
+    let mut source_cursor = 0;
+    let mut candidate_cursor = 0;
+    let mut source_offset = 0;
+    let mut candidate_offset = 0;
+    for (original, cached) in source_layout
+        .sections
+        .iter()
+        .zip(&candidate_layout.sections)
+    {
+        if original.kind != cached.kind {
+            return false;
+        }
+        let source_end = source_offset + original.text.len();
+        let candidate_end = candidate_offset + cached.text.len();
+        let original_owned = clipped_ranges(
+            &source_ranges,
+            &mut source_cursor,
+            source_offset..source_end,
+        );
+        let cached_owned = clipped_ranges(
+            &candidate_ranges,
+            &mut candidate_cursor,
+            candidate_offset..candidate_end,
+        );
+        source_offset = source_end;
+        candidate_offset = candidate_end;
+        let translates = original.kind == SectionKind::Paragraph
+            && original
+                .paragraph_index
+                .is_some_and(|index| translated_paragraphs.contains(&index));
+        if !translates {
+            if original.text != cached.text {
+                return false;
+            }
+            continue;
+        }
+        if !original_owned
+            .iter()
+            .map(|range| &original.text[range.clone()])
+            .eq(cached_owned.iter().map(|range| &cached.text[range.clone()]))
+        {
+            return false;
+        }
+        // Oversized tables may contain otherwise editable cells. Their source
+        // budget decision applies to the corresponding complete candidate block.
+        let blocks = protected_markdown_block_ranges(&original.text);
+        let cached_blocks = protected_markdown_block_ranges(&cached.text);
+        for (index, range) in blocks.iter().enumerate() {
+            if segmenter.count_tokens(&original.text[range.clone()]) > plan.available_source_tokens
+                && cached_blocks.get(index).is_none_or(|cached_range| {
+                    original.text[range.clone()] != cached.text[cached_range.clone()]
+                })
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Keep oversized atomic Markdown blocks out of model input while preserving
 /// translatable text around them as independently segmentable sections.
 pub(super) fn split_oversized_protected_blocks(
@@ -251,6 +341,27 @@ fn protected_markdown_structure_ranges(text: &str) -> Vec<Range<usize>> {
         .iter()
         .map(|(_, definition)| definition.span.clone())
         .collect();
+    // The definition map retains only the first binding. Parser-invisible gaps
+    // also include later duplicate definitions; translating them creates visible
+    // prose from hidden syntax. Preserve these bytes using the same offset parser.
+    let events: Vec<_> = parser.into_offset_iter().collect();
+    let covered = merge_ranges(
+        events
+            .iter()
+            .filter(|(event, _)| !matches!(event, Event::Start(_) | Event::End(_)))
+            .map(|(_, range)| range.clone())
+            .collect(),
+    );
+    let mut cursor = 0;
+    for range in covered {
+        if cursor < range.start && !text[cursor..range.start].trim().is_empty() {
+            owned.push(cursor..range.start);
+        }
+        cursor = cursor.max(range.end);
+    }
+    if cursor < text.len() && !text[cursor..].trim().is_empty() {
+        owned.push(cursor..text.len());
+    }
     let bytes = text.as_bytes();
     let mut index = 0;
     while index + 1 < bytes.len() {
@@ -282,7 +393,7 @@ fn protected_markdown_structure_ranges(text: &str) -> Vec<Range<usize>> {
     let mut literal_delimiters = Vec::new();
     let mut paragraph = None;
     let mut table_paragraphs = Vec::new();
-    for (event, range) in parser.into_offset_iter() {
+    for (event, range) in events {
         match event {
             Event::Start(Tag::Paragraph) => paragraph = Some(range),
             Event::End(TagEnd::Paragraph) => paragraph = None,
@@ -368,6 +479,14 @@ fn protected_markdown_structure_ranges(text: &str) -> Vec<Range<usize>> {
         owned.push(start..end);
         opaque.push(start..end);
         protected_end = end;
+    }
+    // Immutable identities must never be divided into independently translated leaves.
+    for token in hymt_core::completeness::preserved_placeholders(text) {
+        for (start, _) in text.match_indices(&token) {
+            let range = start..start + token.len();
+            owned.push(range.clone());
+            opaque.push(range);
+        }
     }
     exclude_opaque(&mut editable, opaque);
     owned_gaps(text, owned, &editable)
@@ -466,4 +585,20 @@ fn is_markdown_table_separator(line: &str) -> bool {
             let marker = cell.trim().trim_matches(':');
             marker.len() >= 3 && marker.bytes().all(|byte| byte == b'-')
         })
+}
+
+#[cfg(test)]
+mod document_proof_tests {
+    use super::protected_markdown_structure_ranges;
+
+    #[test]
+    fn duplicate_hidden_reference_definition_is_source_owned() {
+        let hidden = "[ID]: ../second \"Hidden duplicate\"\n";
+        let source = format!("[label][id]\n\n[id]: ../first \"Title\"\n{hidden}");
+        let start = source.find(hidden).unwrap();
+        let end = start + hidden.len();
+        assert!(protected_markdown_structure_ranges(&source)
+            .iter()
+            .any(|range| range.start <= start && end <= range.end));
+    }
 }
