@@ -1,5 +1,5 @@
 use super::{DocumentLanguagePlan, SectionKind, Segmenter};
-use pulldown_cmark::{Event, LinkType, Parser, Tag};
+use pulldown_cmark::{Event, LinkType, Parser, Tag, TagEnd};
 use std::ops::Range;
 
 // Keep parser-resolved identity separate from the translated display label.
@@ -261,10 +261,31 @@ fn protected_markdown_structure_ranges(text: &str) -> Vec<Range<usize>> {
             index += 1;
         }
     }
+    let punctuation = |character: char| {
+        character.is_ascii_punctuation()
+            || (!character.is_ascii()
+                && !character.is_whitespace()
+                // Intraword underscores open only after parser-classified punctuation.
+                && Parser::new(&format!("a{character}_b_")).any(|event| {
+                    matches!(event, Event::Start(Tag::Emphasis))
+                }))
+    };
+    // URLs are identity, including visible URL labels; only adjacent prose translates.
+    for range in hymt_core::completeness::preserved_url_ranges(text) {
+        // Keep punctuation separating the URL from translated adjacent text.
+        let left = text[..range.start].trim_end_matches(punctuation).len();
+        let right = text.len() - text[range.end..].trim_start_matches(punctuation).len();
+        owned.push(left..right);
+    }
     let mut opaque = owned.clone();
     let mut editable = Vec::new();
+    let mut literal_delimiters = Vec::new();
+    let mut paragraph = None;
+    let mut table_paragraphs = Vec::new();
     for (event, range) in parser.into_offset_iter() {
         match event {
+            Event::Start(Tag::Paragraph) => paragraph = Some(range),
+            Event::End(TagEnd::Paragraph) => paragraph = None,
             Event::Start(
                 Tag::Heading { .. }
                 | Tag::Emphasis
@@ -294,6 +315,16 @@ fn protected_markdown_structure_ranges(text: &str) -> Vec<Range<usize>> {
             Event::Text(content) if text[range.clone()] == *content => {
                 // Flanking whitespace belongs to syntax, not trimmed model text.
                 let literal = &text[range.clone()];
+                if literal.contains('|') {
+                    if let Some(paragraph) = paragraph.take() {
+                        table_paragraphs.push(paragraph);
+                    }
+                }
+                literal_delimiters.extend(literal.char_indices().filter_map(
+                    |(offset, character)| {
+                        matches!(character, '*' | '_').then_some(range.start + offset)
+                    },
+                ));
                 let start = range.start + literal.len() - literal.trim_start().len();
                 let end = range.start + literal.trim_end().len();
                 if start < end {
@@ -302,6 +333,41 @@ fn protected_markdown_structure_ranges(text: &str) -> Vec<Range<usize>> {
             }
             _ => {}
         }
+    }
+    // Keep table-like prose malformed when present: models must not join headers
+    // or invent separators. Preserve every row boundary, including ragged rows.
+    for paragraph in table_paragraphs {
+        let mut offset = paragraph.start;
+        for line in text[paragraph].split_inclusive('\n') {
+            let separator = line.contains('-')
+                && line
+                    .chars()
+                    .all(|c| matches!(c, '|' | '-' | ':' | ' ' | '\t' | '\r' | '\n'));
+            if separator {
+                owned.push(offset..offset + line.len());
+                opaque.push(offset..offset + line.len());
+            } else {
+                for (index, character) in line.char_indices() {
+                    if matches!(character, '|' | '\r' | '\n') {
+                        owned.push(offset + index..offset + index + 1);
+                        opaque.push(offset + index..offset + index + 1);
+                    }
+                }
+            }
+            offset += line.len();
+        }
+    }
+    // Literal delimiters and their punctuation flanks must not become new emphasis.
+    let mut protected_end = 0;
+    for offset in literal_delimiters {
+        if offset < protected_end {
+            continue;
+        }
+        let start = text[..offset].trim_end_matches(punctuation).len();
+        let end = text.len() - text[offset..].trim_start_matches(punctuation).len();
+        owned.push(start..end);
+        opaque.push(start..end);
+        protected_end = end;
     }
     exclude_opaque(&mut editable, opaque);
     owned_gaps(text, owned, &editable)

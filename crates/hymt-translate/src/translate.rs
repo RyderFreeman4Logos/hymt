@@ -1058,8 +1058,8 @@ fn has_unparsed_link_syntax(text: &str) -> bool {
     unresolved_reference.get()
 }
 
-/// Groups consecutive translatable sections, absorbing intervening separators
-/// when the next content section is also translatable.
+/// Group consecutive translatable leaves, keeping paragraph separators source-owned.
+/// Each paragraph must receive its own independently validated translation.
 fn translation_section_groups(plan: &DocumentLanguagePlan) -> Vec<Vec<usize>> {
     let mut groups: Vec<Vec<usize>> = Vec::new();
     let mut current: Vec<usize> = Vec::new();
@@ -1069,16 +1069,6 @@ fn translation_section_groups(plan: &DocumentLanguagePlan) -> Vec<Vec<usize>> {
         if section.should_translate {
             current.push(i);
             continue;
-        }
-        if section.kind == SectionKind::Separator && !current.is_empty() {
-            let next_translatable = sections[i + 1..]
-                .iter()
-                .find(|s| s.kind != SectionKind::Separator)
-                .is_some_and(|s| s.should_translate);
-            if next_translatable {
-                current.push(i);
-                continue;
-            }
         }
         if !current.is_empty() {
             groups.push(std::mem::take(&mut current));
@@ -4564,7 +4554,7 @@ After ordinary prose must also be translated in document order.\n"
 
     #[tokio::test]
     async fn document_batch_continues_after_a_segment_translation_failure() {
-        let failed_segment_marker = "FAILED_DOCUMENT_SEGMENT".to_owned();
+        let failed_segment_marker = "FAILEDDOCUMENTSEGMENT".to_owned();
         let server =
             start_document_batch_mock_server(failed_segment_marker.clone(), "译".repeat(200)).await;
         let config = make_stream_config(&server.endpoint_url);
@@ -5366,14 +5356,12 @@ After ordinary prose must also be translated in document order.\n"
             "# Heading\n\nBody text that must remain separate.\n",
             "zh",
         );
-        let group = translation_section_groups(&document_plan)
-            .into_iter()
-            .next()
-            .expect("fixture must create a translatable group");
+        let groups = translation_section_groups(&document_plan);
+        assert_eq!(groups.len(), 2);
         let plan = TranslationPlan {
             source_tokens: 0,
             segments: vec![
-                "# Heading\n\n".to_owned(),
+                "# Heading\n".to_owned(),
                 "Body text that must remain separate.\n".to_owned(),
             ],
             available_source_tokens: 100,
@@ -5393,8 +5381,8 @@ After ordinary prose must also be translated in document order.\n"
                 warning: None,
             },
             document_plan: Some(document_plan),
-            segment_section_indexes: vec![group[0], group[0]],
-            segment_section_groups: vec![group.clone(), group],
+            segment_section_indexes: vec![groups[0][0], groups[1][0]],
+            segment_section_groups: groups,
         };
 
         let translated = plan.reconstruct(&["# 标题".to_owned(), "正文保持分段。".to_owned()]);
@@ -5407,8 +5395,8 @@ After ordinary prose must also be translated in document order.\n"
         use hymt_core::language::build_document_translation_plan;
         let plan = build_document_translation_plan("Paragraph one.\n\nParagraph two.\n", "zh");
         let groups = translation_section_groups(&plan);
-        // Two translatable paragraphs separated by a separator that bridges them
-        assert!(!groups.is_empty());
+        // Source-owned separators keep both paragraphs independently validated.
+        assert_eq!(groups.len(), 2);
     }
 
     // ── expansion ratios ──────────────────────────────────────────────────────
@@ -6189,7 +6177,7 @@ Bravo one text carries enough source material for cache validation and ordering 
 
     #[tokio::test]
     async fn validated_streaming_retries_finish_reason_length_before_stdout() {
-        let text = "Usage: ask [OPTIONS]\n\nOptions:\n  -h, --help Print help.\n";
+        let text = "Usage: ask [OPTIONS]\nOptions:\n  -h, --help Print help.\n";
         let planning_cfg = make_stream_config_with_fcp("http://127.0.0.1:1/v1", false);
         let segmenter = fallback_segmenter();
         let plan = plan_translation(
@@ -6534,7 +6522,7 @@ Bravo one text carries enough source material for cache validation and ordering 
 
     #[tokio::test]
     async fn finish_reason_length_retries_selects_best_attempt_and_marks_degraded() {
-        let text = "Hello world paragraph one.\n\nHello world paragraph two.";
+        let text = "Hello world sentence one. Hello world sentence two.";
         let dir = tempfile::tempdir().unwrap();
         let cfg_path = dir.path().join("config.toml");
         std::fs::write(

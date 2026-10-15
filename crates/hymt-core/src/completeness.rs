@@ -395,19 +395,49 @@ pub fn preserved_urls(text: &str) -> HashSet<String> {
 }
 
 fn urls(text: &str) -> HashSet<String> {
-    let mut urls = HashSet::new();
-    let mut remaining = text;
+    preserved_url_ranges(text)
+        .into_iter()
+        .map(|range| text[range].to_owned())
+        .collect()
+}
 
-    while let Some(start) = earliest_url_scheme_start(remaining) {
-        let candidate = &remaining[start..];
-        let end = url_candidate_end(candidate);
-        let candidate = &candidate[..end];
-        if let Some(url) = normalize_url(candidate) {
-            urls.insert(url);
+/// Source byte ranges of immutable URLs, using the same grammar as completeness
+/// validation. Markdown boundaries belong to formatting or link labels, not URLs.
+pub fn preserved_url_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    use pulldown_cmark::{Event, Parser, Tag};
+    let mut boundaries: Vec<_> = Parser::new(text)
+        .into_offset_iter()
+        .filter_map(|(event, range)| match event {
+            Event::Start(Tag::Link { .. } | Tag::Image { .. }) => Some((range.start, None)),
+            Event::Start(Tag::Emphasis) => Some((range.end - 1, Some(range.start))),
+            Event::Start(Tag::Strong | Tag::Strikethrough) => {
+                Some((range.end - 2, Some(range.start)))
+            }
+            _ => None,
+        })
+        .collect();
+    boundaries.sort_unstable();
+    let mut urls = Vec::new();
+    let mut offset = 0;
+    let mut boundary = 0;
+    while let Some(start) = earliest_url_scheme_start(&text[offset..]) {
+        let start = offset + start;
+        while boundary < boundaries.len() && boundaries[boundary].0 <= start {
+            boundary += 1;
         }
-        remaining = &remaining[start + end..];
+        // A future formatting owner does not bound this URL, but its closing
+        // delimiter must remain available for URLs inside that owner later.
+        let end = boundaries[boundary..]
+            .iter()
+            .find(|(_, opening)| opening.is_none_or(|opening| opening < start))
+            .map_or(text.len(), |(end, _)| *end);
+        let candidate = &text[start..end];
+        let end = url_candidate_end(candidate);
+        if let Some(url) = normalize_url(&candidate[..end]) {
+            urls.push(start..start + url.len());
+        }
+        offset = start + end;
     }
-
     urls
 }
 
@@ -1165,6 +1195,43 @@ verbatim ask --no-generate --format json \"哪些证据是相关的？\"";
         assert!(result
             .checks_failed
             .contains(&"url_preservation".to_owned()));
+    }
+
+    #[test]
+    fn urls_stop_at_markdown_boundaries_without_swallowing_link_labels() {
+        for text in [
+            "__https://example.com/path__[contain code](https://example.net/next)",
+            "**https://example.com/path**[Figure A](https://example.net/next)",
+            "https://example.com/path[visible label](https://example.net/next)",
+        ] {
+            assert_eq!(
+                preserved_urls(text),
+                HashSet::from([
+                    "https://example.com/path".to_owned(),
+                    "https://example.net/next".to_owned(),
+                ]),
+                "{text}"
+            );
+        }
+        for url in [
+            "https://[::1]/path",
+            "https://example.com/?items[]=one",
+            "https://example.com/a_b_(c)",
+            "https://example.com/a*b*c",
+            "https://example.com/a\\_b",
+        ] {
+            assert_eq!(preserved_urls(url), HashSet::from([url.to_owned()]));
+        }
+    }
+
+    #[test]
+    fn url_ranges_keep_later_formatting_boundaries() {
+        let text = "https://first.test/x **https://second.test/y**";
+        let urls: Vec<_> = preserved_url_ranges(text)
+            .into_iter()
+            .map(|range| &text[range])
+            .collect();
+        assert_eq!(urls, ["https://first.test/x", "https://second.test/y"]);
     }
 
     #[test]
