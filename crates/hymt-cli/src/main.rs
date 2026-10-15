@@ -465,12 +465,11 @@ fn reorder_for_translation(args: &[String]) -> Vec<String> {
     let command = Cli::command();
     let mut flags: Vec<String> = Vec::new();
     let mut positional: Vec<String> = Vec::new();
-    let mut after_delimiter: Option<&[String]> = None;
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
         if arg == "--" {
-            after_delimiter = Some(&args[i + 1..]);
+            positional.extend_from_slice(&args[i + 1..]);
             break;
         }
         if arg.starts_with('-') && arg.len() > 1 {
@@ -484,11 +483,10 @@ fn reorder_for_translation(args: &[String]) -> Vec<String> {
         }
         i += 1;
     }
+    // Keep one syntax boundary before all text. It also prevents a trailing
+    // value-taking option from borrowing an earlier positional word.
+    flags.push("--".to_owned());
     flags.extend(positional);
-    if let Some(rest) = after_delimiter {
-        flags.push("--".to_owned());
-        flags.extend_from_slice(rest);
-    }
     flags
 }
 
@@ -514,8 +512,16 @@ async fn main() {
 }
 
 async fn run() -> Result<()> {
-    // Pre-scan raw args to decide whether to reorder before clap parsing.
-    let raw: Vec<String> = std::env::args().skip(1).collect();
+    // Check argv before smart routing, config loading, or backend work. Avoid
+    // env::args() panicking on a non-UTF-8 argument or echoing its raw bytes.
+    let argv: Vec<String> = std::env::args_os()
+        .map(|arg| {
+            arg.into_string()
+                .map_err(|_| anyhow::anyhow!("non-UTF-8 command-line argument"))
+        })
+        .collect::<Result<_>>()?;
+    let program = argv.first().cloned().unwrap_or_else(|| "hymt".to_owned());
+    let raw: Vec<String> = argv.into_iter().skip(1).collect();
     let first = find_first_positional(&raw);
     let is_known_sub = first
         .map(|s| KNOWN_SUBCOMMANDS.contains(&s))
@@ -523,10 +529,10 @@ async fn run() -> Result<()> {
 
     let cli = if is_known_sub || first.is_none() {
         // Normal clap parsing — first positional is a subcommand or no args given.
-        Cli::parse()
+        Cli::parse_from(std::iter::once(program).chain(raw))
     } else {
         // The first positional is text to translate; reorder so flags come first.
-        let mut reordered = vec![std::env::args().next().unwrap_or_else(|| "hymt".to_owned())];
+        let mut reordered = vec![program];
         reordered.extend(reorder_for_translation(&raw));
         Cli::parse_from(reordered)
     };
@@ -1868,8 +1874,63 @@ mod tests {
             .collect();
         assert_eq!(
             reorder_for_translation(&args),
-            ["--no-cache", "--lang", "zh", "hello"]
+            ["--no-cache", "--lang", "zh", "--", "hello"]
         );
+    }
+
+    #[test]
+    fn startup_parser_preserves_fences_and_rejects_missing_values() {
+        fn parse_routed(args: &[&str]) -> std::result::Result<Cli, clap::Error> {
+            let raw: Vec<String> = args[1..].iter().map(|s| (*s).to_owned()).collect();
+            let first = find_first_positional(&raw);
+            let routed =
+                if first.is_none() || first.is_some_and(|word| KNOWN_SUBCOMMANDS.contains(&word)) {
+                    args.iter().map(|s| (*s).to_owned()).collect()
+                } else {
+                    let mut routed = vec![args[0].to_owned()];
+                    routed.extend(reorder_for_translation(&raw));
+                    routed
+                };
+            Cli::try_parse_from(routed)
+        }
+
+        for (args, expected, no_cache) in [
+            (
+                vec!["hymt", "hello", "--", "--no-cache"],
+                vec!["hello", "--no-cache"],
+                false,
+            ),
+            (
+                vec!["hymt", "hello", "--", "--", "--no-cache"],
+                vec!["hello", "--", "--no-cache"],
+                false,
+            ),
+            (
+                vec!["hymt", "hello", "--disable-cache", "--", "--no-cache"],
+                vec!["hello", "--no-cache"],
+                true,
+            ),
+            (vec!["hymt", "input.txt", "--"], vec!["input.txt"], false),
+            (vec!["hymt", ".", "--"], vec!["."], false),
+            (vec!["hymt", "--", "batch"], vec!["batch"], false),
+        ] {
+            let cli = parse_routed(&args).unwrap();
+            let Some(Cmd::Text(words)) = cli.cmd else {
+                panic!("expected text: {args:?}")
+            };
+            assert_eq!(words, expected, "{args:?}");
+            assert_eq!(cli.no_cache, no_cache, "{args:?}");
+        }
+        for args in [
+            vec!["hymt", "hello", "--style"],
+            vec!["hymt", "input.txt", "--output"],
+            vec!["hymt", "alpha", "beta", "-o"],
+        ] {
+            assert!(
+                parse_routed(&args).is_err(),
+                "missing value accepted: {args:?}"
+            );
+        }
     }
 
     #[test]
@@ -1907,7 +1968,12 @@ mod tests {
         let reordered = reorder_for_translation(&args);
         assert_eq!(
             reordered,
-            vec!["--lang".to_owned(), "zh".to_owned(), "hello".to_owned()]
+            vec![
+                "--lang".to_owned(),
+                "zh".to_owned(),
+                "--".to_owned(),
+                "hello".to_owned()
+            ]
         );
     }
 
@@ -1915,14 +1981,14 @@ mod tests {
     fn reorder_already_ordered() {
         let args = vec!["--lang".to_owned(), "zh".to_owned(), "hello".to_owned()];
         let reordered = reorder_for_translation(&args);
-        assert_eq!(reordered, args);
+        assert_eq!(reordered, ["--lang", "zh", "--", "hello"]);
     }
 
     #[test]
     fn reorder_only_text() {
         let args = vec!["translate".to_owned(), "this".to_owned()];
         let reordered = reorder_for_translation(&args);
-        assert_eq!(reordered, args);
+        assert_eq!(reordered, ["--", "translate", "this"]);
     }
 
     #[test]
