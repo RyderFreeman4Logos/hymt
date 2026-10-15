@@ -22,7 +22,7 @@ Use `hymt translate-doc` when you want file-oriented Markdown translation instea
 - Mixed-language Markdown uses the same paragraph-level partial translation rules as the main `hymt` command.
 - Fenced code blocks are preserved.
 - Progress is written to stderr as `[done/total] XX.XX% | elapsed ... | eta ... | NN.NN tok/s`.
-- Each completed segment is written to the shared segment cache immediately, so interrupted runs resume cheaply.
+- With `[cache].enabled = true` and without `--no-cache`, validated, non-degraded segments are admitted to the shared segment cache after whole-document validation. An interrupted run can reuse only entries already admitted.
 
 ## Config
 

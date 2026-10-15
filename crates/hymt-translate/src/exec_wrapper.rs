@@ -35,6 +35,8 @@ pub struct ExecCommandOpts<'a> {
     pub explicit_target: bool,
     /// Prompt options, including the document-planning policy selected by CLI flags.
     pub prompt_opts: &'a PromptOpts,
+    /// Bypass application cache reads and writes even when config enables them.
+    pub no_cache: bool,
 }
 
 /// Run `command`, capture stdout/stderr, translate the output, and print it.
@@ -80,7 +82,7 @@ pub async fn run_exec_command(command: &[&str], opts: &ExecCommandOpts<'_>) -> R
         client,
         segmenter,
         history,
-        cache_enabled: true,
+        cache_enabled: config.application_cache_enabled() && !opts.no_cache,
     };
 
     // Translate stderr if configured
@@ -162,8 +164,12 @@ pub(crate) async fn translate_cached(
     ctx: &TranslationCtx<'_>,
 ) -> Result<String> {
     let document_policy = document_policy_for_exec_cache(prompt_opts, ctx.config);
-    if let Ok(Some(cached)) = cache.find(command, subcommand, text, target_lang, document_policy) {
-        return Ok(cached);
+    if ctx.cache_enabled {
+        if let Ok(Some(cached)) =
+            cache.find(command, subcommand, text, target_lang, document_policy)
+        {
+            return Ok(cached);
+        }
     }
 
     let outcome =
@@ -171,15 +177,17 @@ pub(crate) async fn translate_cached(
     outcome.report_completeness_degraded();
     let translated = outcome.text;
 
-    if let Err(e) = cache.store_user(
-        command,
-        subcommand,
-        text,
-        target_lang,
-        document_policy,
-        &translated,
-    ) {
-        eprintln!("Warning: exec cache store failed: {e}");
+    if ctx.cache_enabled {
+        if let Err(e) = cache.store_user(
+            command,
+            subcommand,
+            text,
+            target_lang,
+            document_policy,
+            &translated,
+        ) {
+            eprintln!("Warning: exec cache store failed: {e}");
+        }
     }
     Ok(translated)
 }

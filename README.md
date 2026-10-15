@@ -14,7 +14,7 @@ Hy-MT2 as a practical Rust CLI: tokenizer-aware segmentation, per-segment cache 
 
 - Translate positional text, stdin, or files with one command.
 - Segment long inputs against the Hy-MT2 tokenizer instead of splitting blindly.
-- Reuse cached translations at the segment level, so repeated content becomes nearly instant.
+- Opt in to application translation caches when you want segment and whole-output reuse.
 - Stream tokens by default, which keeps `| less`, `| bat`, and `| tee` workflows responsive.
 - Segment Markdown with structure-aware boundaries; see the mixed-language limitation below.
 - Batch entire directory trees and preview cache status plus ETA before writing.
@@ -234,7 +234,9 @@ force_translate_all = false    # default: false; set true to translate all non-c
 
 ## Smart segmentation and cache reuse
 
-`hymt` plans each translation against the Hy-MT2 tokenizer and the selected prompt template. Each translated segment is currently cached by:
+Application segment and whole-output caches default to off. Set `[cache].enabled = true` to opt in; `--no-cache` overrides that setting for normal translation, batch, man/info, exec and Telegram commands. Disabling these caches preserves old cache entries, translation history, timing estimates and recall. The service inference cache independently reuses exact full HTTP requests/responses and stays enabled by its own service configuration. `hymt exec precache` explicitly populates application caches even with the default setting; combining it with `--no-cache` is rejected.
+
+`hymt` plans each translation against the Hy-MT2 tokenizer and the selected prompt template. When application caching is enabled, translated segments are keyed by:
 
 - segment content hash
 - target language

@@ -149,7 +149,7 @@ struct Cli {
     #[arg(long = "context", global = true)]
     ctx: Option<String>,
 
-    /// Bypass segment-cache reads and writes for this run
+    /// Bypass application segment and whole-output cache reads and writes
     #[arg(long = "no-cache", alias = "disable-cache", global = true)]
     no_cache: bool,
 
@@ -405,27 +405,51 @@ struct TelegramArgs {
 
 // ── Smart arg routing ─────────────────────────────────────────────────────────
 
+/// Whether a top-level option consumes the next argv token, according to Clap's
+/// own argument declarations (including hidden aliases and short clusters).
+fn option_takes_next(command: &clap::Command, token: &str) -> bool {
+    if let Some(long) = token.strip_prefix("--") {
+        let (name, attached) = match long.split_once('=') {
+            Some((name, _)) => (name, true),
+            None => (long, false),
+        };
+        return !attached
+            && command.get_arguments().any(|arg| {
+                (arg.get_long() == Some(name)
+                    || arg
+                        .get_all_aliases()
+                        .is_some_and(|aliases| aliases.contains(&name)))
+                    && arg.get_action().takes_values()
+            });
+    }
+    if let Some(shorts) = token.strip_prefix('-') {
+        for (index, short) in shorts.char_indices() {
+            let value_option = command.get_arguments().any(|arg| {
+                (arg.get_short() == Some(short)
+                    || arg
+                        .get_all_short_aliases()
+                        .is_some_and(|aliases| aliases.contains(&short)))
+                    && arg.get_action().takes_values()
+            });
+            if value_option {
+                return index + short.len_utf8() == shorts.len();
+            }
+        }
+    }
+    false
+}
+
 /// Return the first positional argument from `args` (skip flags and flag values).
 fn find_first_positional(args: &[String]) -> Option<&str> {
-    let mut skip_next = false;
-    for arg in args {
-        if skip_next {
-            skip_next = false;
-            continue;
-        }
+    let command = Cli::command();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
         if arg == "--" {
             return None;
         }
-        if arg.starts_with("--") {
-            // Long option: --foo or --foo=val
-            if !arg.contains('=') {
-                skip_next = true;
-            }
-            continue;
-        }
         if arg.starts_with('-') && arg.len() > 1 {
-            // Short option cluster; may or may not take value — skip conservatively
-            skip_next = true;
+            i += 1 + usize::from(option_takes_next(&command, arg));
             continue;
         }
         return Some(arg.as_str());
@@ -433,34 +457,24 @@ fn find_first_positional(args: &[String]) -> Option<&str> {
     None
 }
 
-/// Reorder `args` so that all flags/options come before positional text.
+/// Reorder `args` so that top-level flags/options come before positional text.
 ///
 /// This mirrors Python's `_option_args_first` and ensures that clap sees
 /// `hymt -l zh some text` the same as `hymt some text -l zh`.
 fn reorder_for_translation(args: &[String]) -> Vec<String> {
+    let command = Cli::command();
     let mut flags: Vec<String> = Vec::new();
     let mut positional: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
         if arg == "--" {
-            // Everything after -- is positional
             positional.extend_from_slice(&args[i + 1..]);
             break;
         }
-        if arg.starts_with("--") {
-            if arg.contains('=') {
-                flags.push(arg.clone());
-            } else {
-                flags.push(arg.clone());
-                if i + 1 < args.len() && !args[i + 1].starts_with('-') {
-                    i += 1;
-                    flags.push(args[i].clone());
-                }
-            }
-        } else if arg.starts_with('-') && arg.len() > 1 {
+        if arg.starts_with('-') && arg.len() > 1 {
             flags.push(arg.clone());
-            if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+            if option_takes_next(&command, arg) && i + 1 < args.len() {
                 i += 1;
                 flags.push(args[i].clone());
             }
@@ -469,6 +483,9 @@ fn reorder_for_translation(args: &[String]) -> Vec<String> {
         }
         i += 1;
     }
+    // Keep one syntax boundary before all text. It also prevents a trailing
+    // value-taking option from borrowing an earlier positional word.
+    flags.push("--".to_owned());
     flags.extend(positional);
     flags
 }
@@ -495,8 +512,16 @@ async fn main() {
 }
 
 async fn run() -> Result<()> {
-    // Pre-scan raw args to decide whether to reorder before clap parsing.
-    let raw: Vec<String> = std::env::args().skip(1).collect();
+    // Check argv before smart routing, config loading, or backend work. Avoid
+    // env::args() panicking on a non-UTF-8 argument or echoing its raw bytes.
+    let argv: Vec<String> = std::env::args_os()
+        .map(|arg| {
+            arg.into_string()
+                .map_err(|_| anyhow::anyhow!("non-UTF-8 command-line argument"))
+        })
+        .collect::<Result<_>>()?;
+    let program = argv.first().cloned().unwrap_or_else(|| "hymt".to_owned());
+    let raw: Vec<String> = argv.into_iter().skip(1).collect();
     let first = find_first_positional(&raw);
     let is_known_sub = first
         .map(|s| KNOWN_SUBCOMMANDS.contains(&s))
@@ -504,13 +529,25 @@ async fn run() -> Result<()> {
 
     let cli = if is_known_sub || first.is_none() {
         // Normal clap parsing — first positional is a subcommand or no args given.
-        Cli::parse()
+        Cli::parse_from(std::iter::once(program).chain(raw))
     } else {
         // The first positional is text to translate; reorder so flags come first.
-        let mut reordered = vec![std::env::args().next().unwrap_or_else(|| "hymt".to_owned())];
+        let mut reordered = vec![program];
         reordered.extend(reorder_for_translation(&raw));
         Cli::parse_from(reordered)
     };
+
+    if cli.no_cache
+        && matches!(
+            cli.cmd.as_ref(),
+            Some(Cmd::Exec(ExecArgs {
+                action: Some(ExecAction::Precache),
+                ..
+            }))
+        )
+    {
+        anyhow::bail!("--no-cache conflicts with exec precache");
+    }
 
     let config = HotConfig::new()?;
     eprintln!("{}", profile_startup_diagnostic(config.model_profile()?));
@@ -619,6 +656,7 @@ async fn run() -> Result<()> {
                 &config,
                 &prompt_opts,
                 concurrency_override,
+                cli.no_cache,
             )
             .await
         }
@@ -630,6 +668,7 @@ async fn run() -> Result<()> {
                 &config,
                 &prompt_opts,
                 concurrency_override,
+                cli.no_cache,
             )
             .await
         }
@@ -641,6 +680,7 @@ async fn run() -> Result<()> {
                 &config,
                 &prompt_opts,
                 concurrency_override,
+                cli.no_cache,
             )
             .await
         }
@@ -666,6 +706,7 @@ async fn run() -> Result<()> {
                 cli.plan,
                 &config,
                 concurrency_override,
+                cli.no_cache,
             )
             .await
         }
@@ -690,7 +731,7 @@ async fn run() -> Result<()> {
             )
             .await
         }
-        Some(Cmd::Telegram(args)) => run_telegram(args, &config).await,
+        Some(Cmd::Telegram(args)) => run_telegram(args, &config, cli.no_cache).await,
     }
 }
 
@@ -1047,7 +1088,7 @@ async fn run_translate_text(
         client: &client,
         segmenter: &segmenter,
         history: &history,
-        cache_enabled: !flags.no_cache,
+        cache_enabled: config.application_cache_enabled() && !flags.no_cache,
     };
     let warn_only = completeness_warn_only(config, flags.warn_only_completeness);
     if flags.stream_output {
@@ -1119,7 +1160,7 @@ async fn run_translate_stdin(
         client: &client,
         segmenter: &segmenter,
         history: &history,
-        cache_enabled: !flags.no_cache,
+        cache_enabled: config.application_cache_enabled() && !flags.no_cache,
     };
     let warn_only = completeness_warn_only(config, flags.warn_only_completeness);
     if flags.stream_output {
@@ -1182,7 +1223,7 @@ async fn run_translate_path(
         client: &client,
         segmenter: &segmenter,
         history: &history,
-        cache_enabled: !flags.no_cache,
+        cache_enabled: config.application_cache_enabled() && !flags.no_cache,
     };
     let warn_only = completeness_warn_only(config, flags.warn_only_completeness);
     if flags.stream_output {
@@ -1313,7 +1354,7 @@ fn run_config(args: ConfigArgs, config: &HotConfig) -> Result<()> {
 
 // ── telegram ──────────────────────────────────────────────────────────────────
 
-async fn run_telegram(args: TelegramArgs, config: &HotConfig) -> Result<()> {
+async fn run_telegram(args: TelegramArgs, config: &HotConfig, no_cache: bool) -> Result<()> {
     if args.regenerate_claim_password {
         let password = config.regenerate_telegram_claim_password()?;
         // Print once to stdout so the user can store it; not re-printed later.
@@ -1327,11 +1368,11 @@ async fn run_telegram(args: TelegramArgs, config: &HotConfig) -> Result<()> {
 
     #[cfg(feature = "telegram")]
     {
-        telegram::run_telegram_bot(config).await
+        telegram::run_telegram_bot(config, no_cache).await
     }
     #[cfg(not(feature = "telegram"))]
     {
-        let _ = config;
+        let _ = (config, no_cache);
         anyhow::bail!(
             "hymt was built without the `telegram` cargo feature. \
              Rebuild with default features, or `cargo install --path crates/hymt-cli --features telegram`."
@@ -1348,6 +1389,7 @@ async fn run_man(
     config: &HotConfig,
     opts: &PromptOpts,
     concurrency_override: Option<u32>,
+    no_cache: bool,
 ) -> Result<()> {
     if args.args.is_empty() {
         anyhow::bail!("man page name is required");
@@ -1365,6 +1407,7 @@ async fn run_man(
         prompt_opts: opts,
         original: args.original,
         explicit_target,
+        no_cache,
     };
     let code = run_man_command(&str_args, &opts).await?;
     std::process::exit(code);
@@ -1379,6 +1422,7 @@ async fn run_info(
     config: &HotConfig,
     opts: &PromptOpts,
     concurrency_override: Option<u32>,
+    no_cache: bool,
 ) -> Result<()> {
     if args.args.is_empty() {
         anyhow::bail!("info topic is required");
@@ -1396,6 +1440,7 @@ async fn run_info(
         prompt_opts: opts,
         original: args.original,
         explicit_target,
+        no_cache,
     };
     let code = run_info_command(&str_args, &opts).await?;
     std::process::exit(code);
@@ -1410,6 +1455,7 @@ async fn run_exec(
     config: &HotConfig,
     opts: &PromptOpts,
     concurrency_override: Option<u32>,
+    no_cache: bool,
 ) -> Result<()> {
     match args.action {
         Some(ExecAction::Install(install_args)) => {
@@ -1468,6 +1514,7 @@ async fn run_exec(
                 history: &history,
                 explicit_target,
                 prompt_opts: opts,
+                no_cache,
             };
             let code = run_exec_command(&command, &exec_opts).await?;
             std::process::exit(code);
@@ -1621,6 +1668,7 @@ async fn run_batch(
     show_plan: bool,
     config: &HotConfig,
     concurrency_override: Option<u32>,
+    no_cache: bool,
 ) -> Result<()> {
     let segmenter = make_segmenter(config)?;
     let history = HistoryDB::default();
@@ -1631,6 +1679,7 @@ async fn run_batch(
         prompt_opts: opts,
         recursive: args.recursive,
         explicit_target,
+        no_cache,
     };
     let plan = build_batch_plan(&args.directory, config, &segmenter, &history, &plan_opts)?;
     show_batch_preview(&plan);
@@ -1737,7 +1786,7 @@ async fn run_translate_doc(
         template,
         prompt_opts: opts,
         explicit_target,
-        cache_enabled: !flags.no_cache,
+        cache_enabled: config.application_cache_enabled() && !flags.no_cache,
     };
     run_doc_translation(&args.source, &doc_opts).await
 }
@@ -1780,6 +1829,111 @@ mod tests {
     }
 
     #[test]
+    fn startup_routing_recognizes_subcommands_after_global_flags() {
+        for flag in [
+            "--no-cache",
+            "--disable-cache",
+            "--no-stream",
+            "--no-streaming",
+        ] {
+            let args = vec![
+                flag.to_owned(),
+                "--lang".to_owned(),
+                "zh".to_owned(),
+                "batch".to_owned(),
+                "dir".to_owned(),
+                "--dry-run".to_owned(),
+            ];
+            assert_eq!(find_first_positional(&args), Some("batch"), "{flag}");
+        }
+        let exec = vec![
+            "--no-cache".to_owned(),
+            "exec".to_owned(),
+            "/usr/bin/printf".to_owned(),
+            "-n".to_owned(),
+            "hello".to_owned(),
+        ];
+        assert_eq!(find_first_positional(&exec), Some("exec"));
+    }
+
+    #[test]
+    fn startup_routing_honors_value_options_clusters_and_delimiter() {
+        for (args, expected) in [
+            (vec!["-ylzh", "batch"], Some("batch")),
+            (vec!["-yl", "zh", "batch"], Some("batch")),
+            (vec!["--lang=zh", "batch"], Some("batch")),
+            (vec!["--term", "a=b", "batch"], Some("batch")),
+            (vec!["--", "batch"], None),
+        ] {
+            let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+            assert_eq!(find_first_positional(&args), expected, "{args:?}");
+        }
+        let args: Vec<String> = ["hello", "--no-cache", "--lang", "zh"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            reorder_for_translation(&args),
+            ["--no-cache", "--lang", "zh", "--", "hello"]
+        );
+    }
+
+    #[test]
+    fn startup_parser_preserves_fences_and_rejects_missing_values() {
+        fn parse_routed(args: &[&str]) -> std::result::Result<Cli, clap::Error> {
+            let raw: Vec<String> = args[1..].iter().map(|s| (*s).to_owned()).collect();
+            let first = find_first_positional(&raw);
+            let routed =
+                if first.is_none() || first.is_some_and(|word| KNOWN_SUBCOMMANDS.contains(&word)) {
+                    args.iter().map(|s| (*s).to_owned()).collect()
+                } else {
+                    let mut routed = vec![args[0].to_owned()];
+                    routed.extend(reorder_for_translation(&raw));
+                    routed
+                };
+            Cli::try_parse_from(routed)
+        }
+
+        for (args, expected, no_cache) in [
+            (
+                vec!["hymt", "hello", "--", "--no-cache"],
+                vec!["hello", "--no-cache"],
+                false,
+            ),
+            (
+                vec!["hymt", "hello", "--", "--", "--no-cache"],
+                vec!["hello", "--", "--no-cache"],
+                false,
+            ),
+            (
+                vec!["hymt", "hello", "--disable-cache", "--", "--no-cache"],
+                vec!["hello", "--no-cache"],
+                true,
+            ),
+            (vec!["hymt", "input.txt", "--"], vec!["input.txt"], false),
+            (vec!["hymt", ".", "--"], vec!["."], false),
+            (vec!["hymt", "--", "batch"], vec!["batch"], false),
+        ] {
+            let cli = parse_routed(&args).unwrap();
+            let Some(Cmd::Text(words)) = cli.cmd else {
+                panic!("expected text: {args:?}")
+            };
+            assert_eq!(words, expected, "{args:?}");
+            assert_eq!(cli.no_cache, no_cache, "{args:?}");
+        }
+        for args in [
+            vec!["hymt", "hello", "--style"],
+            vec!["hymt", "input.txt", "--output"],
+            vec!["hymt", "alpha", "beta", "-o"],
+        ] {
+            assert!(
+                parse_routed(&args).is_err(),
+                "missing value accepted: {args:?}"
+            );
+        }
+    }
+
+    #[test]
     fn find_first_positional_no_args() {
         assert_eq!(find_first_positional(&[]), None);
     }
@@ -1814,7 +1968,12 @@ mod tests {
         let reordered = reorder_for_translation(&args);
         assert_eq!(
             reordered,
-            vec!["--lang".to_owned(), "zh".to_owned(), "hello".to_owned()]
+            vec![
+                "--lang".to_owned(),
+                "zh".to_owned(),
+                "--".to_owned(),
+                "hello".to_owned()
+            ]
         );
     }
 
@@ -1822,14 +1981,14 @@ mod tests {
     fn reorder_already_ordered() {
         let args = vec!["--lang".to_owned(), "zh".to_owned(), "hello".to_owned()];
         let reordered = reorder_for_translation(&args);
-        assert_eq!(reordered, args);
+        assert_eq!(reordered, ["--lang", "zh", "--", "hello"]);
     }
 
     #[test]
     fn reorder_only_text() {
         let args = vec!["translate".to_owned(), "this".to_owned()];
         let reordered = reorder_for_translation(&args);
-        assert_eq!(reordered, args);
+        assert_eq!(reordered, ["--", "translate", "this"]);
     }
 
     #[test]

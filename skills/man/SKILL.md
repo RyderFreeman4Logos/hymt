@@ -20,5 +20,5 @@ Use `hymt man` when a user wants a translated manpage or apropos result.
 - `--original` calls the system `man` command directly.
 - Translated output is displayed through `$PAGER`, or `less -R` when `$PAGER` is unset and stdout is a TTY.
 - If stdout is not a TTY, translated output is written directly to stdout for piping.
-- Cache lookup order is user exec cache, shared exec cache, then live translation stored in the user cache.
-- The underlying translation also uses the segment cache, so repeated manpage sections can reuse prior segment translations.
+- With `[cache].enabled = true` and without `--no-cache`, lookup checks the user exec cache, then the shared exec cache; eligible live translations enter the user cache after validation.
+- Under the same opt-in, validated, non-degraded segments can reuse the segment cache. Cache access is off by default; history and timing remain available.

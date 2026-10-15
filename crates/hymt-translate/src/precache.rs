@@ -2,7 +2,8 @@
 //!
 //! Reads bash, zsh, and fish history files to discover recently-used commands,
 //! then translates their man pages and `--help` output into the target language
-//! so that subsequent `hymt exec` invocations hit the cache immediately.
+//! so that subsequent `hymt exec` invocations can reuse them when
+//! `[cache].enabled = true` and `--no-cache` is absent.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -310,7 +311,8 @@ fn capture_help(cmd: &str) -> Option<String> {
 // ── run_precache ──────────────────────────────────────────────────────────────
 
 /// Discover recently-used commands from shell history and pre-translate their
-/// man pages and `--help` output into `target_lang`.
+/// man pages and `--help` output into `target_lang`. This explicit cache
+/// population request opts in even when ordinary application caching is disabled.
 pub async fn run_precache(
     target_lang: &str,
     config: &HotConfig,
@@ -330,6 +332,7 @@ pub async fn run_precache(
         client,
         segmenter,
         history,
+        // The user explicitly requested cache population.
         cache_enabled: true,
     };
 
