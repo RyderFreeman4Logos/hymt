@@ -404,12 +404,20 @@ fn urls(text: &str) -> HashSet<String> {
 /// Source byte ranges of immutable URLs, using the same grammar as completeness
 /// validation. Markdown boundaries belong to formatting or link labels, not URLs.
 pub fn preserved_url_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
-    preserved_url_ranges_with_boundary_scan(text, || {})
+    preserved_url_ranges_with_scan(text, |_, _| {})
 }
 
-fn preserved_url_ranges_with_boundary_scan(
+#[derive(Clone, Copy)]
+enum UrlScanStep {
+    Scheme,
+    Lexical,
+    Boundary,
+    Delimiter,
+}
+
+fn preserved_url_ranges_with_scan(
     text: &str,
-    mut boundary_scanned: impl FnMut(),
+    mut scanned: impl FnMut(UrlScanStep, usize),
 ) -> Vec<std::ops::Range<usize>> {
     use pulldown_cmark::{Event, Parser, Tag};
     let mut boundaries: Vec<_> = Parser::new(text)
@@ -427,65 +435,78 @@ fn preserved_url_ranges_with_boundary_scan(
     let mut urls = Vec::new();
     let mut offset = 0;
     let mut boundary = 0;
-    while let Some(start) = earliest_url_scheme_start(&text[offset..]) {
+    while let Some(start) = earliest_url_scheme_start(&text[offset..], &mut scanned) {
         let start = offset + start;
         while boundary < boundaries.len() && boundaries[boundary].0 <= start {
+            scanned(UrlScanStep::Boundary, 1);
             boundary += 1;
         }
-        let lexical_end = start + url_candidate_end(&text[start..]);
-        // A future formatting owner does not bound this URL, but its closing
-        // delimiter must remain available for URLs inside that owner later.
-        let end = boundaries[boundary..]
-            .iter()
-            .inspect(|_| boundary_scanned())
-            .take_while(|(end, _)| *end < lexical_end)
-            .find(|(_, opening)| opening.is_none_or(|opening| opening < start))
-            .map_or(lexical_end, |(end, _)| *end);
-        let candidate = &text[start..end];
-        if let Some(url) = normalize_url(candidate) {
-            urls.push(start..start + url.len());
+        let mut end = text.len();
+        let mut retained_end = start;
+        // Each kind has its own balance; accepted URLs need not be properly nested.
+        let mut balances = [0usize; 4];
+        'candidate: for (relative, character) in text[start..].char_indices() {
+            let index = start + relative;
+            while boundary < boundaries.len() && boundaries[boundary].0 <= index {
+                scanned(UrlScanStep::Boundary, 1);
+                let (owner_end, opening) = boundaries[boundary];
+                if owner_end > start && opening.is_none_or(|opening| opening < start) {
+                    end = owner_end;
+                    break 'candidate;
+                }
+                boundary += 1;
+            }
+            scanned(UrlScanStep::Lexical, 1);
+            if character.is_whitespace() || is_fullwidth_url_punctuation(character) {
+                end = index;
+                break;
+            }
+            let delimiter = match character {
+                '(' | ')' => Some((0, character == ')')),
+                '[' | ']' => Some((1, character == ']')),
+                '{' | '}' => Some((2, character == '}')),
+                '<' | '>' => Some((3, character == '>')),
+                _ => None,
+            };
+            if let Some((kind, closing)) = delimiter {
+                scanned(UrlScanStep::Delimiter, 1);
+                if closing {
+                    if balances[kind] == 0 {
+                        end = index;
+                        break;
+                    }
+                    balances[kind] -= 1;
+                } else {
+                    balances[kind] += 1;
+                }
+            }
+            // Trailing punctuation is consumed; later URL bytes can retain it.
+            if !matches!(character, ',' | '.' | ';' | ':' | '!' | '?') {
+                retained_end = index + character.len_utf8();
+            }
+        }
+        if retained_end > start {
+            urls.push(start..retained_end);
         }
         offset = end;
     }
     urls
 }
 
-fn earliest_url_scheme_start(text: &str) -> Option<usize> {
-    match (text.find("http://"), text.find("https://")) {
-        (Some(http_start), Some(https_start)) => Some(http_start.min(https_start)),
-        (Some(start), None) | (None, Some(start)) => Some(start),
-        (None, None) => None,
-    }
-}
-
-fn url_candidate_end(candidate: &str) -> usize {
-    candidate
-        .char_indices()
-        .find_map(|(index, character)| {
-            (character.is_whitespace()
-                || is_fullwidth_url_punctuation(character)
-                || is_unmatched_closing_delimiter(
-                    &candidate[..index + character.len_utf8()],
-                    character,
-                ))
-            .then_some(index)
-        })
-        .unwrap_or(candidate.len())
-}
-
-fn normalize_url(candidate: &str) -> Option<String> {
-    let mut url = candidate;
-    while let Some((index, character)) = url.char_indices().last() {
-        if is_fullwidth_url_punctuation(character)
-            || matches!(character, ',' | '.' | ';' | ':' | '!' | '?')
-            || is_unmatched_closing_delimiter(url, character)
+fn earliest_url_scheme_start(
+    text: &str,
+    scanned: &mut impl FnMut(UrlScanStep, usize),
+) -> Option<usize> {
+    let bytes = text.as_bytes();
+    for index in 0..bytes.len() {
+        scanned(UrlScanStep::Scheme, 1);
+        if bytes[index] == b'h'
+            && (bytes[index..].starts_with(b"http://") || bytes[index..].starts_with(b"https://"))
         {
-            url = &url[..index];
-        } else {
-            break;
+            return Some(index);
         }
     }
-    (!url.is_empty()).then(|| url.to_owned())
+    None
 }
 
 fn is_fullwidth_url_punctuation(character: char) -> bool {
@@ -507,25 +528,6 @@ fn is_fullwidth_url_punctuation(character: char) -> bool {
             | '】'
             | '、'
     )
-}
-
-fn is_unmatched_closing_delimiter(url: &str, closing: char) -> bool {
-    let Some(opening) = (match closing {
-        ')' => Some('('),
-        ']' => Some('['),
-        '}' => Some('{'),
-        '>' => Some('<'),
-        _ => None,
-    }) else {
-        return false;
-    };
-    url.chars()
-        .filter(|character| *character == opening)
-        .count()
-        < url
-            .chars()
-            .filter(|character| *character == closing)
-            .count()
 }
 
 fn preserves_all(input: &HashSet<String>, output: &HashSet<String>) -> bool {
@@ -1252,13 +1254,186 @@ verbatim ask --no-generate --format json \"哪些证据是相关的？\"";
                 "**word**\n".repeat(size)
             );
             let mut scans = 0;
-            let ranges = preserved_url_ranges_with_boundary_scan(&text, || scans += 1);
+            let ranges = preserved_url_ranges_with_scan(&text, |step, count| {
+                if matches!(step, UrlScanStep::Boundary) {
+                    scans += count;
+                }
+            });
             assert_eq!(ranges.len(), 2 * size);
             assert!(
                 scans <= 2 * size,
                 "{size} lines made {scans} boundary scans for {} URLs",
                 ranges.len()
             );
+        }
+    }
+
+    #[test]
+    fn url_scan_work_stays_bounded_across_owner_and_lexer_shapes() {
+        let mut results = Vec::new();
+        for size in [8, 16] {
+            let cases = [
+                (
+                    "strong-plain",
+                    "**http://a.test/x**.**https://b.test/y**.".repeat(size),
+                    ["http://a.test/x", "https://b.test/y"]
+                        .repeat(size)
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>(),
+                ),
+                (
+                    "strong",
+                    "**http://a.test/x()**.**https://b.test/y()**.".repeat(size),
+                    ["http://a.test/x()", "https://b.test/y()"]
+                        .repeat(size)
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>(),
+                ),
+                (
+                    "link",
+                    "http://a.test/x[L](#x).https://b.test/y[L](#x).".repeat(size),
+                    ["http://a.test/x", "https://b.test/y"]
+                        .repeat(size)
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect(),
+                ),
+                (
+                    "image",
+                    "http://a.test/x![L](#x).https://b.test/y![L](#x).".repeat(size),
+                    ["http://a.test/x", "https://b.test/y"]
+                        .repeat(size)
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect(),
+                ),
+                (
+                    "balanced",
+                    format!("https://e.test/{}", "()".repeat(size * 16)),
+                    vec![format!("https://e.test/{}", "()".repeat(size * 16))],
+                ),
+            ];
+            for (shape, text, expected) in cases {
+                let mut work = [0; 4];
+                let ranges = preserved_url_ranges_with_scan(&text, |step, count| {
+                    let index = match step {
+                        UrlScanStep::Scheme => 0,
+                        UrlScanStep::Lexical => 1,
+                        UrlScanStep::Boundary => 2,
+                        UrlScanStep::Delimiter => 3,
+                    };
+                    work[index] += count;
+                });
+                let actual = ranges
+                    .into_iter()
+                    .map(|range| text[range].to_owned())
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, expected, "{shape} size={size}");
+                results.push((shape, size, text.len(), work));
+            }
+        }
+        for size in [128, 256] {
+            let future_text = format!(
+                "{}\n{}",
+                "http://a.test/x https://b.test/y\n".repeat(size),
+                "**word**\n".repeat(size)
+            );
+            let future_expected = ["http://a.test/x", "https://b.test/y"]
+                .repeat(size)
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            let mut future_work = [0; 4];
+            let future_actual = preserved_url_ranges_with_scan(&future_text, |step, count| {
+                let index = match step {
+                    UrlScanStep::Scheme => 0,
+                    UrlScanStep::Lexical => 1,
+                    UrlScanStep::Boundary => 2,
+                    UrlScanStep::Delimiter => 3,
+                };
+                future_work[index] += count;
+            })
+            .into_iter()
+            .map(|range| future_text[range].to_owned())
+            .collect::<Vec<_>>();
+            assert_eq!(future_actual, future_expected, "future size={size}");
+            results.push(("future", size, future_text.len(), future_work));
+            for (shape, source, expected) in [
+                ("http", "http://a.test/x ", "http://a.test/x"),
+                ("https", "https://b.test/y ", "https://b.test/y"),
+                (
+                    "invalid-prefix",
+                    "httpx httpy http://a.test/x ",
+                    "http://a.test/x",
+                ),
+            ] {
+                let text = source.repeat(size);
+                let mut work = [0; 4];
+                let ranges = preserved_url_ranges_with_scan(&text, |step, count| {
+                    let index = match step {
+                        UrlScanStep::Scheme => 0,
+                        UrlScanStep::Lexical => 1,
+                        UrlScanStep::Boundary => 2,
+                        UrlScanStep::Delimiter => 3,
+                    };
+                    work[index] += count;
+                });
+                let actual = ranges
+                    .into_iter()
+                    .map(|range| text[range].to_owned())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    actual,
+                    vec![expected.to_owned(); size],
+                    "{shape} size={size}"
+                );
+                results.push((shape, size, text.len(), work));
+            }
+        }
+        let measured = results
+            .iter()
+            .map(|(shape, size, bytes, work)| format!("{shape}/{size}/{bytes}: {work:?}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        for (shape, size, bytes, work) in results {
+            let total: usize = work.iter().sum();
+            assert!(
+                total <= 12 * bytes + 16,
+                "{shape} size={size} bytes={bytes} scheme={} lexical={} boundary={} delimiter={}; all: {measured}",
+                work[0], work[1], work[2], work[3],
+            );
+        }
+    }
+
+    #[test]
+    fn url_scan_preserves_balanced_and_unicode_source_bytes() {
+        for (text, expected) in [
+            ("https://[::1]/path", "https://[::1]/path"),
+            (
+                "https://example.com/?items[]=one",
+                "https://example.com/?items[]=one",
+            ),
+            ("https://example.com/a\\_b", "https://example.com/a\\_b"),
+            (
+                "https://example.com/path([)]",
+                "https://example.com/path([)]",
+            ),
+            (
+                "前 https://example.com/路径_(甲)）后",
+                "https://example.com/路径_(甲)",
+            ),
+            (
+                "https://example.com/a_(c),;:!?",
+                "https://example.com/a_(c)",
+            ),
+        ] {
+            let urls = preserved_url_ranges(text)
+                .into_iter()
+                .map(|range| &text[range])
+                .collect::<Vec<_>>();
+            assert_eq!(urls, [expected], "{text}");
         }
     }
 
