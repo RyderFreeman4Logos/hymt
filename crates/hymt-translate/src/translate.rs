@@ -320,6 +320,30 @@ impl ScoredAttempt {
     }
 }
 
+fn score_provider_attempt(
+    attempt: usize,
+    source: &str,
+    text: String,
+    target_lang: &str,
+    config: &HotConfig,
+    termination: CompletionTermination,
+    unpublished: bool,
+) -> ScoredAttempt {
+    let text = if unpublished {
+        recover_generated_inline_code(source, &text).unwrap_or(text)
+    } else {
+        text
+    };
+    let validation = check_completeness(
+        source,
+        &text,
+        target_lang,
+        config,
+        &CompletenessContext { termination },
+    );
+    ScoredAttempt::new(attempt, source, text, validation)
+}
+
 /// Prefer structurally valid attempts, then the earliest highest-scoring one.
 fn select_best_attempt(current: Option<ScoredAttempt>, candidate: ScoredAttempt) -> ScoredAttempt {
     match current {
@@ -541,6 +565,16 @@ fn reconstruct_section_groups(
     source_segments: &[String],
     translations: &[String],
 ) -> String {
+    reconstructed_section_parts(plan, segment_section_groups, source_segments, translations)
+        .join("")
+}
+
+fn reconstructed_section_parts(
+    plan: &DocumentLanguagePlan,
+    segment_section_groups: &[Vec<usize>],
+    source_segments: &[String],
+    translations: &[String],
+) -> Vec<String> {
     let mut group_trans: HashMap<usize, Vec<(&str, &str)>> = HashMap::new();
     let mut group_texts: HashMap<usize, String> = HashMap::new();
     let mut covered: HashSet<usize> = HashSet::new();
@@ -582,12 +616,14 @@ fn reconstruct_section_groups(
                     restore_trailing_newlines(&mut out, gt);
                 }
                 parts.push(out);
+            } else {
+                parts.push(String::new());
             }
         } else {
             parts.push(section.text.clone());
         }
     }
-    parts.join("")
+    parts
 }
 
 // ── plan_translation ──────────────────────────────────────────────────────────
@@ -963,6 +999,7 @@ fn fit_segments_to_final_request_budget(
 
 type SegmentPlanResult = (Vec<String>, Vec<usize>, Vec<Vec<usize>>);
 
+mod markdown_boundary;
 mod markdown_ownership;
 mod table_shape;
 #[cfg(test)]
@@ -1043,6 +1080,82 @@ fn ensure_markdown_structure_preserved(source: &str, translated: &str) -> Result
         anyhow::bail!("translated Markdown structure changed");
     }
     Ok(())
+}
+
+/// Remove only provider-added inline-code delimiters when the Markdown parse
+/// proves that no other syntax or interpreted text changes.
+fn recover_generated_inline_code(source: &str, reply: &str) -> Option<String> {
+    if source.contains('`') || !reply.contains('`') {
+        return None;
+    }
+    let source_structure = markdown_structure(source);
+    let mut reply_structure = markdown_structure(reply);
+    if !source_structure.code.is_empty() || reply_structure.code.is_empty() {
+        return None;
+    }
+    reply_structure.code.clear();
+    if reply_structure != source_structure {
+        return None;
+    }
+
+    let mut recovered = String::with_capacity(reply.len());
+    let mut cursor = 0;
+    for (event, range) in Parser::new(reply).into_offset_iter() {
+        let Event::Code(parsed) = event else {
+            continue;
+        };
+        let before = reply.get(cursor..range.start)?;
+        if before.contains('`') {
+            return None;
+        }
+        recovered.push_str(before);
+        let raw = reply.get(range.clone())?;
+        let delimiters = raw.bytes().take_while(|byte| *byte == b'`').count();
+        if delimiters == 0 || raw.len() < delimiters * 2 {
+            return None;
+        }
+        let closing = raw.bytes().rev().take_while(|byte| *byte == b'`').count();
+        if closing != delimiters {
+            return None;
+        }
+        let payload = raw.get(delimiters..raw.len() - delimiters)?;
+        if payload != parsed.as_ref() {
+            return None;
+        }
+        recovered.push_str(payload);
+        cursor = range.end;
+    }
+    let after = reply.get(cursor..)?;
+    if after.contains('`') {
+        return None;
+    }
+    recovered.push_str(after);
+    if recovered == reply
+        || semantic_markdown_events(reply) != semantic_markdown_events(&recovered)
+        || ensure_markdown_structure_preserved(source, &recovered).is_err()
+    {
+        return None;
+    }
+    Some(recovered)
+}
+
+fn semantic_markdown_events(text: &str) -> Vec<Event<'_>> {
+    let mut events = Vec::new();
+    for event in Parser::new(text) {
+        match event {
+            Event::Text(value) | Event::Code(value) => {
+                if let Some(Event::Text(previous)) = events.last_mut() {
+                    let mut merged = previous.to_string();
+                    merged.push_str(&value);
+                    *previous = merged.into();
+                } else {
+                    events.push(Event::Text(value));
+                }
+            }
+            other => events.push(other),
+        }
+    }
+    events
 }
 
 fn has_unparsed_link_syntax(text: &str) -> bool {
@@ -1390,16 +1503,15 @@ async fn translate_segment_with_completeness(
             .translate_with_completion(&prompt)
             .await
             .map_err(|e| map_segment_http_error(index, segment, e))?;
-        let validation = check_completeness(
+        let candidate = score_provider_attempt(
+            attempt,
             segment,
-            &completion.text,
+            completion.text,
             target_lang,
             config,
-            &CompletenessContext {
-                termination: completion.termination,
-            },
+            completion.termination,
+            true,
         );
-        let candidate = ScoredAttempt::new(attempt, segment, completion.text, validation);
 
         if !candidate.validation.advisory_warnings.is_empty() {
             eprintln!(
@@ -1582,14 +1694,15 @@ async fn translate_segment_with_completeness_streaming(
         }
     }
 
-    let validation = check_completeness(
+    let mut best = score_provider_attempt(
+        0,
         request.segment,
-        &translated,
+        translated,
         request.target_lang,
         request.config,
-        &CompletenessContext { termination },
+        termination,
+        !emitted_optimistically,
     );
-    let mut best = ScoredAttempt::new(0, request.segment, translated, validation);
     if !best.validation.advisory_warnings.is_empty() {
         eprintln!(
             "Note: segment {} has advisory warnings: {:?}",
@@ -1659,16 +1772,15 @@ async fn translate_segment_with_completeness_streaming(
             .await
             .map_err(|e| map_segment_http_error(request.index, request.segment, e))?;
 
-        let validation = check_completeness(
+        let candidate = score_provider_attempt(
+            attempt,
             request.segment,
-            &completion.text,
+            completion.text,
             request.target_lang,
             request.config,
-            &CompletenessContext {
-                termination: completion.termination,
-            },
+            completion.termination,
+            true,
         );
-        let candidate = ScoredAttempt::new(attempt, request.segment, completion.text, validation);
         timing.log(request.index, "completeness_retry_end");
 
         if !candidate.validation.advisory_warnings.is_empty() {
@@ -1933,12 +2045,15 @@ pub async fn translate_text(
 
     // ── Phase 3: reconstruct + record ─────────────────────────────────────────
 
-    let completed: Vec<String> = translations
+    let mut completed: Vec<String> = translations
         .into_iter()
         .enumerate()
         .map(|(i, t)| t.ok_or_else(|| anyhow!("missing translated segment {i}")))
         .collect::<Result<_>>()?;
 
+    if !markdown_boundary::render_translations(&plan, &mut completed) {
+        anyhow::bail!("translated Markdown inline boundaries changed");
+    }
     let translated = plan.reconstruct(&completed);
     ensure_markdown_structure_preserved(text, &translated)?;
     if cache_enabled {
@@ -2127,14 +2242,22 @@ async fn translate_text_stream_inner(
     }
 
     let output_event_tx = event_tx.clone();
+    reload_config_and_preflight_strict(ctx).await?;
+    let template_name = template.as_str();
+    let plan = plan_translation(text, target_lang, ctx.config, ctx.segmenter, template, opts)?;
+    // A source-owned delimiter can change its parse when adjacent translated
+    // punctuation arrives. Wait for the complete rendered document before emit.
+    let output_mode = if output_mode == StreamOutputMode::Optimistic
+        && markdown_boundary::requires_validated_rendering(&plan)
+    {
+        StreamOutputMode::Validated
+    } else {
+        output_mode
+    };
     let event_tx = match output_mode {
         StreamOutputMode::Validated => StreamEventSink::Validated(event_tx),
         StreamOutputMode::Optimistic => StreamEventSink::Immediate(event_tx),
     };
-
-    reload_config_and_preflight_strict(ctx).await?;
-    let template_name = template.as_str();
-    let plan = plan_translation(text, target_lang, ctx.config, ctx.segmenter, template, opts)?;
 
     eprintln!(
         "Source tokens: {}; segments: {}",
@@ -2450,12 +2573,15 @@ async fn translate_text_stream_inner(
         }
     }
 
-    let completed: Vec<String> = translations
+    let mut completed: Vec<String> = translations
         .into_iter()
         .enumerate()
         .map(|(i, t)| t.ok_or_else(|| anyhow!("missing translated segment {i}")))
         .collect::<Result<_>>()?;
 
+    if !markdown_boundary::render_translations(&plan, &mut completed) {
+        anyhow::bail!("translated Markdown inline boundaries changed");
+    }
     let translated = plan.reconstruct(&completed);
     ensure_markdown_structure_preserved(text, &translated)?;
     let output = StreamEventSink::Immediate(output_event_tx.clone());
@@ -2642,6 +2768,7 @@ pub async fn translate_file(
 mod tests {
     mod app_cache_policy_tests;
     mod cache_admission_tests;
+    mod markdown_boundary_tests;
     pub(super) mod ownership_interval_tests;
     mod table_shape_tests;
 
@@ -4202,6 +4329,65 @@ After ordinary prose must also be translated in document order.\n"
             previous_output_contents,
             "atomic rename must not mutate the old output inode; direct fs::write would corrupt it"
         );
+    }
+
+    #[test]
+    fn generated_inline_code_recovery_preserves_raw_bytes() {
+        let cases = [
+            (
+                "Plain source text.",
+                "译文 `name` 尾部。",
+                "译文 name 尾部。",
+            ),
+            (
+                "Plain source text.",
+                "译文 ``a`b`` 尾部。",
+                "译文 a`b 尾部。",
+            ),
+            (
+                "Plain source text.",
+                "前缀 `中文 café` 后缀",
+                "前缀 中文 café 后缀",
+            ),
+            (
+                "Plain source text.",
+                "前缀 `x`，保留  空格\t。",
+                "前缀 x，保留  空格\t。",
+            ),
+        ];
+        for (source, reply, expected) in cases {
+            assert_eq!(
+                recover_generated_inline_code(source, reply).as_deref(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn generated_inline_code_recovery_declines_ambiguous_markup() {
+        let cases = [
+            ("A `source` marker.", "一个 `source` 标记。"),
+            ("Plain source text.", "译文 `*word*` 尾部。"),
+            (
+                "Plain source text.",
+                "译文 `[label](https://example.test)` 尾部。",
+            ),
+            ("Plain source text.", "译文 `<b>word</b>` 尾部。"),
+            ("Plain source text.", "译文 `&amp;` 尾部。"),
+            ("Plain source text.", "译文 `\\*word` 尾部。"),
+            ("Plain source text.", "译文 `a\n- item` 尾部。"),
+            ("Plain source text.", "译文 `a\n# heading` 尾部。"),
+            ("Plain source text.", "译文 `a\n```fence` 尾部。"),
+            ("Plain source text.", "译文 ` name ` 尾部。"),
+            ("Plain source text.", "译文 `a\nb` 尾部。"),
+            ("Plain source text.", "译文 `name` 和孤立的 `。"),
+        ];
+        for (source, reply) in cases {
+            assert!(
+                recover_generated_inline_code(source, reply).is_none(),
+                "{reply:?}"
+            );
+        }
     }
 
     #[test]
@@ -6251,7 +6437,7 @@ Bravo one text carries enough source material for cache validation and ordering 
     #[tokio::test]
     async fn added_code_spans_retry_then_publish_only_valid_markdown() {
         let source = "The property name is ordinary prose and should remain ordinary prose after translation.";
-        let invalid = "属性 `name` 是普通文字，翻译之后 `property` 仍应保持普通文字。";
+        let invalid = "属性 `[name](https://example.test)` 是普通文字，翻译之后 `property` 仍应保持普通文字。";
         let valid = "属性名称是普通文字，翻译之后仍应保持普通文字。";
         let segmenter = fallback_segmenter();
         for (streamed, first_chunk_priority) in [(false, false), (true, true), (true, false)] {
