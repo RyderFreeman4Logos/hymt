@@ -1,5 +1,122 @@
-use super::super::markdown_boundary::{block_structure, render_translations};
+use super::super::markdown_boundary::{block_structure, render_translations, take_parse_work};
 use super::*;
+
+#[test]
+fn independent_emphasis_repairs_do_not_reparse_the_document_per_paragraph() {
+    let config = make_stream_config("http://127.0.0.1:1");
+    let segmenter = fallback_segmenter();
+    let mut previous = None;
+    for count in [64, 128] {
+        let source = "a*Title*b\n\n".repeat(count);
+        let plan = plan_translation(
+            &source,
+            "zh",
+            &config,
+            &segmenter,
+            &TemplateType::Default,
+            &PromptOpts::default(),
+        )
+        .unwrap();
+        assert_eq!(plan.segments.len(), 3 * count);
+        let mut leaves = ["甲", "《标题》", "乙\n\n"]
+            .into_iter()
+            .cycle()
+            .take(3 * count)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        take_parse_work();
+        assert!(render_translations(&plan, &mut leaves));
+        let (calls, bytes) = take_parse_work();
+        let output = plan.reconstruct(&leaves);
+        ensure_markdown_structure_preserved(&source, &output).unwrap();
+        if let Some((smaller_calls, smaller_bytes)) = previous {
+            assert!(
+                calls < 3 * smaller_calls,
+                "parse calls grew from {smaller_calls} to {calls}"
+            );
+            assert!(
+                bytes < 3 * smaller_bytes,
+                "parser input bytes grew from {smaller_bytes} to {bytes}"
+            );
+        }
+        previous = Some((calls, bytes));
+    }
+}
+
+#[test]
+fn independent_spans_in_one_paragraph_use_local_owner_windows() {
+    let config = make_stream_config("http://127.0.0.1:1");
+    let segmenter = fallback_segmenter();
+    let mut previous = None;
+    for count in [32, 64] {
+        let source = "a*Title*b ".repeat(count);
+        let plan = plan_translation(
+            &source,
+            "zh",
+            &config,
+            &segmenter,
+            &TemplateType::Default,
+            &PromptOpts::default(),
+        )
+        .unwrap();
+        let mut leaves = plan
+            .segments
+            .iter()
+            .map(|text| {
+                text.replace("Title", "《标题》")
+                    .replace('a', "甲")
+                    .replace('b', "乙")
+            })
+            .collect::<Vec<_>>();
+        take_parse_work();
+        assert!(render_translations(&plan, &mut leaves));
+        let (calls, bytes) = take_parse_work();
+        let output = plan.reconstruct(&leaves);
+        ensure_markdown_structure_preserved(&source, &output).unwrap();
+        assert_eq!(output, "甲 *《标题》* 乙 ".repeat(count));
+        if let Some((smaller_calls, smaller_bytes)) = previous {
+            assert!(
+                calls < 3 * smaller_calls,
+                "parse calls grew from {smaller_calls} to {calls}"
+            );
+            assert!(
+                bytes < 3 * smaller_bytes,
+                "parser input bytes grew from {smaller_bytes} to {bytes}"
+            );
+        }
+        previous = Some((calls, bytes));
+    }
+}
+
+#[test]
+fn mixed_ascii_and_nonbreaking_repairs_keep_each_original_leaf() {
+    let config = make_stream_config("http://127.0.0.1:1");
+    let segmenter = fallback_segmenter();
+    let source = "a*Title*b\n\n*Title.*Journal\n\n".repeat(24);
+    let plan = plan_translation(
+        &source,
+        "zh",
+        &config,
+        &segmenter,
+        &TemplateType::Default,
+        &PromptOpts::default(),
+    )
+    .unwrap();
+    let mut leaves = plan
+        .segments
+        .iter()
+        .map(|text| {
+            text.replace("Title", "标题")
+                .replace("Journal", "《期刊》")
+                .replace('a', "甲")
+                .replace('b', "乙")
+        })
+        .collect::<Vec<_>>();
+    assert!(render_translations(&plan, &mut leaves));
+    let output = plan.reconstruct(&leaves);
+    assert_eq!(output, "甲*标题*乙\n\n*\u{a0}标题.*《期刊》\n\n".repeat(24));
+    ensure_markdown_structure_preserved(&source, &output).unwrap();
+}
 
 #[test]
 fn parser_owned_delimiters_survive_translated_flanks_without_rewriting_leaves() {
