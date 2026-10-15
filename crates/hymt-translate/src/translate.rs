@@ -296,25 +296,40 @@ struct ScoredAttempt {
     attempt: usize,
     text: String,
     validation: CompletenessResult,
+    structure_preserved: bool,
 }
 
 impl ScoredAttempt {
-    fn new(attempt: usize, text: impl Into<String>, validation: CompletenessResult) -> Self {
+    fn new(
+        attempt: usize,
+        source: &str,
+        text: impl Into<String>,
+        validation: CompletenessResult,
+    ) -> Self {
+        let text = text.into();
         Self {
             attempt,
-            text: text.into(),
+            structure_preserved: ensure_markdown_structure_preserved(source, &text).is_ok(),
+            text,
             validation,
         }
     }
 
     fn selection_reason(&self) -> &'static str {
-        "highest_validation_score"
+        "structural_validity_then_validation_score"
     }
 }
 
-/// Retain the earliest attempt that has the highest validation score.
+/// Prefer structurally valid attempts, then the earliest highest-scoring one.
 fn select_best_attempt(current: Option<ScoredAttempt>, candidate: ScoredAttempt) -> ScoredAttempt {
     match current {
+        Some(current) if current.structure_preserved != candidate.structure_preserved => {
+            if current.structure_preserved {
+                current
+            } else {
+                candidate
+            }
+        }
         Some(current) if current.validation.score >= candidate.validation.score => current,
         _ => candidate,
     }
@@ -1384,7 +1399,7 @@ async fn translate_segment_with_completeness(
                 termination: completion.termination,
             },
         );
-        let candidate = ScoredAttempt::new(attempt, completion.text, validation);
+        let candidate = ScoredAttempt::new(attempt, segment, completion.text, validation);
 
         if !candidate.validation.advisory_warnings.is_empty() {
             eprintln!(
@@ -1393,8 +1408,7 @@ async fn translate_segment_with_completeness(
                 candidate.validation.advisory_warnings
             );
         }
-        if candidate.validation.is_complete {
-            ensure_markdown_structure_preserved(segment, &candidate.text)?;
+        if candidate.validation.is_complete && candidate.structure_preserved {
             return Ok(SegmentTranslateOutcome {
                 text: candidate.text,
                 completeness_degraded: false,
@@ -1407,12 +1421,13 @@ async fn translate_segment_with_completeness(
             "retries exhausted"
         };
         eprintln!(
-            "Warning: segment {} failed completeness (attempt {}/{}, {}): {:?}",
+            "Warning: segment {} failed validation (attempt {}/{}, {}, checks_failed={:?}, markdown_structure_preserved={})",
             index + 1,
             attempt + 1,
             max_retries + 1,
             action,
-            candidate.validation.checks_failed
+            candidate.validation.checks_failed,
+            candidate.structure_preserved
         );
         best = Some(select_best_attempt(best, candidate));
     }
@@ -1567,7 +1582,6 @@ async fn translate_segment_with_completeness_streaming(
         }
     }
 
-    ensure_markdown_structure_preserved(request.segment, &translated)?;
     let validation = check_completeness(
         request.segment,
         &translated,
@@ -1575,7 +1589,7 @@ async fn translate_segment_with_completeness_streaming(
         request.config,
         &CompletenessContext { termination },
     );
-    let mut best = ScoredAttempt::new(0, translated, validation);
+    let mut best = ScoredAttempt::new(0, request.segment, translated, validation);
     if !best.validation.advisory_warnings.is_empty() {
         eprintln!(
             "Note: segment {} has advisory warnings: {:?}",
@@ -1583,7 +1597,7 @@ async fn translate_segment_with_completeness_streaming(
             best.validation.advisory_warnings
         );
     }
-    if best.validation.is_complete {
+    if best.validation.is_complete && best.structure_preserved {
         if output_mode == StreamOutputMode::Validated {
             send_stream_event(event_tx, StreamEvent::Token(best.text.clone())).await?;
         }
@@ -1599,6 +1613,7 @@ async fn translate_segment_with_completeness_streaming(
     // Retrying would produce text that diverges from the emitted prefix,
     // corrupting stdout. Accept the best attempt and warn instead.
     if emitted_optimistically {
+        ensure_markdown_structure_preserved(request.segment, &best.text)?;
         reject_unrecoverably_incomplete_best_attempt(request.index, request.segment, &best.text)?;
         eprintln!(
             "Warning: segment {} failed completeness, using streamed attempt (retry skipped \
@@ -1620,11 +1635,12 @@ async fn translate_segment_with_completeness_streaming(
         "retries exhausted"
     };
     eprintln!(
-        "Warning: segment {} failed completeness (attempt 1/{}, {}): {:?}",
+        "Warning: segment {} failed validation (attempt 1/{}, {}, checks_failed={:?}, markdown_structure_preserved={})",
         request.index + 1,
         max_retries + 1,
         action,
-        best.validation.checks_failed
+        best.validation.checks_failed,
+        best.structure_preserved
     );
 
     for attempt in 1..=max_retries {
@@ -1652,7 +1668,7 @@ async fn translate_segment_with_completeness_streaming(
                 termination: completion.termination,
             },
         );
-        let candidate = ScoredAttempt::new(attempt, completion.text, validation);
+        let candidate = ScoredAttempt::new(attempt, request.segment, completion.text, validation);
         timing.log(request.index, "completeness_retry_end");
 
         if !candidate.validation.advisory_warnings.is_empty() {
@@ -1663,8 +1679,7 @@ async fn translate_segment_with_completeness_streaming(
             );
         }
 
-        if candidate.validation.is_complete {
-            ensure_markdown_structure_preserved(request.segment, &candidate.text)?;
+        if candidate.validation.is_complete && candidate.structure_preserved {
             if !candidate.text.is_empty()
                 && (output_mode == StreamOutputMode::Validated || !emitted_optimistically)
             {
@@ -1688,12 +1703,13 @@ async fn translate_segment_with_completeness_streaming(
             "retries exhausted"
         };
         eprintln!(
-            "Warning: segment {} failed completeness (attempt {}/{}, {}): {:?}",
+            "Warning: segment {} failed validation (attempt {}/{}, {}, checks_failed={:?}, markdown_structure_preserved={})",
             request.index + 1,
             attempt + 1,
             max_retries + 1,
             action,
-            candidate.validation.checks_failed
+            candidate.validation.checks_failed,
+            candidate.structure_preserved
         );
         best = select_best_attempt(Some(best), candidate);
     }
@@ -4429,9 +4445,11 @@ After ordinary prose must also be translated in document order.\n"
             .iter()
             .all(|request| !request.contains("https://example.test/fabricated")));
 
-        let stream_server =
-            start_capturing_mock_server(vec![MockResponse::Sse(vec![mock_translation.to_owned()])])
-                .await;
+        let stream_server = start_capturing_mock_server(vec![
+            MockResponse::Sse(vec![mock_translation.to_owned()]),
+            MockResponse::Json(mock_translation.to_owned()),
+        ])
+        .await;
         let stream_config = make_protected_block_config(&stream_server.endpoint_url);
         let stream_client = TranslationClient::new(stream_config.clone()).expect("stream client");
         let stream_history = HistoryDB::new(dir.path().join("stream-history.db"));
@@ -4463,8 +4481,8 @@ After ordinary prose must also be translated in document order.\n"
         );
         assert_eq!(
             stream_server.requests.lock().unwrap().len(),
-            1,
-            "stream must make one SSE request"
+            2,
+            "stream must retry the structurally invalid SSE response"
         );
         let mut streamed_tokens = String::new();
         let mut saw_all_done = false;
@@ -6231,6 +6249,75 @@ Bravo one text carries enough source material for cache validation and ordering 
     }
 
     #[tokio::test]
+    async fn added_code_spans_retry_then_publish_only_valid_markdown() {
+        let source = "The property name is ordinary prose and should remain ordinary prose after translation.";
+        let invalid = "属性 `name` 是普通文字，翻译之后 `property` 仍应保持普通文字。";
+        let valid = "属性名称是普通文字，翻译之后仍应保持普通文字。";
+        let segmenter = fallback_segmenter();
+        for (streamed, first_chunk_priority) in [(false, false), (true, true), (true, false)] {
+            for recover in [false, true] {
+                let server = start_capturing_mock_server(vec![
+                    if first_chunk_priority {
+                        MockResponse::Sse(vec![invalid.to_owned()])
+                    } else {
+                        MockResponse::Json(invalid.to_owned())
+                    },
+                    MockResponse::Json(if recover { valid } else { invalid }.to_owned()),
+                ])
+                .await;
+                let config =
+                    make_stream_config_with_fcp(&server.endpoint_url, first_chunk_priority);
+                let client = TranslationClient::new(config.clone()).unwrap();
+                let history = HistoryDB::new(temp_path("markdown-code-retry.db"));
+                let ctx = TranslationCtx {
+                    config: &config,
+                    client: &client,
+                    segmenter: &segmenter,
+                    history: &history,
+                    cache_enabled: true,
+                };
+                let opts = PromptOpts::default();
+                let mut emitted = String::new();
+                let result = if streamed {
+                    let (tx, mut rx) = mpsc::channel(32);
+                    let result = translate_text_stream_with_mode(
+                        source,
+                        "zh",
+                        &TemplateType::Default,
+                        &opts,
+                        &ctx,
+                        StreamOutputMode::Validated,
+                        tx,
+                    )
+                    .await;
+                    while let Some(event) = rx.recv().await {
+                        if let StreamEvent::Token(text) = event {
+                            emitted.push_str(&text);
+                        }
+                    }
+                    result
+                } else {
+                    translate_text(source, "zh", &TemplateType::Default, &opts, &ctx).await
+                };
+                let requests = server.requests.lock().unwrap();
+                assert_eq!(requests.len(), 2);
+                assert!(requests[1].contains("Translate the COMPLETE input"));
+                drop(requests);
+                if recover {
+                    assert_eq!(result.unwrap().text, valid);
+                    if streamed {
+                        assert_eq!(emitted, valid);
+                    }
+                } else {
+                    assert!(result.is_err());
+                    assert!(emitted.is_empty());
+                    assert!(history.fetch_recent(None).unwrap().is_empty());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn partial_sampler_override_bypasses_segment_cache() {
         let source = "This partial sampler override must not reuse a cached translation.";
         let fresh = "fresh translation ".repeat(16);
@@ -6830,6 +6917,7 @@ max_retries = 1
         let source = "This source paragraph has enough text to discriminate incomplete attempts.";
         let first = ScoredAttempt::new(
             0,
+            source,
             "A substantially longer translated paragraph that preserves the whole source idea.",
             validate_completeness(
                 source,
@@ -6840,6 +6928,7 @@ max_retries = 1
         );
         let last = ScoredAttempt::new(
             1,
+            source,
             "Short.",
             validate_completeness(source, "Short.", "en", None),
         );
@@ -6849,7 +6938,35 @@ max_retries = 1
 
         assert_eq!(selected.attempt, 0);
         assert!(selected.validation.score > 0);
-        assert_eq!(selected.selection_reason(), "highest_validation_score");
+        assert_eq!(
+            selected.selection_reason(),
+            "structural_validity_then_validation_score"
+        );
+    }
+
+    #[test]
+    fn best_attempt_selection_prefers_valid_structure_over_higher_completeness_score() {
+        let source =
+            "A property name in ordinary prose should be translated without adding formatting.";
+        let invalid_text =
+            "The `property` name in ordinary prose is fully translated with added formatting.";
+        let valid_text = "A brief translation.";
+        let invalid = ScoredAttempt::new(
+            0,
+            source,
+            invalid_text,
+            validate_completeness(source, invalid_text, "en", None),
+        );
+        let valid = ScoredAttempt::new(
+            1,
+            source,
+            valid_text,
+            validate_completeness(source, valid_text, "en", None),
+        );
+        assert!(!invalid.structure_preserved);
+        assert!(valid.structure_preserved);
+        assert!(invalid.validation.score > valid.validation.score);
+        assert_eq!(select_best_attempt(Some(invalid), valid).attempt, 1);
     }
 
     #[test]

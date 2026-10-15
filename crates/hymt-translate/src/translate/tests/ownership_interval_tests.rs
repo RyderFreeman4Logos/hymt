@@ -297,12 +297,14 @@ async fn malformed_multiline_link_repair_is_rejected_atomically_in_all_publicati
             .iter()
             .cloned()
             .enumerate()
-            .map(|(index, response)| {
-                if streaming && index == 0 {
-                    MockResponse::Sse(vec![response])
+            .flat_map(|(index, response)| {
+                let initial = if streaming && index == 0 {
+                    MockResponse::Sse(vec![response.clone()])
                 } else {
-                    MockResponse::Json(response)
-                }
+                    MockResponse::Json(response.clone())
+                };
+                let retry = (index == boundary_segment).then_some(MockResponse::Json(response));
+                [Some(initial), retry].into_iter().flatten()
             })
             .collect();
         let server = start_capturing_mock_server(responses).await;
@@ -377,8 +379,8 @@ async fn malformed_multiline_link_repair_is_rejected_atomically_in_all_publicati
         let requests = server.requests.lock().unwrap().clone();
         assert_eq!(
             requests.len(),
-            planned_inputs.len(),
-            "one mock response per planned segment"
+            planned_inputs.len() + 1,
+            "malformed boundary must use one structural retry"
         );
         let captured_inputs: Vec<_> = requests
             .iter()
@@ -402,7 +404,7 @@ async fn malformed_multiline_link_repair_is_rejected_atomically_in_all_publicati
                     .to_owned()
             })
             .collect();
-        assert_eq!(captured_inputs.len(), planned_inputs.len());
+        assert_eq!(captured_inputs.len(), planned_inputs.len() + 1);
         for planned in &planned_inputs {
             assert!(
                 captured_inputs
