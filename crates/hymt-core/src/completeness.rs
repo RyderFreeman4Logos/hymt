@@ -404,6 +404,13 @@ fn urls(text: &str) -> HashSet<String> {
 /// Source byte ranges of immutable URLs, using the same grammar as completeness
 /// validation. Markdown boundaries belong to formatting or link labels, not URLs.
 pub fn preserved_url_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    preserved_url_ranges_with_boundary_scan(text, || {})
+}
+
+fn preserved_url_ranges_with_boundary_scan(
+    text: &str,
+    mut boundary_scanned: impl FnMut(),
+) -> Vec<std::ops::Range<usize>> {
     use pulldown_cmark::{Event, Parser, Tag};
     let mut boundaries: Vec<_> = Parser::new(text)
         .into_offset_iter()
@@ -425,18 +432,20 @@ pub fn preserved_url_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
         while boundary < boundaries.len() && boundaries[boundary].0 <= start {
             boundary += 1;
         }
+        let lexical_end = start + url_candidate_end(&text[start..]);
         // A future formatting owner does not bound this URL, but its closing
         // delimiter must remain available for URLs inside that owner later.
         let end = boundaries[boundary..]
             .iter()
+            .inspect(|_| boundary_scanned())
+            .take_while(|(end, _)| *end < lexical_end)
             .find(|(_, opening)| opening.is_none_or(|opening| opening < start))
-            .map_or(text.len(), |(end, _)| *end);
+            .map_or(lexical_end, |(end, _)| *end);
         let candidate = &text[start..end];
-        let end = url_candidate_end(candidate);
-        if let Some(url) = normalize_url(&candidate[..end]) {
+        if let Some(url) = normalize_url(candidate) {
             urls.push(start..start + url.len());
         }
-        offset = start + end;
+        offset = end;
     }
     urls
 }
@@ -1232,6 +1241,25 @@ verbatim ask --no-generate --format json \"哪些证据是相关的？\"";
             .map(|range| &text[range])
             .collect();
         assert_eq!(urls, ["https://first.test/x", "https://second.test/y"]);
+    }
+
+    #[test]
+    fn url_boundary_scans_stay_bounded_before_future_formatting() {
+        for size in [128, 256] {
+            let text = format!(
+                "{}\n{}",
+                "http://a.test/x https://b.test/y\n".repeat(size),
+                "**word**\n".repeat(size)
+            );
+            let mut scans = 0;
+            let ranges = preserved_url_ranges_with_boundary_scan(&text, || scans += 1);
+            assert_eq!(ranges.len(), 2 * size);
+            assert!(
+                scans <= 2 * size,
+                "{size} lines made {scans} boundary scans for {} URLs",
+                ranges.len()
+            );
+        }
     }
 
     #[test]
