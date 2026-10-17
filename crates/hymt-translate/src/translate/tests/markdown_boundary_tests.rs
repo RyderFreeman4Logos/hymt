@@ -1,11 +1,342 @@
-use super::super::markdown_boundary::{block_structure, render_translations, take_parse_work};
+use super::super::markdown_boundary::{
+    block_structure, render_translations, take_parse_work, take_render_work, RenderWork,
+};
 use super::*;
+
+fn assert_work_growth(smaller: RenderWork, larger: RenderWork) {
+    eprintln!("renderer work: {smaller:?} -> {larger:?}");
+    assert!(
+        larger.joined_bytes < 3 * smaller.joined_bytes,
+        "joined bytes: {smaller:?} -> {larger:?}"
+    );
+    assert!(
+        larger.copied_bytes < 3 * smaller.copied_bytes,
+        "copied bytes: {smaller:?} -> {larger:?}"
+    );
+    assert!(
+        larger.member_visits < 3 * smaller.member_visits,
+        "member visits: {smaller:?} -> {larger:?}"
+    );
+    assert!(
+        larger.invalidation_queries < 3 * smaller.invalidation_queries,
+        "invalidation queries: {smaller:?} -> {larger:?}"
+    );
+}
+
+fn strong_span_count(text: &str) -> usize {
+    pulldown_cmark::Parser::new(text)
+        .filter(|event| {
+            matches!(
+                event,
+                pulldown_cmark::Event::Start(pulldown_cmark::Tag::Strong)
+            )
+        })
+        .count()
+}
+
+#[test]
+fn identical_nested_strong_spans_settle_without_repeated_parse() {
+    let config = make_stream_config("http://127.0.0.1:1");
+    let segmenter = fallback_segmenter();
+    let mut previous = None;
+    let mut previous_work = None;
+    for count in [64, 128] {
+        let source = format!("a{}Title{}b", "**".repeat(count), "**".repeat(count));
+        assert_eq!(strong_span_count(&source), count);
+        let plan = plan_translation(
+            &source,
+            "zh",
+            &config,
+            &segmenter,
+            &TemplateType::Default,
+            &PromptOpts::default(),
+        )
+        .unwrap();
+        assert_eq!(plan.segments, ["a", "Title", "b"]);
+        assert_eq!(plan.segment_section_groups.len(), 3);
+        assert_eq!(plan.reconstruct(&plan.segments), source);
+        assert_eq!(
+            plan.document_plan
+                .as_ref()
+                .unwrap()
+                .sections
+                .iter()
+                .filter(|section| section.text.contains("**"))
+                .count(),
+            2
+        );
+        let mut leaves = vec!["甲".to_owned(), "《标题》".to_owned(), "乙".to_owned()];
+        take_parse_work();
+        take_render_work();
+        assert!(render_translations(&plan, &mut leaves));
+        let work = take_parse_work();
+        let render_work = take_render_work();
+        let output = plan.reconstruct(&leaves);
+        ensure_markdown_structure_preserved(&source, &output).unwrap();
+        assert_eq!(leaves, ["甲 ", "《标题》", " 乙"]);
+        if let Some((small_calls, small_bytes)) = previous {
+            assert!(
+                work.0 < 3 * small_calls,
+                "parse calls: {small_calls} -> {}",
+                work.0
+            );
+            assert!(
+                work.1 < 3 * small_bytes,
+                "parser bytes: {small_bytes} -> {}",
+                work.1
+            );
+        }
+        if let Some(smaller) = previous_work {
+            assert_work_growth(smaller, render_work);
+        }
+        previous = Some(work);
+        previous_work = Some(render_work);
+    }
+}
+
+#[test]
+fn distributed_nested_strong_spans_settle_without_repeated_parse() {
+    let config = make_stream_config("http://127.0.0.1:1");
+    let segmenter = fallback_segmenter();
+    let mut previous = None;
+    let mut previous_work = None;
+    for count in [63, 126] {
+        let source = format!("a{}Title{}", "**".repeat(count), "** b".repeat(count));
+        assert_eq!(strong_span_count(&source), count);
+        let plan = plan_translation(
+            &source,
+            "zh",
+            &config,
+            &segmenter,
+            &TemplateType::Default,
+            &PromptOpts::default(),
+        )
+        .unwrap();
+        assert_eq!(plan.segments.len(), count + 2);
+        assert_eq!(plan.segments[0], "a");
+        assert_eq!(plan.segments[1], "Title");
+        assert_eq!(plan.reconstruct(&plan.segments), source);
+        assert_eq!(
+            plan.document_plan
+                .as_ref()
+                .unwrap()
+                .sections
+                .iter()
+                .filter(|section| section.text.contains("**"))
+                .count(),
+            count + 1
+        );
+        let mut leaves = plan
+            .segments
+            .iter()
+            .map(|s| {
+                s.replace('a', "甲")
+                    .replace("Title", "《标题》")
+                    .replace('b', "乙")
+            })
+            .collect::<Vec<_>>();
+        take_parse_work();
+        take_render_work();
+        assert!(render_translations(&plan, &mut leaves));
+        let work = take_parse_work();
+        let render_work = take_render_work();
+        let output = plan.reconstruct(&leaves);
+        ensure_markdown_structure_preserved(&source, &output).unwrap();
+        assert_eq!(leaves[0], "甲 ");
+        assert_eq!(leaves[1], "《标题》");
+        if let Some((small_calls, small_bytes)) = previous {
+            assert!(
+                work.0 < 3 * small_calls,
+                "parse calls: {small_calls} -> {}",
+                work.0
+            );
+            assert!(
+                work.1 < 3 * small_bytes,
+                "parser bytes: {small_bytes} -> {}",
+                work.1
+            );
+        }
+        if let Some(smaller) = previous_work {
+            assert_work_growth(smaller, render_work);
+        }
+        previous = Some(work);
+        previous_work = Some(render_work);
+    }
+}
+
+#[test]
+fn separate_nested_groups_each_repair_without_repeated_parse() {
+    let config = make_stream_config("http://127.0.0.1:1");
+    let segmenter = fallback_segmenter();
+    let mut previous = None;
+    let mut previous_work = None;
+    for count in [32, 64] {
+        let group = format!("a{}Title{}b\n\n", "**".repeat(count), "**".repeat(count));
+        let source = group.repeat(4);
+        assert_eq!(strong_span_count(&source), 4 * count);
+        let plan = plan_translation(
+            &source,
+            "zh",
+            &config,
+            &segmenter,
+            &TemplateType::Default,
+            &PromptOpts::default(),
+        )
+        .unwrap();
+        assert_eq!(plan.segments.len(), 12);
+        assert_eq!(plan.reconstruct(&plan.segments), source);
+        let mut leaves = plan
+            .segments
+            .iter()
+            .map(|s| {
+                s.replace('a', "甲")
+                    .replace("Title", "《标题》")
+                    .replace('b', "乙")
+            })
+            .collect::<Vec<_>>();
+        take_parse_work();
+        take_render_work();
+        assert!(render_translations(&plan, &mut leaves));
+        let work = take_parse_work();
+        let render_work = take_render_work();
+        let output = plan.reconstruct(&leaves);
+        ensure_markdown_structure_preserved(&source, &output).unwrap();
+        assert_eq!(output.matches("甲 ").count(), 4);
+        if let Some((small_calls, small_bytes)) = previous {
+            assert!(
+                work.0 < 3 * small_calls,
+                "parse calls: {small_calls} -> {}",
+                work.0
+            );
+            assert!(
+                work.1 < 3 * small_bytes,
+                "parser bytes: {small_bytes} -> {}",
+                work.1
+            );
+        }
+        if let Some(smaller) = previous_work {
+            assert_work_growth(smaller, render_work);
+        }
+        previous = Some(work);
+        previous_work = Some(render_work);
+    }
+}
+
+#[test]
+fn separate_distributed_nested_groups_settle_locally() {
+    let config = make_stream_config("http://127.0.0.1:1");
+    let segmenter = fallback_segmenter();
+    let mut previous = None;
+    let mut previous_work = None;
+    for count in [30, 60] {
+        let group = format!("a{}Title{}\n\n", "**".repeat(count), "** b".repeat(count));
+        let source = group.repeat(4);
+        assert_eq!(strong_span_count(&source), 4 * count);
+        let plan = plan_translation(
+            &source,
+            "zh",
+            &config,
+            &segmenter,
+            &TemplateType::Default,
+            &PromptOpts::default(),
+        )
+        .unwrap();
+        assert_eq!(plan.segments.len(), 4 * (count + 2));
+        assert_eq!(plan.reconstruct(&plan.segments), source);
+        let mut leaves = plan
+            .segments
+            .iter()
+            .map(|s| {
+                s.replace('a', "甲")
+                    .replace("Title", "《标题》")
+                    .replace('b', "乙")
+            })
+            .collect::<Vec<_>>();
+        take_parse_work();
+        take_render_work();
+        assert!(render_translations(&plan, &mut leaves));
+        let work = take_parse_work();
+        let render_work = take_render_work();
+        let output = plan.reconstruct(&leaves);
+        ensure_markdown_structure_preserved(&source, &output).unwrap();
+        assert_eq!(output.matches("甲 ").count(), 4);
+        if let Some((small_calls, small_bytes)) = previous {
+            assert!(
+                work.0 < 3 * small_calls,
+                "parse calls: {small_calls} -> {}",
+                work.0
+            );
+            assert!(
+                work.1 < 3 * small_bytes,
+                "parser bytes: {small_bytes} -> {}",
+                work.1
+            );
+        }
+        if let Some(smaller) = previous_work {
+            assert_work_growth(smaller, render_work);
+        }
+        previous = Some(work);
+        previous_work = Some(render_work);
+    }
+}
+
+#[test]
+fn covered_empty_section_and_split_group_keep_exact_owners() {
+    let source = "a*Title*b";
+    let config = make_stream_config("http://127.0.0.1:1");
+    let segmenter = fallback_segmenter();
+    let mut plan = plan_translation(
+        source,
+        "zh",
+        &config,
+        &segmenter,
+        &TemplateType::Default,
+        &PromptOpts::default(),
+    )
+    .unwrap();
+    assert_eq!(plan.segments, ["a", "Title", "b"]);
+    {
+        let document = plan.document_plan.as_mut().unwrap();
+        assert_eq!(
+            document
+                .sections
+                .iter()
+                .map(|section| section.text.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "*", "Title", "*", "b"]
+        );
+        document.sections[2].text = "Ti".to_owned();
+        let mut covered = document.sections[2].clone();
+        covered.text = "tle".to_owned();
+        document.sections.insert(3, covered);
+    }
+    plan.segments = ["a", "Ti", "tle", "b"].map(str::to_owned).to_vec();
+    plan.segment_section_indexes = vec![0, 2, 2, 5];
+    plan.segment_section_groups = vec![vec![0], vec![2, 3], vec![2, 3], vec![5]];
+    assert_eq!(plan.reconstruct(&plan.segments), source);
+    assert_eq!(
+        reconstructed_section_parts(
+            plan.document_plan.as_ref().unwrap(),
+            &plan.segment_section_groups,
+            &plan.segments,
+            &plan.segments
+        ),
+        ["a", "*", "Title", "", "*", "b"]
+    );
+    let mut leaves = ["甲", "《标", "题》", "乙"].map(str::to_owned).to_vec();
+    assert!(render_translations(&plan, &mut leaves));
+    assert_eq!(leaves, ["甲 ", "《标", "题》", " 乙"]);
+    let output = plan.reconstruct(&leaves);
+    assert_eq!(output, "甲 *《标题》* 乙");
+    ensure_markdown_structure_preserved(source, &output).unwrap();
+}
 
 #[test]
 fn independent_emphasis_repairs_do_not_reparse_the_document_per_paragraph() {
     let config = make_stream_config("http://127.0.0.1:1");
     let segmenter = fallback_segmenter();
     let mut previous = None;
+    let mut previous_work = None;
     for count in [64, 128] {
         let source = "a*Title*b\n\n".repeat(count);
         let plan = plan_translation(
@@ -25,8 +356,10 @@ fn independent_emphasis_repairs_do_not_reparse_the_document_per_paragraph() {
             .map(str::to_owned)
             .collect::<Vec<_>>();
         take_parse_work();
+        take_render_work();
         assert!(render_translations(&plan, &mut leaves));
         let (calls, bytes) = take_parse_work();
+        let render_work = take_render_work();
         let output = plan.reconstruct(&leaves);
         ensure_markdown_structure_preserved(&source, &output).unwrap();
         if let Some((smaller_calls, smaller_bytes)) = previous {
@@ -39,7 +372,11 @@ fn independent_emphasis_repairs_do_not_reparse_the_document_per_paragraph() {
                 "parser input bytes grew from {smaller_bytes} to {bytes}"
             );
         }
+        if let Some(smaller) = previous_work {
+            assert_work_growth(smaller, render_work);
+        }
         previous = Some((calls, bytes));
+        previous_work = Some(render_work);
     }
 }
 
@@ -48,6 +385,7 @@ fn independent_spans_in_one_paragraph_use_local_owner_windows() {
     let config = make_stream_config("http://127.0.0.1:1");
     let segmenter = fallback_segmenter();
     let mut previous = None;
+    let mut previous_work = None;
     for count in [32, 64] {
         let source = "a*Title*b ".repeat(count);
         let plan = plan_translation(
@@ -69,8 +407,10 @@ fn independent_spans_in_one_paragraph_use_local_owner_windows() {
             })
             .collect::<Vec<_>>();
         take_parse_work();
+        take_render_work();
         assert!(render_translations(&plan, &mut leaves));
         let (calls, bytes) = take_parse_work();
+        let render_work = take_render_work();
         let output = plan.reconstruct(&leaves);
         ensure_markdown_structure_preserved(&source, &output).unwrap();
         assert_eq!(output, "甲 *《标题》* 乙 ".repeat(count));
@@ -84,7 +424,11 @@ fn independent_spans_in_one_paragraph_use_local_owner_windows() {
                 "parser input bytes grew from {smaller_bytes} to {bytes}"
             );
         }
+        if let Some(smaller) = previous_work {
+            assert_work_growth(smaller, render_work);
+        }
         previous = Some((calls, bytes));
+        previous_work = Some(render_work);
     }
 }
 

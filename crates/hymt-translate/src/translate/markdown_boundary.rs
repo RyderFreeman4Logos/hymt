@@ -6,14 +6,70 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 type Owner = (usize, usize);
 type Span = (u8, Owner, Owner);
 
+#[derive(Clone, Copy)]
+struct Mismatch {
+    span: Span,
+    missing: bool,
+    left: Option<(usize, bool)>,
+    right: Option<(usize, bool)>,
+    start: usize,
+    end: usize,
+    group: usize,
+}
+
+struct SharedOpening {
+    start: usize,
+    end: usize,
+    members: Vec<usize>,
+    settled_at: Option<usize>,
+}
+
 #[cfg(test)]
 thread_local! {
     static PARSE_WORK: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+    static RENDER_WORK: std::cell::Cell<RenderWork> = const { std::cell::Cell::new(RenderWork::new()) };
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(super) struct RenderWork {
+    pub joined_bytes: usize,
+    pub copied_bytes: usize,
+    pub member_visits: usize,
+    pub invalidation_queries: usize,
+}
+
+#[cfg(test)]
+impl RenderWork {
+    const fn new() -> Self {
+        Self {
+            joined_bytes: 0,
+            copied_bytes: 0,
+            member_visits: 0,
+            invalidation_queries: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) fn take_render_work() -> RenderWork {
+    RENDER_WORK.with(|work| work.replace(RenderWork::new()))
 }
 
 #[cfg(test)]
 pub(super) fn take_parse_work() -> (usize, usize) {
     PARSE_WORK.with(|work| work.replace((0, 0)))
+}
+
+fn join_parts(parts: &[String]) -> String {
+    let joined = parts.join("");
+    #[cfg(test)]
+    RENDER_WORK.with(|work| {
+        let mut current = work.get();
+        current.joined_bytes += joined.len();
+        work.set(current);
+    });
+    joined
 }
 
 pub(super) fn requires_validated_rendering(plan: &TranslationPlan) -> bool {
@@ -88,7 +144,7 @@ fn spans_in_parts(parts: &[String], first_section: usize) -> BTreeSet<Span> {
         }
         (first_section + index, position - offsets[index])
     };
-    let text = parts.join("");
+    let text = join_parts(parts);
     #[cfg(test)]
     PARSE_WORK.with(|work| {
         let (calls, bytes) = work.get();
@@ -118,6 +174,12 @@ fn spans(plan: &TranslationPlan, translations: &[String]) -> BTreeSet<Span> {
         &plan.segments,
         translations,
     );
+    #[cfg(test)]
+    RENDER_WORK.with(|work| {
+        let mut current = work.get();
+        current.copied_bytes += parts.iter().map(String::len).sum::<usize>();
+        work.set(current);
+    });
     spans_in_parts(&parts, 0)
 }
 
@@ -151,6 +213,12 @@ fn section_part(
         .map(|&index| document.sections[index].text.as_str())
         .collect();
     super::restore_trailing_newlines(&mut part, &group_source);
+    #[cfg(test)]
+    RENDER_WORK.with(|work| {
+        let mut current = work.get();
+        current.copied_bytes += part.len() + group_source.len();
+        work.set(current);
+    });
     part
 }
 
@@ -225,9 +293,19 @@ pub(super) fn render_translations(plan: &TranslationPlan, translations: &mut [St
         &plan.segments,
         translations,
     );
-    // Probe each mismatched span in its own delimiter-and-leaf window.
-    // Independent spans can share a translated leaf without making their
-    // parser windows include each other's delimiters.
+    #[cfg(test)]
+    RENDER_WORK.with(|work| {
+        let mut current = work.get();
+        current.copied_bytes += source_parts.iter().map(String::len).sum::<usize>();
+        current.copied_bytes += parts.iter().map(String::len).sum::<usize>();
+        work.set(current);
+    });
+    // Keep the original missing-then-extra order. Spans with one opening
+    // section can have different closing windows, yet one edge edit may
+    // settle all of them. Their union is checked only after an accepted edit.
+    let mut mismatches = Vec::new();
+    let mut groups: Vec<SharedOpening> = Vec::new();
+    let mut opening_groups = HashMap::new();
     for (span @ (_, open, close), missing) in expected
         .difference(&actual)
         .map(|span| (span, true))
@@ -246,16 +324,60 @@ pub(super) fn render_translations(plan: &TranslationPlan, translations: &mut [St
                 }
             }
         }
+        let group = *opening_groups.entry((missing, open.0)).or_insert_with(|| {
+            groups.push(SharedOpening {
+                start,
+                end,
+                members: Vec::new(),
+                settled_at: None,
+            });
+            groups.len() - 1
+        });
+        groups[group].start = groups[group].start.min(start);
+        groups[group].end = groups[group].end.max(end);
+        groups[group].members.push(mismatches.len());
+        mismatches.push(Mismatch {
+            span: *span,
+            missing,
+            left,
+            right,
+            start,
+            end,
+            group,
+        });
+    }
+    let mut revision = 0;
+    // Independent spans still use their own delimiter-and-leaf windows.
+    for mismatch in &mismatches {
+        let Mismatch {
+            span,
+            missing,
+            left,
+            right,
+            start,
+            end,
+            group,
+        } = *mismatch;
+        #[cfg(test)]
+        RENDER_WORK.with(|work| {
+            let mut current = work.get();
+            current.member_visits += 1;
+            current.invalidation_queries += 1;
+            work.set(current);
+        });
+        if groups[group].settled_at == Some(revision) {
+            continue;
+        }
         let local_expected = spans_in_parts(&source_parts[start..end], start);
         let local_actual = spans_in_parts(&parts[start..end], start);
-        if missing && !local_expected.contains(span) {
+        if missing && !local_expected.contains(&span) {
             return false;
         }
-        if local_actual.contains(span) == missing {
+        if local_actual.contains(&span) == missing {
             continue;
         }
         let old_score = local_expected.symmetric_difference(&local_actual).count();
-        let local_blocks = block_structure(&parts[start..end].join(""));
+        let local_blocks = block_structure(&join_parts(&parts[start..end]));
         let candidates = [
             left.map(|edge| vec![edge]),
             right.map(|edge| vec![edge]),
@@ -274,7 +396,15 @@ pub(super) fn render_translations(plan: &TranslationPlan, translations: &mut [St
                     {
                         continue;
                     }
-                    originals.entry(index).or_insert_with(|| text.clone());
+                    originals.entry(index).or_insert_with(|| {
+                        #[cfg(test)]
+                        RENDER_WORK.with(|work| {
+                            let mut current = work.get();
+                            current.copied_bytes += text.len();
+                            work.set(current);
+                        });
+                        text.clone()
+                    });
                     text.insert(if leading { 0 } else { text.len() }, separator);
                     changed_sections.insert(section);
                 }
@@ -285,9 +415,9 @@ pub(super) fn render_translations(plan: &TranslationPlan, translations: &mut [St
                     parts[section] = section_part(plan, translations, &section_segments, section);
                 }
                 let next = spans_in_parts(&parts[start..end], start);
-                if next.contains(span) == missing
+                if next.contains(&span) == missing
                     && local_expected.symmetric_difference(&next).count() < old_score
-                    && block_structure(&parts[start..end].join("")) == local_blocks
+                    && block_structure(&join_parts(&parts[start..end])) == local_blocks
                 {
                     repaired = true;
                     break 'candidates;
@@ -302,6 +432,28 @@ pub(super) fn render_translations(plan: &TranslationPlan, translations: &mut [St
         }
         if !repaired {
             return false;
+        }
+        revision += 1;
+        let shared = &mut groups[group];
+        if shared.members.len() > 1 {
+            let group_expected =
+                spans_in_parts(&source_parts[shared.start..shared.end], shared.start);
+            let group_actual = spans_in_parts(&parts[shared.start..shared.end], shared.start);
+            #[cfg(test)]
+            RENDER_WORK.with(|work| {
+                let mut current = work.get();
+                current.member_visits += shared.members.len();
+                work.set(current);
+            });
+            if group_expected == group_actual
+                && shared.members.iter().all(|&index| {
+                    group_expected.contains(&mismatches[index].span) == mismatches[index].missing
+                })
+                && block_structure(&join_parts(&source_parts[shared.start..shared.end]))
+                    == block_structure(&join_parts(&parts[shared.start..shared.end]))
+            {
+                shared.settled_at = Some(revision);
+            }
         }
     }
     actual = spans(plan, translations);
