@@ -17,7 +17,9 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_stream::StreamExt as _;
 
-use hymt_cache::history::{format_duration, HistoryDB, SegmentCacheScope, TaskRecord};
+use hymt_cache::history::{
+    format_duration, EstimateScope, HistoryDB, SegmentCacheScope, TaskRecord,
+};
 use hymt_client::{TranslationClient, TranslationStreamEvent};
 #[cfg(test)]
 use hymt_core::completeness::validate_completeness;
@@ -284,6 +286,7 @@ impl TranslationOutcome {
 
 /// Single-segment translate result (internal).
 struct SegmentTranslateOutcome {
+    cold_generation: bool,
     text: String,
     completeness_degraded: bool,
 }
@@ -1117,7 +1120,9 @@ pub(crate) fn segment_cache_hash(text: &str) -> String {
     hex::encode(h.finalize())
 }
 
-pub(crate) fn template_options_hash(
+/// Hash the effective prompt options for inference and timing identity.
+/// The document policy must include the configuration default when no override is set.
+pub fn template_options_hash(
     opts: &PromptOpts,
     document_policy: DocumentTranslationPolicy,
 ) -> String {
@@ -1343,6 +1348,7 @@ async fn translate_segment_with_completeness<'a>(
             return Ok(SegmentTranslateOutcome {
                 text: candidate.text,
                 completeness_degraded: false,
+                cold_generation: attempt == 0 && completion.cold_generation,
             });
         }
 
@@ -1379,6 +1385,7 @@ async fn translate_segment_with_completeness<'a>(
     Ok(SegmentTranslateOutcome {
         text: best.text,
         completeness_degraded: true,
+        cold_generation: false,
     })
 }
 
@@ -1398,8 +1405,8 @@ async fn send_stream_event(tx: &StreamEventSink, event: StreamEvent) -> Result<(
 }
 
 fn joined_segment(
-    res: std::result::Result<Result<(usize, String, bool)>, tokio::task::JoinError>,
-) -> Result<(usize, String, bool)> {
+    res: std::result::Result<Result<(usize, String, bool, bool)>, tokio::task::JoinError>,
+) -> Result<(usize, String, bool, bool)> {
     match res {
         Ok(Ok(segment)) => Ok(segment),
         Ok(Err(e)) => Err(e.context("segment translation failed")),
@@ -1489,9 +1496,11 @@ async fn translate_segment_with_completeness_streaming(
     let mut first_token_tx = first_token_tx;
     let mut emitted_optimistically = false;
     let mut termination = CompletionTermination::Unknown;
+    let mut cold_generation = false;
 
     while let Some(item) = stream.next().await {
         match item.map_err(|e| map_segment_http_error(request.index, request.segment, e))? {
+            TranslationStreamEvent::ColdGeneration(cold) => cold_generation = cold,
             TranslationStreamEvent::Token(token) => {
                 if token.is_empty() {
                     continue;
@@ -1538,6 +1547,7 @@ async fn translate_segment_with_completeness_streaming(
         return Ok(SegmentTranslateOutcome {
             text: best.text,
             completeness_degraded: false,
+            cold_generation,
         });
     }
 
@@ -1563,6 +1573,7 @@ async fn translate_segment_with_completeness_streaming(
         return Ok(SegmentTranslateOutcome {
             text: best.text,
             completeness_degraded: true,
+            cold_generation: false,
         });
     }
 
@@ -1630,6 +1641,7 @@ async fn translate_segment_with_completeness_streaming(
             return Ok(SegmentTranslateOutcome {
                 text: candidate.text,
                 completeness_degraded: false,
+                cold_generation: false,
             });
         }
 
@@ -1682,6 +1694,7 @@ async fn translate_segment_with_completeness_streaming(
     Ok(SegmentTranslateOutcome {
         text: best.text,
         completeness_degraded: true,
+        cold_generation: false,
     })
 }
 
@@ -1834,6 +1847,38 @@ pub async fn translate_text(
         &mut missing,
     );
     let cache_hits = (plan.segment_count() - missing.len()) as i64;
+    let source_tokens: i64 = missing
+        .iter()
+        .map(|&idx| ctx.segmenter.count_tokens(&plan.segments[idx]) as i64)
+        .sum();
+    let counting_source = if ctx.segmenter.has_exact_tokenizer() {
+        "local"
+    } else {
+        "approximate"
+    };
+    let estimate = if cache_hits == 0 && inference_fingerprint.is_cache_verified() {
+        ctx.history
+            .estimate(
+                source_tokens,
+                missing.len() as i64,
+                ctx.client.concurrency() as i64,
+                EstimateScope {
+                    target_lang,
+                    template_type: template_name,
+                    profile_id,
+                    inference_fingerprint: inference_fingerprint.hash(),
+                    prompt_schema: PROMPT_SCHEMA_ID,
+                    config_version: ctx.config.config_version() as i64,
+                    counting_source,
+                },
+            )
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    let mut cold_generation =
+        !missing.is_empty() && cache_hits == 0 && inference_fingerprint.is_cache_verified();
     let mut cache_candidates = vec![false; plan.segment_count()];
 
     // ── Phase 2: parallel translate missing segments ───────────────────────────
@@ -1841,7 +1886,7 @@ pub async fn translate_text(
     let mut degraded_segments: Vec<usize> = Vec::new();
 
     if !missing.is_empty() {
-        let mut join_set: JoinSet<Result<(usize, String, bool)>> = JoinSet::new();
+        let mut join_set: JoinSet<Result<(usize, String, bool, bool)>> = JoinSet::new();
 
         for &idx in &missing {
             let client = ctx.client.clone();
@@ -1863,15 +1908,21 @@ pub async fn translate_text(
                     &cfg,
                 )
                 .await?;
-                Ok((idx, outcome.text, outcome.completeness_degraded))
+                Ok((
+                    idx,
+                    outcome.text,
+                    outcome.completeness_degraded,
+                    outcome.cold_generation,
+                ))
             });
         }
 
         while let Some(res) = join_set.join_next().await {
-            let (idx, translated, degraded) = joined_segment(res)?;
+            let (idx, translated, degraded, cold) = joined_segment(res)?;
             if degraded {
                 degraded_segments.push(idx + 1);
             }
+            cold_generation &= cold;
             cache_candidates[idx] = !degraded;
             translations[idx] = Some(translated);
         }
@@ -1938,6 +1989,9 @@ pub async fn translate_text(
         inference_fingerprint: inference_fingerprint.hash().to_owned(),
         prompt_schema: PROMPT_SCHEMA_ID.to_owned(),
         cache_hits: Some(cache_hits),
+        cold_source_tokens: cold_generation.then_some(source_tokens),
+        counting_source: Some(counting_source.to_owned()),
+        estimated_seconds: estimate.as_ref().map(|forecast| forecast.seconds),
         tokens_per_second: tps,
         input_chars: text.chars().count() as i64,
         output_chars: translated.chars().count() as i64,
@@ -1960,14 +2014,7 @@ pub async fn translate_text(
     let seg_count: i64 = plan.segment_count() as i64;
     let concurrency = ctx.client.concurrency() as i64;
     let cfg_ver = ctx.config.config_version() as i64;
-    if let Ok(Some(estimate)) = ctx.history.estimate(
-        seg_count,
-        concurrency,
-        Some(target_lang),
-        Some(template_name),
-        Some(cfg_ver),
-        None,
-    ) {
+    if let Some(estimate) = estimate.filter(|_| cold_generation) {
         let threshold = ctx.config.timing_divergence_threshold();
         let data = hymt_cache::TimingIssueData {
             input_tokens: plan.source_tokens as i64,
@@ -2177,6 +2224,38 @@ async fn translate_text_stream_inner(
         &mut missing,
     );
     let cache_hits = (plan.segment_count() - missing.len()) as i64;
+    let source_tokens: i64 = missing
+        .iter()
+        .map(|&idx| ctx.segmenter.count_tokens(&plan.segments[idx]) as i64)
+        .sum();
+    let counting_source = if ctx.segmenter.has_exact_tokenizer() {
+        "local"
+    } else {
+        "approximate"
+    };
+    let estimate = if cache_hits == 0 && inference_fingerprint.is_cache_verified() {
+        ctx.history
+            .estimate(
+                source_tokens,
+                missing.len() as i64,
+                ctx.client.concurrency() as i64,
+                EstimateScope {
+                    target_lang,
+                    template_type: template_name,
+                    profile_id,
+                    inference_fingerprint: inference_fingerprint.hash(),
+                    prompt_schema: PROMPT_SCHEMA_ID,
+                    config_version: ctx.config.config_version() as i64,
+                    counting_source,
+                },
+            )
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    let mut cold_generation =
+        !missing.is_empty() && cache_hits == 0 && inference_fingerprint.is_cache_verified();
     let mut cache_candidates = vec![false; plan.segment_count()];
 
     let mut degraded_segments: Vec<usize> = Vec::new();
@@ -2247,10 +2326,15 @@ async fn translate_text_stream_inner(
                     timing,
                 )
                 .await?;
-                Ok((chunk_idx, outcome.text, outcome.completeness_degraded))
+                Ok((
+                    chunk_idx,
+                    outcome.text,
+                    outcome.completeness_degraded,
+                    outcome.cold_generation,
+                ))
             });
 
-            let mut priority_done: Option<(usize, String, bool)> = None;
+            let mut priority_done: Option<(usize, String, bool, bool)> = None;
             if !missing.is_empty() {
                 tokio::select! {
                     _ = first_token_rx.recv() => {}
@@ -2259,7 +2343,7 @@ async fn translate_text_stream_inner(
                     }
                 }
 
-                let mut join_set: JoinSet<Result<(usize, String, bool)>> = JoinSet::new();
+                let mut join_set: JoinSet<Result<(usize, String, bool, bool)>> = JoinSet::new();
                 for &idx in &missing {
                     let client = ctx.client.clone();
                     let segment = plan.segments[idx].clone();
@@ -2283,11 +2367,16 @@ async fn translate_text_stream_inner(
                         )
                         .await?;
                         timing.log(idx, "complete");
-                        Ok((idx, outcome.text, outcome.completeness_degraded))
+                        Ok((
+                            idx,
+                            outcome.text,
+                            outcome.completeness_degraded,
+                            outcome.cold_generation,
+                        ))
                     });
                 }
 
-                let (idx, translated, degraded) = if let Some(done) = priority_done {
+                let (idx, translated, degraded, cold) = if let Some(done) = priority_done {
                     done
                 } else {
                     joined_segment(
@@ -2300,6 +2389,7 @@ async fn translate_text_stream_inner(
                 if degraded {
                     degraded_segments.push(idx + 1);
                 }
+                cold_generation &= cold;
                 cache_candidates[idx] = !degraded;
                 translations[idx] = Some(translated);
                 // Priority segment already streamed its tokens (validated or
@@ -2324,10 +2414,11 @@ async fn translate_text_stream_inner(
                 .await?;
 
                 while let Some(res) = join_set.join_next().await {
-                    let (idx, translated, degraded) = joined_segment(res)?;
+                    let (idx, translated, degraded, cold) = joined_segment(res)?;
                     if degraded {
                         degraded_segments.push(idx + 1);
                     }
+                    cold_generation &= cold;
                     cache_candidates[idx] = !degraded;
                     translations[idx] = Some(translated);
                     flush_ready_stream_prefix(
@@ -2340,7 +2431,7 @@ async fn translate_text_stream_inner(
                     .await?;
                 }
             } else {
-                let (idx, translated, degraded) = joined_segment(
+                let (idx, translated, degraded, cold) = joined_segment(
                     priority_tasks
                         .join_next()
                         .await
@@ -2349,6 +2440,7 @@ async fn translate_text_stream_inner(
                 if degraded {
                     degraded_segments.push(idx + 1);
                 }
+                cold_generation &= cold;
                 cache_candidates[idx] = !degraded;
                 translations[idx] = Some(translated);
                 advance_stream_cursor_past_segment(
@@ -2362,7 +2454,7 @@ async fn translate_text_stream_inner(
                 .await?;
             }
         } else {
-            let mut join_set: JoinSet<Result<(usize, String, bool)>> = JoinSet::new();
+            let mut join_set: JoinSet<Result<(usize, String, bool, bool)>> = JoinSet::new();
 
             for &idx in &missing {
                 let client = ctx.client.clone();
@@ -2387,15 +2479,21 @@ async fn translate_text_stream_inner(
                     )
                     .await?;
                     timing.log(idx, "complete");
-                    Ok((idx, outcome.text, outcome.completeness_degraded))
+                    Ok((
+                        idx,
+                        outcome.text,
+                        outcome.completeness_degraded,
+                        outcome.cold_generation,
+                    ))
                 });
             }
 
             while let Some(res) = join_set.join_next().await {
-                let (idx, translated, degraded) = joined_segment(res)?;
+                let (idx, translated, degraded, cold) = joined_segment(res)?;
                 if degraded {
                     degraded_segments.push(idx + 1);
                 }
+                cold_generation &= cold;
                 cache_candidates[idx] = !degraded;
                 translations[idx] = Some(translated);
                 flush_ready_stream_prefix(
@@ -2494,6 +2592,9 @@ async fn translate_text_stream_inner(
         inference_fingerprint: inference_fingerprint.hash().to_owned(),
         prompt_schema: PROMPT_SCHEMA_ID.to_owned(),
         cache_hits: Some(cache_hits),
+        cold_source_tokens: cold_generation.then_some(source_tokens),
+        counting_source: Some(counting_source.to_owned()),
+        estimated_seconds: estimate.as_ref().map(|forecast| forecast.seconds),
         tokens_per_second: tps,
         input_chars: text.chars().count() as i64,
         output_chars: translated.chars().count() as i64,
@@ -2515,14 +2616,7 @@ async fn translate_text_stream_inner(
     let seg_count: i64 = plan.segment_count() as i64;
     let concurrency = ctx.client.concurrency() as i64;
     let cfg_ver = ctx.config.config_version() as i64;
-    if let Ok(Some(estimate)) = ctx.history.estimate(
-        seg_count,
-        concurrency,
-        Some(target_lang),
-        Some(template_name),
-        Some(cfg_ver),
-        None,
-    ) {
+    if let Some(estimate) = estimate.filter(|_| cold_generation) {
         let threshold = ctx.config.timing_divergence_threshold();
         let data = hymt_cache::TimingIssueData {
             input_tokens: plan.source_tokens as i64,
@@ -2620,6 +2714,7 @@ mod tests {
     pub(super) use markdown_boundary_tests::record_semantic_bytes;
     pub(super) mod ownership_interval_tests;
     mod table_shape_tests;
+    mod timing_tests;
 
     use super::*;
     use std::collections::VecDeque;
@@ -2639,7 +2734,7 @@ mod tests {
     use tokio::sync::Notify;
 
     #[tokio::test]
-    async fn no_cache_translation_persists_observations_and_estimates_from_cold_history() {
+    async fn no_cache_translation_preserves_observations_without_inventing_cold_provenance() {
         let tmp = tempfile::tempdir().unwrap();
         let history = HistoryDB::new(tmp.path().join("history.db"));
         let source = "This report explains why reliable translation timing matters.";
@@ -2725,18 +2820,28 @@ mod tests {
             cache_free.iter().map(|record| record.output_tokens).sum();
         let estimate = history
             .estimate(
+                plan.source_tokens as i64,
                 segments,
                 concurrency,
-                Some("zh"),
-                Some("default"),
-                Some(config_version),
-                None,
+                EstimateScope {
+                    target_lang: "zh",
+                    template_type: "default",
+                    profile_id: &cache_free[0].profile_id,
+                    inference_fingerprint: &cache_free[0].inference_fingerprint,
+                    prompt_schema: PROMPT_SCHEMA_ID,
+                    config_version,
+                    counting_source: "approximate",
+                },
             )
-            .unwrap()
-            .expect("three persisted no-cache observations should yield an ETA");
-        assert_eq!(estimate.stats.count, 3);
-        assert_eq!(estimate.stats.total_output_tokens, expected_output_tokens);
-        assert!(estimate.seconds.is_finite() && estimate.seconds > 0.0);
+            .unwrap();
+        assert!(cache_free
+            .iter()
+            .all(|record| record.cold_source_tokens.is_none()));
+        assert!(
+            estimate.is_none(),
+            "unmarked shared-cache provenance must not calibrate timing"
+        );
+        assert!(expected_output_tokens > 0);
     }
 
     fn fallback_segmenter() -> Segmenter {

@@ -9,12 +9,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use walkdir::WalkDir;
 
-use hymt_cache::history::{HistoryDB, SegmentCacheScope};
+use hymt_cache::history::{EstimateScope, HistoryDB, SegmentCacheScope};
 use hymt_client::TranslationClient;
 use hymt_core::config::HotConfig;
 use hymt_core::language::resolve_target_language;
 use hymt_core::language_spec::normalize_language_code;
-use hymt_core::templates::{PromptOpts, TemplateType};
+use hymt_core::templates::{PromptOpts, TemplateType, PROMPT_SCHEMA_ID};
 use hymt_segment::Segmenter;
 
 use crate::doc_translate::{build_output_path, target_lang_path_suffix};
@@ -261,12 +261,27 @@ pub fn build_batch_plan(
         } else {
             history
                 .estimate(
+                    plan.segments
+                        .iter()
+                        .zip(&seg_hashes)
+                        .filter(|(_, hash)| !cached_set.contains(*hash))
+                        .map(|(segment, _)| segmenter.count_tokens(segment) as i64)
+                        .sum(),
                     missing as i64,
                     config.concurrency() as i64,
-                    Some(&effective_lang),
-                    Some(template_name),
-                    Some(config.config_version() as i64),
-                    None,
+                    EstimateScope {
+                        target_lang: &effective_lang,
+                        template_type: template_name,
+                        profile_id,
+                        inference_fingerprint: inference_fingerprint.hash(),
+                        prompt_schema: PROMPT_SCHEMA_ID,
+                        config_version: config.config_version() as i64,
+                        counting_source: if segmenter.has_exact_tokenizer() {
+                            "local"
+                        } else {
+                            "approximate"
+                        },
+                    },
                 )
                 .ok()
                 .flatten()

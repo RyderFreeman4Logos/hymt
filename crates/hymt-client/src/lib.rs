@@ -58,11 +58,15 @@ pub enum ClientError {
 pub struct TranslationCompletion {
     pub text: String,
     pub termination: CompletionTermination,
+    /// True only for one explicit X-Hymt-Cache: MISS or BYPASS response marker.
+    pub cold_generation: bool,
 }
 
 /// An item emitted by a termination-aware translation stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranslationStreamEvent {
+    /// Response provenance, emitted before content; unmarked responses are unknown.
+    ColdGeneration(bool),
     Token(String),
     Finished(CompletionTermination),
 }
@@ -850,8 +854,16 @@ impl TranslationClient {
             tokio::sync::mpsc::channel::<Result<TranslationStreamEvent, ClientError>>(64);
 
         let is_sse = is_event_stream(&response);
+        let cold_generation = cold_generation(response.headers());
         tokio::spawn(async move {
             let _permit = permit; // held for the entire stream duration
+            if tx
+                .send(Ok(TranslationStreamEvent::ColdGeneration(cold_generation)))
+                .await
+                .is_err()
+            {
+                return;
+            }
             let closed = tx.clone();
             tokio::select! {
                 biased;
@@ -969,9 +981,12 @@ impl TranslationClient {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
                     if status < 400 {
+                        let cold_generation = cold_generation(resp.headers());
                         let body = resp.bytes().await?;
                         let chat: ChatResponse = serde_json::from_slice(&body)?;
-                        return extract_completion_from_response(chat);
+                        let mut completion = extract_completion_from_response(chat)?;
+                        completion.cold_generation = cold_generation;
+                        return Ok(completion);
                     }
                     let body = resp.bytes().await.unwrap_or_default();
                     let err = http_error(status, &body);
@@ -1038,6 +1053,17 @@ impl TranslationClient {
             body: "max retries exceeded".into(),
         }))
     }
+}
+
+// Missing, malformed, duplicate, HIT and UNKNOWN markers cannot prove cold generation.
+fn cold_generation(headers: &reqwest::header::HeaderMap) -> bool {
+    let mut markers = headers.get_all("x-hymt-cache").iter();
+    let marker = markers.next();
+    markers.next().is_none()
+        && matches!(
+            marker.map(|value| value.as_bytes()),
+            Some(b"MISS" | b"BYPASS")
+        )
 }
 
 fn unix_timestamp_secs() -> u64 {
@@ -1273,11 +1299,16 @@ fn extract_completion_from_response(
             return Ok(TranslationCompletion {
                 text: content,
                 termination,
+                cold_generation: false,
             });
         }
     }
     if let Some(text) = first.text {
-        return Ok(TranslationCompletion { text, termination });
+        return Ok(TranslationCompletion {
+            text,
+            termination,
+            cold_generation: false,
+        });
     }
 
     Err(ClientError::MissingContent)
@@ -1410,6 +1441,31 @@ mod llama_cpp_integration_tests;
 mod tests {
     use super::*;
     use hymt_core::config::{GenerationBackend, GenerationSettings, Setting};
+
+    #[test]
+    fn cold_generation_requires_one_explicit_marker() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        for (values, expected) in [
+            (vec![], false),
+            (vec!["MISS"], true),
+            (vec!["BYPASS"], true),
+            (vec!["HIT"], false),
+            (vec!["UNKNOWN"], false),
+            (vec!["miss"], false),
+            (vec!["MISS,HIT"], false),
+            (vec!["MISS", "MISS"], false),
+            (vec!["MISS", "HIT"], false),
+        ] {
+            let mut headers = HeaderMap::new();
+            for value in values {
+                headers.append("x-hymt-cache", HeaderValue::from_str(value).unwrap());
+            }
+            assert_eq!(cold_generation(&headers), expected, "{headers:?}");
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert("x-hymt-cache", HeaderValue::from_bytes(&[0xff]).unwrap());
+        assert!(!cold_generation(&headers));
+    }
 
     fn parse_chat(json: &str) -> ChatResponse {
         serde_json::from_str(json).expect("test JSON must be valid")
