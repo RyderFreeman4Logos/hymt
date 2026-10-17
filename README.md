@@ -218,6 +218,8 @@ For Chinese-family targets (`zh`, `zh-Hant`, and `yue`), hymt plans a document p
 
 Markdown headings, list items, blockquotes, and table rows use the same paragraph rule. Fenced code blocks and leading YAML frontmatter are always preserved. Very short, code-like, or otherwise ambiguous snippets are translated rather than classified as already-target-language. `--plan` for text, stdin, and file input prints each paragraph's detection metadata, including `is_target_language` and `should_translate`.
 
+Global `--plan` supports text, stdin, file input, and `batch`; other subcommands, including `translate-doc`, reject it before config, backend, or output access. Supported planners may read backend metadata and compatible cache/history data, but do not translate or publish outputs.
+
 Use either a one-run override or configuration to translate every non-code paragraph:
 
 ```bash
