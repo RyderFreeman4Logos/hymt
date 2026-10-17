@@ -114,6 +114,127 @@ fn verified_json_config(endpoint: &str) -> HotConfig {
     HotConfig::from_path(config.path()).unwrap()
 }
 
+#[tokio::test]
+async fn json_newline_paragraph_loss_retries_before_publication_and_cache() {
+    for streaming in [false, true] {
+        let source = serde_json::json!({"message": "First complete instruction.\r\n \t\nSecond complete instruction.\r\n\r\nThird complete instruction."}).to_string();
+        let complete = serde_json::json!({"message": "请完整保留第一条操作说明。\n\n请完整保留第二条操作说明。\n\n请完整保留第三条操作说明。"}).to_string();
+        let missing =
+            serde_json::json!({"message": "请完整保留第一条操作说明，并保持所有样本完整可用。"})
+                .to_string();
+        let response = |text: &str, stream: bool| {
+            let encoded = serde_json::to_string(text).unwrap();
+            let content = encoded[1..encoded.len() - 1].to_owned();
+            if stream {
+                MockResponse::Sse(vec![content])
+            } else {
+                MockResponse::Json(content)
+            }
+        };
+        let server = start_capturing_mock_server(vec![
+            response(&missing, streaming),
+            response(&complete, false),
+        ])
+        .await;
+        let config = verified_json_config(&server.endpoint_url);
+        let client = TranslationClient::new(config.clone()).unwrap();
+        let segmenter = fallback_segmenter();
+        let dir = tempfile::tempdir().unwrap();
+        let history = HistoryDB::new(dir.path().join("history.db"));
+        let opts = PromptOpts::default();
+        let policy = effective_document_translation_policy(&opts, &config);
+        let options_hash = template_options_hash(&opts, policy);
+        let fingerprint = config
+            .inference_fingerprint(TemplateType::Default.as_str(), &options_hash)
+            .unwrap();
+        assert!(fingerprint.is_cache_verified());
+        let profile = config.model_profile().unwrap().id().to_owned();
+        let scope = SegmentCacheScope {
+            target_lang: "zh",
+            template_type: TemplateType::Default.as_str(),
+            options_hash: &options_hash,
+            profile_id: &profile,
+            inference_fingerprint: fingerprint.hash(),
+        };
+        history
+            .store_segment_cache(
+                &segment_cache_hash(&source),
+                scope,
+                &missing,
+                "2026-10-07T00:00:00Z",
+            )
+            .unwrap();
+        let ctx = TranslationCtx {
+            config: &config,
+            client: &client,
+            segmenter: &segmenter,
+            history: &history,
+            cache_enabled: true,
+        };
+        let outcome = if streaming {
+            let (tx, mut rx) = mpsc::channel(32);
+            let outcome = translate_text_stream_with_mode(
+                &source,
+                "zh",
+                &TemplateType::Default,
+                &opts,
+                &ctx,
+                StreamOutputMode::Validated,
+                tx,
+            )
+            .await;
+            let mut published = String::new();
+            let mut done = 0;
+            while let Some(event) = rx.recv().await {
+                match event {
+                    StreamEvent::Token(text) => published.push_str(&text),
+                    StreamEvent::AllDone(_) => done += 1,
+                    _ => {}
+                }
+            }
+            assert_eq!(published, complete);
+            assert_eq!(done, 1);
+            outcome
+        } else {
+            translate_text(&source, "zh", &TemplateType::Default, &opts, &ctx).await
+        };
+        assert_eq!(outcome.unwrap().text, complete);
+        assert_eq!(server.requests.lock().unwrap().len(), 2);
+        assert_eq!(history.fetch_recent(None).unwrap().len(), 1);
+        let cache =
+            ExecCache::with_user_path(dir.path().join("shared.db"), dir.path().join("user.db"));
+        if streaming {
+            cache
+                .store_shared("man", "newlines", &source, "zh", policy, &missing)
+                .unwrap();
+        } else {
+            cache
+                .store_user("man", "newlines", &source, "zh", policy, &missing)
+                .unwrap();
+        }
+        assert_eq!(
+            translate_cached("man", "newlines", &source, "zh", &cache, &opts, &ctx)
+                .await
+                .unwrap(),
+            complete
+        );
+        assert_eq!(
+            server.requests.lock().unwrap().len(),
+            2,
+            "valid segment cache must serve regeneration"
+        );
+        let tasks = history.fetch_recent(None).unwrap().len();
+        assert_eq!(
+            translate_cached("man", "newlines", &source, "zh", &cache, &opts, &ctx)
+                .await
+                .unwrap(),
+            complete
+        );
+        assert_eq!(history.fetch_recent(None).unwrap().len(), tasks);
+        assert_eq!(server.requests.lock().unwrap().len(), 2);
+    }
+}
+
 #[test]
 fn source_context_preserves_inline_and_heading_prefix_roles() {
     let config = make_protected_block_config("http://127.0.0.1:9/v1");

@@ -14,6 +14,8 @@ use crate::language_spec::{language_spec_or_none, LanguageFamily};
 mod identity;
 pub use identity::{identity_preservation_failures, parse_json_document, preserved_urls};
 mod json_content;
+#[cfg(test)]
+mod newline_tests;
 pub use json_content::json_string_values;
 mod placeholders;
 pub use placeholders::{preserved_placeholder_ranges, preserved_placeholders};
@@ -372,7 +374,18 @@ fn count_fenced_code_blocks(text: &str) -> usize {
 }
 
 fn count_paragraphs(text: &str) -> usize {
-    text.split("\n\n").filter(|b| !b.trim().is_empty()).count()
+    // LF and CRLF end lines; a lone CR remains within its line.
+    let mut count = 0;
+    let mut in_paragraph = false;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            in_paragraph = false;
+        } else if !in_paragraph {
+            count += 1;
+            in_paragraph = true;
+        }
+    }
+    count
 }
 
 /// Same fallback as `hymt_segment::estimate_token_count`: one token per four UTF-8 bytes.
