@@ -353,6 +353,8 @@ class CacheServer(ThreadingMixIn, HTTPServer):
         self.clients = threading.BoundedSemaphore(max_clients)
         self.generations = threading.BoundedSemaphore(max_upstream)
         self.controls = threading.BoundedSemaphore(1)
+        self.planning_lock = threading.Lock()
+        self.planning_revoked = False
         self.store = _Store(database)
         try:
             previous = _load(self.store.planning()[1].encode())
@@ -513,14 +515,21 @@ class CacheServer(ThreadingMixIn, HTTPServer):
                     matches = False
                 if not matches:
                     # Revoke an observed contradiction before a later probe can fail, independent of caller alias.
-                    self.store.clear()
+                    with self.planning_lock:
+                        self.planning_revoked = True
+                        self.store.clear()
                     retained = None
             if unavailable and budget.expired:
                 break
         if unavailable:
             raise _Unavailable("upstream metadata unavailable")
         identity = self.identity(values["/props"], values["/v1/models"], None)
-        self.store.activate(identity)
+        with self.planning_lock:
+            # A failed revocation may leave old entries, even if the backend returns to that identity.
+            if self.planning_revoked:
+                self.store.clear()
+            self.store.activate(identity)
+            self.planning_revoked = False
         # A valid replacement model revokes old evidence even if this caller requested the old alias.
         return self.identity(values["/props"], values["/v1/models"], requested_model)
 
@@ -557,7 +566,10 @@ class CacheServer(ThreadingMixIn, HTTPServer):
         return _canonical({"cache_schema": _SCHEMA, "prompt_schema": _PROMPT_SCHEMA, "upstream": self.upstream.geturl(), "props": {key: props[key] for key in fields if key in props}, "selected_model": stable_model})
 
     def retained(self, requested_model: object) -> tuple[int, str, int, str | None, bytes | None, str | None]:
-        record = self.store.planning()
+        with self.planning_lock:
+            if self.planning_revoked:
+                raise _Invalid("retained planning identity was revoked")
+            record = self.store.planning()
         value = _load(record[1].encode())
         if not isinstance(value, dict) or value.get("upstream") != self.upstream.geturl() or self.identity(value.get("props"), {"data": [value.get("selected_model")]}, requested_model) != record[1]:
             raise _Invalid("invalid retained planning identity")

@@ -406,6 +406,51 @@ class CacheContracts(unittest.TestCase):
                 self.assertEqual(json.loads(raw), self.state["props"])
                 self.assertNotIn("X-Hymt-Planning", headers)
 
+    def test_failed_revocation_stays_ineligible_until_durable_online_recovery(self):
+        for trigger in ("/props", "/v1/models", "/tokenize", "/v1/chat/completions"):
+            with self.subTest(trigger=trigger):
+                self.state["offline"] = False
+                self.state["props"].update(build_info="original", eos_token=".")
+                self.cache.store.clear()
+                for stream in (False, True):
+                    self.assertEqual(self.request({"model": "Hy-MT2-7B", "stream": stream})[1]["X-Hymt-Cache"], "MISS")
+                self.assertEqual(self.request({"content": "."}, path="/tokenize")[0], 200)
+                self.state["props"]["build_info"] = "replacement"
+                blocker = sqlite3.connect(self.db)
+                try:
+                    blocker.execute("BEGIN IMMEDIATE")
+                    if trigger in ("/props", "/v1/models"):
+                        self.assertEqual(self.get_metadata(trigger)[0], 200)
+                    else:
+                        payload = {"content": "."} if trigger == "/tokenize" else {"model": "Hy-MT2-7B", "stream": False}
+                        self.assertEqual(self.request(payload, path=trigger)[0], 200)
+                finally:
+                    blocker.close()
+                with sqlite3.connect(self.db) as conn:
+                    self.assertEqual(conn.execute("SELECT count(*) FROM entries").fetchone()[0], 2)
+                self.state["offline"] = True
+                for path in ("/props", "/v1/models"):
+                    status, headers, _body = self.get_metadata(path)
+                    self.assertEqual(status, 502)
+                    self.assertNotIn("X-Hymt-Planning", headers)
+                self.assertEqual(self.request({"content": "."}, path="/tokenize")[0], 503)
+                for stream in (False, True):
+                    self.assertEqual(self.request({"model": "Hy-MT2-7B", "stream": stream})[0], 503)
+                # Returning to A must clear contradicted entries before reauthorizing A.
+                self.state["offline"] = False
+                self.state["props"]["build_info"] = "original"
+                self.assertEqual(self.get_metadata()[0], 200)
+                for stream in (False, True):
+                    payload = {"model": "Hy-MT2-7B", "stream": stream}
+                    self.assertEqual(self.request(payload)[1]["X-Hymt-Cache"], "MISS")
+                    self.assertEqual(self.request(payload)[1]["X-Hymt-Cache"], "HIT")
+                self.assertEqual(self.request({"content": "."}, path="/tokenize")[0], 200)
+                self.state["offline"] = True
+                self.assertEqual(self.get_metadata()[1]["X-Hymt-Planning"], "historical")
+                self.assertEqual(self.request({"content": "."}, path="/tokenize")[1]["X-Hymt-Cache"], "HIT")
+                for stream in (False, True):
+                    self.assertEqual(self.request({"model": "Hy-MT2-7B", "stream": stream})[1]["X-Hymt-Cache"], "HIT")
+
     def test_live_partial_contradiction_revokes_before_other_endpoint_rejection(self):
         for path, other in (("/props", "/v1/models"), ("/v1/models", "/props")):
             with self.subTest(path=path):
