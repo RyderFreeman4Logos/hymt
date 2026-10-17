@@ -587,11 +587,19 @@ async fn run() -> Result<()> {
         // CLI flag forces timing logs for this process; config/env also enable them.
         std::env::set_var("HYMT_DEBUG_CHUNK_TIMING", "1");
     }
-    let config = if matches!(cli.cmd.as_ref(), Some(Cmd::Telegram(_))) {
-        config
-    } else {
+    // Long-lived commands keep the live owner so later files or messages can reload.
+    let config = if matches!(
+        cli.cmd.as_ref(),
+        None | Some(Cmd::Text(_))
+            | Some(Cmd::Man(_))
+            | Some(Cmd::Info(_))
+            | Some(Cmd::Estimate(_))
+            | Some(Cmd::Exec(ExecArgs { action: None, .. }))
+    ) {
         config.maybe_reload()?;
         config.detached_snapshot()
+    } else {
+        config
     };
     let concurrency_override = cli.concurrency;
     let document_policy =
