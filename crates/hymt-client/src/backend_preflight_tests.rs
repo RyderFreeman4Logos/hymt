@@ -304,3 +304,38 @@ async fn forced_refresh_replaces_runtime_info_after_server_restart() {
     );
     assert_eq!(config.resolved_per_request_context(), 4_096);
 }
+
+#[tokio::test]
+async fn live_reload_invalidates_preflight_ttl_even_at_the_same_endpoint() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
+    let address = listener.local_addr().expect("listener address");
+    let server = tokio::spawn(respond(
+        listener,
+        vec![
+            r#"{"build_info":"before","model_alias":"served-model","n_ctx":8192,"n_ctx_per_seq":8192}"#,
+            r#"{"build_info":"after","model_alias":"served-model","n_ctx":4096,"n_ctx_per_seq":4096}"#,
+        ],
+    ));
+    let config = config_for(&format!("http://{address}/v1"), false);
+    let client = TranslationClient::new(config.clone()).expect("client");
+    let before = client.preflight_backend().await.expect("first preflight");
+    let changed = std::fs::read_to_string(config.path())
+        .unwrap()
+        .replace("model = \"served-model\"", "model = \"next-model\"");
+    std::fs::write(config.path(), changed).unwrap();
+    std::fs::File::open(config.path())
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::now() + Duration::from_secs(2)),
+        )
+        .unwrap();
+    assert!(config.maybe_reload().unwrap());
+    let after = client.preflight_backend().await.expect("second preflight");
+    server.abort();
+    assert_ne!(
+        before.runtime.server_identity,
+        after.runtime.server_identity
+    );
+    assert_eq!(after.runtime.per_slot_context, Some(4096));
+}

@@ -9,12 +9,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use walkdir::WalkDir;
 
-use hymt_cache::history::{HistoryDB, SegmentCacheScope};
+use hymt_cache::history::{EstimateScope, HistoryDB, SegmentCacheScope};
 use hymt_client::TranslationClient;
 use hymt_core::config::HotConfig;
 use hymt_core::language::resolve_target_language;
 use hymt_core::language_spec::normalize_language_code;
-use hymt_core::templates::{PromptOpts, TemplateType};
+use hymt_core::templates::{PromptOpts, TemplateType, PROMPT_SCHEMA_ID};
 use hymt_segment::Segmenter;
 
 use crate::doc_translate::{build_output_path, target_lang_path_suffix};
@@ -108,6 +108,8 @@ pub struct BatchPlanOpts<'a> {
     pub prompt_opts: &'a PromptOpts,
     pub recursive: bool,
     pub explicit_target: bool,
+    /// CLI override shared with the translation client; otherwise use config.
+    pub concurrency_override: Option<u32>,
     /// Bypass application cache reads and writes even when config enables them.
     pub no_cache: bool,
 }
@@ -124,6 +126,12 @@ pub fn build_batch_plan(
     opts: &BatchPlanOpts<'_>,
 ) -> Result<BatchPlan> {
     config.maybe_reload()?;
+    let snapshot = config.detached_snapshot();
+    let config = &snapshot;
+    let concurrency = opts
+        .concurrency_override
+        .unwrap_or_else(|| config.concurrency())
+        .max(1);
     let (output_dir, target_lang, template, prompt_opts, recursive, explicit_target) = (
         opts.output_dir,
         opts.target_lang,
@@ -261,12 +269,27 @@ pub fn build_batch_plan(
         } else {
             history
                 .estimate(
+                    plan.segments
+                        .iter()
+                        .zip(&seg_hashes)
+                        .filter(|(_, hash)| !cached_set.contains(*hash))
+                        .map(|(segment, _)| segmenter.count_tokens(segment) as i64)
+                        .sum(),
                     missing as i64,
-                    config.concurrency() as i64,
-                    Some(&effective_lang),
-                    Some(template_name),
-                    Some(config.config_version() as i64),
-                    None,
+                    concurrency as i64,
+                    EstimateScope {
+                        target_lang: &effective_lang,
+                        template_type: template_name,
+                        profile_id,
+                        inference_fingerprint: inference_fingerprint.hash(),
+                        prompt_schema: PROMPT_SCHEMA_ID,
+                        config_version: config.config_version() as i64,
+                        counting_source: if segmenter.has_exact_tokenizer() {
+                            "local"
+                        } else {
+                            "approximate"
+                        },
+                    },
                 )
                 .ok()
                 .flatten()
@@ -490,6 +513,7 @@ max_retries = 1
                 prompt_opts: &prompt_opts,
                 recursive: false,
                 explicit_target: true,
+                concurrency_override: None,
                 no_cache,
             };
             let batch =
@@ -555,6 +579,7 @@ max_retries = 1
             prompt_opts: &prompt_opts,
             recursive: false,
             explicit_target: true,
+            concurrency_override: None,
             no_cache: false,
         };
         let batch = build_batch_plan(&source_dir, &config, &segmenter, &history, &opts).unwrap();

@@ -813,10 +813,11 @@ fn env_flag_enabled(name: &str) -> bool {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ConfigState {
     data: toml::Table,
     mtime: Option<SystemTime>,
+    generation: u64,
     profile: Option<ModelProfile>,
     uses_legacy_generation_scalars: bool,
     uses_legacy_context_window: bool,
@@ -828,6 +829,7 @@ impl ConfigState {
         Self {
             data: toml::Table::new(),
             mtime: None,
+            generation: 0,
             profile: None,
             uses_legacy_generation_scalars: false,
             uses_legacy_context_window: false,
@@ -844,6 +846,7 @@ impl ConfigState {
 pub struct HotConfig {
     path: PathBuf,
     state: Arc<RwLock<ConfigState>>,
+    detached: bool,
 }
 
 impl HotConfig {
@@ -858,6 +861,7 @@ impl HotConfig {
         let cfg = Self {
             path,
             state: Arc::new(RwLock::new(ConfigState::empty())),
+            detached: false,
         };
         cfg.ensure_exists()?;
         cfg.load_from_disk()?;
@@ -869,10 +873,52 @@ impl HotConfig {
         &self.path
     }
 
+    /// Copy one coherent configuration and runtime state for a translation invocation.
+    /// The copy cannot reload from disk; later live reloads affect only later invocations.
+    pub fn detached_snapshot(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            state: Arc::new(RwLock::new(self.state.read().unwrap().clone())),
+            detached: true,
+        }
+    }
+
+    /// Monotonic in-memory revision of successful disk loads.
+    pub fn generation(&self) -> u64 {
+        self.state.read().unwrap().generation
+    }
+
+    /// Publish preflight facts only if its starting configuration is still live.
+    pub fn set_backend_runtime_info_if_generation(
+        &self,
+        generation: u64,
+        info: BackendRuntimeInfo,
+    ) -> bool {
+        let mut state = self.state.write().unwrap();
+        if state.generation != generation {
+            return false;
+        }
+        state.backend_runtime_info = Some(info);
+        true
+    }
+
+    /// Clear preflight facts only while the probed configuration still owns them.
+    pub fn clear_backend_runtime_info_if_generation(&self, generation: u64) -> bool {
+        let mut state = self.state.write().unwrap();
+        if state.generation != generation {
+            return false;
+        }
+        state.backend_runtime_info = None;
+        true
+    }
+
     /// Reloads from disk if the file's mtime changed since the last load.
     ///
     /// Returns `true` when a reload occurred.
     pub fn maybe_reload(&self) -> Result<bool, CoreError> {
+        if self.detached {
+            return Ok(false);
+        }
         let current_mtime = std::fs::metadata(&self.path)
             .and_then(|m| m.modified())
             .ok();
@@ -1529,6 +1575,7 @@ impl HotConfig {
         state.backend_runtime_info = None;
         state.data = data;
         state.mtime = mtime;
+        state.generation = state.generation.wrapping_add(1);
         state.uses_legacy_generation_scalars = uses_legacy_generation_scalars;
         state.uses_legacy_context_window = uses_legacy_context_window;
         Ok(())

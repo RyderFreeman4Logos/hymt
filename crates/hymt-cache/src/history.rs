@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 use crate::error::CacheError;
 
@@ -28,7 +28,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     profile_id TEXT NOT NULL DEFAULT '',
     inference_fingerprint TEXT NOT NULL DEFAULT '',
     prompt_schema TEXT NOT NULL DEFAULT '',
-    cache_hits INTEGER
+    cache_hits INTEGER,
+    cold_source_tokens INTEGER,
+    counting_source TEXT,
+    estimated_seconds REAL
 );
 
 CREATE TABLE IF NOT EXISTS segment_cache (
@@ -66,6 +69,13 @@ pub struct TaskRecord {
     pub prompt_schema: String,
     /// Number of segments served from cache; None is legacy/unknown history.
     pub cache_hits: Option<i64>,
+    /// Model-visible source tokens, present only for an entirely proven cold run
+    /// without application-cache hits or completeness retries. Legacy is unknown.
+    pub cold_source_tokens: Option<i64>,
+    /// Tokenizer units used by cold_source_tokens (local or approximate).
+    pub counting_source: Option<String>,
+    /// Forecast frozen before the first request; completion never calibrates itself.
+    pub estimated_seconds: Option<f64>,
     pub tokens_per_second: f64,
     pub input_chars: i64,
     pub output_chars: i64,
@@ -86,6 +96,18 @@ pub struct SegmentCacheScope<'a> {
     pub options_hash: &'a str,
     pub profile_id: &'a str,
     pub inference_fingerprint: &'a str,
+}
+
+/// Identity and counting units required for comparable cold timing observations.
+#[derive(Debug, Clone, Copy)]
+pub struct EstimateScope<'a> {
+    pub target_lang: &'a str,
+    pub template_type: &'a str,
+    pub profile_id: &'a str,
+    pub inference_fingerprint: &'a str,
+    pub prompt_schema: &'a str,
+    pub config_version: i64,
+    pub counting_source: &'a str,
 }
 
 #[derive(Debug, Clone)]
@@ -120,8 +142,6 @@ pub struct DurationEstimate {
     /// Estimated wall-clock seconds. Always > 0.0 when present.
     pub seconds: f64,
     pub concurrency: i64,
-    pub estimated_output_tokens: f64,
-    pub versions_used: Vec<i64>,
 }
 
 pub fn history_path() -> PathBuf {
@@ -181,8 +201,8 @@ impl HistoryDB {
                 source_lang, target_lang, template_type, model,
                 tokens_per_second, input_chars, output_chars,
                 output_text, input_hash, config_version, profile_id, inference_fingerprint,
-                prompt_schema, cache_hits
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+                prompt_schema, cache_hits, cold_source_tokens, counting_source, estimated_seconds
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)",
             rusqlite::params![
                 record.started_at,
                 record.finished_at,
@@ -205,6 +225,9 @@ impl HistoryDB {
                 record.inference_fingerprint,
                 record.prompt_schema,
                 record.cache_hits,
+                record.cold_source_tokens,
+                record.counting_source,
+                record.estimated_seconds,
             ],
         )?;
         Ok(())
@@ -489,25 +512,6 @@ impl HistoryDB {
         template_type: Option<&str>,
         config_version: Option<i64>,
     ) -> Result<Option<PerformanceStats>, CacheError> {
-        self.stats_filtered(target_lang, template_type, config_version, false)
-    }
-
-    fn stats_for_estimate(
-        &self,
-        target_lang: Option<&str>,
-        template_type: Option<&str>,
-        config_version: Option<i64>,
-    ) -> Result<Option<PerformanceStats>, CacheError> {
-        self.stats_filtered(target_lang, template_type, config_version, true)
-    }
-
-    fn stats_filtered(
-        &self,
-        target_lang: Option<&str>,
-        template_type: Option<&str>,
-        config_version: Option<i64>,
-        cache_free_only: bool,
-    ) -> Result<Option<PerformanceStats>, CacheError> {
         let conn = match self.connect_if_exists()? {
             Some(c) => c,
             None => return Ok(None),
@@ -516,11 +520,6 @@ impl HistoryDB {
 
         let mut conditions: Vec<&str> = vec!["tokens_per_second > 0", "segments > 0"];
         let mut params: Vec<rusqlite::types::Value> = Vec::new();
-        if cache_free_only {
-            conditions.push("cache_hits = ?");
-            params.push(rusqlite::types::Value::Integer(0));
-        }
-
         if let Some(tl) = target_lang {
             conditions.push("target_lang = ?");
             params.push(rusqlite::types::Value::Text(tl.to_owned()));
@@ -560,79 +559,89 @@ impl HistoryDB {
         Ok(stats_from_rows(&rows))
     }
 
-    /// Estimate translation duration.
-    ///
-    /// Returns `None` when there is insufficient history data — never returns an
-    /// estimate with `seconds = 0` (that was the bug in issue #53).
+    /// Estimate pending source work from at least three identical-identity cold
+    /// observations. Unknown or incompatible evidence never broadens the cohort.
     pub fn estimate(
         &self,
+        source_tokens: i64,
         segments: i64,
         concurrency: i64,
-        target_lang: Option<&str>,
-        template_type: Option<&str>,
-        config_version: Option<i64>,
-        min_samples: Option<usize>,
+        scope: EstimateScope<'_>,
     ) -> Result<Option<DurationEstimate>, CacheError> {
-        let min_samples = min_samples.unwrap_or(3);
-        let mut versions_used: Vec<i64> = config_version.into_iter().collect();
-
-        let stats = self.stats_for_estimate(target_lang, template_type, config_version)?;
-        if let Some(ref s) = stats {
-            if s.count >= min_samples && s.avg_tokens_per_second > 0.0 {
-                return Ok(Some(build_estimate(
-                    s,
-                    segments,
-                    concurrency,
-                    versions_used,
-                )));
-            }
+        if source_tokens <= 0
+            || segments <= 0
+            || scope.profile_id.is_empty()
+            || scope.inference_fingerprint.is_empty()
+            || scope.prompt_schema.is_empty()
+            || !matches!(scope.counting_source, "local" | "approximate")
+        {
+            return Ok(None);
         }
-
-        // Fallback: broaden by dropping config_version filter
-        if config_version.is_some() {
-            let broader = self.stats_for_estimate(target_lang, template_type, None)?;
-            if let Some(ref s) = broader {
-                if s.count >= min_samples && s.avg_tokens_per_second > 0.0 {
-                    versions_used = self.distinct_versions()?;
-                    return Ok(Some(build_estimate(
-                        s,
-                        segments,
-                        concurrency,
-                        versions_used,
-                    )));
-                }
-            }
+        let Some(conn) = self.connect_if_exists()? else {
+            return Ok(None);
+        };
+        ensure_schema(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT duration_seconds, input_tokens, output_tokens, segments,
+                    tokens_per_second, concurrency, cold_source_tokens
+             FROM tasks WHERE cache_hits = 0 AND cold_source_tokens > 0
+               AND duration_seconds > 0 AND segments > 0 AND tokens_per_second > 0
+               AND target_lang = ?1 AND template_type = ?2 AND profile_id = ?3
+               AND inference_fingerprint = ?4 AND prompt_schema = ?5
+               AND config_version = ?6 AND counting_source = ?7
+             ORDER BY tokens_per_second",
+        )?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![
+                    scope.target_lang,
+                    scope.template_type,
+                    scope.profile_id,
+                    scope.inference_fingerprint,
+                    scope.prompt_schema,
+                    scope.config_version,
+                    scope.counting_source,
+                ],
+                |row| {
+                    let duration: f64 = row.get(0)?;
+                    let segments: i64 = row.get(3)?;
+                    let concurrency: i64 = row.get(5)?;
+                    let tokens: i64 = row.get(6)?;
+                    let rate = tokens as f64 / duration / concurrency.max(1).min(segments) as f64;
+                    Ok((
+                        (
+                            duration,
+                            row.get(1)?,
+                            row.get(2)?,
+                            segments,
+                            row.get(4)?,
+                            concurrency,
+                        ),
+                        rate,
+                    ))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows: Vec<_> = rows
+            .into_iter()
+            .filter(|(row, rate)| row.0.is_finite() && rate.is_finite() && *rate > 0.0)
+            .collect();
+        if rows.len() < 3 {
+            return Ok(None);
         }
-
-        // Fallback: broaden by dropping lang/template filters
-        if target_lang.is_some() || template_type.is_some() {
-            let fallback = self.stats_for_estimate(None, None, config_version)?;
-            if let Some(ref s) = fallback {
-                if s.count >= min_samples && s.avg_tokens_per_second > 0.0 {
-                    return Ok(Some(build_estimate(
-                        s,
-                        segments,
-                        concurrency,
-                        versions_used.clone(),
-                    )));
-                }
-            }
-            let global = self.stats_for_estimate(None, None, None)?;
-            if let Some(ref s) = global {
-                if s.count >= min_samples && s.avg_tokens_per_second > 0.0 {
-                    versions_used = self.distinct_versions()?;
-                    return Ok(Some(build_estimate(
-                        s,
-                        segments,
-                        concurrency,
-                        versions_used,
-                    )));
-                }
-            }
+        let rate = rows.iter().map(|(_, rate)| rate).sum::<f64>() / rows.len() as f64;
+        let seconds = source_tokens as f64 / rate / concurrency.max(1).min(segments) as f64;
+        if !seconds.is_finite() || seconds <= 0.0 {
+            return Ok(None);
         }
-
-        // No usable history — return None (issue #53 fix: never return seconds=0)
-        Ok(None)
+        let observations: Vec<_> = rows.into_iter().map(|(row, _)| row).collect();
+        Ok(
+            stats_from_rows(&observations).map(|stats| DurationEstimate {
+                stats,
+                seconds,
+                concurrency,
+            }),
+        )
     }
 
     pub fn clear(&self) -> Result<usize, CacheError> {
@@ -661,29 +670,16 @@ impl HistoryDB {
         let conn = Connection::open(&self.path)?;
         Ok(Some(conn))
     }
-
-    fn distinct_versions(&self) -> Result<Vec<i64>, CacheError> {
-        let conn = match self.connect_if_exists()? {
-            Some(c) => c,
-            None => return Ok(Vec::new()),
-        };
-        ensure_schema(&conn)?;
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT config_version FROM tasks
-             WHERE config_version IS NOT NULL
-             ORDER BY config_version",
-        )?;
-        let versions = stmt
-            .query_map([], |row| row.get::<_, i64>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(versions)
-    }
 }
 
 fn ensure_schema(conn: &Connection) -> Result<(), CacheError> {
-    conn.execute_batch(SCHEMA)?;
-    migrate_tasks_columns(conn)?;
-    migrate_segment_cache_columns(conn)?;
+    // Lock before reading columns: concurrent upgrades must not use stale snapshots.
+    // The connection busy timeout bounds waiting; an error rolls back both tables.
+    let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    transaction.execute_batch(SCHEMA)?;
+    migrate_tasks_columns(&transaction)?;
+    migrate_segment_cache_columns(&transaction)?;
+    transaction.commit()?;
     Ok(())
 }
 
@@ -709,6 +705,15 @@ fn migrate_tasks_columns(conn: &Connection) -> Result<(), CacheError> {
     if !cols.contains("prompt_schema") {
         conn.execute_batch("ALTER TABLE tasks ADD COLUMN prompt_schema TEXT NOT NULL DEFAULT ''")?;
     }
+    for (name, sql_type) in [
+        ("cold_source_tokens", "INTEGER"),
+        ("counting_source", "TEXT"),
+        ("estimated_seconds", "REAL"),
+    ] {
+        if !cols.contains(name) {
+            conn.execute_batch(&format!("ALTER TABLE tasks ADD COLUMN {name} {sql_type}"))?;
+        }
+    }
     if !cols.contains("cache_hits") {
         conn.execute_batch("ALTER TABLE tasks ADD COLUMN cache_hits INTEGER")?;
     }
@@ -716,21 +721,6 @@ fn migrate_tasks_columns(conn: &Connection) -> Result<(), CacheError> {
 }
 
 fn migrate_segment_cache_columns(conn: &Connection) -> Result<(), CacheError> {
-    let transaction = conn.unchecked_transaction()?;
-    let result = migrate_segment_cache_columns_in_transaction(&transaction);
-    match result {
-        Ok(()) => {
-            transaction.commit()?;
-            Ok(())
-        }
-        Err(error) => {
-            let _ = transaction.rollback();
-            Err(error)
-        }
-    }
-}
-
-fn migrate_segment_cache_columns_in_transaction(conn: &Connection) -> Result<(), CacheError> {
     let cols = table_column_names(conn, "segment_cache")?;
     if !cols.contains("options_hash") {
         conn.execute_batch(
@@ -829,6 +819,9 @@ fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
             .get::<_, Option<String>>("prompt_schema")?
             .unwrap_or_default(),
         cache_hits: row.get("cache_hits")?,
+        cold_source_tokens: row.get("cold_source_tokens")?,
+        counting_source: row.get("counting_source")?,
+        estimated_seconds: row.get("estimated_seconds")?,
         tokens_per_second: row.get("tokens_per_second")?,
         input_chars: row.get("input_chars")?,
         output_chars: row.get("output_chars")?,
@@ -872,28 +865,6 @@ fn stats_from_rows(rows: &[(f64, i64, i64, i64, f64, i64)]) -> Option<Performanc
         total_input_tokens,
         total_output_tokens,
     })
-}
-
-fn build_estimate(
-    stats: &PerformanceStats,
-    segments: i64,
-    concurrency: i64,
-    versions_used: Vec<i64>,
-) -> DurationEstimate {
-    let effective_segments = segments.max(1) as f64;
-    let effective_concurrency = concurrency.max(1).min(segments.max(1)) as f64;
-    let estimated_output_tokens = stats.avg_output_tokens_per_segment * effective_segments;
-    // Stored throughput already includes the source task's parallelism; only
-    // the per-slot rate may be scaled by the requested concurrency.
-    let seconds =
-        estimated_output_tokens / stats.avg_tokens_per_second_per_slot / effective_concurrency;
-    DurationEstimate {
-        stats: stats.clone(),
-        seconds,
-        concurrency,
-        estimated_output_tokens,
-        versions_used,
-    }
 }
 
 /// Sorted ascending; already sorted by the SQL ORDER BY tokens_per_second.
@@ -956,7 +927,7 @@ mod tests {
             id: None,
             started_at: "2024-01-01T00:00:00Z".to_owned(),
             finished_at: "2024-01-01T00:00:10Z".to_owned(),
-            duration_seconds: 10.0,
+            duration_seconds: output_tokens as f64 / tps,
             input_tokens: 100,
             output_tokens,
             segments,
@@ -969,6 +940,9 @@ mod tests {
             inference_fingerprint: "sha256:sample".to_owned(),
             prompt_schema: "hy-mt2-prompts/v2".to_owned(),
             cache_hits: Some(0),
+            cold_source_tokens: Some(output_tokens),
+            counting_source: Some("approximate".to_owned()),
+            estimated_seconds: None,
             tokens_per_second: tps,
             input_chars: 500,
             output_chars: 400,
@@ -990,6 +964,184 @@ mod tests {
         assert_eq!(records[0].inference_fingerprint, "sha256:sample");
         assert_eq!(records[0].prompt_schema, "hy-mt2-prompts/v2");
         assert!((records[0].tokens_per_second - 50.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_concurrent_legacy_schema_migrations_preserve_rows() {
+        use std::cell::RefCell;
+        use std::sync::mpsc::{channel, Receiver, Sender};
+        use std::thread;
+        use std::time::Duration;
+
+        thread_local! {
+            static MIGRATION_GATE: RefCell<Option<(Sender<()>, Receiver<()>)>> = const { RefCell::new(None) };
+        }
+
+        fn migration_busy(count: i32) -> bool {
+            if let Some((ready, release)) = MIGRATION_GATE.with(|gate| gate.borrow_mut().take()) {
+                if ready.send(()).is_err() || release.recv_timeout(Duration::from_secs(5)).is_err()
+                {
+                    return false;
+                }
+            }
+            if count >= 5000 {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(1));
+            true
+        }
+
+        let mut failures = Vec::new();
+        for legacy_tasks in [true, false] {
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("concurrent-legacy-history.db");
+            let conn = Connection::open(&path).unwrap();
+            let mut tasks_schema = SCHEMA
+                .split_once("CREATE TABLE IF NOT EXISTS segment_cache")
+                .unwrap()
+                .0
+                .to_owned();
+            if legacy_tasks {
+                for column in [
+                    "output_text TEXT",
+                    "input_hash TEXT",
+                    "config_version INTEGER DEFAULT 1",
+                    "profile_id TEXT NOT NULL DEFAULT ''",
+                    "inference_fingerprint TEXT NOT NULL DEFAULT ''",
+                    "prompt_schema TEXT NOT NULL DEFAULT ''",
+                    "cache_hits INTEGER",
+                    "cold_source_tokens INTEGER",
+                    "counting_source TEXT",
+                    "estimated_seconds REAL",
+                ] {
+                    tasks_schema = tasks_schema.replace(&format!(",\n    {column}"), "");
+                }
+            }
+            conn.execute_batch(&tasks_schema).unwrap();
+            if legacy_tasks {
+                conn.execute_batch(SCHEMA).unwrap();
+            } else {
+                conn.execute_batch(
+                    "CREATE TABLE segment_cache (
+                         content_hash TEXT NOT NULL,
+                         target_lang TEXT NOT NULL,
+                         template_type TEXT NOT NULL,
+                         translated_text TEXT NOT NULL,
+                         created_at TEXT NOT NULL,
+                         PRIMARY KEY (content_hash, target_lang, template_type)
+                     );",
+                )
+                .unwrap();
+            }
+            conn.execute_batch(
+                "INSERT INTO tasks
+                     (id, started_at, finished_at, duration_seconds, input_tokens,
+                      output_tokens, segments, concurrency, target_lang,
+                      template_type, tokens_per_second, input_chars, output_chars)
+                 VALUES (7, 'start', 'finish', 10, 100, 200, 2, 1, 'en',
+                         'default', 20, 500, 400);
+                 INSERT INTO segment_cache
+                     (content_hash, target_lang, template_type, translated_text, created_at)
+                 VALUES ('hash', 'en', 'default', 'legacy translation', 'created');
+                 BEGIN IMMEDIATE;",
+            )
+            .unwrap();
+
+            let (ready_tx, ready_rx) = channel();
+            let (ready, results) = thread::scope(|scope| {
+                let mut releases = Vec::new();
+                let mut workers = Vec::new();
+                for _ in 0..2 {
+                    let (release_tx, release_rx) = channel();
+                    releases.push(release_tx);
+                    let ready_tx = ready_tx.clone();
+                    let path = &path;
+                    workers.push(scope.spawn(move || {
+                        let conn = Connection::open(path).unwrap();
+                        MIGRATION_GATE.with(|gate| {
+                            *gate.borrow_mut() = Some((ready_tx, release_rx));
+                        });
+                        conn.busy_handler(Some(migration_busy)).unwrap();
+                        let result = ensure_schema(&conn);
+                        // A deferred read-to-write upgrade can return BUSY without
+                        // invoking SQLite's busy callback. Signal completion too.
+                        if let Some((ready, _)) =
+                            MIGRATION_GATE.with(|gate| gate.borrow_mut().take())
+                        {
+                            ready.send(()).unwrap();
+                        }
+                        result
+                    }));
+                }
+                let ready = (0..2)
+                    .map(|_| ready_rx.recv_timeout(Duration::from_secs(5)))
+                    .collect::<Vec<_>>();
+                conn.execute_batch("ROLLBACK").unwrap();
+                for release in releases {
+                    let _ = release.send(());
+                }
+                let results = workers
+                    .into_iter()
+                    .map(|worker| worker.join().unwrap())
+                    .collect::<Vec<_>>();
+                (ready, results)
+            });
+            assert!(
+                ready.iter().all(Result::is_ok),
+                "fixture synchronization failed"
+            );
+            for result in results {
+                if let Err(error) = result {
+                    failures.push(format!("legacy_tasks={legacy_tasks}: {error}"));
+                }
+            }
+
+            let records = HistoryDB::new(&path).fetch_recent(Some(10)).unwrap();
+            assert_eq!(records.len(), 1);
+            let row = &records[0];
+            assert_eq!(row.id, Some(7));
+            assert_eq!(
+                (row.input_tokens, row.output_tokens, row.segments),
+                (100, 200, 2)
+            );
+            assert_eq!(row.cache_hits, None);
+            assert_eq!(row.cold_source_tokens, None);
+            assert_eq!(row.counting_source, None);
+            assert_eq!(row.estimated_seconds, None);
+            assert_eq!(row.config_version, 1);
+            assert_eq!(row.profile_id, "");
+            assert_eq!(row.inference_fingerprint, "");
+            assert_eq!(row.prompt_schema, "");
+            let cached = conn
+                .query_row(
+                    "SELECT translated_text, options_hash, profile_id, inference_fingerprint
+                     FROM segment_cache WHERE content_hash = 'hash'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                cached,
+                (
+                    "legacy translation".to_owned(),
+                    String::new(),
+                    String::new(),
+                    String::new()
+                )
+            );
+            assert!(segment_cache_has_current_primary_key(&conn).unwrap());
+        }
+        assert!(
+            failures.is_empty(),
+            "concurrent migrations failed: {failures:?}"
+        );
     }
 
     #[test]
@@ -1312,12 +1464,24 @@ mod tests {
         assert!((s.avg_output_tokens_per_segment - 100.0).abs() < 1e-9);
     }
 
+    fn estimate_scope() -> EstimateScope<'static> {
+        EstimateScope {
+            target_lang: "en",
+            template_type: "default",
+            profile_id: "hy_mt2_7b",
+            inference_fingerprint: "sha256:sample",
+            prompt_schema: "hy-mt2-prompts/v2",
+            config_version: 1,
+            counting_source: "approximate",
+        }
+    }
+
     #[test]
     fn test_estimate_empty_returns_none() {
         // Issue #53 fix: no history data → None, not DurationEstimate { seconds: 0.0 }
         let tmp = TempDir::new().unwrap();
         let db = HistoryDB::new(tmp.path().join("history.db"));
-        let est = db.estimate(5, 2, None, None, None, None).unwrap();
+        let est = db.estimate(500, 5, 2, estimate_scope()).unwrap();
         assert!(
             est.is_none(),
             "expected None when no history, got Some({:?})",
@@ -1366,7 +1530,7 @@ mod tests {
         }
 
         assert_eq!(db.stats(None, None, None).unwrap().unwrap().count, 8);
-        let estimate = db.estimate(5, 1, None, None, None, Some(3)).unwrap();
+        let estimate = db.estimate(500, 5, 1, estimate_scope()).unwrap();
         assert!(
             estimate.is_none(),
             "only two known cache-free samples qualify; warm and legacy-unknown timing must not satisfy the minimum"
@@ -1383,7 +1547,7 @@ mod tests {
             db.insert_task(&record).unwrap();
         }
         let estimate = |segments, concurrency| {
-            db.estimate(segments, concurrency, None, None, None, None)
+            db.estimate(segments * 500, segments, concurrency, estimate_scope())
                 .unwrap()
                 .unwrap()
                 .seconds
@@ -1414,7 +1578,7 @@ mod tests {
         for _ in 0..4 {
             db.insert_task(&sample_record(100.0, 5, 500)).unwrap();
         }
-        let est = db.estimate(5, 1, None, None, None, None).unwrap();
+        let est = db.estimate(500, 5, 1, estimate_scope()).unwrap();
         assert!(est.is_some());
         let est = est.unwrap();
         assert!(
@@ -1433,7 +1597,7 @@ mod tests {
         // Only 2 records, min_samples=3 → None
         db.insert_task(&sample_record(100.0, 5, 500)).unwrap();
         db.insert_task(&sample_record(100.0, 5, 500)).unwrap();
-        let est = db.estimate(5, 1, None, None, None, Some(3)).unwrap();
+        let est = db.estimate(500, 5, 1, estimate_scope()).unwrap();
         assert!(est.is_none());
     }
 
@@ -1442,7 +1606,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let db = HistoryDB::new(tmp.path().join("history.db"));
         let conn = Connection::open(db.path()).unwrap();
-        let legacy_schema = SCHEMA.replace(",\n    cache_hits INTEGER", "");
+        let legacy_schema = SCHEMA.replace("    cache_hits INTEGER,\n", "");
         conn.execute_batch(&legacy_schema).unwrap();
         assert!(!table_column_names(&conn, "tasks")
             .unwrap()
@@ -1462,10 +1626,7 @@ mod tests {
         drop(conn);
 
         assert_eq!(db.stats(None, None, None).unwrap().unwrap().count, 3);
-        assert!(db
-            .estimate(5, 1, None, None, None, Some(3))
-            .unwrap()
-            .is_none());
+        assert!(db.estimate(500, 5, 1, estimate_scope()).unwrap().is_none());
         let migrated = db.fetch_recent(Some(10)).unwrap();
         assert_eq!(migrated.len(), 3);
         assert!(migrated.iter().all(|record| record.cache_hits.is_none()));
@@ -1475,23 +1636,121 @@ mod tests {
     fn test_estimate_fallback_below_min_samples_returns_none() {
         let tmp = TempDir::new().unwrap();
         let db = HistoryDB::new(tmp.path().join("history.db"));
-        db.insert_task(&sample_record(100.0, 1, 1)).unwrap();
+        for _ in 0..3 {
+            db.insert_task(&sample_record(100.0, 1, 1)).unwrap();
+        }
 
         let broadened_config = db
-            .estimate(1, 1, Some("en"), Some("default"), Some(2), None)
+            .estimate(
+                100,
+                1,
+                1,
+                EstimateScope {
+                    config_version: 2,
+                    ..estimate_scope()
+                },
+            )
             .unwrap();
         assert!(
             broadened_config.is_none(),
-            "config-version fallback must not estimate from one sample"
+            "config-version fallback must not use incompatible samples"
         );
 
         let global = db
-            .estimate(1, 1, Some("zh"), Some("default"), Some(2), None)
+            .estimate(
+                100,
+                1,
+                1,
+                EstimateScope {
+                    target_lang: "zh",
+                    config_version: 2,
+                    ..estimate_scope()
+                },
+            )
             .unwrap();
         assert!(
             global.is_none(),
-            "global fallback must not estimate from one sample"
+            "global fallback must not use incompatible samples"
         );
+    }
+
+    #[test]
+    fn estimate_requires_identical_identity_and_scales_pending_source_work() {
+        let tmp = TempDir::new().unwrap();
+        let db = HistoryDB::new(tmp.path().join("history.db"));
+        for _ in 0..3 {
+            db.insert_task(&sample_record(100.0, 1, 100)).unwrap();
+        }
+        let estimate = |tokens, scope| db.estimate(tokens, 1, 1, scope).unwrap();
+        assert!((estimate(100, estimate_scope()).unwrap().seconds - 1.0).abs() < 1e-9);
+        assert!((estimate(1000, estimate_scope()).unwrap().seconds - 10.0).abs() < 1e-9);
+        for scope in [
+            EstimateScope {
+                target_lang: "zh",
+                ..estimate_scope()
+            },
+            EstimateScope {
+                template_type: "json",
+                ..estimate_scope()
+            },
+            EstimateScope {
+                profile_id: "other",
+                ..estimate_scope()
+            },
+            EstimateScope {
+                inference_fingerprint: "other",
+                ..estimate_scope()
+            },
+            EstimateScope {
+                inference_fingerprint: "",
+                ..estimate_scope()
+            },
+            EstimateScope {
+                prompt_schema: "other",
+                ..estimate_scope()
+            },
+            EstimateScope {
+                config_version: 2,
+                ..estimate_scope()
+            },
+            EstimateScope {
+                counting_source: "local",
+                ..estimate_scope()
+            },
+        ] {
+            assert!(estimate(100, scope).is_none(), "{scope:?}");
+        }
+        assert!(estimate(0, estimate_scope()).is_none());
+    }
+
+    #[test]
+    fn legacy_app_cache_zero_does_not_invent_shared_cache_provenance() {
+        let tmp = TempDir::new().unwrap();
+        let db = HistoryDB::new(tmp.path().join("history.db"));
+        let legacy = SCHEMA
+            .replace("    cold_source_tokens INTEGER,\n", "")
+            .replace("    counting_source TEXT,\n", "")
+            .replace(",\n    estimated_seconds REAL", "");
+        let conn = Connection::open(db.path()).unwrap();
+        conn.execute_batch(&legacy).unwrap();
+        for _ in 0..3 {
+            conn.execute(
+                "INSERT INTO tasks (started_at, finished_at, duration_seconds,
+                input_tokens, output_tokens, segments, concurrency, target_lang, template_type,
+                tokens_per_second, input_chars, output_chars, cache_hits, profile_id,
+                inference_fingerprint, prompt_schema) VALUES ('start','finish',1,100,100,1,1,
+                'en','default',100,400,400,0,'hy_mt2_7b','sha256:sample','hy-mt2-prompts/v2')",
+                [],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        assert!(db.estimate(100, 1, 1, estimate_scope()).unwrap().is_none());
+        let records = db.fetch_recent(None).unwrap();
+        assert_eq!(records.len(), 3);
+        assert!(records.iter().all(|record| record.cache_hits == Some(0)
+            && record.cold_source_tokens.is_none()
+            && record.estimated_seconds.is_none()));
     }
 
     #[test]

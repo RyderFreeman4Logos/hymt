@@ -10,13 +10,15 @@ use anyhow::Result;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-use hymt_cache::history::HistoryDB;
+use hymt_cache::history::{EstimateScope, HistoryDB};
 use hymt_client::TranslationClient;
 use hymt_core::config::HotConfig;
 use hymt_core::language::{resolve_target_language, DocumentTranslationPolicy};
 use hymt_core::language_spec::{language_spec_or_none, LanguageFamily};
 use hymt_core::model_profile::ModelProfile;
-use hymt_core::templates::{looks_like_cli_help_source, PromptOpts, TemplateType};
+use hymt_core::templates::{
+    looks_like_cli_help_source, PromptOpts, TemplateType, PROMPT_SCHEMA_ID,
+};
 use hymt_segment::Segmenter;
 use hymt_translate::batch::{
     build_batch_plan, run_batch_translation, show_batch_preview, BatchPlanOpts,
@@ -26,9 +28,9 @@ use hymt_translate::docs::{run_info_command, run_man_command, ManInfoOpts};
 use hymt_translate::exec_wrapper::{run_exec_command, ExecCommandOpts};
 use hymt_translate::precache::run_precache;
 use hymt_translate::translate::{
-    plan_translation, translate_file, translate_text, translate_text_stream_with_mode,
-    write_translation_output, StreamEvent, StreamOutputMode, TranslationCtx, TranslationOutcome,
-    TranslationPlan,
+    plan_translation, template_options_hash, translate_file, translate_text,
+    translate_text_stream_with_mode, write_translation_output, StreamEvent, StreamOutputMode,
+    TranslationCtx, TranslationOutcome, TranslationPlan,
 };
 
 // ── Known subcommand names (for smart routing) ────────────────────────────────
@@ -585,6 +587,20 @@ async fn run() -> Result<()> {
         // CLI flag forces timing logs for this process; config/env also enable them.
         std::env::set_var("HYMT_DEBUG_CHUNK_TIMING", "1");
     }
+    // Long-lived commands keep the live owner so later files or messages can reload.
+    let config = if matches!(
+        cli.cmd.as_ref(),
+        None | Some(Cmd::Text(_))
+            | Some(Cmd::Man(_))
+            | Some(Cmd::Info(_))
+            | Some(Cmd::Estimate(_))
+            | Some(Cmd::Exec(ExecArgs { action: None, .. }))
+    ) {
+        config.maybe_reload()?;
+        config.detached_snapshot()
+    } else {
+        config
+    };
     let concurrency_override = cli.concurrency;
     let document_policy =
         document_translation_policy(&config, cli.force_translate_all, cli.no_language_detection);
@@ -1549,6 +1565,11 @@ async fn run_estimate(
     config: &HotConfig,
     concurrency_override: Option<u32>,
 ) -> Result<()> {
+    config.maybe_reload()?;
+    let snapshot = config.detached_snapshot();
+    let config = &snapshot;
+    let client = make_client_with_concurrency(config, concurrency_override)?;
+    client.refresh_backend_preflight().await?;
     let segmenter = make_segmenter(config)?;
     let plan = plan_translation("sample", target_lang, config, &segmenter, template, opts)?;
     let source_lang = estimate_source_lang(target_lang, config);
@@ -1567,17 +1588,38 @@ async fn run_estimate(
         "Source characters: {source_chars}, estimated segments: {segments}, ~{chars_per_segment} chars/segment, concurrency: {concurrency}, template: {template_name}",
     );
 
+    let options_hash = template_options_hash(
+        opts,
+        opts.document_translation_policy
+            .unwrap_or_else(|| config.document_translation_policy()),
+    );
+    let fingerprint = config.inference_fingerprint(template_name, &options_hash)?;
+    let sample = build_source_sample(&source_lang, 512);
+    let source_tokens = (source_chars as u128 * segmenter.count_tokens(&sample) as u128)
+        .div_ceil(sample.chars().count().max(1) as u128);
+    let source_tokens = i64::try_from(source_tokens)
+        .map_err(|_| anyhow::anyhow!("estimated source token count is too large"))?;
     match history.estimate(
+        source_tokens,
         segments,
         concurrency,
-        Some(target_lang),
-        Some(template_name),
-        Some(config.config_version() as i64),
-        None,
+        EstimateScope {
+            target_lang,
+            template_type: template_name,
+            profile_id: config.model_profile()?.id(),
+            inference_fingerprint: fingerprint.hash(),
+            prompt_schema: PROMPT_SCHEMA_ID,
+            config_version: config.config_version() as i64,
+            counting_source: if segmenter.has_exact_tokenizer() {
+                "local"
+            } else {
+                "approximate"
+            },
+        },
     ) {
         Ok(Some(est)) => {
             println!(
-                "Estimated time: {:.1}s ({} samples)",
+                "Approximate time: {:.1}s ({} samples)",
                 est.seconds, est.stats.count
             );
         }
@@ -1680,6 +1722,7 @@ async fn run_batch(
         prompt_opts: opts,
         recursive: args.recursive,
         explicit_target,
+        concurrency_override,
         no_cache,
     };
     let plan = build_batch_plan(&args.directory, config, &segmenter, &history, &plan_opts)?;

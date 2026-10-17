@@ -51,6 +51,9 @@ pub enum ClientError {
 
     #[error("strict backend preflight refused translation: {0}")]
     BackendPreflight(String),
+
+    #[error("configuration changed during backend preflight")]
+    ConfigChangedDuringPreflight,
 }
 
 /// A completed non-streaming translation with its provider termination signal.
@@ -58,11 +61,15 @@ pub enum ClientError {
 pub struct TranslationCompletion {
     pub text: String,
     pub termination: CompletionTermination,
+    /// True only for one explicit X-Hymt-Cache: MISS or BYPASS response marker.
+    pub cold_generation: bool,
 }
 
 /// An item emitted by a termination-aware translation stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranslationStreamEvent {
+    /// Response provenance, emitted before content; unmarked responses are unknown.
+    ColdGeneration(bool),
     Token(String),
     Finished(CompletionTermination),
 }
@@ -312,6 +319,7 @@ struct RuntimeCacheKey {
     endpoint_url: String,
     backend: GenerationBackend,
     profile: String,
+    config_generation: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -381,6 +389,27 @@ impl TranslationClient {
         self.inner.concurrency
     }
 
+    /// Bind a detached invocation configuration to the existing HTTP pool and limit.
+    pub fn with_config(&self, config: HotConfig) -> Result<Self, ClientError> {
+        config.generation_settings()?;
+        config.generation_backend()?;
+        let runtime_cache = self
+            .inner
+            .runtime_cache
+            .lock()
+            .ok()
+            .and_then(|entry| entry.clone());
+        Ok(Self {
+            inner: Arc::new(Inner {
+                config,
+                http: self.inner.http.clone(),
+                semaphore: Arc::clone(&self.inner.semaphore),
+                concurrency: self.inner.concurrency,
+                runtime_cache: Mutex::new(runtime_cache),
+            }),
+        })
+    }
+
     /// Discover runtime state once per endpoint/backend/profile TTL.
     ///
     /// Normal mode always returns a report: an unavailable or malformed endpoint
@@ -407,12 +436,17 @@ impl TranslationClient {
         enforce_strict: bool,
     ) -> Result<BackendPreflight, ClientError> {
         let _ = self.inner.config.maybe_reload();
+        let generation = self.inner.config.generation();
         let key = self.runtime_cache_key()?;
         if !force_refresh {
             if let Some(entry) = self.cached_runtime(&key) {
-                self.inner
+                if !self
+                    .inner
                     .config
-                    .set_backend_runtime_info(entry.runtime.clone());
+                    .set_backend_runtime_info_if_generation(generation, entry.runtime.clone())
+                {
+                    return Err(ClientError::ConfigChangedDuringPreflight);
+                }
                 return self.backend_preflight_report(
                     entry.runtime,
                     entry.warnings,
@@ -423,11 +457,26 @@ impl TranslationClient {
 
         // A changed endpoint/backend/profile must never continue planning against
         // a previous server's runtime state while this request is in flight.
-        self.inner.config.clear_backend_runtime_info();
+        if !self
+            .inner
+            .config
+            .clear_backend_runtime_info_if_generation(generation)
+        {
+            return Err(ClientError::ConfigChangedDuringPreflight);
+        }
         let observed_at = unix_timestamp_secs();
         let runtime = self.fetch_backend_runtime(key.backend, observed_at).await;
+        if !self
+            .inner
+            .config
+            .set_backend_runtime_info_if_generation(generation, runtime.clone())
+        {
+            return Err(ClientError::ConfigChangedDuringPreflight);
+        }
         let warnings = self.preflight_warnings(&runtime)?;
-        self.inner.config.set_backend_runtime_info(runtime.clone());
+        if self.inner.config.generation() != generation {
+            return Err(ClientError::ConfigChangedDuringPreflight);
+        }
         if let Ok(mut cache) = self.inner.runtime_cache.lock() {
             *cache = Some(RuntimeCacheEntry {
                 key,
@@ -444,6 +493,7 @@ impl TranslationClient {
             endpoint_url: self.inner.config.endpoint_url(),
             backend: self.inner.config.generation_backend()?,
             profile: self.inner.config.model_profile()?.id().to_owned(),
+            config_generation: self.inner.config.generation(),
         })
     }
 
@@ -792,7 +842,7 @@ impl TranslationClient {
         let headers = self.build_headers();
         let url = self.chat_url();
 
-        let response = self
+        let (response, _) = self
             .connect_stream_with_retry(&url, &payload, &headers)
             .await?;
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, ClientError>>(64);
@@ -843,7 +893,7 @@ impl TranslationClient {
         let headers = self.build_headers();
         let url = self.chat_url();
 
-        let response = self
+        let (response, cold_generation) = self
             .connect_stream_with_retry(&url, &payload, &headers)
             .await?;
         let (tx, rx) =
@@ -852,6 +902,13 @@ impl TranslationClient {
         let is_sse = is_event_stream(&response);
         tokio::spawn(async move {
             let _permit = permit; // held for the entire stream duration
+            if tx
+                .send(Ok(TranslationStreamEvent::ColdGeneration(cold_generation)))
+                .await
+                .is_err()
+            {
+                return;
+            }
             let closed = tx.clone();
             tokio::select! {
                 biased;
@@ -969,9 +1026,12 @@ impl TranslationClient {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
                     if status < 400 {
+                        let cold_generation = attempt == 0 && cold_generation(resp.headers());
                         let body = resp.bytes().await?;
                         let chat: ChatResponse = serde_json::from_slice(&body)?;
-                        return extract_completion_from_response(chat);
+                        let mut completion = extract_completion_from_response(chat)?;
+                        completion.cold_generation = cold_generation;
+                        return Ok(completion);
                     }
                     let body = resp.bytes().await.unwrap_or_default();
                     let err = http_error(status, &body);
@@ -1000,7 +1060,7 @@ impl TranslationClient {
         url: &str,
         payload: &ChatPayload,
         headers: &reqwest::header::HeaderMap,
-    ) -> Result<reqwest::Response, ClientError> {
+    ) -> Result<(reqwest::Response, bool), ClientError> {
         let mut last: Option<ClientError> = None;
         for attempt in 0..=MAX_RETRIES {
             match self
@@ -1015,7 +1075,8 @@ impl TranslationClient {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
                     if status < 400 {
-                        return Ok(resp);
+                        let cold = attempt == 0 && cold_generation(resp.headers());
+                        return Ok((resp, cold));
                     }
                     let body = resp.bytes().await.unwrap_or_default();
                     let err = http_error(status, &body);
@@ -1038,6 +1099,17 @@ impl TranslationClient {
             body: "max retries exceeded".into(),
         }))
     }
+}
+
+// Missing, malformed, duplicate, HIT and UNKNOWN markers cannot prove cold generation.
+fn cold_generation(headers: &reqwest::header::HeaderMap) -> bool {
+    let mut markers = headers.get_all("x-hymt-cache").iter();
+    let marker = markers.next();
+    markers.next().is_none()
+        && matches!(
+            marker.map(|value| value.as_bytes()),
+            Some(b"MISS" | b"BYPASS")
+        )
 }
 
 fn unix_timestamp_secs() -> u64 {
@@ -1273,11 +1345,16 @@ fn extract_completion_from_response(
             return Ok(TranslationCompletion {
                 text: content,
                 termination,
+                cold_generation: false,
             });
         }
     }
     if let Some(text) = first.text {
-        return Ok(TranslationCompletion { text, termination });
+        return Ok(TranslationCompletion {
+            text,
+            termination,
+            cold_generation: false,
+        });
     }
 
     Err(ClientError::MissingContent)
@@ -1410,6 +1487,31 @@ mod llama_cpp_integration_tests;
 mod tests {
     use super::*;
     use hymt_core::config::{GenerationBackend, GenerationSettings, Setting};
+
+    #[test]
+    fn cold_generation_requires_one_explicit_marker() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        for (values, expected) in [
+            (vec![], false),
+            (vec!["MISS"], true),
+            (vec!["BYPASS"], true),
+            (vec!["HIT"], false),
+            (vec!["UNKNOWN"], false),
+            (vec!["miss"], false),
+            (vec!["MISS,HIT"], false),
+            (vec!["MISS", "MISS"], false),
+            (vec!["MISS", "HIT"], false),
+        ] {
+            let mut headers = HeaderMap::new();
+            for value in values {
+                headers.append("x-hymt-cache", HeaderValue::from_str(value).unwrap());
+            }
+            assert_eq!(cold_generation(&headers), expected, "{headers:?}");
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert("x-hymt-cache", HeaderValue::from_bytes(&[0xff]).unwrap());
+        assert!(!cold_generation(&headers));
+    }
 
     fn parse_chat(json: &str) -> ChatResponse {
         serde_json::from_str(json).expect("test JSON must be valid")
