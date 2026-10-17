@@ -1001,6 +1001,8 @@ type SegmentPlanResult = (Vec<String>, Vec<usize>, Vec<Vec<usize>>);
 
 mod markdown_boundary;
 mod markdown_ownership;
+mod markdown_recovery;
+use markdown_recovery::recover_generated_inline_code;
 mod table_shape;
 #[cfg(test)]
 use markdown_ownership::protected_markdown_block_ranges;
@@ -1080,82 +1082,6 @@ fn ensure_markdown_structure_preserved(source: &str, translated: &str) -> Result
         anyhow::bail!("translated Markdown structure changed");
     }
     Ok(())
-}
-
-/// Remove only provider-added inline-code delimiters when the Markdown parse
-/// proves that no other syntax or interpreted text changes.
-fn recover_generated_inline_code(source: &str, reply: &str) -> Option<String> {
-    if source.contains('`') || !reply.contains('`') {
-        return None;
-    }
-    let source_structure = markdown_structure(source);
-    let mut reply_structure = markdown_structure(reply);
-    if !source_structure.code.is_empty() || reply_structure.code.is_empty() {
-        return None;
-    }
-    reply_structure.code.clear();
-    if reply_structure != source_structure {
-        return None;
-    }
-
-    let mut recovered = String::with_capacity(reply.len());
-    let mut cursor = 0;
-    for (event, range) in Parser::new(reply).into_offset_iter() {
-        let Event::Code(parsed) = event else {
-            continue;
-        };
-        let before = reply.get(cursor..range.start)?;
-        if before.contains('`') {
-            return None;
-        }
-        recovered.push_str(before);
-        let raw = reply.get(range.clone())?;
-        let delimiters = raw.bytes().take_while(|byte| *byte == b'`').count();
-        if delimiters == 0 || raw.len() < delimiters * 2 {
-            return None;
-        }
-        let closing = raw.bytes().rev().take_while(|byte| *byte == b'`').count();
-        if closing != delimiters {
-            return None;
-        }
-        let payload = raw.get(delimiters..raw.len() - delimiters)?;
-        if payload != parsed.as_ref() {
-            return None;
-        }
-        recovered.push_str(payload);
-        cursor = range.end;
-    }
-    let after = reply.get(cursor..)?;
-    if after.contains('`') {
-        return None;
-    }
-    recovered.push_str(after);
-    if recovered == reply
-        || semantic_markdown_events(reply) != semantic_markdown_events(&recovered)
-        || ensure_markdown_structure_preserved(source, &recovered).is_err()
-    {
-        return None;
-    }
-    Some(recovered)
-}
-
-fn semantic_markdown_events(text: &str) -> Vec<Event<'_>> {
-    let mut events = Vec::new();
-    for event in Parser::new(text) {
-        match event {
-            Event::Text(value) | Event::Code(value) => {
-                if let Some(Event::Text(previous)) = events.last_mut() {
-                    let mut merged = previous.to_string();
-                    merged.push_str(&value);
-                    *previous = merged.into();
-                } else {
-                    events.push(Event::Text(value));
-                }
-            }
-            other => events.push(other),
-        }
-    }
-    events
 }
 
 fn has_unparsed_link_syntax(text: &str) -> bool {
@@ -2769,6 +2695,7 @@ mod tests {
     mod app_cache_policy_tests;
     mod cache_admission_tests;
     mod markdown_boundary_tests;
+    pub(super) use markdown_boundary_tests::record_semantic_bytes;
     pub(super) mod ownership_interval_tests;
     mod table_shape_tests;
 

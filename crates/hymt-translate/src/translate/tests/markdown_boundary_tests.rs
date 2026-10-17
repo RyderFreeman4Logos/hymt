@@ -3,6 +3,41 @@ use super::super::markdown_boundary::{
 };
 use super::*;
 
+thread_local! {
+    static SEMANTIC_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub(in super::super) fn record_semantic_bytes(bytes: usize) {
+    SEMANTIC_BYTES.with(|total| total.set(total.get() + bytes));
+}
+
+#[test]
+fn generated_inline_code_recovery_appends_each_run_without_prefix_copies() {
+    let mut work = Vec::new();
+    for count in [64, 128] {
+        let reply = format!("a {}", "`x` ".repeat(count));
+        SEMANTIC_BYTES.with(|total| total.set(0));
+        assert_eq!(
+            recover_generated_inline_code("Plain source text.", &reply),
+            Some(format!("a {}", "x ".repeat(count)))
+        );
+        let bytes = SEMANTIC_BYTES.with(std::cell::Cell::get);
+        eprintln!(
+            "semantic recovery n={count} reply_bytes={} copied_or_appended_bytes={bytes}",
+            reply.len()
+        );
+        work.push((bytes, reply.len()));
+    }
+    assert!(
+        work[1].0 < 3 * work[0].0,
+        "prefix copying must not grow quadratically: {work:?}"
+    );
+    assert!(
+        work.iter().all(|(bytes, input)| *bytes <= 4 * input),
+        "each decoded run must append linearly: {work:?}"
+    );
+}
+
 fn assert_work_growth(smaller: RenderWork, larger: RenderWork) {
     eprintln!("renderer work: {smaller:?} -> {larger:?}");
     assert!(
