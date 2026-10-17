@@ -74,7 +74,7 @@ struct Cli {
     #[arg(short = 'y', long, global = true)]
     yes: bool,
 
-    /// Show translation plan without executing
+    /// Show a plan for text, stdin, file input, or batch without translating
     #[arg(long, global = true)]
     plan: bool,
 
@@ -538,6 +538,15 @@ async fn run() -> Result<()> {
         reordered.extend(reorder_for_translation(&raw));
         Cli::parse_from(reordered)
     };
+
+    if cli.plan
+        && !matches!(
+            cli.cmd.as_ref(),
+            None | Some(Cmd::Text(_)) | Some(Cmd::Batch(_))
+        )
+    {
+        anyhow::bail!("--plan supports only text, stdin, file input, and batch");
+    }
 
     if cli.no_cache
         && matches!(

@@ -18,6 +18,7 @@ Use `hymt` when an agent should drive the local Hy-MT2 CLI instead of hand-writi
 - Show progress indicators: `cat article.txt | hymt -l fr --progress`
 - Skip interactive checks: `hymt input.txt -l ja --yes`
 - If the source text matches a subcommand name, disambiguate with `--`: `hymt -l zh -- "config"`
+- Global `--plan` supports text, stdin, file input, and `batch`. Other subcommands reject it before reading config, contacting the backend, or changing state. Supported planners may read backend metadata and compatible cache/history data but do not translate or publish outputs.
 - Without an explicit `-l/--lang`, hymt routes between `[language].primary` (default `zh`) and `[language].secondary` (default `en`): mostly-primary input targets secondary, otherwise it targets primary.
 - Mixed-language documents targeting `zh`, `zh-Hant`, or `yue` preserve only high-confidence CJK target-language paragraphs by default; code blocks and frontmatter are always preserved. Use `--force-translate-all` (or `[translation].force_translate_all = true`) to submit every non-code paragraph, or `--no-language-detection` / `[translation].language_detection = false` to disable detection for one run or configuration.
 
@@ -28,9 +29,8 @@ Use `hymt` when an agent should drive the local Hy-MT2 CLI instead of hand-writi
 - Translate and write outputs: `hymt batch ./docs -l zh`
 - Skip confirmation for automation: `hymt batch ./docs -l zh --yes`
 - Write to a separate tree while preserving source-relative paths: `hymt batch ./docs -l zh --output-dir translated-docs`
-- Batch mode scans the top-level directory by default; add `--recursive` to descend into subdirectories. It follows symlinks and selects `.txt` and `.md` files.
-- Output names are `{stem}.{target}.{ext}` using the effective target; with default routing, English files write `README.zh.md` and mostly-primary files write `README.en.md`.
-- Files whose resolved output path would leave the scan root or `--output-dir` are skipped with a stderr warning.
+- Batch mode scans the top-level directory by default; add `--recursive` to descend into subdirectories. An explicit root directory symlink is accepted; interior symlinks are not followed or selected. It selects `.txt` and `.md` files.
+- Output names are `{stem}.{target}.{ext}` using the effective target; with default routing, English files write `README.zh-cn.md` and mostly-primary files write `README.en.md`.
 - Batch target names accept only ASCII letters, digits, and hyphens; dots, path separators, and other characters are rejected.
 - Files are planned by translatable segments; a file made entirely of preserved target-language paragraphs has no model segments but is still reconstructed to its normal output path. Mixed-language files preserve high-confidence Chinese-family target paragraphs and translate the remaining paragraphs.
 - Batch planning progress is written to stderr before the preview, including scanned file count, per-file analysis, and selected/skipped totals.
