@@ -142,15 +142,14 @@ cancel_readme() {
 }
 
 run_readme_consumer() {
-  local status=1
+  local status=1 consumer_script
   # Record signals during fork before the owned process group PID is available.
   trap 'readme_cancel_status=129' HUP
   trap 'readme_cancel_status=130' INT
   trap 'readme_cancel_status=143' TERM
   readme_consumer_status_file="$(mktemp "${readme_workspace}/consumer-status-XXXXXXXX")" || return 1
-  # The child Bash must expand its own positional arguments and status.
-  # shellcheck disable=SC2016
-  /usr/bin/setsid -- /usr/bin/bash -c '
+  IFS= read -r -d '' consumer_script <<'README_CONSUMER' || :
+
     trap : HUP INT TERM
     status_file=$1
     shift
@@ -165,7 +164,9 @@ run_readme_consumer() {
     done
     printf "%s\n" "$status" > "$status_file"
     while [ ! -e "${status_file}.release" ]; do /usr/bin/sleep 0.05; done
-  ' readme-consumer "${readme_consumer_status_file}" "$@" &
+
+README_CONSUMER
+  /usr/bin/setsid -- /usr/bin/bash -c "${consumer_script}" readme-consumer "${readme_consumer_status_file}" "$@" &
   readme_consumer_pid=$!
   readme_consumer_start=""
   readme_consumer_group_owned=0
