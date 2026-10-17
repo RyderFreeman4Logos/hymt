@@ -619,6 +619,61 @@ async fn all_urls_remain_source_owned_while_adjacent_prose_translates() {
 }
 
 #[tokio::test]
+async fn adjacent_url_owners_leave_prose_translatable() {
+    let config = make_stream_config("http://127.0.0.1:9/v1");
+    let segmenter = fallback_segmenter();
+    let opts = PromptOpts {
+        document_translation_policy: Some(DocumentTranslationPolicy::TranslateAll),
+        ..PromptOpts::default()
+    };
+    for source in [
+        "|https://example.test/x|Visible|\n|---|---|\n",
+        "| https://example.test/x | Visible |\n| --- | --- |\n",
+        "https://example.test/x**Visible**",
+        "https://example.test/x **Visible**",
+        "https://example.test/x*Visible*",
+        "https://example.test/x`kept`Visible",
+        "https://example.test/x<span>Visible</span>",
+        "https://example.test/x|Visible",
+        "https://example.test/x**Visible**.",
+        "https://example.test/x*Visible*，",
+        "https://example.test/x[Visible](https://example.test/a*b*c|d)",
+        "https://example.test/x![Visible](https://example.test/a*b*c|d)",
+    ] {
+        let plan = plan_translation(
+            source,
+            "zh",
+            &config,
+            &segmenter,
+            &TemplateType::Default,
+            &opts,
+        )
+        .unwrap();
+        assert!(
+            plan.segments
+                .iter()
+                .any(|segment| segment.contains("Visible")),
+            "adjacent prose must enter the real planner: {source:?}: {:?}",
+            plan.segments
+        );
+        assert_eq!(plan.reconstruct(&plan.segments), source);
+        let (output, requests) = translated_source(source).await;
+        assert!(requests.iter().any(|request| request.contains("Visible")));
+        assert!(requests.iter().all(|request| !request.contains("https://")));
+        assert!(!output.contains("Visible"), "{source:?}: {output:?}");
+        assert!(output.contains('译'));
+        assert_eq!(
+            hymt_core::completeness::preserved_urls(source),
+            hymt_core::completeness::preserved_urls(&output)
+        );
+        assert_eq!(markdown_structure(source), markdown_structure(&output));
+        if source.contains("`kept`") {
+            assert!(output.contains("`kept`"));
+        }
+    }
+}
+
+#[tokio::test]
 async fn paragraph_boundaries_are_source_owned() {
     let source = "First paragraph contains the first factual claim.\n\nSecond paragraph contains a different factual claim.\n\nThird paragraph contains the final factual claim.\n";
     let (output, requests) = translated_source(source).await;

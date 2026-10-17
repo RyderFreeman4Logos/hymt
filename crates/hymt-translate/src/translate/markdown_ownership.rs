@@ -328,7 +328,13 @@ fn protected_markdown_structure_ranges(text: &str) -> Vec<Range<usize>> {
                 let start = range.start + literal.len() - literal.trim_start().len();
                 let end = range.start + literal.trim_end().len();
                 if start < end {
-                    editable.push(start..end);
+                    // Punctuation-only leaves are boundaries, not prose. Translating
+                    // a suffix period could join a preceding URL's inline owner.
+                    if text[start..end].chars().all(punctuation) {
+                        owned.push(start..end);
+                    } else {
+                        editable.push(start..end);
+                    }
                 }
             }
             _ => {}
