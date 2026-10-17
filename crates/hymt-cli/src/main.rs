@@ -595,9 +595,7 @@ async fn run() -> Result<()> {
         let preflight = TranslationClient::new(config.clone())?
             .preflight_backend()
             .await?;
-        for warning in preflight.warnings {
-            eprintln!("Warning: {warning}");
-        }
+        preflight.report_warnings();
     } else if matches!(cli.cmd.as_ref(), Some(Cmd::Telegram(_)))
         && should_run_llama_cpp_props_diagnostic(cli.cmd.as_ref())
     {
@@ -1756,14 +1754,22 @@ async fn run_batch(
         concurrency_override,
         no_cache,
     };
-    let plan = build_batch_plan(&args.directory, config, &segmenter, &history, &plan_opts)?;
+    let client = make_client_with_concurrency(config, concurrency_override, no_cache)?;
+    let plan = build_batch_plan(
+        &args.directory,
+        config,
+        &client,
+        &segmenter,
+        &history,
+        &plan_opts,
+    )
+    .await?;
     show_batch_preview(&plan);
 
     if args.dry_run || show_plan {
         return Ok(());
     }
 
-    let client = make_client_with_concurrency(config, concurrency_override, no_cache)?;
     run_batch_translation(&plan, config, &client, &segmenter, &history, template, opts).await?;
     eprintln!("Batch translation complete: {} files", plan.files.len());
     Ok(())

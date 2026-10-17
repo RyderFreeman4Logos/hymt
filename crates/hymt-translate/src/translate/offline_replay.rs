@@ -45,7 +45,6 @@ pub(super) fn request_plan_digest(
     template: &TemplateType,
     opts: &PromptOpts,
     client: &TranslationClient,
-    config: &HotConfig,
     streaming: bool,
 ) -> Result<String> {
     let mut hash = Sha256::new();
@@ -65,10 +64,8 @@ pub(super) fn request_plan_digest(
         let prompt = build_prompt(segment, target, template, opts)?;
         bind(segment.as_bytes());
         bind(prompt.as_bytes());
-        bind(&client.request_bytes(
-            &prompt,
-            streaming && config.first_chunk_priority() && index == 0,
-        )?);
+        // Eligible plans have no cached segments: segment 0 is the stream route.
+        bind(&client.request_bytes(&prompt, streaming && index == 0)?);
     }
     Ok(format!("{:x}", hash.finalize()))
 }
@@ -104,7 +101,7 @@ pub(super) fn population_proof(
     let proof = serde_json::to_string(&json!({
         "version": VERSION, "configured": configured, "runtime": runtime,
         "inference": inference.hash(),
-        "requests": request_plan_digest(plan, target, template, opts, ctx.client, ctx.config, streaming)?,
+        "requests": request_plan_digest(plan, target, template, opts, ctx.client, streaming)?,
         "output": digest(output),
     }))?;
     Ok((proof.len() <= 16_384).then_some((configured, proof)))
@@ -228,9 +225,7 @@ pub(crate) fn find_replay(
             };
             if proof["output"] != digest(output)
                 || proof["requests"]
-                    != request_plan_digest(
-                        &plan, target, template, opts, &client, &isolated, streaming,
-                    )?
+                    != request_plan_digest(&plan, target, template, opts, &client, streaming)?
                 || !complete(source, output, target, &isolated, &plan)
             {
                 return Ok(None);

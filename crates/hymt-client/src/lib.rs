@@ -118,6 +118,15 @@ pub struct BackendPreflight {
     pub warnings: Vec<String>,
 }
 
+impl BackendPreflight {
+    /// Emit runtime diagnostics after either eager or deferred live preflight.
+    pub fn report_warnings(&self) {
+        for warning in &self.warnings {
+            eprintln!("Warning: {warning}");
+        }
+    }
+}
+
 // ── Serde types ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]

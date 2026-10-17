@@ -1754,11 +1754,12 @@ async fn prepare_invocation(ctx: &TranslationCtx<'_>) -> Result<(HotConfig, Tran
     if (config.strict_backend_preflight() || client.has_deferred_preflight())
         && (reloaded || config.backend_runtime_info().is_none())
     {
-        if reloaded {
-            client.refresh_backend_preflight().await?;
+        let preflight = if reloaded {
+            client.refresh_backend_preflight().await?
         } else {
-            client.preflight_backend().await?;
-        }
+            client.preflight_backend().await?
+        };
+        preflight.report_warnings();
     }
     Ok((config, client))
 }

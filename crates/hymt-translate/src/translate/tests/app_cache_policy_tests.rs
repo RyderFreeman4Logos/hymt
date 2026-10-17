@@ -166,6 +166,138 @@ async fn explicit_library_cache_opt_in_reuses_whole_output() {
 // A fresh invocation must validate its retained proof before strict live preflight.
 const REPLY: &str = "这份报告说明可靠的翻译历史记录和缓存行为为什么重要。";
 
+#[tokio::test]
+async fn populated_stream_proof_binds_captured_requests_for_both_priority_settings() {
+    for priority in [true, false] {
+        let source = streaming_regression_source();
+        let segmenter = fallback_segmenter();
+        let planning = make_stream_config_with_fcp("http://127.0.0.1:1/v1", priority);
+        let opts = PromptOpts::default();
+        let plan = plan_translation(
+            &source,
+            "zh",
+            &planning,
+            &segmenter,
+            &TemplateType::Default,
+            &opts,
+        )
+        .unwrap();
+        assert!(plan.segment_count() > 1);
+        let replies = planned_complete_zh_translations(&plan);
+        let server = start_capturing_mock_server(
+            replies
+                .into_iter()
+                .enumerate()
+                .map(|(i, text)| {
+                    if i == 0 {
+                        MockResponse::Sse(vec![text])
+                    } else {
+                        MockResponse::Json(text)
+                    }
+                })
+                .collect(),
+        )
+        .await;
+        let config = make_stream_config_with_fcp(&server.endpoint_url, priority);
+        config.set_backend_runtime_info(
+            hymt_core::runtime::BackendRuntimeInfo::from_llama_cpp_props(
+                &serde_json::json!({"model":"test-model", "n_ctx_per_seq":512}),
+                123,
+            )
+            .unwrap(),
+        );
+        let client = TranslationClient::new(config.clone()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let history = HistoryDB::new(dir.path().join("history.db"));
+        let ctx = TranslationCtx {
+            config: &config,
+            client: &client,
+            segmenter: &segmenter,
+            history: &history,
+            cache_enabled: true,
+        };
+        let (tx, mut rx) = mpsc::channel(64);
+        translate_text_stream(&source, "zh", &TemplateType::Default, &opts, &ctx, tx)
+            .await
+            .unwrap();
+        assert!(rx.recv().await.is_some());
+        let plan = plan_translation(
+            &source,
+            "zh",
+            &config,
+            &segmenter,
+            &TemplateType::Default,
+            &opts,
+        )
+        .unwrap();
+        let (key, _) = offline_replay::population_proof(
+            (
+                &source,
+                history.fetch_recent(Some(1)).unwrap()[0]
+                    .output_text
+                    .as_deref()
+                    .unwrap(),
+            ),
+            "zh",
+            &TemplateType::Default,
+            &opts,
+            &ctx,
+            &plan,
+            true,
+        )
+        .unwrap()
+        .expect("initial complete streaming run qualifies");
+        let candidates = history
+            .find_replay_candidates(&segment_cache_hash(&source), &key)
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        let proof: serde_json::Value = serde_json::from_str(&candidates[0].1).unwrap();
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), plan.segment_count());
+        let bodies: Vec<_> = requests
+            .iter()
+            .map(|request| {
+                let body = request.split_once("\r\n\r\n").unwrap().1;
+                (
+                    body,
+                    serde_json::from_str::<serde_json::Value>(body).unwrap(),
+                )
+            })
+            .collect();
+        let mut hash = Sha256::new();
+        let mut bind = |bytes: &[u8]| {
+            hash.update((bytes.len() as u64).to_le_bytes());
+            hash.update(bytes);
+        };
+        bind(
+            &serde_json::to_vec(&serde_json::json!({
+                "source_tokens":plan.source_tokens,
+                "available_source_tokens":plan.available_source_tokens,
+                "budget":format!("{:?}",plan.token_budget),
+                "document":plan.document_plan,"indexes":plan.segment_section_indexes,
+                "groups":plan.segment_section_groups,
+            }))
+            .unwrap(),
+        );
+        for (index, segment) in plan.segments.iter().enumerate() {
+            let prompt = build_prompt(segment, "zh", &TemplateType::Default, &opts).unwrap();
+            let (body, payload) = bodies
+                .iter()
+                .find(|(_, payload)| payload["messages"][0]["content"] == prompt)
+                .unwrap();
+            assert_eq!(payload["stream"].as_bool(), (index == 0).then_some(true));
+            bind(segment.as_bytes());
+            bind(prompt.as_bytes());
+            bind(body.as_bytes());
+        }
+        assert_eq!(
+            proof["requests"],
+            format!("{:x}", hash.finalize()),
+            "persisted proof must bind actual wire bytes; first_chunk_priority={priority}"
+        );
+    }
+}
+
 struct OfflineFixture {
     _dir: tempfile::TempDir,
     config: HotConfig,
@@ -623,19 +755,21 @@ async fn batch_preview_reaches_validated_replay() {
         concurrency_override: None,
         no_cache: false,
     };
+    let client = TranslationClient::new(config.clone())
+        .unwrap()
+        .with_deferred_preflight(true);
     let plan = crate::batch::build_batch_plan(
         &inputs,
         &config,
+        &client,
         &fixture.segmenter,
         &fixture.history,
         &opts,
     )
+    .await
     .unwrap();
     assert_eq!(plan.files.len(), 1);
     assert_eq!(plan.total_missing_segments(), 0);
-    let client = TranslationClient::new(config.clone())
-        .unwrap()
-        .with_deferred_preflight(true);
     crate::batch::run_batch_translation(
         &plan,
         &config,
@@ -779,7 +913,6 @@ async fn request_binding_uses_actual_rendered_content_adapter_bytes_and_order() 
         &TemplateType::Personalization,
         &opts,
         &client,
-        &config,
         false,
     )
     .unwrap();
@@ -796,7 +929,6 @@ async fn request_binding_uses_actual_rendered_content_adapter_bytes_and_order() 
             &TemplateType::Personalization,
             &changed,
             &client,
-            &config,
             false
         )
         .unwrap()
@@ -813,7 +945,6 @@ async fn request_binding_uses_actual_rendered_content_adapter_bytes_and_order() 
             &TemplateType::Personalization,
             &opts,
             &client,
-            &config,
             false
         )
         .unwrap()
@@ -827,7 +958,6 @@ async fn request_binding_uses_actual_rendered_content_adapter_bytes_and_order() 
             &TemplateType::Personalization,
             &opts,
             &client,
-            &config,
             false
         )
         .unwrap()
@@ -841,7 +971,6 @@ async fn request_binding_uses_actual_rendered_content_adapter_bytes_and_order() 
             &TemplateType::Personalization,
             &opts,
             &client,
-            &config,
             false
         )
         .unwrap()
