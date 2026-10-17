@@ -486,8 +486,14 @@ class CacheServer(ThreadingMixIn, HTTPServer):
 
     def metadata(self, path: str, authorization: str | None, budget: _Budget) -> tuple[int, list[tuple[str, str]], bytes]:
         with self.upstream_response("GET", path, None, authorization, budget) as response:
-            # Once an error status is known, its body cannot change the outage/auth classification.
-            raw = _read(response, budget, self.response_limit) if response.status == 200 else b''
+            raw = b''
+            if response.status not in {502, 503, 504}:
+                try:
+                    raw = _read(response, budget, self.response_limit)
+                except (OSError, http.client.HTTPException, ValueError):
+                    if response.status == 200:
+                        raise
+                    # Preserve a known rejection even if its optional error body cannot be read.
             return response.status, response.getheaders(), raw
 
     def _observe(self, requested_model: object, authorization: str | None, budget: _Budget, initial: tuple[str, tuple[int, list[tuple[str, str]], bytes] | None] | None = None, *, observation: int) -> str:

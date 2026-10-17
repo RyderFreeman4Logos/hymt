@@ -553,7 +553,21 @@ class CacheContracts(unittest.TestCase):
                     self.assertEqual(code, status)
                     self.assertNotIn("X-Hymt-Planning", headers)
                     self.assertNotEqual(generation[1]["X-Hymt-Cache"], "HIT")
-                self.assertLess(time.monotonic() - started, 0.7)
+                if status in (502, 503, 504):
+                    self.assertLess(time.monotonic() - started, 0.7)
+
+    def test_live_metadata_error_body_survives_status_classification(self):
+        self.request()
+        for status in (401, 403, 429):
+            for path in ("/props", "/v1/models"):
+                with self.subTest(status=status, path=path):
+                    self.state["metadata_status"] = {path: status}
+                    code, headers, body = self.get_metadata(path)
+                    self.assertEqual(code, status)
+                    self.assertEqual(body, b'{"error":"metadata rejected"}')
+                    self.assertEqual(headers["Content-Type"], "application/json")
+                    self.assertNotIn("X-Hymt-Planning", headers)
+                    self.assertNotEqual(self.request()[1]["X-Hymt-Cache"], "HIT")
 
     def test_revocation_before_admission_denies_copied_get_token_and_generation(self):
         for path in ("/props", "/tokenize", "/v1/chat/completions"):
