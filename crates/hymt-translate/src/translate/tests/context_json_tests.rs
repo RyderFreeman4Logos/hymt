@@ -95,6 +95,17 @@ async fn json_content_admission_ignores_external_formatting_on_all_cache_paths()
         .unwrap()
         .replace('\n', &"\n".repeat(80));
     let complete = r#"{"message":"请完整阅读这一条合成操作说明。","count":2,"enabled":true,"items":["第一项"]}"#;
+    assert_json_translation_and_cache_paths(&source, complete).await;
+}
+
+#[tokio::test]
+async fn json_escaped_identities_publish_and_reuse_all_cache_paths() {
+    let source = r#"{"message":"Read {{field}} and {{field}} at https://example.test/a and https://example.test/a again.","count":2}"#;
+    let complete = r#"{"message":"请完整阅读 \u007b\u007bfield\u007d\u007d 和 \u007b\u007bfield\u007d\u007d，参见 https:\/\/example.test/a 和 https:\/\/example.test/a 的相关说明。","count":2}"#;
+    assert_json_translation_and_cache_paths(source, complete).await;
+}
+
+async fn assert_json_translation_and_cache_paths(source: &str, complete: &str) {
     let encoded = serde_json::to_string(complete).unwrap();
     for streaming in [false, true] {
         let server = start_capturing_mock_server(vec![
@@ -122,7 +133,7 @@ async fn json_content_admission_ignores_external_formatting_on_all_cache_paths()
         let result = if streaming {
             let (tx, mut rx) = mpsc::channel(32);
             let result = translate_text_stream_with_mode(
-                &source,
+                source,
                 "zh",
                 &TemplateType::Default,
                 &opts,
@@ -145,11 +156,11 @@ async fn json_content_admission_ignores_external_formatting_on_all_cache_paths()
             assert_eq!(done, 1);
             result
         } else {
-            translate_text(&source, "zh", &TemplateType::Default, &opts, &ctx).await
+            translate_text(source, "zh", &TemplateType::Default, &opts, &ctx).await
         };
         assert_eq!(result.unwrap().text, complete);
         assert_eq!(
-            translate_text(&source, "zh", &TemplateType::Default, &opts, &ctx)
+            translate_text(source, "zh", &TemplateType::Default, &opts, &ctx)
                 .await
                 .unwrap()
                 .text,
@@ -168,15 +179,15 @@ async fn json_content_admission_ignores_external_formatting_on_all_cache_paths()
             );
             if shared {
                 cache
-                    .store_shared("man", "fixture", &source, "zh", policy, complete)
+                    .store_shared("man", "fixture", source, "zh", policy, complete)
                     .unwrap();
             } else {
                 cache
-                    .store_user("man", "fixture", &source, "zh", policy, complete)
+                    .store_user("man", "fixture", source, "zh", policy, complete)
                     .unwrap();
             }
             assert_eq!(
-                translate_cached("man", "fixture", &source, "zh", &cache, &opts, &ctx)
+                translate_cached("man", "fixture", source, "zh", &cache, &opts, &ctx)
                     .await
                     .unwrap(),
                 complete
