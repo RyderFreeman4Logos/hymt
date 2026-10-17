@@ -8,6 +8,49 @@ readme_identity() {
   printf '%s:%s\n' "${identity%:*}" "$((16#${identity##*:} & 0170000))"
 }
 
+# Metadata checks in callers are only hints; admit and hash the same opened file.
+# Python 3 is also required by the repository's normal hook/gate entry points.
+readme_checksum() {
+  python3 - "$1" "$2" "$3" <<'README_CHECKSUM'
+import hashlib
+import os
+import stat
+import sys
+
+
+def main() -> None:
+    path, expected_identity, expected_mode = sys.argv[1:]
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, "rb") as source:
+        before = os.fstat(source.fileno())
+        identity = f"{before.st_dev}:{before.st_ino}:{before.st_uid}:{stat.S_IFMT(before.st_mode)}"
+        if (not stat.S_ISREG(before.st_mode) or identity != expected_identity
+                or stat.S_IMODE(before.st_mode) != int(expected_mode)):
+            raise ValueError("README file identity or mode changed before read")
+        digest = hashlib.sha256()
+        remaining = before.st_size
+        while remaining:
+            chunk = source.read(min(remaining, 1024 * 1024))
+            if not chunk:
+                raise ValueError("README file shrank during read")
+            digest.update(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(source.fileno())
+        fields = ("st_dev", "st_ino", "st_uid", "st_gid", "st_mode", "st_size",
+                  "st_mtime_ns", "st_ctime_ns")
+        if source.read(1) or any(getattr(before, name) != getattr(after, name) for name in fields):
+            raise ValueError("README file changed during read")
+    print(digest.hexdigest() + "  -")
+
+
+try:
+    main()
+except (OSError, ValueError) as error:
+    print(f"README checksum refused: {error}", file=sys.stderr)
+    sys.exit(1)
+README_CHECKSUM
+}
+
 remember_readme_path() {
   owned_readme_paths+=("$1")
   owned_readme_identities+=("$(readme_identity "$1")")
@@ -327,7 +370,7 @@ capture_readme_destination() {
     output_mode="$(stat -c %a -- "${readme_zh}")" || return $?
     [ "$((8#${output_mode}))" -le "$((0777))" ] || return 1
     output_mode="$((8#${output_mode}))"
-    output_hash="$(sha256sum < "${readme_zh}")" || return $?
+    output_hash="$(readme_checksum "${readme_zh}" "${output_identity}" "${output_mode}")" || return $?
   fi
 }
 
@@ -335,7 +378,7 @@ published_readme_is_current() {
   [ -f "${readme_zh}" ] && [ ! -L "${readme_zh}" ] || return 1
   [ "$(readme_identity "${readme_zh}")" = "${published_readme_identity}" ] || return 1
   [ "$(stat -c %a -- "${readme_zh}")" = "${published_readme_mode}" ] || return 1
-  [ "$(sha256sum < "${readme_zh}")" = "${published_readme_hash}" ]
+  [ "$(readme_checksum "${readme_zh}" "${published_readme_identity}" "$((8#${published_readme_mode}))")" = "${published_readme_hash}" ]
 }
 
 publish_readme_candidate() {
@@ -345,7 +388,7 @@ publish_readme_candidate() {
   publication_identity="$(readme_identity "${publication_temp}")" || return $?
   cp "${readme_candidate}" "${publication_temp}" || return $?
   [ "$(readme_identity "${publication_temp}")" = "${publication_identity}" ] || return 1
-  published_readme_hash="$(sha256sum < "${publication_temp}")" || return $?
+  published_readme_hash="$(readme_checksum "${publication_temp}" "${publication_identity}" "$((0600))")" || return $?
   published_readme_mode="$(printf '%o' "${output_mode}")"
   chmod "${published_readme_mode}" -- "${publication_temp}" || return $?
   current=""
@@ -355,7 +398,7 @@ publish_readme_candidate() {
     current="$(readme_identity "${readme_zh}")" || return $?
     [ "${current}" = "${output_identity}" ] || return 1
     [ "$(stat -c %a -- "${readme_zh}")" = "${published_readme_mode}" ] || return 1
-    current_hash="$(sha256sum < "${readme_zh}")" || return $?
+    current_hash="$(readme_checksum "${readme_zh}" "${output_identity}" "${output_mode}")" || return $?
   fi
   [ "${current}" = "${output_identity}" ] && [ "${current_hash}" = "${output_hash}" ] || return 1
   [ -z "$(git -C "${repo_root}" diff --cached -- README.zh-cn.md)" ] || return 1

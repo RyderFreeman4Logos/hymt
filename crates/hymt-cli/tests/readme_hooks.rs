@@ -283,12 +283,29 @@ if [ "$(/usr/bin/readlink -f -- "${@: -1}")" = "$(/usr/bin/readlink -f -- "$FIXT
   if [ "$FIXTURE_ROOT_FAULT" = device ] && [ "$2" = %d ]; then printf 'root-fault\tdevice\n' >> "$FIXTURE_LOG"; printf '0\n'; exit 0; fi
   if [ "$FIXTURE_ROOT_FAULT" = owner ] && [ "$2" = %u ]; then printf 'root-fault\towner\n' >> "$FIXTURE_LOG"; printf '999999\n'; exit 0; fi
 fi
-exec /usr/bin/stat "$@"
+/usr/bin/stat "$@" || exit $?
+path=${@: -1}
+kind=
+if [ "$2" = %a ] && [ "$path" = "$FIXTURE_ROOT/README.zh-cn.md" ]; then kind=destination; fi
+if [ "$2" = '%d:%i:%u:%f' ] && [[ "$path" == "$FIXTURE_ROOT/.README.zh-cn.md.hymt-"* ]]; then kind=publication; fi
+if [ -n "$kind" ]; then
+  count=0
+  [ ! -f "$FIXTURE_ROOT/$kind-reads" ] || read -r count < "$FIXTURE_ROOT/$kind-reads"
+  count=$((count + 1))
+  printf '%s\n' "$count" > "$FIXTURE_ROOT/$kind-reads"
+  if [ "$FIXTURE_LATE_FIFO" = "$kind:$count" ]; then
+    /usr/bin/mv "$path" "$path.late-saved" || exit $?
+    /usr/bin/mkfifo "$path" || exit $?
+    printf '%s\n' "$path" > "$FIXTURE_ROOT/late-fifo"
+  fi
+fi
 "#;
 
 struct Fixture {
     root: PathBuf,
     installed: bool,
+    signal_program: PathBuf,
+    git_environment: Vec<(String, String)>,
 }
 
 impl Fixture {
@@ -316,6 +333,11 @@ impl Fixture {
         ] {
             std::fs::write(root.join(name), text).unwrap();
         }
+        std::fs::set_permissions(
+            root.join("README.zh-cn.md"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         for name in ["auto-translate-readme.sh", "translate-readme-zh.sh"] {
             std::fs::copy(
@@ -336,7 +358,15 @@ impl Fixture {
         ] {
             Self::script(&root.join("bin").join(name), script);
         }
-        for name in ["bash", "grep", "rm", "env", "readlink", "sha256sum"] {
+        for name in [
+            "bash",
+            "grep",
+            "rm",
+            "env",
+            "readlink",
+            "sha256sum",
+            "python3",
+        ] {
             std::os::unix::fs::symlink(format!("/usr/bin/{name}"), root.join("bin").join(name))
                 .unwrap();
         }
@@ -347,7 +377,12 @@ impl Fixture {
             std::fs::create_dir_all(root.join(".venv/bin")).unwrap();
             Self::script(&root.join(".venv/bin/python"), TRANSLATOR);
         }
-        Self { root, installed }
+        Self {
+            root,
+            installed,
+            signal_program: PathBuf::from("/usr/bin/kill"),
+            git_environment: Vec::new(),
+        }
     }
 
     fn script(path: &Path, text: &str) {
@@ -360,7 +395,12 @@ impl Fixture {
             .arg("-C")
             .arg(&self.root)
             .args(args)
+            .envs(self.git_environment.iter().map(|(key, value)| (key, value)))
+            .env_clear()
             .env("HOME", self.root.join("home"))
+            .env("PATH", "/usr/bin:/bin")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .output()
             .unwrap();
         assert!(output.status.success(), "{args:?}: {output:?}");
@@ -421,6 +461,7 @@ impl Fixture {
             .env("FIXTURE_FORCE_UNCERTAIN", "0")
             .env("FIXTURE_POST_PUBLISH", "")
             .env("FIXTURE_ROOT_FAULT", "")
+            .env("FIXTURE_LATE_FIFO", "")
             .env("FIXTURE_ATOMIC", "0")
             .env("FIXTURE_CAPABLE", "1")
             .env("FIXTURE_COMMIT_EXIT", "0")
@@ -438,7 +479,8 @@ impl Fixture {
             Ok(status) => status.unwrap(),
             Err(_) => {
                 self.kill_owned_consumer();
-                Self::kill_group(hook_pid);
+                // The timed-out wait has not reaped this child; it still anchors its group.
+                self.kill_group(hook_pid);
                 tokio::time::timeout(Duration::from_secs(2), child.wait())
                     .await
                     .expect("hook did not reap after kill")
@@ -453,7 +495,6 @@ impl Fixture {
                 Ok(output) => output.unwrap(),
                 Err(_) => {
                     self.kill_owned_consumer();
-                    Self::kill_group(hook_pid);
                     panic!("hook output remained open after shell exit");
                 }
             };
@@ -461,9 +502,10 @@ impl Fixture {
         output
     }
 
-    fn kill_group(pid: u32) {
-        let _ = std::process::Command::new("/usr/bin/kill")
+    fn kill_group(&self, pid: u32) {
+        let _ = std::process::Command::new(&self.signal_program)
             .args(["-KILL", "--", &format!("-{pid}")])
+            .env("FIXTURE_ROOT", &self.root)
             .status();
     }
 
@@ -501,7 +543,7 @@ impl Fixture {
 
     fn kill_owned_consumer(&self) {
         if let Some(group) = self.owned_consumer_group() {
-            Self::kill_group(group);
+            self.kill_group(group);
         }
     }
 
@@ -1550,4 +1592,158 @@ async fn readme_hook_retains_runtime_when_group_settlement_is_unconfirmed() {
     );
     fixture.kill_owned_consumer();
     fixture.assert_owned_consumer_settled();
+}
+
+#[tokio::test]
+async fn readme_hook_rejects_late_fifo_at_all_checksum_boundaries() {
+    let mut timed_out = Vec::new();
+    for phase in [
+        "destination:1",
+        "destination:2",
+        "destination:3",
+        "destination:4",
+        "publication:2",
+    ] {
+        let fixture = std::sync::Arc::new(Fixture::new(true, false));
+        let running = fixture.clone();
+        let wrapper = phase == "destination:4";
+        let result =
+            tokio::spawn(
+                async move { running.run(wrapper, &[("FIXTURE_LATE_FIFO", phase)]).await },
+            )
+            .await;
+        let fifo = std::fs::read_to_string(fixture.root.join("late-fifo"))
+            .expect("late metadata-to-open replacement was not reached");
+        assert!(Path::new(fifo.trim())
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_fifo());
+        match result {
+            Ok(output) => {
+                assert_eq!(output.status.success(), wrapper, "{phase}: {output:?}");
+                assert_eq!(fixture.commits(), 0, "{phase}");
+                assert!(!String::from_utf8_lossy(&output.stderr).contains("already in sync"));
+                assert!(fixture.private_workspace().is_none(), "{phase}");
+            }
+            Err(error) => {
+                assert!(error.is_panic(), "{phase}: {error}");
+                timed_out.push(phase);
+            }
+        }
+    }
+    assert!(
+        timed_out.is_empty(),
+        "late FIFO open blocked instead of refusing the replacement: {timed_out:?}"
+    );
+}
+
+#[tokio::test]
+async fn readme_fixture_never_signals_hook_group_after_reap() {
+    let mut fixture = Fixture::new(true, false);
+    fixture.signal_program = fixture.root.join("record-signal");
+    Fixture::script(
+        &fixture.signal_program,
+        r#"#!/bin/bash
+read -r hook < "$FIXTURE_ROOT/hook-pid"
+if [ "$3" = "-$hook" ]; then
+  printf 'stale-hook-group-signal\n' >> "$FIXTURE_ROOT/events"
+  exit 0
+fi
+exec /usr/bin/kill "$@"
+"#,
+    );
+    Fixture::script(
+        &fixture.root.join("scripts/hooks/auto-translate-readme.sh"),
+        r#"#!/bin/bash
+printf '%s\n' "$BASHPID" > "$FIXTURE_ROOT/hook-pid"
+/usr/bin/setsid /usr/bin/bash -c '
+  start=$(/usr/bin/awk "{print \$22}" /proc/$BASHPID/stat)
+  printf "%s %s %s %s\n" "$BASHPID" "$start" "$BASHPID" "$start" > "$FIXTURE_ROOT/consumer-process"
+  /usr/bin/sleep 30
+' &
+for ((attempt=0; attempt<200; attempt++)); do
+  [ ! -s "$FIXTURE_ROOT/consumer-process" ] || exit 0
+  /usr/bin/sleep 0.01
+done
+exit 99
+"#,
+    );
+    let fixture = std::sync::Arc::new(fixture);
+    let running = fixture.clone();
+    let error = tokio::spawn(async move { running.run(true, &[]).await })
+        .await
+        .expect_err("the output-holder fixture must hit the real output timeout");
+    let panic = error.into_panic();
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap();
+    assert!(message.contains("hook output remained open after shell exit"));
+    fixture.assert_owned_consumer_settled();
+    assert!(
+        !fixture.events().contains("stale-hook-group-signal"),
+        "fixture attempted to signal its already-reaped hook group"
+    );
+}
+
+#[test]
+fn readme_fixture_git_isolates_caller_repository_and_index() {
+    let mut changed = Vec::new();
+    for kind in ["index", "repository"] {
+        let caller = Fixture::new(true, false);
+        caller.use_real_git();
+        let index = std::fs::read(caller.root.join(".git/index")).unwrap();
+        let config = std::fs::read(caller.root.join(".git/config")).unwrap();
+        let head = caller.git(&["rev-parse", "HEAD"]);
+        let mut fixture = Fixture::new(true, false);
+        if kind == "index" {
+            fixture.git_environment.push((
+                "GIT_INDEX_FILE".to_owned(),
+                caller.root.join(".git/index").to_str().unwrap().to_owned(),
+            ));
+        } else {
+            fixture.git_environment.extend([
+                (
+                    "GIT_DIR".to_owned(),
+                    caller.root.join(".git").to_str().unwrap().to_owned(),
+                ),
+                (
+                    "GIT_WORK_TREE".to_owned(),
+                    fixture.root.to_str().unwrap().to_owned(),
+                ),
+            ]);
+        }
+        fixture.use_real_git();
+        if std::fs::read(caller.root.join(".git/index")).unwrap() != index
+            || std::fs::read(caller.root.join(".git/config")).unwrap() != config
+            || caller.git(&["rev-parse", "HEAD"]) != head
+        {
+            changed.push(kind);
+        }
+    }
+    assert!(
+        changed.is_empty(),
+        "fixture changed caller Git state: {changed:?}"
+    );
+}
+
+#[tokio::test]
+async fn readme_hook_missing_checksum_capability_fails_without_translation() {
+    for wrapper in [false, true] {
+        let fixture = Fixture::new(true, false);
+        std::fs::remove_file(fixture.root.join("bin/python3")).unwrap();
+        let output = fixture.run(wrapper, &[]).await;
+        assert_eq!(output.status.code(), Some(if wrapper { 0 } else { 127 }));
+        assert_eq!(fixture.translated(), 0);
+        assert!(String::from_utf8_lossy(&output.stderr)
+            .contains("output preparation failed (exit 127)"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("already in sync"));
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("README.zh-cn.md")).unwrap(),
+            OLD_CHINESE
+        );
+        fixture.assert_no_followup();
+    }
 }
