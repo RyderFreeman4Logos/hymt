@@ -28,7 +28,6 @@ Use `hymt translate-doc` when you want file-oriented Markdown translation instea
 
 ```toml
 [translation]
-stream = true
 max_source_tokens_per_segment = 384
 
 [completeness]
@@ -39,7 +38,7 @@ max_retries = 2
 warn_only = false
 ```
 
-- `stream` controls streaming requests to the endpoint.
+- `translate-doc` uses non-streaming translation requests, buffers the results, and publishes each document only after validation.
 - Completeness validation checks translated segments for output/input density, paragraph retention, Markdown structure, repeated URL/placeholder identities, JSON structure and values, and transport truncation.
 - Failed segments retry up to `[completeness].max_retries`, the shared completeness retry setting used by normal, streaming, batch, and `translate-doc` segment validation. After retries are exhausted, the default is an error before document output, segment-cache storage, or successful history publication. Pass `--warn-only-completeness` or set `[completeness].warn_only = true` to explicitly allow a non-empty best attempt that meets the 33% approximate source-token floor; it emits `completeness_degraded_segments=…` on stderr. Empty or below-floor results remain errors, and structural validation still applies. A rejected `translate-doc` document leaves any existing output file untouched; directory translation continues with later documents, then exits non-zero if any document failed. `batch` also fails before writing the rejected result. `exec` reports translation errors without changing the wrapped command's exit status. Validated streaming withholds failed output; optimistic streaming cannot retract emitted bytes, but a failed attempt does not become document success.
 - Repeated URLs and placeholders retain every source occurrence. Atomic JSON keeps the same object keys, array lengths, value types, and non-string scalar values; only string values may translate. Identity or Markdown ownership failures remain errors even in warn-only mode. These mechanical checks do not prove semantic accuracy.
