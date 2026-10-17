@@ -179,24 +179,25 @@ pub(super) fn validate_exhausted_attempt(
     opts: &PromptOpts,
     config: &HotConfig,
 ) -> Result<()> {
-    // Empty output has no Markdown events; preserve the missing-output diagnostic.
+    if hymt_core::completeness::parse_json_document(source.text).is_none()
+        && opts
+            .warn_only_completeness
+            .unwrap_or_else(|| config.completeness_warn_only())
+    {
+        return Ok(());
+    }
+    // Atomic JSON and explicit strict mode never publish a failed candidate.
     if best.text.trim().is_empty() {
         return reject_unrecoverably_incomplete_best_attempt(index, source.text, &best.text);
     }
     source.structure_preserved(&best.text)?;
     ensure_document_identities_preserved(source.text, &best.text)?;
     reject_unrecoverably_incomplete_best_attempt(index, source.text, &best.text)?;
-    if !opts
-        .warn_only_completeness
-        .unwrap_or_else(|| config.completeness_warn_only())
-    {
-        anyhow::bail!(
-            "segment {} failed completeness after retries: {:?}",
-            index + 1,
-            best.validation.checks_failed,
-        );
-    }
-    Ok(())
+    anyhow::bail!(
+        "segment {} failed completeness after retries: {:?}",
+        index + 1,
+        best.validation.checks_failed,
+    );
 }
 
 /// One failed candidate retained only long enough to select the safest available

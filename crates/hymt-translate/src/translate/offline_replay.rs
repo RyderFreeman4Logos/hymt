@@ -59,6 +59,7 @@ pub(super) fn request_plan_digest(
         "document": plan.document_plan,
         "indexes": plan.segment_section_indexes,
         "groups": plan.segment_section_groups,
+        "original_paragraphs": format!("{:?}", plan.original_paragraphs),
     }))?);
     for (index, segment) in plan.segments.iter().enumerate() {
         let prompt = build_prompt(segment, target, template, opts)?;
@@ -177,6 +178,7 @@ impl Replay {
         Ok(TranslationOutcome {
             text: output,
             completeness_degraded_segments: Vec::new(),
+            retained_regions: Vec::new(),
         })
     }
 }

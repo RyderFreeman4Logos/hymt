@@ -288,7 +288,7 @@ fn cached_missing_content_is_revalidated() {
 }
 
 #[tokio::test]
-async fn explicit_warn_only_retains_eligible_best_effort_compatibility() {
+async fn explicit_warn_only_retains_original_instead_of_best_effort() {
     let source = "Keep {{customer}} available throughout the complete migration process.";
     let server = start_mock_server(
         (0..2)
@@ -367,8 +367,9 @@ async fn identity_contract_rejects_loss_in_strict_warn_only_and_cache_admission(
                 &config,
             )
             .await;
-            if result.is_ok() {
-                admitted.push((source, warn_only, "segment"));
+            if let Ok(outcome) = result {
+                assert!(warn_only && outcome.completeness_degraded);
+                assert_eq!(outcome.text, source);
             }
             if cached_document_is_complete(
                 source,
@@ -602,6 +603,18 @@ async fn shared_block_guard_retries_before_publication_and_rejects_exhaustion() 
                     assert_eq!(tokens, valid);
                     assert_eq!(segment_done, 1);
                     assert_eq!(all_done, [valid]);
+                }
+            } else if warn_only {
+                let outcome = result.unwrap();
+                assert!(outcome.is_completeness_degraded());
+                assert_eq!(
+                    &outcome.text[outcome.retained_regions[0].output_bytes.clone()],
+                    source
+                );
+                assert!(cached.is_none());
+                if mode.is_some() {
+                    assert_eq!(tokens, outcome.text);
+                    assert_eq!(all_done, [outcome.text]);
                 }
             } else {
                 assert!(

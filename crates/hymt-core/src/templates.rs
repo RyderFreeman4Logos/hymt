@@ -82,7 +82,7 @@ pub struct PromptOpts {
     pub context: Option<String>,
     /// Optional document-planning override; `None` uses the translation config.
     pub document_translation_policy: Option<DocumentTranslationPolicy>,
-    /// Explicit best-effort override; `None` uses the completeness config.
+    /// Retain complete originals on validation exhaustion; `None` uses config.
     pub warn_only_completeness: Option<bool>,
 }
 

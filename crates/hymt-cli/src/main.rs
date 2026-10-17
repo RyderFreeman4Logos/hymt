@@ -123,7 +123,7 @@ struct Cli {
     #[arg(long = "no-progress", global = true, hide = true)]
     no_progress: bool,
 
-    /// Allow eligible incomplete best attempts with warnings instead of rejecting them
+    /// Retain marked complete original paragraphs after validation retries (default)
     #[arg(long = "warn-only-completeness", global = true)]
     warn_only_completeness: bool,
 
@@ -1071,7 +1071,7 @@ fn finalize_top_level_outcome(outcome: &TranslationOutcome, warn_only: bool) -> 
         return Ok(());
     }
     anyhow::bail!(
-        "completeness degraded (best attempt) for segment(s): {}",
+        "completeness degraded (original retained) for segment(s): {}",
         outcome
             .completeness_degraded_segments
             .iter()

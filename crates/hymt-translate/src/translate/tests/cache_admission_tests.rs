@@ -144,6 +144,7 @@ zh_to_en_min_ratio = 0.3
 en_to_zh_min_ratio = 0.3
 min_paragraph_ratio = 0.5
 max_retries = 1
+warn_only = false
 "#
         ),
     )

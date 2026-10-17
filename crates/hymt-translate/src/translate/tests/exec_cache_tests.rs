@@ -141,6 +141,9 @@ async fn whole_output_cache_revalidates_hits_and_never_stores_degraded_results()
         );
     }
 
+    // Plain paragraphs may retain their complete original; atomic JSON above stays strict.
+    let source =
+        "Keep the complete synthetic migration instructions available throughout the process.";
     let server = start_capturing_mock_server(
         (0..4)
             .map(|_| MockResponse::JsonWithFinishReason {
@@ -172,12 +175,11 @@ async fn whole_output_cache_revalidates_hits_and_never_stores_degraded_results()
         warn_only_completeness: Some(true),
         ..PromptOpts::default()
     };
-    assert_eq!(
-        translate_cached("man", "test", source, "zh", &cache, &warn, &ctx)
-            .await
-            .unwrap(),
-        complete
-    );
+    let retained = translate_cached("man", "test", source, "zh", &cache, &warn, &ctx)
+        .await
+        .unwrap();
+    assert!(retained.contains("Untranslated original"));
+    assert!(retained.ends_with(source));
     assert!(
         cache
             .find("man", "test", source, "zh", policy)

@@ -78,11 +78,9 @@ zh_to_en_min_ratio = 0.3
 en_to_zh_min_ratio = 0.3
 min_paragraph_ratio = 0.5
 max_retries = 2
-# Failed completeness retries are rejected before output, cache, or success history.
-# Set true (or pass --warn-only-completeness) to explicitly allow eligible degraded
-# best attempts with warnings. Empty, below-33%, identity, and Markdown structure
-# failures remain errors even in this opt-in mode.
-warn_only = false
+# Retain marked complete original paragraphs after content validation retries fail.
+# Set false for strict failure instead. Runtime errors and atomic JSON remain strict.
+warn_only = true
 
 [cache]
 # Application segment and whole-output caches are opt-in.
@@ -1365,12 +1363,10 @@ impl HotConfig {
         self.get_non_negative_u32("completeness", "max_retries", 2)
     }
 
-    /// Whether eligible best attempts may return with warnings after retries fail.
-    ///
-    /// Default is `false`: exhausted failures are errors before document output.
-    /// Opting in still rejects empty, below-floor, identity, and structure failures.
+    /// Retain complete original paragraphs after exhausted content validation.
+    /// Missing settings default to true; explicit false preserves strict failure.
     pub fn completeness_warn_only(&self) -> bool {
-        self.get_bool("completeness", "warn_only", false)
+        self.get_bool("completeness", "warn_only", true)
     }
 
     /// Whether ordinary callers may reuse/store application translation outputs.
@@ -1551,6 +1547,16 @@ impl HotConfig {
         let content = std::fs::read_to_string(&self.path)?;
         let data: toml::Table = toml::from_str(&content)
             .map_err(|e| CoreError::Config(format!("{}: {}", self.path.display(), e)))?;
+        if let Some(value) = data.get("completeness") {
+            let table = value
+                .as_table()
+                .ok_or_else(|| CoreError::Config("completeness must be a table".into()))?;
+            if table.get("warn_only").is_some_and(|value| !value.is_bool()) {
+                return Err(CoreError::Config(
+                    "completeness.warn_only must be a boolean".into(),
+                ));
+            }
+        }
         validate_backend_context(&data)?;
         let profile = self
             .state
@@ -1849,9 +1855,33 @@ mod tests {
         assert!((cfg.completeness_en_to_zh_min_ratio() - 0.3).abs() < f64::EPSILON);
         assert!((cfg.completeness_min_paragraph_ratio() - 0.5).abs() < f64::EPSILON);
         assert_eq!(cfg.completeness_max_retries(), 2);
-        assert!(!cfg.completeness_warn_only());
+        assert!(cfg.completeness_warn_only());
         assert!(!cfg.strict_token_budget());
         assert!(!cfg.application_cache_enabled());
+    }
+
+    #[test]
+    fn retained_original_default_explicit_strict_and_invalid_config() {
+        for (suffix, enabled) in [
+            ("", true),
+            ("[completeness]\n", true),
+            ("[completeness]\nwarn_only = false\n", false),
+            ("[completeness]\nwarn_only = true\n", true),
+        ] {
+            let path = temp_config_path("retained-original-policy");
+            fs::write(&path, suffix).unwrap();
+            assert_eq!(
+                HotConfig::from_path(&path)
+                    .unwrap()
+                    .completeness_warn_only(),
+                enabled
+            );
+        }
+        for invalid in ["completeness = false", "[completeness]\nwarn_only = 'true'"] {
+            let path = temp_config_path("invalid-retained-original-policy");
+            fs::write(&path, invalid).unwrap();
+            assert!(HotConfig::from_path(&path).is_err());
+        }
     }
 
     #[test]

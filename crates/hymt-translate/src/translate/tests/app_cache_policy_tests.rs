@@ -276,6 +276,7 @@ async fn populated_stream_proof_binds_captured_requests_for_both_priority_settin
                 "budget":format!("{:?}",plan.token_budget),
                 "document":plan.document_plan,"indexes":plan.segment_section_indexes,
                 "groups":plan.segment_section_groups,
+                "original_paragraphs":format!("{:?}", plan.original_paragraphs),
             }))
             .unwrap(),
         );

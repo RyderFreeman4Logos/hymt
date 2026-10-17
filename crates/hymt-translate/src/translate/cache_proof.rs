@@ -231,6 +231,7 @@ pub(super) fn cached_owned_payloads_match(
         document_plan: Some(document.clone()),
         segment_section_indexes: groups.iter().map(|group| group[0]).collect(),
         segment_section_groups: groups,
+        original_paragraphs: plan.original_paragraphs.clone(),
     };
     let Ok(contexts) = super::segment_contexts(&scratch) else {
         return false;

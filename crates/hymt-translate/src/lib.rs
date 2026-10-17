@@ -7,6 +7,7 @@ pub mod translate;
 
 pub use translate::{
     plan_translation, translate_file, translate_text, translate_text_stream,
-    translate_text_stream_with_mode, write_translation_output, StreamEvent, StreamOutputMode,
-    TokenBudget, TokenCountingSource, TranslationCtx, TranslationOutcome, TranslationPlan,
+    translate_text_stream_with_mode, write_translation_output, RetainedRegion, StreamEvent,
+    StreamOutputMode, TokenBudget, TokenCountingSource, TranslationCtx, TranslationOutcome,
+    TranslationPlan,
 };
