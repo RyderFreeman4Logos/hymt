@@ -1795,7 +1795,7 @@ mod tests {
         assert_eq!(cfg.concurrency(), 1);
         assert_eq!(cfg.primary_lang(), "zh");
         assert_eq!(cfg.secondary_lang(), "en");
-        assert_eq!(cfg.stream(), true);
+        assert!(cfg.stream());
         assert!((cfg.timeout() - 600.0).abs() < f64::EPSILON);
         assert_eq!(cfg.max_source_tokens_per_segment(), 384);
         assert!((cfg.completeness_zh_to_en_min_ratio() - 0.3).abs() < f64::EPSILON);
@@ -1914,8 +1914,7 @@ mod tests {
             fs::write(&path, format!("[backend]\n{backend}\n")).unwrap();
 
             let error = HotConfig::from_path(&path)
-                .err()
-                .expect("inconsistent backend context must fail at load");
+                .expect_err("inconsistent backend context must fail at load");
             let message = match error {
                 CoreError::Config(message) => message,
                 error => panic!("{tag}: expected a configuration error, got {error}"),

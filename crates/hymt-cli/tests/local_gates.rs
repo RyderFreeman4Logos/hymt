@@ -1467,7 +1467,7 @@ print(f'ORACLE signal={signum} cleanup_error={cleanup_error} bounded={bounded} s
         assert_eq!(leaf.parent(), Some(fixture.root.as_path()));
         assert_eq!(
             fixture.artifacts.lock().unwrap().as_slice(),
-            &[leaf.clone()]
+            std::slice::from_ref(&leaf)
         );
         assert!(leaf.join("gate.log").exists());
         if !text.contains("bounded=True")

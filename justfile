@@ -50,7 +50,7 @@ fmt:
     {{_io_prefix}} cargo fmt --all -- --check
 
 lint:
-    {{_io_prefix}} cargo clippy --workspace --locked -- -D warnings
+    {{_io_prefix}} cargo clippy --workspace --all-targets --locked -- -D warnings
 
 check:
     {{_io_prefix}} cargo check --workspace --locked

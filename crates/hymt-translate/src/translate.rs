@@ -3848,15 +3848,16 @@ max_retries = 1
         );
         let destination_at = translated.find(destination).expect("link destination");
         assert!(translated[destination_at + destination.len()..].contains(mock_translation));
-        let requests = server.requests.lock().unwrap();
-        assert!(
-            requests
-                .iter()
-                .all(|request| !request.contains(destination)),
-            "model request contained the opaque destination"
-        );
-        assert!(requests.iter().any(|request| request.contains("report")));
-        drop(requests);
+        {
+            let requests = server.requests.lock().unwrap();
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| !request.contains(destination)),
+                "model request contained the opaque destination"
+            );
+            assert!(requests.iter().any(|request| request.contains("report")));
+        }
 
         let streaming_server = start_capturing_mock_server(vec![
             MockResponse::Sse(vec![mock_translation.to_owned()]),
@@ -3986,15 +3987,16 @@ After ordinary prose must also be translated in document order.\n"
             &translations,
         );
 
-        let requests = server.requests.lock().unwrap();
-        assert_eq!(requests.len(), plan.segment_count());
-        assert!(
-            requests
-                .iter()
-                .all(|request| !request.contains("OVERSIZED_PROTECTED_TABLE")),
-            "protected table reached the model: {requests:?}"
-        );
-        drop(requests);
+        {
+            let requests = server.requests.lock().unwrap();
+            assert_eq!(requests.len(), plan.segment_count());
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| !request.contains("OVERSIZED_PROTECTED_TABLE")),
+                "protected table reached the model: {requests:?}"
+            );
+        }
 
         let mut streaming_responses = vec![MockResponse::Sse(vec![translations[0].clone()])];
         streaming_responses.extend(translations.iter().skip(1).cloned().map(MockResponse::Json));
@@ -4370,24 +4372,25 @@ After ordinary prose must also be translated in document order.\n"
             previous_output_contents,
             "atomic rename must not mutate the old output inode"
         );
-        let requests = server.requests.lock().unwrap();
-        assert!(
-            requests
+        let first_request_count = {
+            let requests = server.requests.lock().unwrap();
+            assert!(
+                requests
+                    .iter()
+                    .any(|request| request.contains("Preserve complete heading structure")),
+                "heading title must remain translatable"
+            );
+            assert!(
+                requests
+                    .iter()
+                    .any(|request| request.contains("the public reference guide")),
+                "link label must remain translatable"
+            );
+            assert!(requests
                 .iter()
-                .any(|request| request.contains("Preserve complete heading structure")),
-            "heading title must remain translatable"
-        );
-        assert!(
-            requests
-                .iter()
-                .any(|request| request.contains("the public reference guide")),
-            "link label must remain translatable"
-        );
-        assert!(requests
-            .iter()
-            .all(|request| !request.contains("https://example.test/structure")));
-        let first_request_count = requests.len();
-        drop(requests);
+                .all(|request| !request.contains("https://example.test/structure")));
+            requests.len()
+        };
 
         crate::doc_translate::run_doc_translation(&input, &doc_opts)
             .await
@@ -5038,7 +5041,7 @@ After ordinary prose must also be translated in document order.\n"
         assert_eq!(seg.count_tokens(text), 820);
 
         let plan = plan_translation(
-            &text,
+            text,
             "zh",
             &cfg,
             &seg,
@@ -6927,11 +6930,10 @@ max_retries = 1
             while rx.recv().await.is_some() {}
             // The timing logger always targets stderr; verify flag path by re-emitting a sample
             // and checking the public helper semantics through config.
-            format!(
-                "hymt chunk-timing: segment=0 event=request_start t_ms=0.0\n\
-                 hymt chunk-timing: segment=0 event=first_token t_ms=1.0\n\
-                 hymt chunk-timing: segment=0 event=complete t_ms=2.0\n"
-            )
+            "hymt chunk-timing: segment=0 event=request_start t_ms=0.0\n\
+             hymt chunk-timing: segment=0 event=first_token t_ms=1.0\n\
+             hymt chunk-timing: segment=0 event=complete t_ms=2.0\n"
+                .to_owned()
         };
 
         assert!(stderr.contains("hymt chunk-timing:"));
