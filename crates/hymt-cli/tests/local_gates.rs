@@ -1031,7 +1031,7 @@ async fn local_gates_fixed_aggregate_uses_all_locked_linux_checks() {
         std::fs::read_to_string(counter).unwrap(),
         concat!(
             "fmt --all -- --check\n",
-            "clippy --workspace --locked -- -D warnings\n",
+            "clippy --workspace --all-targets --locked -- -D warnings\n",
             "test --workspace --locked\n",
             "check --workspace --locked\n",
             "check -p hymt-cli --locked --no-default-features\n",
