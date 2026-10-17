@@ -184,7 +184,7 @@ impl Fixture {
         self.add_inputs(&[("justfile", &format!(
             "set shell := [\"bash\", \"-c\"]\npre-push-gate target=\"head\":\n    python3 scripts/hooks/local-gates.py run {{{{target}}}}\n_full-gate:\n    {body}\n"
         ))]).await;
-        let mut command = self.command("/home/obj/.local/share/mise/shims/just");
+        let mut command = self.command("just");
         command.args(["--no-dotenv", "pre-push-gate", "head"]);
         self.output(command).await
     }
@@ -1015,7 +1015,7 @@ async fn local_gates_fixed_aggregate_uses_all_locked_linux_checks() {
     std::fs::write(&verify, "#!/bin/bash\nprintf '%s\\n' 'hy-mt2-throughput.service: Command /home/obj/.local/share/llama-cpp-cuda/llama-server is not executable: No such file or directory'\nexit 1\n").unwrap();
     std::fs::set_permissions(&verify, std::fs::Permissions::from_mode(0o700)).unwrap();
     fixture.add_inputs(&[("fixture.toml", "value = 1\n")]).await;
-    let mut command = fixture.command("/home/obj/.local/share/mise/shims/just");
+    let mut command = fixture.command("just");
     command.args(["--no-dotenv", "pre-push-gate", "head"]).env(
         "PATH",
         format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
@@ -1054,7 +1054,7 @@ async fn local_gates_fixed_aggregate_uses_all_locked_linux_checks() {
     fixture
         .git(&["commit", "-m", "broken synthetic cache suite"])
         .await;
-    let mut command = fixture.command("/home/obj/.local/share/mise/shims/just");
+    let mut command = fixture.command("just");
     command.args(["--no-dotenv", "pre-push-gate", "head"]).env(
         "PATH",
         format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
