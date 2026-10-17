@@ -11,7 +11,7 @@ Use `hymt exec` when an agent or user wants original command output preserved an
 
 - Basic form: `hymt exec -- <command> [args...]`
 - Target language: `hymt -l zh exec -- cargo build`
-- Original stdout and stderr are streamed unchanged while the command runs.
+- Original stdout and stderr are captured and printed unchanged after the wrapped command exits, before translated output. Translation errors do not change the wrapped command's exit status.
 - After completion, stderr is translated when textual. Stdout is translated by default, but binary, JSON, XML, YAML-like structured output, configured skip patterns, and configured skip commands are skipped.
 - Translated stderr is yellow on a TTY; translated stdout is cyan on a TTY. When stdout is piped, translated stdout is written to stderr so the command's stdout stays pipe-safe.
 - `Ctrl+C` during the translation phase cancels translation without changing the wrapped command's exit status.

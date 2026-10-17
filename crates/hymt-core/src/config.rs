@@ -78,12 +78,10 @@ zh_to_en_min_ratio = 0.3
 en_to_zh_min_ratio = 0.3
 min_paragraph_ratio = 0.5
 max_retries = 2
-# When false (default), top-level CLI translation exits non-zero after writing
-# best attempt if any segment exhausted completeness retries (provided the
-# attempt meets the minimum 33% output floor). Set true (or pass
-# --warn-only-completeness) to keep exit 0 with warnings only. Attempts that
-# are empty or below the 33% floor are always rejected as errors and never
-# written, even with warn_only = true.
+# Failed completeness retries are rejected before output, cache, or success history.
+# Set true (or pass --warn-only-completeness) to explicitly allow eligible degraded
+# best attempts with warnings. Empty, below-33%, identity, and Markdown structure
+# failures remain errors even in this opt-in mode.
 warn_only = false
 
 [cache]
@@ -1321,10 +1319,10 @@ impl HotConfig {
         self.get_non_negative_u32("completeness", "max_retries", 2)
     }
 
-    /// When true, completeness best-attempt fallback only warns (exit 0).
+    /// Whether eligible best attempts may return with warnings after retries fail.
     ///
-    /// Default is `false`: top-level CLI translation reports non-success after
-    /// writing the best-effort output so scripts can detect degraded results.
+    /// Default is `false`: exhausted failures are errors before document output.
+    /// Opting in still rejects empty, below-floor, identity, and structure failures.
     pub fn completeness_warn_only(&self) -> bool {
         self.get_bool("completeness", "warn_only", false)
     }
@@ -1797,7 +1795,7 @@ mod tests {
         assert_eq!(cfg.concurrency(), 1);
         assert_eq!(cfg.primary_lang(), "zh");
         assert_eq!(cfg.secondary_lang(), "en");
-        assert_eq!(cfg.stream(), true);
+        assert!(cfg.stream());
         assert!((cfg.timeout() - 600.0).abs() < f64::EPSILON);
         assert_eq!(cfg.max_source_tokens_per_segment(), 384);
         assert!((cfg.completeness_zh_to_en_min_ratio() - 0.3).abs() < f64::EPSILON);
@@ -1916,8 +1914,7 @@ mod tests {
             fs::write(&path, format!("[backend]\n{backend}\n")).unwrap();
 
             let error = HotConfig::from_path(&path)
-                .err()
-                .expect("inconsistent backend context must fail at load");
+                .expect_err("inconsistent backend context must fail at load");
             let message = match error {
                 CoreError::Config(message) => message,
                 error => panic!("{tag}: expected a configuration error, got {error}"),

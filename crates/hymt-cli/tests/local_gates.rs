@@ -1031,7 +1031,7 @@ async fn local_gates_fixed_aggregate_uses_all_locked_linux_checks() {
         std::fs::read_to_string(counter).unwrap(),
         concat!(
             "fmt --all -- --check\n",
-            "clippy --workspace --locked -- -D warnings\n",
+            "clippy --workspace --all-targets --locked -- -D warnings\n",
             "test --workspace --locked\n",
             "check --workspace --locked\n",
             "check -p hymt-cli --locked --no-default-features\n",
@@ -1467,7 +1467,7 @@ print(f'ORACLE signal={signum} cleanup_error={cleanup_error} bounded={bounded} s
         assert_eq!(leaf.parent(), Some(fixture.root.as_path()));
         assert_eq!(
             fixture.artifacts.lock().unwrap().as_slice(),
-            &[leaf.clone()]
+            std::slice::from_ref(&leaf)
         );
         assert!(leaf.join("gate.log").exists());
         if !text.contains("bounded=True")

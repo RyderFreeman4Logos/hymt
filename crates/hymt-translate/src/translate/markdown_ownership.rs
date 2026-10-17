@@ -251,6 +251,27 @@ fn protected_markdown_structure_ranges(text: &str) -> Vec<Range<usize>> {
         .iter()
         .map(|(_, definition)| definition.span.clone())
         .collect();
+    // The definition map retains only the first binding. Parser-invisible gaps
+    // also include later duplicate definitions; translating them creates visible
+    // prose from hidden syntax. Preserve these bytes using the same offset parser.
+    let events: Vec<_> = parser.into_offset_iter().collect();
+    let covered = merge_ranges(
+        events
+            .iter()
+            .filter(|(event, _)| !matches!(event, Event::Start(_) | Event::End(_)))
+            .map(|(_, range)| range.clone())
+            .collect(),
+    );
+    let mut cursor = 0;
+    for range in covered {
+        if cursor < range.start && !text[cursor..range.start].trim().is_empty() {
+            owned.push(cursor..range.start);
+        }
+        cursor = cursor.max(range.end);
+    }
+    if cursor < text.len() && !text[cursor..].trim().is_empty() {
+        owned.push(cursor..text.len());
+    }
     let bytes = text.as_bytes();
     let mut index = 0;
     while index + 1 < bytes.len() {
@@ -302,7 +323,7 @@ fn protected_markdown_structure_ranges(text: &str) -> Vec<Range<usize>> {
     let mut literal_delimiters = Vec::new();
     let mut paragraph = None;
     let mut table_paragraphs = Vec::new();
-    for (event, range) in parser.into_offset_iter() {
+    for (event, range) in events {
         match event {
             Event::Start(Tag::Paragraph) => paragraph = Some(range),
             Event::End(TagEnd::Paragraph) => paragraph = None,
@@ -399,6 +420,14 @@ fn protected_markdown_structure_ranges(text: &str) -> Vec<Range<usize>> {
         owned.push(start..end);
         opaque.push(start..end);
         protected_end = end;
+    }
+    // Immutable identities must never be divided into independently translated leaves.
+    // Account actual haystack bytes handed to recognition, not result counts.
+    #[cfg(test)]
+    super::tests::record_placeholder_scan(text.len());
+    for range in hymt_core::completeness::preserved_placeholder_ranges(text) {
+        owned.push(range.clone());
+        opaque.push(range);
     }
     exclude_opaque(&mut editable, opaque);
     owned_gaps(text, owned, &editable)
@@ -497,4 +526,20 @@ fn is_markdown_table_separator(line: &str) -> bool {
             let marker = cell.trim().trim_matches(':');
             marker.len() >= 3 && marker.bytes().all(|byte| byte == b'-')
         })
+}
+
+#[cfg(test)]
+mod document_proof_tests {
+    use super::protected_markdown_structure_ranges;
+
+    #[test]
+    fn duplicate_hidden_reference_definition_is_source_owned() {
+        let hidden = "[ID]: ../second \"Hidden duplicate\"\n";
+        let source = format!("[label][id]\n\n[id]: ../first \"Title\"\n{hidden}");
+        let start = source.find(hidden).unwrap();
+        let end = start + hidden.len();
+        assert!(protected_markdown_structure_ranges(&source)
+            .iter()
+            .any(|range| range.start <= start && end <= range.end));
+    }
 }

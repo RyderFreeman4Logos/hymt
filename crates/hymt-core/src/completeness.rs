@@ -11,6 +11,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::language_spec::{language_spec_or_none, LanguageFamily};
 
+mod identity;
+pub use identity::{identity_preservation_failures, parse_json_document, preserved_urls};
+mod json_content;
+#[cfg(test)]
+mod newline_tests;
+pub use json_content::json_string_values;
+mod placeholders;
+pub use placeholders::{preserved_placeholder_ranges, preserved_placeholders};
 mod urls;
 pub use urls::preserved_url_ranges;
 use urls::urls;
@@ -78,6 +86,9 @@ pub enum CompletionTermination {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompletenessContext {
     pub termination: CompletionTermination,
+    /// The source leaf starts after non-whitespace on its original line.
+    #[serde(default)]
+    pub markdown_inline_start: bool,
 }
 
 /// Indicates whether density bounds are calibrated for the selected target.
@@ -163,8 +174,26 @@ pub fn validate_completeness_with_context(
     context: &CompletenessContext,
 ) -> CompletenessResult {
     let thresholds = thresholds.cloned().unwrap_or_default();
-    let input_stats = compute_stats(input_text);
-    let output_stats = compute_stats(output_text);
+    let input_json = parse_json_document(input_text);
+    let output_json = input_json
+        .as_ref()
+        .and_then(|_| parse_json_document(output_text));
+    let mut input_stats = input_json
+        .as_ref()
+        .map_or_else(|| compute_stats(input_text), json_content::stats);
+    let mut output_stats = output_json
+        .as_ref()
+        .map_or_else(|| compute_stats(output_text), json_content::stats);
+    if input_json.is_none() && context.markdown_inline_start {
+        for (text, stats) in [
+            (input_text, &mut input_stats),
+            (output_text, &mut output_stats),
+        ] {
+            let framed = format!("x {text}");
+            stats.heading_count = count_markdown_headings(&framed);
+            stats.fenced_code_block_count = count_fenced_code_blocks(&framed);
+        }
+    }
     let density = density_check(&input_stats, &output_stats, target_lang, &thresholds);
     let mut checks_failed = Vec::new();
     let mut advisory_warnings = Vec::new();
@@ -183,18 +212,13 @@ pub fn validate_completeness_with_context(
     // UTF-8-byte/4 estimate the segmenter uses when its tokenizer is absent.
     // Scalar ratios reject complete English→Chinese prose because Chinese uses
     // fewer scalars per word. Other targets stay explicit advisories.
-    let mut density_passed = None;
     match density.status {
         DensityStatus::Calibrated => {
             if let Some(ratio) = density.ratio {
                 if ratio < density.minimum_ratio.unwrap_or_default() {
                     checks_failed.push("token_ratio".to_owned());
-                    density_passed = Some(false);
                 } else if ratio > density.maximum_ratio.unwrap_or(f64::INFINITY) {
                     checks_failed.push("density_upper_bound".to_owned());
-                    density_passed = Some(false);
-                } else {
-                    density_passed = Some(true);
                 }
             }
         }
@@ -205,11 +229,7 @@ pub fn validate_completeness_with_context(
     if input_stats.paragraph_count > 0 {
         let ratio = output_stats.paragraph_count as f64 / input_stats.paragraph_count as f64;
         if ratio < thresholds.min_paragraph_ratio {
-            if density_passed == Some(true) {
-                advisory_warnings.push("paragraph_count".to_owned());
-            } else {
-                checks_failed.push("paragraph_count".to_owned());
-            }
+            checks_failed.push("paragraph_count".to_owned());
         }
     }
 
@@ -219,22 +239,7 @@ pub fn validate_completeness_with_context(
     if input_stats.fenced_code_block_count > output_stats.fenced_code_block_count {
         checks_failed.push("fenced_code_preservation".to_owned());
     }
-    if !preserves_all(
-        &placeholder_tokens(input_text),
-        &placeholder_tokens(output_text),
-    ) {
-        checks_failed.push("placeholder_preservation".to_owned());
-    }
-    if !preserves_all(&urls(input_text), &urls(output_text)) {
-        checks_failed.push("url_preservation".to_owned());
-    }
-    if let Some(input_json) = parse_json_document(input_text) {
-        match serde_json::from_str::<serde_json::Value>(output_text.trim()) {
-            Ok(output_json) if preserves_json_object_keys(&input_json, &output_json) => {}
-            Ok(_) => checks_failed.push("json_key_preservation".to_owned()),
-            Err(_) => checks_failed.push("json_validity".to_owned()),
-        }
-    }
+    checks_failed.extend(identity_preservation_failures(input_text, output_text));
     if generic_refusal(output_text) {
         checks_failed.push("generic_refusal".to_owned());
     }
@@ -244,6 +249,14 @@ pub fn validate_completeness_with_context(
         checks_failed.retain(|check| check != "token_ratio" && check != "paragraph_count");
         if checks_failed.len() != before {
             advisory_warnings.push("cli_help_density".to_owned());
+        }
+    }
+
+    if let (Some(input), Some(output)) = (&input_json, &output_json) {
+        for failure in json_content::string_failures(input, output, target_lang, &thresholds) {
+            if !checks_failed.contains(&failure) {
+                checks_failed.push(failure);
+            }
         }
     }
 
@@ -271,7 +284,7 @@ fn compute_stats(text: &str) -> CompletenessStats {
         heading_count: count_markdown_headings(text),
         fenced_code_block_count: count_fenced_code_blocks(text),
         url_count: urls(text).len(),
-        placeholder_count: placeholder_tokens(text).len(),
+        placeholder_count: preserved_placeholders(text).len(),
     }
 }
 
@@ -360,82 +373,19 @@ fn count_fenced_code_blocks(text: &str) -> usize {
         .div_ceil(2)
 }
 
-fn placeholder_tokens(text: &str) -> HashSet<String> {
-    let mut tokens = HashSet::new();
-    let mut remaining = text;
-    while let Some(start) = remaining.find("{{") {
-        let after_start = &remaining[start + 2..];
-        let Some(end) = after_start.find("}}") else {
-            break;
-        };
-        let candidate = &after_start[..end];
-        if !candidate.trim().is_empty() {
-            tokens.insert(format!("{{{{{candidate}}}}}"));
-        }
-        remaining = &after_start[end + 2..];
-    }
-
-    let mut remaining = text;
-    while let Some(start) = remaining.find('{') {
-        let after_start = &remaining[start + 1..];
-        let Some(end) = after_start.find('}') else {
-            break;
-        };
-        let candidate = &after_start[..end];
-        if !candidate.is_empty()
-            && candidate.chars().all(|character| {
-                character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
-            })
-        {
-            tokens.insert(format!("{{{candidate}}}"));
-        }
-        remaining = &after_start[end + 1..];
-    }
-    tokens
-}
-
-pub fn preserved_urls(text: &str) -> HashSet<String> {
-    urls(text)
-}
-
-fn preserves_all(input: &HashSet<String>, output: &HashSet<String>) -> bool {
-    input.iter().all(|token| output.contains(token))
-}
-
-fn parse_json_document(text: &str) -> Option<serde_json::Value> {
-    let trimmed = text.trim();
-    (trimmed.starts_with('{') || trimmed.starts_with('['))
-        .then(|| serde_json::from_str::<serde_json::Value>(trimmed).ok())
-        .flatten()
-}
-
-fn preserves_json_object_keys(input: &serde_json::Value, output: &serde_json::Value) -> bool {
-    match input {
-        serde_json::Value::Object(input) => {
-            let serde_json::Value::Object(output) = output else {
-                return false;
-            };
-            input.iter().all(|(key, input_value)| {
-                output.get(key).is_some_and(|output_value| {
-                    preserves_json_object_keys(input_value, output_value)
-                })
-            })
-        }
-        serde_json::Value::Array(input) => {
-            let serde_json::Value::Array(output) = output else {
-                return false;
-            };
-            input.len() <= output.len()
-                && input.iter().zip(output).all(|(input_value, output_value)| {
-                    preserves_json_object_keys(input_value, output_value)
-                })
-        }
-        _ => true,
-    }
-}
-
 fn count_paragraphs(text: &str) -> usize {
-    text.split("\n\n").filter(|b| !b.trim().is_empty()).count()
+    // LF and CRLF end lines; a lone CR remains within its line.
+    let mut count = 0;
+    let mut in_paragraph = false;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            in_paragraph = false;
+        } else if !in_paragraph {
+            count += 1;
+            in_paragraph = true;
+        }
+    }
+    count
 }
 
 /// Same fallback as `hymt_segment::estimate_token_count`: one token per four UTF-8 bytes.
@@ -857,28 +807,23 @@ mod tests {
     // ── Advisory warnings ────────────────────────────────────────────────────
 
     #[test]
-    fn zh_to_en_paragraph_merge_is_advisory() {
+    fn zh_to_en_paragraph_loss_is_rejected_despite_length() {
         // 3 paras in zh, 1 in en. Ratio = 0.33 < 0.5 (threshold)
         let input = "第一段。\n\n第二段。\n\n第三段。";
         let output = "Para one and two and three merged into one single paragraph that is long enough to pass ratio.";
         let result = validate_completeness(input, output, "en", None);
-        // Should be complete because char_ratio passed (output is long enough)
-        assert!(result.is_complete);
-        assert!(result
-            .advisory_warnings
-            .contains(&"paragraph_count".to_owned()));
-        assert!(!result.checks_failed.contains(&"paragraph_count".to_owned()));
+        // Length cannot establish that all three source paragraphs survived.
+        assert!(!result.is_complete);
+        assert!(result.checks_failed.contains(&"paragraph_count".to_owned()));
     }
 
     #[test]
-    fn en_to_zh_paragraph_merge_is_advisory() {
+    fn en_to_zh_paragraph_loss_is_rejected_despite_length() {
         let input = "Para one.\n\nPara two.\n\nPara three.";
         let output = "第一段、第二段和第三段被合并成了一个足够长的段落。";
         let result = validate_completeness(input, output, "zh", None);
-        assert!(result.is_complete);
-        assert!(result
-            .advisory_warnings
-            .contains(&"paragraph_count".to_owned()));
+        assert!(!result.is_complete);
+        assert!(result.checks_failed.contains(&"paragraph_count".to_owned()));
     }
 
     #[test]
@@ -1204,6 +1149,7 @@ verbatim ask --no-generate --format json \"哪些证据是相关的？\"";
     fn finish_reason_length_is_retryable_transport_failure() {
         let context = CompletenessContext {
             termination: CompletionTermination::Length,
+            ..CompletenessContext::default()
         };
         let result = validate_completeness_with_context(
             "Source text.",

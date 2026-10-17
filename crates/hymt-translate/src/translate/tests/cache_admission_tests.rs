@@ -177,7 +177,10 @@ fn make_markdown_plan(
     assert!(!link_segment.contains(LINK_URL));
     assert_eq!(
         markdown_structure(link_segment),
-        MarkdownStructure::default()
+        MarkdownStructure {
+            blocks: vec!["start:Paragraph".to_owned(), "end:Paragraph".to_owned()],
+            ..MarkdownStructure::default()
+        }
     );
     assert_eq!(
         markdown_structure(SOURCE).headings,
@@ -195,6 +198,10 @@ fn translation_for(segment: &str, broken: bool) -> String {
         } else {
             VALID_LABEL.to_owned()
         }
+    } else if segment.trim() == "Strong" {
+        "强调".to_owned()
+    } else if segment.trim() == "rest" {
+        "其余".to_owned()
     } else if segment.trim() == "Public Guide" {
         "公共指南".to_owned()
     } else if segment.trim() == "Read" {
@@ -298,16 +305,18 @@ async fn degraded_termination_is_not_laundered_by_warm_cache() {
     };
     let cold = translate_text(source, "zh", &TemplateType::Default, &opts, &ctx)
         .await
-        .unwrap();
-    assert!(cold.is_completeness_degraded());
+        .unwrap_err();
+    assert!(format!("{cold:#}").contains("finish_reason_length"));
+    assert!(history.fetch_recent(None).unwrap().is_empty());
     assert_eq!(provider.requests.lock().unwrap().len(), 2);
     let warm = translate_text(source, "zh", &TemplateType::Default, &opts, &ctx)
         .await
-        .unwrap();
+        .unwrap_err();
     assert!(
-        warm.is_completeness_degraded(),
+        format!("{warm:#}").contains("finish_reason_length"),
         "warm cache must not erase Length evidence"
     );
+    assert!(history.fetch_recent(None).unwrap().is_empty());
     assert_eq!(provider.requests.lock().unwrap().len(), 4);
 }
 
@@ -631,7 +640,10 @@ fn markdown_owner_matrix_preserves_complete_inline_nodes() {
         let plan = plan_translation(source, "zh", &config, &segmenter, &TemplateType::Default, &PromptOpts::default()).unwrap();
         for segment in &plan.segments {
             assert!(!segment.contains("https://"), "destination leaked: source={source:?}, segment={segment:?}");
-            assert_eq!(markdown_structure(segment), MarkdownStructure::default(), "incomplete inline owner: source={source:?}, segment={segment:?}");
+            assert_eq!(markdown_structure(segment), MarkdownStructure {
+                blocks: vec!["start:Paragraph".to_owned(), "end:Paragraph".to_owned()],
+                ..MarkdownStructure::default()
+            }, "incomplete inline owner: source={source:?}, segment={segment:?}");
         }
         let output = plan.reconstruct(&vec!["Traduction".to_owned(); plan.segment_count()]);
         assert_eq!(markdown_structure(&output), markdown_structure(source), "syntax mismatch: source={source:?}, output={output:?}");
@@ -695,7 +707,10 @@ async fn markdown_inline_owners_preserve_syntax_and_translate_labels() {
         );
         assert_eq!(
             markdown_structure(segment),
-            MarkdownStructure::default(),
+            MarkdownStructure {
+                blocks: vec!["start:Paragraph".to_owned(), "end:Paragraph".to_owned()],
+                ..MarkdownStructure::default()
+            },
             "model input must be plain complete text: {segment:?}"
         );
         assert!(
@@ -715,7 +730,7 @@ async fn markdown_inline_owners_preserve_syntax_and_translate_labels() {
     let outcome = translate_text(source, "zh", &TemplateType::Default, &opts, &ctx)
         .await
         .unwrap();
-    assert!(outcome.text.contains(&format!("**{OTHER_TRANSLATION}**")));
+    assert!(outcome.text.contains("**强调**"));
     assert!(outcome.text.contains(&format!(
         "![{OTHER_TRANSLATION}](https://example.test/diagram.png \"Figure\")"
     )));

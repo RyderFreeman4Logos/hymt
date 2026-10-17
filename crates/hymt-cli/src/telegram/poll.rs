@@ -1113,6 +1113,11 @@ fn redact_token_in_text(token: &str, text: &str) -> String {
     text.replace(token, "<redacted>")
 }
 
+fn make_segmenter(config: &HotConfig) -> Result<Segmenter> {
+    let profile = config.model_profile()?;
+    hymt_segment::create_segmenter(profile).map_err(|error| anyhow::anyhow!("{error}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1603,9 +1608,4 @@ mod tests {
         .unwrap();
         assert_eq!(api.calls(), vec![DocumentCall::Send(denial_text().into())]);
     }
-}
-
-fn make_segmenter(config: &HotConfig) -> Result<Segmenter> {
-    let profile = config.model_profile()?;
-    hymt_segment::create_segmenter(profile).map_err(|error| anyhow::anyhow!("{error}"))
 }

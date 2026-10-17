@@ -37,7 +37,7 @@ fn payload_from_config(contents: &str) -> serde_json::Value {
     ));
     fs::write(&path, contents).expect("write config fixture");
 
-    let result = (|| {
+    let result = {
         let config = HotConfig::from_path(&path).expect("load config fixture");
         let settings = config.generation_settings().expect("generation settings");
         let backend = config.generation_backend().expect("generation backend");
@@ -50,7 +50,7 @@ fn payload_from_config(contents: &str) -> serde_json::Value {
             backend,
         ))
         .expect("payload must serialize")
-    })();
+    };
 
     fs::remove_file(path).expect("remove config fixture");
     result

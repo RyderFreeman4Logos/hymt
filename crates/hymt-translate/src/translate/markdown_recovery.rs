@@ -2,16 +2,22 @@
 
 use pulldown_cmark::{Event, Parser};
 
-use super::{ensure_markdown_structure_preserved, markdown_structure};
+use super::{markdown_context::SegmentSource, markdown_structure};
 
 /// Remove only provider-added inline-code delimiters when the Markdown parse
 /// proves that no other syntax or interpreted text changes.
-pub(super) fn recover_generated_inline_code(source: &str, reply: &str) -> Option<String> {
-    if source.contains('`') || !reply.contains('`') {
+pub(super) fn recover_generated_inline_code<'a>(
+    source: impl Into<SegmentSource<'a>>,
+    reply: &str,
+) -> Option<String> {
+    let source = source.into();
+    if source.text.contains('`') || !reply.contains('`') {
         return None;
     }
-    let source_structure = markdown_structure(source);
-    let mut reply_structure = markdown_structure(reply);
+    let original_reply = reply;
+    let reply = source.frame(reply);
+    let source_structure = markdown_structure(&source.frame(source.text));
+    let mut reply_structure = markdown_structure(&reply);
     if !source_structure.code.is_empty() || reply_structure.code.is_empty() {
         return None;
     }
@@ -22,7 +28,7 @@ pub(super) fn recover_generated_inline_code(source: &str, reply: &str) -> Option
 
     let mut recovered = String::with_capacity(reply.len());
     let mut cursor = 0;
-    for (event, range) in Parser::new(reply).into_offset_iter() {
+    for (event, range) in Parser::new(&reply).into_offset_iter() {
         let Event::Code(parsed) = event else {
             continue;
         };
@@ -52,9 +58,12 @@ pub(super) fn recover_generated_inline_code(source: &str, reply: &str) -> Option
         return None;
     }
     recovered.push_str(after);
-    if recovered == reply
-        || semantic_markdown_events(reply) != semantic_markdown_events(&recovered)
-        || ensure_markdown_structure_preserved(source, &recovered).is_err()
+    let recovered = recovered
+        .get(reply.len() - original_reply.len()..)?
+        .to_owned();
+    if recovered == original_reply
+        || semantic_markdown_events(&reply) != semantic_markdown_events(&source.frame(&recovered))
+        || source.structure_preserved(&recovered).is_err()
     {
         return None;
     }

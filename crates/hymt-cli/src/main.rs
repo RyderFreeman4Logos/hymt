@@ -121,7 +121,7 @@ struct Cli {
     #[arg(long = "no-progress", global = true, hide = true)]
     no_progress: bool,
 
-    /// Keep exit 0 when completeness falls back to best attempt
+    /// Allow eligible incomplete best attempts with warnings instead of rejecting them
     #[arg(long = "warn-only-completeness", global = true)]
     warn_only_completeness: bool,
 
@@ -608,6 +608,7 @@ async fn run() -> Result<()> {
         format_type: cli.format_type.clone(),
         context: cli.ctx.clone(),
         document_translation_policy: Some(document_policy),
+        warn_only_completeness: cli.warn_only_completeness.then_some(true),
     };
 
     match cli.cmd {
