@@ -27,11 +27,20 @@ fn preserved_url_ranges_with_scan(
     text: &str,
     mut scanned: impl FnMut(UrlScanStep, usize),
 ) -> Vec<std::ops::Range<usize>> {
-    let boundaries = markdown_boundaries(text);
+    let boundaries = markdown_boundaries(text, &mut scanned);
+    scan_url_ranges(text, &boundaries, &mut scanned, |_| {})
+}
+
+fn scan_url_ranges(
+    text: &str,
+    boundaries: &[(usize, Option<usize>)],
+    scanned: &mut impl FnMut(UrlScanStep, usize),
+    mut candidate_end: impl FnMut(usize),
+) -> Vec<std::ops::Range<usize>> {
     let mut urls = Vec::new();
     let mut offset = 0;
     let mut boundary = 0;
-    while let Some(start) = earliest_url_scheme_start(&text[offset..], &mut scanned) {
+    while let Some(start) = earliest_url_scheme_start(&text[offset..], scanned) {
         let start = offset + start;
         while boundary < boundaries.len() && boundaries[boundary].0 <= start {
             scanned(UrlScanStep::Boundary, 1);
@@ -84,12 +93,16 @@ fn preserved_url_ranges_with_scan(
         if retained_end > start {
             urls.push(start..retained_end);
         }
+        candidate_end(end);
         offset = end;
     }
     urls
 }
 
-fn markdown_boundaries(text: &str) -> Vec<(usize, Option<usize>)> {
+fn markdown_boundaries(
+    text: &str,
+    scanned: &mut impl FnMut(UrlScanStep, usize),
+) -> Vec<(usize, Option<usize>)> {
     use pulldown_cmark::{Event, Parser, Tag, TagEnd};
     let mut boundaries = Vec::new();
     let mut inline = Vec::new();
@@ -134,9 +147,19 @@ fn markdown_boundaries(text: &str) -> Vec<(usize, Option<usize>)> {
             _ => {}
         }
     }
-    // Preserve the existing URL reading of internal a*b*c. A parsed suffix
-    // such as x**prose**, followed only by punctuation, belongs to Markdown.
-    // One reverse cursor classifies every suffix, including nested spans.
+    // Preserve internal a*b*c, but a parsed suffix before the actual URL
+    // endpoint belongs to Markdown. Reuse the lexer (including delimiter
+    // balance), so neither later owners nor unmatched closers hide that suffix.
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    let mut stops: Vec<_> = boundaries
+        .iter()
+        .filter_map(|&(offset, opening)| opening.is_none().then_some(offset))
+        .collect();
+    scan_url_ranges(text, &boundaries, scanned, |end| stops.push(end));
+    stops.sort_unstable();
+    stops.dedup();
+    let mut stop = stops.len();
     inline.sort_unstable_by_key(|range| std::cmp::Reverse(range.end));
     let mut suffix = text.char_indices().rev().peekable();
     let mut has_text = false;
@@ -146,10 +169,18 @@ fn markdown_boundaries(text: &str) -> Vec<(usize, Option<usize>)> {
                 break;
             }
             suffix.next();
+            while stop > 0 && stops[stop - 1] > offset {
+                has_text = false;
+                stop -= 1;
+            }
             if character.is_whitespace() || is_fullwidth_url_punctuation(character) {
                 has_text = false;
             } else if !character.is_ascii_punctuation() {
                 has_text = true;
+            }
+            if stop > 0 && stops[stop - 1] == offset {
+                has_text = false;
+                stop -= 1;
             }
         }
         if !has_text {
@@ -227,6 +258,18 @@ mod tests {
                 "https://example.test/x",
             ),
             ("https://example.test/x|Visible", "https://example.test/x"),
+            (
+                "|https://example.test/x**Visible**|Other|\n|---|---|\n",
+                "https://example.test/x",
+            ),
+            (
+                "https://example.test/x**Visible**[Other](#other)",
+                "https://example.test/x",
+            ),
+            (
+                "https://example.test/x**Visible**)Other",
+                "https://example.test/x",
+            ),
             ("https://example.test/a*b*c", "https://example.test/a*b*c"),
             (
                 "[Visible](https://example.test/a*b*c|d)",

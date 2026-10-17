@@ -637,6 +637,13 @@ async fn adjacent_url_owners_leave_prose_translatable() {
         "https://example.test/x|Visible",
         "https://example.test/x**Visible**.",
         "https://example.test/x*Visible*，",
+        "https://example.test/x**Visible**，Body",
+        "Body，_Visible_",
+        "_Visible_，Body",
+        "|https://example.test/x**Visible**|Other|\n|---|---|\n",
+        "https://example.test/x**Visible**[Other](https://other.test)",
+        "https://example.test/x**Visible**)Other",
+        "https://example.test/a_b_(c) **Visible**",
         "https://example.test/x[Visible](https://example.test/a*b*c|d)",
         "https://example.test/x![Visible](https://example.test/a*b*c|d)",
     ] {
