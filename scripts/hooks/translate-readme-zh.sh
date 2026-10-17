@@ -148,6 +148,8 @@ run_readme_consumer() {
   trap 'readme_cancel_status=130' INT
   trap 'readme_cancel_status=143' TERM
   readme_consumer_status_file="$(mktemp "${readme_workspace}/consumer-status-XXXXXXXX")" || return 1
+  # The child Bash must expand its own positional arguments and status.
+  # shellcheck disable=SC2016
   /usr/bin/setsid -- /usr/bin/bash -c '
     trap : HUP INT TERM
     status_file=$1
