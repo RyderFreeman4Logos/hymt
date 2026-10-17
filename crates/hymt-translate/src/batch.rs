@@ -126,6 +126,8 @@ pub fn build_batch_plan(
     opts: &BatchPlanOpts<'_>,
 ) -> Result<BatchPlan> {
     config.maybe_reload()?;
+    let snapshot = config.detached_snapshot();
+    let config = &snapshot;
     let concurrency = opts
         .concurrency_override
         .unwrap_or_else(|| config.concurrency())

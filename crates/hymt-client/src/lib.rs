@@ -51,6 +51,9 @@ pub enum ClientError {
 
     #[error("strict backend preflight refused translation: {0}")]
     BackendPreflight(String),
+
+    #[error("configuration changed during backend preflight")]
+    ConfigChangedDuringPreflight,
 }
 
 /// A completed non-streaming translation with its provider termination signal.
@@ -316,6 +319,7 @@ struct RuntimeCacheKey {
     endpoint_url: String,
     backend: GenerationBackend,
     profile: String,
+    config_generation: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -385,6 +389,27 @@ impl TranslationClient {
         self.inner.concurrency
     }
 
+    /// Bind a detached invocation configuration to the existing HTTP pool and limit.
+    pub fn with_config(&self, config: HotConfig) -> Result<Self, ClientError> {
+        config.generation_settings()?;
+        config.generation_backend()?;
+        let runtime_cache = self
+            .inner
+            .runtime_cache
+            .lock()
+            .ok()
+            .and_then(|entry| entry.clone());
+        Ok(Self {
+            inner: Arc::new(Inner {
+                config,
+                http: self.inner.http.clone(),
+                semaphore: Arc::clone(&self.inner.semaphore),
+                concurrency: self.inner.concurrency,
+                runtime_cache: Mutex::new(runtime_cache),
+            }),
+        })
+    }
+
     /// Discover runtime state once per endpoint/backend/profile TTL.
     ///
     /// Normal mode always returns a report: an unavailable or malformed endpoint
@@ -411,12 +436,17 @@ impl TranslationClient {
         enforce_strict: bool,
     ) -> Result<BackendPreflight, ClientError> {
         let _ = self.inner.config.maybe_reload();
+        let generation = self.inner.config.generation();
         let key = self.runtime_cache_key()?;
         if !force_refresh {
             if let Some(entry) = self.cached_runtime(&key) {
-                self.inner
+                if !self
+                    .inner
                     .config
-                    .set_backend_runtime_info(entry.runtime.clone());
+                    .set_backend_runtime_info_if_generation(generation, entry.runtime.clone())
+                {
+                    return Err(ClientError::ConfigChangedDuringPreflight);
+                }
                 return self.backend_preflight_report(
                     entry.runtime,
                     entry.warnings,
@@ -427,11 +457,26 @@ impl TranslationClient {
 
         // A changed endpoint/backend/profile must never continue planning against
         // a previous server's runtime state while this request is in flight.
-        self.inner.config.clear_backend_runtime_info();
+        if !self
+            .inner
+            .config
+            .clear_backend_runtime_info_if_generation(generation)
+        {
+            return Err(ClientError::ConfigChangedDuringPreflight);
+        }
         let observed_at = unix_timestamp_secs();
         let runtime = self.fetch_backend_runtime(key.backend, observed_at).await;
+        if !self
+            .inner
+            .config
+            .set_backend_runtime_info_if_generation(generation, runtime.clone())
+        {
+            return Err(ClientError::ConfigChangedDuringPreflight);
+        }
         let warnings = self.preflight_warnings(&runtime)?;
-        self.inner.config.set_backend_runtime_info(runtime.clone());
+        if self.inner.config.generation() != generation {
+            return Err(ClientError::ConfigChangedDuringPreflight);
+        }
         if let Ok(mut cache) = self.inner.runtime_cache.lock() {
             *cache = Some(RuntimeCacheEntry {
                 key,
@@ -448,6 +493,7 @@ impl TranslationClient {
             endpoint_url: self.inner.config.endpoint_url(),
             backend: self.inner.config.generation_backend()?,
             profile: self.inner.config.model_profile()?.id().to_owned(),
+            config_generation: self.inner.config.generation(),
         })
     }
 
@@ -796,7 +842,7 @@ impl TranslationClient {
         let headers = self.build_headers();
         let url = self.chat_url();
 
-        let response = self
+        let (response, _) = self
             .connect_stream_with_retry(&url, &payload, &headers)
             .await?;
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, ClientError>>(64);
@@ -847,14 +893,13 @@ impl TranslationClient {
         let headers = self.build_headers();
         let url = self.chat_url();
 
-        let response = self
+        let (response, cold_generation) = self
             .connect_stream_with_retry(&url, &payload, &headers)
             .await?;
         let (tx, rx) =
             tokio::sync::mpsc::channel::<Result<TranslationStreamEvent, ClientError>>(64);
 
         let is_sse = is_event_stream(&response);
-        let cold_generation = cold_generation(response.headers());
         tokio::spawn(async move {
             let _permit = permit; // held for the entire stream duration
             if tx
@@ -981,7 +1026,7 @@ impl TranslationClient {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
                     if status < 400 {
-                        let cold_generation = cold_generation(resp.headers());
+                        let cold_generation = attempt == 0 && cold_generation(resp.headers());
                         let body = resp.bytes().await?;
                         let chat: ChatResponse = serde_json::from_slice(&body)?;
                         let mut completion = extract_completion_from_response(chat)?;
@@ -1015,7 +1060,7 @@ impl TranslationClient {
         url: &str,
         payload: &ChatPayload,
         headers: &reqwest::header::HeaderMap,
-    ) -> Result<reqwest::Response, ClientError> {
+    ) -> Result<(reqwest::Response, bool), ClientError> {
         let mut last: Option<ClientError> = None;
         for attempt in 0..=MAX_RETRIES {
             match self
@@ -1030,7 +1075,8 @@ impl TranslationClient {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
                     if status < 400 {
-                        return Ok(resp);
+                        let cold = attempt == 0 && cold_generation(resp.headers());
+                        return Ok((resp, cold));
                     }
                     let body = resp.bytes().await.unwrap_or_default();
                     let err = http_error(status, &body);

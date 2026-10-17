@@ -76,6 +76,19 @@ tokio::task_local! {
 }
 
 #[cfg(test)]
+tokio::task_local! {
+    static DISPATCH_BARRIER: (std::sync::Arc<tokio::sync::Notify>, std::sync::Arc<tokio::sync::Notify>);
+}
+
+#[cfg(test)]
+async fn wait_at_dispatch_barrier() {
+    if let Ok((entered, release)) = DISPATCH_BARRIER.try_with(Clone::clone) {
+        entered.notify_one();
+        release.notified().await;
+    }
+}
+
+#[cfg(test)]
 fn acknowledge_terminal_consumer_exit() {
     let _ = TERMINAL_SENT_ACK.try_with(|ack| {
         ack.recv_timeout(std::time::Duration::from_secs(5))
@@ -1722,20 +1735,19 @@ fn partition_pipeline(
 
 // ── translate_text ─────────────────────────────────────────────────────────────
 
-/// Reload configuration before planning and enforce strict backend preflight for
-/// the same snapshot before a cache lookup or model request can proceed.
-async fn reload_config_and_preflight_strict(ctx: &TranslationCtx<'_>) -> Result<()> {
+/// Bind preparation, requests, and publication to one detached config generation.
+async fn prepare_invocation(ctx: &TranslationCtx<'_>) -> Result<(HotConfig, TranslationClient)> {
     let reloaded = ctx.config.maybe_reload()?;
-    if ctx.config.strict_backend_preflight()
-        && (reloaded || ctx.config.backend_runtime_info().is_none())
-    {
+    let config = ctx.config.detached_snapshot();
+    let client = ctx.client.with_config(config.clone())?;
+    if config.strict_backend_preflight() && (reloaded || config.backend_runtime_info().is_none()) {
         if reloaded {
-            ctx.client.refresh_backend_preflight().await?;
+            client.refresh_backend_preflight().await?;
         } else {
-            ctx.client.preflight_backend().await?;
+            client.preflight_backend().await?;
         }
     }
-    Ok(())
+    Ok((config, client))
 }
 
 /// Translate `text` to `target_lang`, caching and translating segments in parallel.
@@ -1758,7 +1770,15 @@ pub async fn translate_text(
         });
     }
 
-    reload_config_and_preflight_strict(ctx).await?;
+    let (config, client) = prepare_invocation(ctx).await?;
+    let invocation = TranslationCtx {
+        config: &config,
+        client: &client,
+        segmenter: ctx.segmenter,
+        history: ctx.history,
+        cache_enabled: ctx.cache_enabled,
+    };
+    let ctx = &invocation;
     let template_name = template.as_str();
     let plan = plan_translation(text, target_lang, ctx.config, ctx.segmenter, template, opts)?;
 
@@ -1882,6 +1902,8 @@ pub async fn translate_text(
     let mut cache_candidates = vec![false; plan.segment_count()];
 
     // ── Phase 2: parallel translate missing segments ───────────────────────────
+    #[cfg(test)]
+    wait_at_dispatch_barrier().await;
 
     let mut degraded_segments: Vec<usize> = Vec::new();
 
@@ -2124,7 +2146,15 @@ async fn translate_text_stream_inner(
     }
 
     let output_event_tx = event_tx.clone();
-    reload_config_and_preflight_strict(ctx).await?;
+    let (config, client) = prepare_invocation(ctx).await?;
+    let invocation = TranslationCtx {
+        config: &config,
+        client: &client,
+        segmenter: ctx.segmenter,
+        history: ctx.history,
+        cache_enabled: ctx.cache_enabled,
+    };
+    let ctx = &invocation;
     let template_name = template.as_str();
     let plan = plan_translation(text, target_lang, ctx.config, ctx.segmenter, template, opts)?;
     // A source-owned delimiter can change its parse when adjacent translated
@@ -2259,6 +2289,8 @@ async fn translate_text_stream_inner(
     let mut cache_candidates = vec![false; plan.segment_count()];
 
     let mut degraded_segments: Vec<usize> = Vec::new();
+    #[cfg(test)]
+    wait_at_dispatch_barrier().await;
     let mut next_section_index = 0;
     let mut cached_prefix_len = 0;
     while cached_prefix_len < plan.segment_count() && translations[cached_prefix_len].is_some() {

@@ -587,6 +587,12 @@ async fn run() -> Result<()> {
         // CLI flag forces timing logs for this process; config/env also enable them.
         std::env::set_var("HYMT_DEBUG_CHUNK_TIMING", "1");
     }
+    let config = if matches!(cli.cmd.as_ref(), Some(Cmd::Telegram(_))) {
+        config
+    } else {
+        config.maybe_reload()?;
+        config.detached_snapshot()
+    };
     let concurrency_override = cli.concurrency;
     let document_policy =
         document_translation_policy(&config, cli.force_translate_all, cli.no_language_detection);
@@ -1551,6 +1557,9 @@ async fn run_estimate(
     config: &HotConfig,
     concurrency_override: Option<u32>,
 ) -> Result<()> {
+    config.maybe_reload()?;
+    let snapshot = config.detached_snapshot();
+    let config = &snapshot;
     let client = make_client_with_concurrency(config, concurrency_override)?;
     client.refresh_backend_preflight().await?;
     let segmenter = make_segmenter(config)?;
