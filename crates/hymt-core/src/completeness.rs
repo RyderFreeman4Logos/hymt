@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::language_spec::{language_spec_or_none, LanguageFamily};
 
+mod placeholders;
+pub use placeholders::{preserved_placeholder_ranges, preserved_placeholders};
 mod urls;
 pub use urls::preserved_url_ranges;
 use urls::urls;
@@ -357,41 +359,6 @@ pub fn identity_preservation_failures(input_text: &str, output_text: &str) -> Ve
         }
     }
     checks_failed
-}
-
-/// Complete placeholder identities recognized by the completeness validator.
-pub fn preserved_placeholders(text: &str) -> HashSet<String> {
-    let mut tokens = HashSet::new();
-    let mut remaining = text;
-    while let Some(start) = remaining.find("{{") {
-        let after_start = &remaining[start + 2..];
-        let Some(end) = after_start.find("}}") else {
-            break;
-        };
-        let candidate = &after_start[..end];
-        if !candidate.trim().is_empty() {
-            tokens.insert(format!("{{{{{candidate}}}}}"));
-        }
-        remaining = &after_start[end + 2..];
-    }
-
-    let mut remaining = text;
-    while let Some(start) = remaining.find('{') {
-        let after_start = &remaining[start + 1..];
-        let Some(end) = after_start.find('}') else {
-            break;
-        };
-        let candidate = &after_start[..end];
-        if !candidate.is_empty()
-            && candidate.chars().all(|character| {
-                character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
-            })
-        {
-            tokens.insert(format!("{{{candidate}}}"));
-        }
-        remaining = &after_start[end + 1..];
-    }
-    tokens
 }
 
 pub fn preserved_urls(text: &str) -> HashSet<String> {

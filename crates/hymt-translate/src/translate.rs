@@ -2805,6 +2805,7 @@ mod tests {
     mod completeness_terminal_tests;
     mod exec_cache_tests;
     mod identity_tests;
+    pub(super) use identity_tests::record_placeholder_scan;
     mod markdown_boundary_tests;
     pub(super) use markdown_boundary_tests::record_semantic_bytes;
     pub(super) mod ownership_interval_tests;

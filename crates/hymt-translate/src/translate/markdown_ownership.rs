@@ -512,12 +512,12 @@ fn protected_markdown_structure_ranges(text: &str) -> Vec<Range<usize>> {
         protected_end = end;
     }
     // Immutable identities must never be divided into independently translated leaves.
-    for token in hymt_core::completeness::preserved_placeholders(text) {
-        for (start, _) in text.match_indices(&token) {
-            let range = start..start + token.len();
-            owned.push(range.clone());
-            opaque.push(range);
-        }
+    // Account actual haystack bytes handed to recognition, not result counts.
+    #[cfg(test)]
+    super::tests::record_placeholder_scan(text.len());
+    for range in hymt_core::completeness::preserved_placeholder_ranges(text) {
+        owned.push(range.clone());
+        opaque.push(range);
     }
     exclude_opaque(&mut editable, opaque);
     owned_gaps(text, owned, &editable)

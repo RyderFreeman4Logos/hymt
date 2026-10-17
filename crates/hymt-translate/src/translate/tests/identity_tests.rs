@@ -258,3 +258,62 @@ fn oversized_json_fails_before_fragmenting_and_placeholder_ownership_keeps_code_
     assert!(ensure_document_identities_preserved(source, &result).is_ok());
     assert!(ensure_markdown_structure_preserved(source, &result).is_ok());
 }
+
+thread_local! {
+    static PLACEHOLDER_SCAN_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub(in super::super) fn record_placeholder_scan(bytes: usize) {
+    PLACEHOLDER_SCAN_BYTES.with(|count| count.set(count.get() + bytes));
+}
+
+#[test]
+fn distinct_placeholders_use_bounded_planner_scan_work() {
+    let config = make_stream_config("http://127.0.0.1:9/v1");
+    let segmenter = fallback_segmenter();
+    let mut samples = Vec::new();
+    for count in [64, 128] {
+        let source: String = (0..count)
+            .map(|index| format!("Translate {{field_{index:05}}} accurately.\n\n"))
+            .collect();
+        PLACEHOLDER_SCAN_BYTES.with(|work| work.set(0));
+        let plan = plan_translation(
+            &source,
+            "fr",
+            &config,
+            &segmenter,
+            &TemplateType::Default,
+            &PromptOpts::default(),
+        )
+        .unwrap();
+        let work = PLACEHOLDER_SCAN_BYTES.with(std::cell::Cell::get);
+        assert!(work > 0, "oracle must observe production scanner input");
+        samples.push((source.len(), work));
+        assert!(plan
+            .segments
+            .iter()
+            .any(|segment| segment.contains("Translate")));
+        assert!(plan
+            .segments
+            .iter()
+            .all(|segment| !segment.contains("{field_")));
+        let output = plan.reconstruct(&vec![
+            "Traduction complete".to_owned();
+            plan.segment_count()
+        ]);
+        for index in 0..count {
+            assert!(output.contains(&format!("{{field_{index:05}}}")));
+        }
+    }
+    eprintln!("placeholder scanner (source bytes, scan input bytes): {samples:?}");
+    assert!(
+        samples[1].1 <= samples[0].1 * 3,
+        "doubling placeholders amplified scan work: {samples:?}"
+    );
+    for (bytes, work) in samples {
+        assert!(
+            work <= 4 * bytes,
+            "repeated full-input scans: {work} for {bytes} bytes"
+        );
+    }
+}
