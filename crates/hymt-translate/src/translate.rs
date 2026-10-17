@@ -1000,6 +1000,7 @@ fn fit_segments_to_final_request_budget(
 
 type SegmentPlanResult = (Vec<String>, Vec<usize>, Vec<Vec<usize>>);
 
+mod cache_proof;
 mod markdown_boundary;
 mod markdown_ownership;
 mod markdown_recovery;
@@ -1363,7 +1364,7 @@ pub(crate) fn cached_document_is_complete(
         &TemplateType::Default,
         opts,
     )
-    .is_ok_and(|plan| markdown_ownership::cached_owned_payloads_match(&plan, cached, segmenter))
+    .is_ok_and(|plan| cache_proof::cached_owned_payloads_match(&plan, cached))
 }
 
 fn cached_segment_is_complete(

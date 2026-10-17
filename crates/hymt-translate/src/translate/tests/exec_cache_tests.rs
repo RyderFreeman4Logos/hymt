@@ -280,3 +280,156 @@ fn whole_output_cache_uses_source_policy_and_anchored_payloads() {
         );
     }
 }
+
+#[tokio::test]
+async fn renderer_separators_survive_production_whole_cache_roundtrip() {
+    for (source, leaves, expected) in [
+        (
+            "Alpha*Title*Beta",
+            vec!["甲方", "《标题》", "乙方"],
+            "甲方 *《标题》* 乙方",
+        ),
+        (
+            "*Title.*Journal",
+            vec!["标题", "《期刊》"],
+            "*\u{a0}标题.*《期刊》",
+        ),
+    ] {
+        for shared in [false, true] {
+            let server = start_capturing_mock_server(
+                leaves
+                    .iter()
+                    .cycle()
+                    .take(leaves.len() * 2)
+                    .map(|leaf| MockResponse::Json((*leaf).to_owned()))
+                    .collect(),
+            )
+            .await;
+            let config = make_stream_config(&server.endpoint_url);
+            let client = TranslationClient::new(config.clone()).unwrap();
+            let segmenter = fallback_segmenter();
+            let dir = tempfile::tempdir().unwrap();
+            let history = HistoryDB::new(dir.path().join("history.db"));
+            let cache =
+                ExecCache::with_user_path(dir.path().join("shared.db"), dir.path().join("user.db"));
+            let opts = PromptOpts::default();
+            let policy = effective_document_translation_policy(&opts, &config);
+            let ctx = TranslationCtx {
+                config: &config,
+                client: &client,
+                segmenter: &segmenter,
+                history: &history,
+                cache_enabled: true,
+            };
+            let cold = translate_cached("man", "renderer", source, "zh", &cache, &opts, &ctx)
+                .await
+                .unwrap();
+            assert_eq!(cold, expected);
+            assert_eq!(server.requests.lock().unwrap().len(), leaves.len());
+            // Use an empty segment history so a false whole-cache miss cannot hide
+            // behind segment hits. The shared case also has no user-cache entry.
+            let warm_history = HistoryDB::new(dir.path().join("warm-history.db"));
+            let shared_cache = ExecCache::with_user_path(
+                dir.path().join("shared-only.db"),
+                dir.path().join("empty-user.db"),
+            );
+            if shared {
+                shared_cache
+                    .store_shared("man", "renderer", source, "zh", policy, &cold)
+                    .unwrap();
+            }
+            let warm_ctx = TranslationCtx {
+                history: &warm_history,
+                ..ctx
+            };
+            let warm = translate_cached(
+                "man",
+                "renderer",
+                source,
+                "zh",
+                if shared { &shared_cache } else { &cache },
+                &opts,
+                &warm_ctx,
+            )
+            .await
+            .unwrap();
+            assert_eq!(warm, cold);
+            assert_eq!(
+                server.requests.lock().unwrap().len(),
+                leaves.len(),
+                "warm output must make no provider request"
+            );
+            assert!(warm_history.fetch_recent(None).unwrap().is_empty());
+        }
+    }
+}
+
+#[test]
+fn cache_separator_exception_does_not_normalize_owned_payloads() {
+    let config = make_stream_config("http://127.0.0.1:9/v1");
+    let segmenter = fallback_segmenter();
+    let opts = PromptOpts::default();
+    for (source, candidate) in [
+        ("Alpha*Title*Beta", "甲方  *《标题》* 乙方"),
+        ("Alpha*Title*Beta", "甲方\t*《标题》* 乙方"),
+        ("Alpha *Title* Beta", "甲方*标题*乙方"),
+        ("Read ` value ` carefully.", "认真阅读 `value` 内容。"),
+        ("Read `a*b` carefully.", "认真阅读 `a* b` 内容。"),
+        (
+            "Read https://example.test/a_b carefully.",
+            "认真阅读 https://example.test/a_ b 内容。",
+        ),
+        (
+            "Read <span title=\"a b\">Label</span> carefully.",
+            "认真阅读 <span title=\"ab\">标签</span> 内容。",
+        ),
+        (
+            "Read [Label][ref] carefully.\n\n[ref]: https://example.test/a_b\n",
+            "认真阅读 [标签][ref] 内容。\n\n[ref]: https://example.test/ab\n",
+        ),
+    ] {
+        assert!(
+            !cached_document_is_complete(source, candidate, "zh", &config, &opts, &segmenter),
+            "must reject changed owner: {source:?} -> {candidate:?}"
+        );
+    }
+}
+
+#[test]
+fn cache_template_rejects_ambiguous_or_relocated_owners() {
+    let config = make_stream_config("http://127.0.0.1:9/v1");
+    let segmenter = fallback_segmenter();
+    let opts = PromptOpts::default();
+    let accepts = |source, candidate| {
+        cached_document_is_complete(source, candidate, "zh", &config, &opts, &segmenter)
+    };
+    assert!(accepts("Alpha_One_Beta", "甲方_标题_乙方"));
+    for (source, candidate) in [
+        ("Alpha_One_Beta", "甲方_标题_乙方_额外"),
+        (
+            "Read {{field}} carefully.",
+            "认真阅读 {{field}} 和 {{forged}} 内容。",
+        ),
+        (
+            "Read https://example.test/a carefully.",
+            "认真阅读 https://example.test/a 和 https://example.test/forged 内容。",
+        ),
+        (
+            "Read `value` carefully.\n\nRead the other instruction.",
+            "请完整阅读操作说明。\n\n请认真阅读 `value` 内容。",
+        ),
+        (
+            "Read {{field}} carefully.\n\nRead the other instruction.",
+            "请完整阅读操作说明。\n\n请认真阅读 {{field}} 内容。",
+        ),
+        (
+            "Read https://example.test/a carefully.\n\nRead the other instruction.",
+            "请完整阅读操作说明。\n\n请认真阅读 https://example.test/a 内容。",
+        ),
+    ] {
+        assert!(
+            !accepts(source, candidate),
+            "unbound owner accepted: {source:?} -> {candidate:?}"
+        );
+    }
+}
