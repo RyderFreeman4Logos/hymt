@@ -60,6 +60,7 @@ pub(super) fn request_plan_digest(
         "indexes": plan.segment_section_indexes,
         "groups": plan.segment_section_groups,
         "original_paragraphs": format!("{:?}", plan.original_paragraphs),
+        "coherent_paragraphs": plan.coherent_paragraphs,
     }))?);
     for (index, segment) in plan.segments.iter().enumerate() {
         let prompt = build_prompt(segment, target, template, opts)?;

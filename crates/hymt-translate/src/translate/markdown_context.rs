@@ -7,6 +7,7 @@ use std::borrow::Cow;
 #[derive(Clone, Copy, Default)]
 pub(super) struct MarkdownContext {
     inline_start: bool,
+    coherent_paragraph: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -34,7 +35,18 @@ impl<'a> SegmentSource<'a> {
         if hymt_core::completeness::parse_json_document(self.text).is_some() {
             return super::ensure_document_identities_preserved(self.text, translated);
         }
-        super::ensure_markdown_structure_preserved(&self.frame(self.text), &self.frame(translated))
+        super::ensure_markdown_structure_preserved(
+            &self.frame(self.text),
+            &self.frame(translated),
+        )?;
+        ensure!(
+            !self.context.coherent_paragraph
+                || super::markdown_ownership::coherent_protected_bytes_preserved(
+                    self.text, translated
+                ),
+            "translated coherent paragraph protected bytes changed"
+        );
+        Ok(())
     }
 
     pub(super) fn frame(self, text: &str) -> Cow<'_, str> {
@@ -126,7 +138,12 @@ pub(super) fn segment_contexts(plan: &TranslationPlan) -> Result<Vec<MarkdownCon
         #[cfg(test)]
         CONTEXT_WORK.with(|work| work.set(work.get() + start - scanned));
         scanned = start;
-        contexts.push(MarkdownContext { inline_start });
+        contexts.push(MarkdownContext {
+            inline_start,
+            coherent_paragraph: document.sections[first]
+                .paragraph_index
+                .is_some_and(|owner| plan.coherent_paragraphs.contains(&owner)),
+        });
         consumed += segment.len();
     }
     Ok(contexts)

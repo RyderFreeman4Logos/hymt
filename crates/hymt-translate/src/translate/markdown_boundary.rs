@@ -73,13 +73,14 @@ fn join_parts(parts: &[String]) -> String {
 }
 
 pub(super) fn requires_validated_rendering(plan: &TranslationPlan) -> bool {
-    plan.document_plan.as_ref().is_some_and(|document| {
-        document.sections.iter().any(|section| {
-            section.kind == super::SectionKind::Paragraph
-                && !section.should_translate
-                && section.text.contains(['*', '_'])
+    !plan.coherent_paragraphs.is_empty()
+        || plan.document_plan.as_ref().is_some_and(|document| {
+            document.sections.iter().any(|section| {
+                section.kind == super::SectionKind::Paragraph
+                    && !section.should_translate
+                    && section.text.contains(['*', '_'])
+            })
         })
-    })
 }
 
 pub(super) fn block_structure(text: &str) -> Vec<String> {
@@ -183,6 +184,17 @@ fn spans(plan: &TranslationPlan, translations: &[String]) -> BTreeSet<Span> {
         work.set(current);
     });
     spans_in_parts(&parts, 0)
+        .into_iter()
+        // Complete translated paragraphs own their inline positions. Their AST
+        // is checked by segment admission; only fixed delimiter positions need
+        // the renderer's edge repair contract.
+        .filter(|(_, open, close)| {
+            open.0 != close.0
+                || !document.sections[open.0]
+                    .paragraph_index
+                    .is_some_and(|owner| plan.coherent_paragraphs.contains(&owner))
+        })
+        .collect()
 }
 
 fn section_part(
@@ -244,6 +256,26 @@ pub(super) fn render_translations(plan: &TranslationPlan, translations: &mut [St
                 .collect::<String>()
         })
         .unwrap_or_default();
+    if !plan
+        .segments
+        .iter()
+        .zip(translations.iter())
+        .zip(&plan.segment_section_groups)
+        .all(|((source, candidate), group)| {
+            let coherent = plan
+                .document_plan
+                .as_ref()
+                .and_then(|document| document.sections[group[0]].paragraph_index)
+                .is_some_and(|owner| plan.coherent_paragraphs.contains(&owner));
+            !coherent
+                || (super::ensure_markdown_structure_preserved(source, candidate).is_ok()
+                    && super::markdown_ownership::coherent_protected_bytes_preserved(
+                        source, candidate,
+                    ))
+        })
+    {
+        return false;
+    }
     let reconstructed = plan.reconstruct(translations);
     if hymt_core::completeness::parse_json_document(&source).is_some() {
         return super::ensure_document_identities_preserved(&source, &reconstructed).is_ok();

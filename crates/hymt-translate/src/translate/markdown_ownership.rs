@@ -99,12 +99,74 @@ fn clipped_ranges(
         .collect()
 }
 
+/// Ordinary inline Markdown can be validated as a complete paragraph by the
+/// existing AST and identity checks. Containers, references and opaque block
+/// syntax keep their source-owned reconstruction path.
+pub(super) fn is_coherent_inline_paragraph(source: &str) -> bool {
+    if source.contains(['|', '$', '\\', '{', '}']) || super::has_unparsed_link_syntax(source) {
+        return false;
+    }
+    let mut paragraphs = 0;
+    let mut inline = false;
+    for event in Parser::new(source) {
+        match event {
+            Event::Start(Tag::Paragraph) => paragraphs += 1,
+            Event::Start(Tag::Emphasis | Tag::Strong | Tag::Strikethrough)
+            | Event::Code(_)
+            | Event::Start(
+                Tag::Link {
+                    link_type: LinkType::Inline,
+                    ..
+                }
+                | Tag::Image {
+                    link_type: LinkType::Inline,
+                    ..
+                },
+            ) => inline = true,
+            Event::Text(_)
+            | Event::SoftBreak
+            | Event::HardBreak
+            | Event::End(
+                TagEnd::Paragraph
+                | TagEnd::Emphasis
+                | TagEnd::Strong
+                | TagEnd::Strikethrough
+                | TagEnd::Link
+                | TagEnd::Image,
+            ) => {}
+            _ => return false,
+        }
+    }
+    paragraphs == 1 && inline
+}
+
+/// Compare the same immutable atoms and parser roles used by leaf rendering.
+/// Prose byte offsets may change; the ordered protected atoms and their parser
+/// roles must retain exact syntax, URLs, placeholders and opaque payload bytes.
+pub(super) fn coherent_protected_bytes_preserved(source: &str, candidate: &str) -> bool {
+    fn signature(text: &str) -> Option<(Vec<String>, Vec<super::cache_proof::Role>)> {
+        let fixed = merge_ranges(protected_markdown_structure_ranges(text));
+        let roles = super::cache_proof::roles(text, &fixed, &[])?;
+        Some((
+            fixed
+                .iter()
+                .map(|range| text[range.clone()].to_owned())
+                .collect(),
+            roles,
+        ))
+    }
+    let mut rendered = candidate.to_owned();
+    super::restore_trailing_newlines(&mut rendered, source);
+    signature(source).is_some_and(|expected| signature(&rendered).as_ref() == Some(&expected))
+}
+
 /// Keep oversized atomic Markdown blocks out of model input while preserving
 /// translatable text around them as independently segmentable sections.
 pub(super) fn split_oversized_protected_blocks(
     doc_plan: &mut DocumentLanguagePlan,
     segmenter: &Segmenter,
     max_tokens: usize,
+    coherent_sections: &std::collections::BTreeSet<usize>,
 ) {
     make_short_references_explicit(doc_plan);
     // Reference definitions and Setext markers can live in another section.
@@ -123,7 +185,12 @@ pub(super) fn split_oversized_protected_blocks(
         offset += section.text.len();
         let structural_ranges =
             clipped_ranges(&structural_ranges, &mut structural_cursor, start..offset);
-        if section.kind != SectionKind::Paragraph || !section.should_translate {
+        if section.kind != SectionKind::Paragraph
+            || !section.should_translate
+            || section
+                .paragraph_index
+                .is_some_and(|owner| coherent_sections.contains(&owner))
+        {
             split_sections.push(section);
             continue;
         }

@@ -257,7 +257,7 @@ async fn whole_output_cache_preserves_owned_payloads_and_production_warm_output(
         for shared in [false, true] {
             let server =
                 start_capturing_mock_server(vec![MockResponse::Json(translated.to_owned())]).await;
-            let config = make_stream_config(&server.endpoint_url);
+            let config = leaf_fixture_config(&make_stream_config(&server.endpoint_url), &source);
             let client = TranslationClient::new(config.clone()).unwrap();
             let segmenter = fallback_segmenter();
             let dir = tempfile::tempdir().unwrap();
@@ -376,7 +376,7 @@ async fn renderer_separators_survive_production_whole_cache_roundtrip() {
                     .collect(),
             )
             .await;
-            let config = make_stream_config(&server.endpoint_url);
+            let config = leaf_fixture_config(&make_stream_config(&server.endpoint_url), source);
             let client = TranslationClient::new(config.clone()).unwrap();
             let segmenter = fallback_segmenter();
             let dir = tempfile::tempdir().unwrap();

@@ -6,7 +6,7 @@
 //!      (bounded by the concurrency semaphore inside `TranslationClient`), validate
 //!      completeness with retry, reassemble, record history.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -250,6 +250,8 @@ pub struct TranslationPlan {
     /// For each segment: all section indexes in its group (for correct reconstruction).
     pub segment_section_groups: Vec<Vec<usize>>,
     original_paragraphs: Vec<retained_original::SourceParagraph>,
+    /// Original paragraph occurrences admitted as complete, budget-fitting requests.
+    coherent_paragraphs: BTreeSet<usize>,
 }
 
 /// Result of a full translation pipeline run.
@@ -670,27 +672,26 @@ pub fn plan_translation_with_policy(
             segment_section_indexes: Vec::new(),
             segment_section_groups: Vec::new(),
             original_paragraphs: Vec::new(),
+            coherent_paragraphs: BTreeSet::new(),
         });
     }
 
     let mut doc_plan = plan_document_translation(text, target_lang, document_policy);
     let original_paragraphs = retained_original::source_paragraphs(&doc_plan, segmenter, available);
     let source_tokens = segmenter.count_tokens(text);
-    let (segments, indexes, groups) = segment_document_plan(&mut doc_plan, segmenter, available)?;
-    let fitted = fit_segments_to_final_request_budget(
-        segments,
-        indexes,
-        groups,
-        FinalRequestBudgetOptions {
-            target_lang,
-            template,
-            prompt_opts: opts,
-            config,
-            segmenter,
-            profile,
-            input_capacity,
-        },
-    )?;
+    let budget_options = FinalRequestBudgetOptions {
+        target_lang,
+        template,
+        prompt_opts: opts,
+        config,
+        segmenter,
+        profile,
+        input_capacity,
+    };
+    let coherent_sections = coherent_paragraph_sections(&doc_plan, &budget_options, available)?;
+    let (segments, indexes, groups) =
+        segment_document_plan(&mut doc_plan, segmenter, available, &coherent_sections)?;
+    let fitted = fit_segments_to_final_request_budget(segments, indexes, groups, budget_options)?;
     let counting_source =
         if overhead.source == TokenCountingSource::Approximate || fitted.used_approximate {
             TokenCountingSource::Approximate
@@ -722,6 +723,7 @@ pub fn plan_translation_with_policy(
         segment_section_indexes: fitted.indexes,
         segment_section_groups: fitted.groups,
         original_paragraphs,
+        coherent_paragraphs: coherent_sections,
     })
 }
 
@@ -978,10 +980,46 @@ mod table_shape;
 use markdown_ownership::protected_markdown_block_ranges;
 use markdown_ownership::split_oversized_protected_blocks;
 
+// Select before inline ownership refitting. The exact existing prompt (including
+// its retry reserve) must fit, so an admitted paragraph cannot later be split.
+fn coherent_paragraph_sections(
+    document: &DocumentLanguagePlan,
+    options: &FinalRequestBudgetOptions<'_>,
+    source_cap: usize,
+) -> Result<BTreeSet<usize>> {
+    let mut selected = BTreeSet::new();
+    for section in &document.sections {
+        if section.kind != SectionKind::Paragraph
+            || !section.should_translate
+            || options.segmenter.count_tokens(&section.text) > source_cap
+            || !markdown_ownership::is_coherent_inline_paragraph(&section.text)
+            || !markdown_ownership::coherent_protected_bytes_preserved(&section.text, &section.text)
+        {
+            continue;
+        }
+        let prompt = prompt_for_budget(
+            &section.text,
+            options.target_lang,
+            options.template,
+            options.prompt_opts,
+            options.config,
+        )?;
+        let request = count_final_request(options.profile, options.segmenter, &prompt);
+        if request.tokens <= options.input_capacity {
+            reject_approximate_budget_if_strict(request.source, options.config)?;
+            if let Some(owner) = section.paragraph_index {
+                selected.insert(owner);
+            }
+        }
+    }
+    Ok(selected)
+}
+
 fn segment_document_plan(
     doc_plan: &mut DocumentLanguagePlan,
     segmenter: &Segmenter,
     max_tokens: usize,
+    coherent_sections: &BTreeSet<usize>,
 ) -> Result<SegmentPlanResult> {
     let source: String = doc_plan
         .sections
@@ -1010,7 +1048,7 @@ fn segment_document_plan(
         }
         return Ok((vec![source], vec![0], vec![vec![0]]));
     }
-    split_oversized_protected_blocks(doc_plan, segmenter, max_tokens);
+    split_oversized_protected_blocks(doc_plan, segmenter, max_tokens, coherent_sections);
     let mut segments: Vec<String> = Vec::new();
     let mut indexes: Vec<usize> = Vec::new();
     let mut groups: Vec<Vec<usize>> = Vec::new();
@@ -3156,6 +3194,55 @@ mod tests {
             "unmarked shared-cache provenance must not calibrate timing"
         );
         assert!(expected_output_tokens > 0);
+    }
+
+    // Leaf renderer tests must exercise the real over-budget branch now that
+    // fitting inline paragraphs travel as complete requests by default.
+    fn leaf_fixture_config(config: &HotConfig, source: &str) -> HotConfig {
+        if hymt_core::completeness::parse_json_document(source).is_some() {
+            return config.clone();
+        }
+        let segmenter = fallback_segmenter();
+        let mut document =
+            plan_document_translation(source, "zh", DocumentTranslationPolicy::TranslateAll);
+        if !document
+            .sections
+            .iter()
+            .any(|section| markdown_ownership::is_coherent_inline_paragraph(&section.text))
+        {
+            return config.clone();
+        }
+        split_oversized_protected_blocks(&mut document, &segmenter, usize::MAX, &BTreeSet::new());
+        let cap = translation_section_groups(&document)
+            .iter()
+            .map(|group| {
+                segmenter.count_tokens(
+                    &group
+                        .iter()
+                        .map(|&i| document.sections[i].text.as_str())
+                        .collect::<String>(),
+                )
+            })
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let text = std::fs::read_to_string(config.path())
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                !line
+                    .trim_start()
+                    .starts_with("max_source_tokens_per_segment")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            .replace(
+                "[translation]\n",
+                &format!("[translation]\nmax_source_tokens_per_segment = {cap}\n"),
+            );
+        let path = temp_path("leaf-budget-config.toml");
+        std::fs::write(&path, text).unwrap();
+        HotConfig::from_path(path).unwrap()
     }
 
     fn fallback_segmenter() -> Segmenter {
@@ -5833,6 +5920,7 @@ After ordinary prose must also be translated in document order.\n"
             segment_section_indexes: vec![],
             segment_section_groups: vec![],
             original_paragraphs: Vec::new(),
+            coherent_paragraphs: BTreeSet::new(),
         };
         let result = plan.reconstruct(&["A".to_owned(), "B".to_owned(), "C".to_owned()]);
         assert_eq!(result, "ABC");
@@ -5874,6 +5962,7 @@ After ordinary prose must also be translated in document order.\n"
             segment_section_indexes: vec![groups[0][0], groups[1][0]],
             segment_section_groups: groups,
             original_paragraphs: Vec::new(),
+            coherent_paragraphs: BTreeSet::new(),
         };
 
         let translated = plan.reconstruct(&["# 标题".to_owned(), "正文保持分段。".to_owned()]);

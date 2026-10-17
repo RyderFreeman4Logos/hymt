@@ -5,7 +5,7 @@ use pulldown_cmark::{Event, Parser, Tag};
 use std::ops::Range;
 
 type Owner = (usize, usize);
-type Role = (u8, Owner, Owner);
+pub(super) type Role = (u8, Owner, Owner);
 
 // KMP consumes each search window once. Reverse matching uses the same byte
 // algorithm without allocating a reversed document or exploring bindings.
@@ -90,11 +90,21 @@ fn bind_literals(
 fn owner(position: usize, fixed: &[Range<usize>]) -> Option<Owner> {
     let index = fixed.partition_point(|range| range.end <= position);
     let range = fixed.get(index)?;
-    (range.start <= position).then_some((index, position - range.start))
+    (range.start <= position).then(|| (index, position - range.start))
 }
 
-fn roles(text: &str, fixed: &[Range<usize>]) -> Option<Vec<Role>> {
+pub(super) fn roles(
+    text: &str,
+    fixed: &[Range<usize>],
+    coherent: &[Range<usize>],
+) -> Option<Vec<Role>> {
     let mut result = Vec::new();
+    let is_coherent = |range: &Range<usize>| {
+        let index = coherent.partition_point(|slot| slot.end <= range.start);
+        coherent
+            .get(index)
+            .is_some_and(|slot| slot.start <= range.start && range.end <= slot.end)
+    };
     for (event, range) in Parser::new(text).into_offset_iter() {
         let kind = match event {
             Event::Code(_) => 0,
@@ -104,23 +114,27 @@ fn roles(text: &str, fixed: &[Range<usize>]) -> Option<Vec<Role>> {
             Event::Start(Tag::Image { .. }) => 4,
             _ => continue,
         };
-        result.push((
-            kind,
-            owner(range.start, fixed)?,
-            owner(range.end.checked_sub(1)?, fixed)?,
-        ));
+        if !is_coherent(&range) {
+            result.push((
+                kind,
+                owner(range.start, fixed)?,
+                owner(range.end.checked_sub(1)?, fixed)?,
+            ));
+        }
     }
     for (kind, ranges) in [
         (5, preserved_url_ranges(text)),
         (6, preserved_placeholder_ranges(text)),
     ] {
         for range in ranges {
-            let start = owner(range.start, fixed)?;
-            let end = owner(range.end.checked_sub(1)?, fixed)?;
-            if start.0 != end.0 {
-                return None;
+            if !is_coherent(&range) {
+                let start = owner(range.start, fixed)?;
+                let end = owner(range.end.checked_sub(1)?, fixed)?;
+                if start.0 != end.0 {
+                    return None;
+                }
+                result.push((kind, start, end));
             }
-            result.push((kind, start, end));
         }
     }
     Some(result)
@@ -176,13 +190,11 @@ pub(super) fn cached_owned_payloads_match(
     if bind_literals(&source, candidate, &fixed, true).as_ref() != Some(&bindings) {
         return false;
     }
-    let source_roles = roles(&source, &fixed);
-    if source_roles.is_none() || source_roles != roles(candidate, &bindings) {
-        return false;
-    }
+    let mut coherent_source = Vec::new();
+    let mut coherent_candidate = Vec::new();
     let mut translations = Vec::with_capacity(groups.len());
     let mut fixed_cursor = 0;
-    for slot in &slots {
+    for (slot, group) in slots.iter().zip(&groups) {
         while fixed_cursor < fixed.len() && fixed[fixed_cursor].end <= slot.start {
             fixed_cursor += 1;
         }
@@ -194,6 +206,13 @@ pub(super) fn cached_owned_payloads_match(
         let end = bindings
             .get(fixed_cursor)
             .map_or(candidate.len(), |r| r.start);
+        if document.sections[group[0]]
+            .paragraph_index
+            .is_some_and(|owner| plan.coherent_paragraphs.contains(&owner))
+        {
+            coherent_source.push(slot.clone());
+            coherent_candidate.push(start..end);
+        }
         let Some(mut text) = candidate.get(start..end) else {
             return false;
         };
@@ -212,6 +231,10 @@ pub(super) fn cached_owned_payloads_match(
             return false;
         }
         translations.push(text.to_owned());
+    }
+    let source_roles = roles(&source, &fixed, &coherent_source);
+    if source_roles.is_none() || source_roles != roles(candidate, &bindings, &coherent_candidate) {
+        return false;
     }
     // One scratch segment per existing editable group retains owner section IDs
     // and outer edges while avoiding guesses about provider segment boundaries.
@@ -232,6 +255,7 @@ pub(super) fn cached_owned_payloads_match(
         segment_section_indexes: groups.iter().map(|group| group[0]).collect(),
         segment_section_groups: groups,
         original_paragraphs: plan.original_paragraphs.clone(),
+        coherent_paragraphs: plan.coherent_paragraphs.clone(),
     };
     let Ok(contexts) = super::segment_contexts(&scratch) else {
         return false;

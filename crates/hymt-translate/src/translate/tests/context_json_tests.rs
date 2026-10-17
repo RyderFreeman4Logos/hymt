@@ -246,6 +246,7 @@ fn source_context_preserves_inline_and_heading_prefix_roles() {
             _ => "",
         };
         let source = format!("{prefix}Read the complete synthetic instruction.{suffix}");
+        let config = leaf_fixture_config(&config, &source);
         let plan = plan_translation(
             &source,
             "zh",
