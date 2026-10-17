@@ -527,6 +527,130 @@ impl Drop for OwnedChild<'_> {
     }
 }
 
+fn pid_record(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut text = String::new();
+    std::fs::File::open(path)?
+        .take(32)
+        .read_to_string(&mut text)?;
+    if text.len() == 32 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "PID record exceeds limit",
+        ));
+    }
+    Ok(text)
+}
+
+fn fixture_pids(paths: [&Path; 2]) -> std::io::Result<Option<[String; 2]>> {
+    let mut pids = [String::new(), String::new()];
+    for (index, path) in paths.into_iter().enumerate() {
+        let text = match pid_record(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if text.is_empty() {
+            return Ok(None);
+        }
+        let pid = text.parse::<u32>().ok().filter(|pid| *pid > 0);
+        if !text.bytes().all(|byte| byte.is_ascii_digit()) || pid.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid positive PID record",
+            ));
+        }
+        pids[index] = pid.unwrap().to_string();
+    }
+    Ok(Some(pids))
+}
+
+impl Fixture {
+    fn retain_failure(&self, message: impl std::fmt::Display) -> ! {
+        self.cleanup_failed.store(true, Ordering::Relaxed);
+        panic!(
+            "{message}; fixture evidence retained at {}",
+            self.root.display()
+        );
+    }
+
+    fn ready_pids(&self, paths: [&Path; 2], context: &str) -> Option<[String; 2]> {
+        fixture_pids(paths).unwrap_or_else(|error| {
+            self.retain_failure(format!(
+                "{context}: {error}; ledger={:?}",
+                paths.map(pid_record)
+            ))
+        })
+    }
+}
+
+fn pid_identity(pid: &str) -> String {
+    use std::io::Read;
+    let mut stat = String::new();
+    let result = std::fs::File::open(Path::new("/proc").join(pid).join("stat"))
+        .and_then(|file| file.take(1024).read_to_string(&mut stat));
+    match result {
+        Ok(_) => {
+            let fields: Vec<_> = stat
+                .rsplit_once(')')
+                .map_or("", |(_, fields)| fields)
+                .split_whitespace()
+                .collect();
+            format!(
+                "pid={pid} state={:?} start_time={:?}",
+                fields.first(),
+                fields.get(19)
+            )
+        }
+        Err(error) => format!("pid={pid} stat_error={error}"),
+    }
+}
+
+#[tokio::test]
+async fn local_gates_pid_records_are_complete_before_readiness() {
+    let fixture = Fixture::new().await;
+    let parent = fixture.root.join("parent.pid");
+    let child = fixture.root.join("grandchild.pid");
+    private_write(&parent, "123");
+    private_write(&child, "");
+    assert!(fixture_pids([&parent, &child]).unwrap().is_none());
+    publish_control(&child, "456").unwrap();
+    assert_eq!(
+        fixture_pids([&parent, &child]).unwrap(),
+        Some(["123".into(), "456".into()])
+    );
+    for invalid in ["0", "12x", "+123"] {
+        private_write(&child, invalid);
+        assert_eq!(
+            fixture_pids([&parent, &child]).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+}
+
+#[tokio::test]
+async fn local_gates_invalid_pid_failure_retains_owned_evidence() {
+    let fixture = Fixture::new().await;
+    let root = fixture.root.clone();
+    let parent = root.join("parent.pid");
+    let child = root.join("grandchild.pid");
+    private_write(&parent, "123");
+    private_write(&child, "invalid");
+    private_write(&root.join("sentinel"), "owned inactive evidence");
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        fixture.ready_pids([&parent, &child], "deterministic inactive fixture");
+    }));
+    assert!(failure.is_err());
+    assert!(fixture.cleanup_failed.load(Ordering::Relaxed));
+    drop(fixture);
+    assert_eq!(std::fs::read_to_string(child).unwrap(), "invalid");
+    assert_eq!(
+        std::fs::read_to_string(root.join("sentinel")).unwrap(),
+        "owned inactive evidence"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 fn publish_control(path: &Path, text: &str) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
@@ -1711,7 +1835,7 @@ async fn local_gates_interrupt_and_fixture_timeout_settle_descendants() {
         let parent_pid = fixture.root.join("parent.pid");
         let grandchild_pid = fixture.root.join("grandchild.pid");
         std::fs::write(&worker, format!(
-            "import os,signal,time\nfrom pathlib import Path\nsignal.signal(signal.SIGTERM,signal.SIG_IGN)\nif os.fork()==0:\n os.setsid()\n Path('{}').write_text(str(os.getpid()))\nelse:\n print('x'*4096,flush=True)\n print('fixture timeout marker',flush=True)\n Path('{}').write_text(str(os.getpid()))\nwhile True:time.sleep(1)\n",
+            "import os,signal,time\nfrom pathlib import Path\ndef publish_pid(path):\n path=Path(path)\n pending=path.with_suffix('.pending')\n with os.fdopen(os.open(pending,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),'w') as output: output.write(str(os.getpid()))\n pending.rename(path)\nsignal.signal(signal.SIGTERM,signal.SIG_IGN)\nif os.fork()==0:\n os.setsid()\n publish_pid('{}')\nelse:\n print('x'*4096,flush=True)\n print('fixture timeout marker',flush=True)\n publish_pid('{}')\nwhile True:time.sleep(1)\n",
             grandchild_pid.display(), parent_pid.display()
         )).unwrap();
         fixture
@@ -1726,18 +1850,20 @@ async fn local_gates_interrupt_and_fixture_timeout_settle_descendants() {
         let mut command = fixture.command("/usr/bin/python3");
         command.args(["scripts/hooks/local-gates.py", "run", "head"]);
         let child = fixture.spawn(command);
+        let context = format!("interrupt={interrupt} block_ack={block_ack}");
         let ready = Instant::now();
-        while !parent_pid.exists() || !grandchild_pid.exists() {
-            assert!(
-                ready.elapsed() < Duration::from_secs(5),
-                "adversarial worker failed to start"
-            );
+        let pids = loop {
+            if let Some(pids) = fixture.ready_pids([&parent_pid, &grandchild_pid], &context) {
+                break pids;
+            }
+            if ready.elapsed() >= Duration::from_secs(5) {
+                fixture.retain_failure(format!(
+                    "{context}: adversarial worker failed to start; ledger={:?}",
+                    [&parent_pid, &grandchild_pid].map(|path| pid_record(path))
+                ));
+            }
             tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let pids: Vec<String> = [&parent_pid, &grandchild_pid]
-            .into_iter()
-            .map(|path| std::fs::read_to_string(path).unwrap())
-            .collect();
+        };
         let failed = child.failed.clone();
         if block_ack {
             // Settlement still runs, but positive acknowledgement cannot publish.
@@ -1758,6 +1884,14 @@ async fn local_gates_interrupt_and_fixture_timeout_settle_descendants() {
                 },
             )
             .await;
+        let output_evidence = match &result {
+            Ok(output) => format!(
+                "stdout_bytes={} stderr_tail={:?}",
+                output.stdout.len(),
+                String::from_utf8_lossy(&output.stderr[output.stderr.len().saturating_sub(1024)..])
+            ),
+            Err(error) => error.to_string(),
+        };
         assert!(
             began.elapsed() < Duration::from_secs(8),
             "cleanup exceeded its bound"
@@ -1792,11 +1926,10 @@ async fn local_gates_interrupt_and_fixture_timeout_settle_descendants() {
                 assert!(qualified, "uncertified cleanup after original {timeout}");
             }
         }
-        for pid in pids {
-            assert!(
-                !Path::new("/proc").join(pid).exists(),
-                "recorded descendant survived cleanup"
-            );
+        for pid in &pids {
+            if Path::new("/proc").join(pid).exists() {
+                fixture.retain_failure(format!("{context}: recorded descendant survived cleanup; {}; pids={pids:?} ledger={:?}; {output_evidence}", pid_identity(pid), [&parent_pid, &grandchild_pid].map(|path| pid_record(path))));
+            }
         }
         let artifacts = fixture.artifacts.lock().unwrap();
         assert_eq!(
