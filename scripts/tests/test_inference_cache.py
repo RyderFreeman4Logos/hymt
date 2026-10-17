@@ -8,6 +8,7 @@ import json
 import os
 import socket
 import sqlite3
+import ssl
 import struct
 import subprocess
 import sys
@@ -54,12 +55,15 @@ class _Upstream(BaseHTTPRequestHandler):
             return
         if state["probe_stall"]:
             state["probe_release"].wait(2)
-        if state["unknown"]:
+        status = state.get("metadata_status", {}).get(self.path)
+        if status is not None:
+            self._reply(status, b'{"error":"metadata rejected"}')
+        elif state["unknown"] or state.get("offline"):
             self._reply(503, b'{"error":"unavailable"}')
         elif self.path == "/props":
             self._reply(200, state.get("props_raw") or json.dumps(state["props"]).encode())
         elif self.path == "/v1/models":
-            self._reply(200, json.dumps({"data": [{"id": "Hy-MT2-7B", "aliases": ["Hy-MT2-7B"], "created": state["generation"], "meta": state["meta"]}, *state["models_extra"]]}).encode())
+            self._reply(200, json.dumps({"data": [{"id": state.get("model_id", "Hy-MT2-7B"), "aliases": [state.get("model_id", "Hy-MT2-7B")], "created": state["generation"], "meta": state["meta"]}, *state["models_extra"]]}).encode())
         else:
             self._reply(404, b'{}')
 
@@ -84,6 +88,10 @@ class _Upstream(BaseHTTPRequestHandler):
         if self.headers.get("Authorization") == "Bearer denied":
             self._reply(401, b'{"error":"denied"}')
             return
+        if state.get("offline"):
+            self._reply(503, b'{"error":"offline"}')
+            return
+        state.setdefault("requests", []).append((self.path, payload))
         if self.path == "/tokenize":
             self._reply(200, b'{"tokens":[42]}')
             return
@@ -163,11 +171,11 @@ class CacheContracts(unittest.TestCase):
         self.cache_thread = None
         self.start_cache()
 
-    def start_cache(self, **limits: object) -> None:
+    def start_cache(self, upstream: str | None = None, **limits: object) -> None:
         if _MODULE is None:
             self.port = self.upstream.server_port
             return
-        self.cache = _MODULE.CacheServer(("127.0.0.1", 0), f"http://127.0.0.1:{self.upstream.server_port}", self.db, **limits)
+        self.cache = _MODULE.CacheServer(("127.0.0.1", 0), upstream or f"http://127.0.0.1:{self.upstream.server_port}", self.db, **limits)
         self.port = self.cache.server_port
         self.cache_thread = threading.Thread(target=self.cache.serve_forever, kwargs={"poll_interval": 0.01})
         self.cache_thread.start()
@@ -212,6 +220,177 @@ class CacheContracts(unittest.TestCase):
             while chunk := conn.recv(65536):
                 chunks.append(chunk)
         return b"".join(chunks)
+
+    def get_metadata(self, path="/props"):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=4)
+        try:
+            conn.request("GET", path)
+            response = conn.getresponse()
+            return response.status, dict(response.getheaders()), response.read()
+        finally:
+            conn.close()
+
+    def test_offline_exact_hits_planning_and_restart(self):
+        for stream in (False, True):
+            payload = {"model": "Hy-MT2-7B", "stream": stream}
+            self.assertEqual(self.request(payload)[1]["X-Hymt-Cache"], "MISS")
+        self.state["props"].update(eos_token=".", supports_streaming=True, supports_tokenization=True, supports_structured_output=False)
+        self.assertEqual(self.get_metadata()[0], 200)
+        # Refresh both exact requests after the advertised capabilities change identity.
+        for stream in (False, True):
+            self.request({"model": "Hy-MT2-7B", "stream": stream})
+        self.assertEqual(self.request({"content": "."}, path="/tokenize")[0], 200)
+        self.assertEqual(self.request({"content": "unrelated"}, path="/tokenize")[0], 200)
+        posts = self.state["posts"]
+        self.state["unknown"] = True
+        self.stop_cache()
+        self.start_cache()
+        status, headers, body = self.get_metadata()
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("X-Hymt-Planning"), "historical")
+        self.assertTrue(headers.get("X-Hymt-Observed-At", "").isdigit())
+        self.assertTrue(json.loads(body)["supports_streaming"])
+        self.assertEqual(self.request({"content": "."}, path="/tokenize")[1]["X-Hymt-Cache"], "HIT")
+        for stream in (False, True):
+            response = self.request({"model": "Hy-MT2-7B", "stream": stream})
+            self.assertEqual(response[1]["X-Hymt-Cache"], "HIT")
+        self.assertEqual(self.state["posts"], posts)
+        self.cache.store.clear()
+        self.assertNotEqual(self.get_metadata()[0], 200)
+        self.assertNotEqual(self.request({"model": "Hy-MT2-7B", "stream": False})[1]["X-Hymt-Cache"], "HIT")
+
+    def test_offline_does_not_resurrect_changed_identity(self):
+        self.request()
+        self.state["props"]["build_info"] = "new-build"
+        self.assertEqual(self.get_metadata()[0], 200)
+        self.state["unknown"] = True
+        self.assertNotEqual(self.request()[1]["X-Hymt-Cache"], "HIT")
+
+    def test_offline_miss_bypass_and_origin_change_require_backend(self):
+        self.request()
+        self.state["offline"] = True
+        self.assertEqual(self.request()[1]["X-Hymt-Cache"], "HIT")
+        for headers, payload in (({}, {"model": "Hy-MT2-7B", "different": True}), ({"X-Hymt-Cache-Bypass": "1"}, None), ({"x-bf-eh-x-hymt-cache-bypass": "1"}, None)):
+            self.assertEqual(self.request(payload, headers)[0], 503)
+        self.stop_cache()
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            other_port = sock.getsockname()[1]
+        self.start_cache(upstream=f"http://127.0.0.1:{other_port}")
+        self.assertEqual(self.request()[0], 502)
+        self.assertEqual(self.get_metadata()[0], 502)
+        self.stop_cache()
+        self.start_cache()
+        self.assertEqual(self.get_metadata()[0], 502, "switching back must not resurrect old evidence")
+
+    def test_stalled_upstream_probe_can_replay_within_request_budget(self):
+        self.stop_cache()
+        self.start_cache(timeout=0.6)
+        self.request()
+        self.state["probe_stall"] = True
+        started = time.monotonic()
+        self.assertEqual(self.get_metadata()[0], 200)
+        self.assertEqual(self.request()[1]["X-Hymt-Cache"], "HIT")
+        self.assertLess(time.monotonic() - started, 1.2)
+
+    def test_missing_model_remains_ineligible_online_and_offline(self):
+        for _ in range(2):
+            self.assertEqual(self.request({})[1]["X-Hymt-Cache"], "UNKNOWN")
+        self.assertEqual(self.state["posts"], 2)
+        self.request()
+        self.state["offline"] = True
+        self.assertEqual(self.request({})[0], 503)
+
+    def test_active_model_replacement_revokes_old_requested_alias(self):
+        self.request()
+        self.state["model_id"] = "replacement"
+        self.state["props"]["model_alias"] = "replacement"
+        self.assertNotEqual(self.request()[1]["X-Hymt-Cache"], "HIT")
+        self.state["unknown"] = True
+        self.assertNotEqual(self.request()[1]["X-Hymt-Cache"], "HIT")
+
+    def test_denied_malformed_tls_and_local_capacity_do_not_fallback(self):
+        self.request()
+        for status in (401, 403):
+            self.state["metadata_status"] = {"/props": status}
+            self.assertNotEqual(self.request()[1]["X-Hymt-Cache"], "HIT")
+            self.assertEqual(self.get_metadata()[0], 502)
+        self.state.pop("metadata_status")
+        for raw in (b'not-json', b'{"build":1,"build":2}', b'{}'):
+            self.state["props_raw"] = raw
+            self.assertNotEqual(self.request()[1]["X-Hymt-Cache"], "HIT")
+            self.assertEqual(self.get_metadata()[0], 502)
+        self.state.pop("props_raw")
+        self.state["unknown"] = True
+        for headers in ([("Content-Encoding", "gzip")], [("Content-Type", "application/json")]):
+            self.state["extra_headers"] = headers
+            self.assertNotEqual(self.request()[1]["X-Hymt-Cache"], "HIT")
+            self.assertEqual(self.get_metadata()[0], 502)
+        self.state.pop("extra_headers")
+        self.state["unknown"] = False
+        with patch.object(http.client.HTTPConnection, "getresponse", side_effect=http.client.BadStatusLine("synthetic malformed status")):
+            budget = _MODULE._Budget(1)
+            try:
+                with self.assertRaises(http.client.BadStatusLine):
+                    self.cache.read_identity("Hy-MT2-7B", None, budget)
+            finally:
+                budget.close()
+        with patch.object(socket.socket, "connect", side_effect=ssl.SSLCertVerificationError("synthetic verification failure")):
+            budget = _MODULE._Budget(1)
+            try:
+                with self.assertRaises(ssl.SSLCertVerificationError):
+                    self.cache.read_identity("Hy-MT2-7B", None, budget)
+            finally:
+                budget.close()
+        with patch.object(self.cache.controls, "acquire", return_value=False):
+            self.assertNotEqual(self.request()[1]["X-Hymt-Cache"], "HIT")
+            self.assertEqual(self.get_metadata()[0], 502)
+
+    def test_partial_metadata_conflict_revokes_retained_evidence(self):
+        for unavailable_path in ("/props", "/v1/models"):
+            with self.subTest(unavailable=unavailable_path):
+                self.state["unknown"] = False
+                self.state.pop("metadata_status", None)
+                self.request()
+                if unavailable_path == "/v1/models":
+                    self.state["props"]["build_info"] += "changed"
+                else:
+                    self.state["meta"]["n_params"] += 1
+                self.state["metadata_status"] = {unavailable_path: 503}
+                self.assertNotEqual(self.request()[1]["X-Hymt-Cache"], "HIT")
+                self.state.pop("metadata_status")
+                self.state["unknown"] = True
+                self.assertEqual(self.get_metadata()[0], 502)
+                self.assertNotEqual(self.request()[1]["X-Hymt-Cache"], "HIT")
+
+    def test_corrupt_oversized_and_legacy_planning_are_ineligible(self):
+        self.request()
+        with sqlite3.connect(self.db) as conn:
+            original = conn.execute("SELECT * FROM planning").fetchone()
+        for assignment, value in (("identity", "{}"), ("identity", "x" * (1024 * 1024 + 1)), ("epoch", 9999), ("observed", -1)):
+            with self.subTest(column=assignment, size=len(str(value))):
+                with sqlite3.connect(self.db) as conn:
+                    conn.execute("DELETE FROM planning")
+                    conn.execute("INSERT INTO planning VALUES (?,?,?,?,?,?,?)", original)
+                    conn.execute(f"UPDATE planning SET {assignment}=?", (value,))
+                self.state["unknown"] = True
+                self.assertEqual(self.get_metadata()[0], 502)
+                self.assertNotEqual(self.request()[1]["X-Hymt-Cache"], "HIT")
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("DELETE FROM planning")
+        self.assertEqual(self.get_metadata()[0], 502)
+
+    def test_failed_post_probe_cannot_admit_under_retained_identity(self):
+        self.state["release"].clear()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            job = pool.submit(self.request)
+            self.assertTrue(self.state["entered"].wait(1))
+            self.state["unknown"] = True
+            self.state["release"].set()
+            self.assertEqual(job.result(4)[0], 200)
+        self.state["unknown"] = False
+        self.assertEqual(self.request()[1]["X-Hymt-Cache"], "MISS")
+        self.assertEqual(self.state["posts"], 2)
 
     def test_timeout_limits_reject_before_database_creation(self) -> None:
         upstream = f"http://127.0.0.1:{self.upstream.server_port}"
@@ -736,7 +915,7 @@ class CacheContracts(unittest.TestCase):
         self.stop_cache()
         self.start_cache(max_upstream=1)
         original = _MODULE._Flight
-        for mode in ("drift", "clear", "write_failure"):
+        for mode in ("drift", "clear", "outage", "write_failure"):
             self.cache.store.clear()
             self.state["entered"].clear()
             self.state["release"].clear()
@@ -758,6 +937,8 @@ class CacheContracts(unittest.TestCase):
                     self.state["props"]["build_info"] += "replacement"
                 elif mode == "clear":
                     self.cache.store.clear()
+                elif mode == "outage":
+                    self.state["unknown"] = True
                 else:
                     with sqlite3.connect(self.db) as conn:
                         conn.execute("DROP TABLE entries")
@@ -766,6 +947,7 @@ class CacheContracts(unittest.TestCase):
             self.assertEqual(_JSON, first[2])
             self.assertEqual(_JSON, second[2])
             self.assertEqual("UNKNOWN", second[1]["X-Hymt-Cache"], mode)
+            self.state["unknown"] = False
 
     @unittest.skipUnless(_MODULE, "shared service not implemented yet")
     def test_stalled_optional_probe_preserves_actual_generation(self) -> None:

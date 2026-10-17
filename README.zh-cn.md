@@ -377,13 +377,13 @@ hymt telegram --regenerate-claim-password
 
 ### 可选的共享推理缓存
 
-独立的明文缓存跨客户端和 API/VK 凭据保存完整的原始推理响应，包括 usage。缓存身份使用观测到的上游模型、构建、默认采样、模板和上下文元数据；身份检查仍需上游服务。它不替代 hymt 的译文验证或片段缓存。
+独立的明文缓存跨客户端和 API/VK 凭据保存完整的原始推理响应，包括 usage。缓存身份使用观测到的上游模型、构建、默认采样、模板和上下文元数据；查找前会先探测上游；仅在已分类的传输故障或 HTTP 502/503/504 时，完整且完全相同的请求才能使用现有 SQLite 中保留的同源活动身份与 epoch。它不替代 hymt 的译文验证或片段缓存。
 
 直接访问缓存仅限受信任的 Tailscale 客户端，或将缓存置于现有的身份验证网关之后。API/VK 凭据不隔离缓存命中。
 
 `just install-inference-cache` 将脚本与用户 unit 安装到稳定路径，重载 systemd，并在缓存已运行时重启它。首次启动执行 `systemctl --user enable --now hy-mt2-cache.service`。附带的 unit 绑定特定宿主机：监听 Tailscale 的 `100.78.159.38:8402`，并转发到 `100.78.159.38:8401` 的模型服务。需要使用缓存的客户端可设置 `[endpoint].url = "http://100.78.159.38:8402/v1"`，保留 `backend = "llama_cpp"`，并将 `[endpoint].model` 设为上游 `/v1/models` 公布的实际 ID 或别名。示例配置中的空 `model` 会使请求省略该字段，无法产生缓存命中。
 
-若在观测元数据不变的情况下替换了模型内容，执行 `python3 "$HOME/.local/share/hymt/inference-cache.py" clear --database "$HOME/.local/state/hymt/inference-cache.sqlite3"`；清理操作会使持久化条目及正在进行的写入失效。该缓存独立于 hymt 的翻译历史，且不提供离线重放。
+若在观测元数据不变的情况下替换了模型内容，执行 `python3 "$HOME/.local/share/hymt/inference-cache.py" clear --database "$HOME/.local/state/hymt/inference-cache.sqlite3"`；清理操作会使持久化条目及正在进行的写入失效。清理也会移除保留的规划证据。缓存 HTTP 服务可达而模型后端不可用时，包括缓存服务重启后，完整且完全相同的 JSON/SSE 响应仍可命中。历史 `/props` 与 `/v1/models` 带有 `X-Hymt-Planning: historical` 和 `X-Hymt-Observed-At`；CLI 使用历史规划上限，但不声称刚刚验证了后端。一个有界的精确 tokenization 结果保留 false-EOS 请求偏置。严格预检继续要求实时验证。未命中与显式绕过仍需后端；身份验证拒绝、损坏的元数据、TLS 验证错误以及本地容量或数据库故障均不会授权回放。来源或模型变化会使旧证据失效。该缓存仍独立于 hymt 的翻译历史；缓存服务本身不可达时不适用此能力。
 
 ## 架构
 

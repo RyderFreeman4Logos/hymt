@@ -1,6 +1,7 @@
 """Shared plaintext llama.cpp response cache. Run behind the authenticating gateway."""
 
 import argparse
+import errno
 import hashlib
 import http.client
 import ipaddress
@@ -52,6 +53,14 @@ def _cacheable_headers(headers: list[tuple[str, str]] | list[list[str]]) -> bool
 
 class _Invalid(ValueError):
     """Unusable JSON, response or upstream identity."""
+
+
+class _Deadline(TimeoutError):
+    """Local request or admission budget exhausted; not an upstream outage."""
+
+
+class _Unavailable(OSError):
+    """A classified upstream transport outage, never local admission or bad metadata."""
 
 
 class _Number(str):
@@ -166,7 +175,7 @@ class _Budget:
     def remaining(self) -> float:
         remaining = self.end - time.monotonic()
         if remaining <= 0 or self.expired:
-            raise TimeoutError("request deadline")
+            raise _Deadline("request deadline")
         return remaining
 
     def add(self, sock: socket.socket) -> None:
@@ -175,7 +184,7 @@ class _Budget:
         with self.lock:
             if self.expired:
                 sock.close()
-                raise TimeoutError("request deadline")
+                raise _Deadline("request deadline")
             self.sockets.append(sock)
             sock.settimeout(self.remaining())
 
@@ -212,6 +221,7 @@ class _Store:
                 conn.execute("CREATE TABLE IF NOT EXISTS epoch (id INTEGER PRIMARY KEY CHECK(id=1), value INTEGER NOT NULL)")
                 conn.execute("INSERT OR IGNORE INTO epoch VALUES (1, 0)")
                 conn.execute("CREATE TABLE IF NOT EXISTS entries (key TEXT PRIMARY KEY, epoch INTEGER NOT NULL, request BLOB NOT NULL, canonical TEXT NOT NULL, identity TEXT NOT NULL, response BLOB NOT NULL, headers TEXT NOT NULL, digest TEXT NOT NULL, complete INTEGER NOT NULL CHECK(complete=1))")
+                conn.execute("CREATE TABLE IF NOT EXISTS planning (id INTEGER PRIMARY KEY CHECK(id=1), epoch INTEGER NOT NULL, identity TEXT NOT NULL, observed INTEGER NOT NULL, token_request TEXT, token_response BLOB, token_digest TEXT)")
             self.ready = True
         except (OSError, sqlite3.Error, _Invalid):
             pass
@@ -268,6 +278,42 @@ class _Store:
             conn.execute("INSERT OR REPLACE INTO entries VALUES (?,?,?,?,?,?,?,?,1)", (key, epoch, request, canonical, identity, raw, json.dumps(headers), hashlib.sha256(raw).hexdigest()))
         return True
 
+    def activate(self, identity: str) -> None:
+        if len(identity.encode()) > 1024 * 1024:
+            raise _Invalid("planning evidence too large")
+        if not self.ready:
+            raise _Invalid("cache database unavailable")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            old = conn.execute("SELECT identity=? AND typeof(epoch)='integer' AND epoch=(SELECT value FROM epoch WHERE id=1) FROM planning WHERE id=1", (identity,)).fetchone()
+            if old is not None and not old[0]:
+                conn.execute("UPDATE epoch SET value=value+1 WHERE id=1")
+                conn.execute("DELETE FROM entries")
+                conn.execute("DELETE FROM planning")
+            epoch = conn.execute("SELECT value FROM epoch WHERE id=1").fetchone()[0]
+            conn.execute("INSERT INTO planning (id,epoch,identity,observed) VALUES (1,?,?,?) ON CONFLICT(id) DO UPDATE SET observed=excluded.observed", (epoch, identity, int(time.time())))
+
+    def planning(self) -> tuple[int, str, int, str | None, bytes | None, str | None]:
+        if not self.ready:
+            raise _Invalid("cache database unavailable")
+        with self.connect() as conn:
+            row = conn.execute("""SELECT p.epoch,p.identity,p.observed,p.token_request,p.token_response,p.token_digest
+                FROM planning p JOIN epoch e ON e.id=1 AND e.value=p.epoch WHERE p.id=1
+                AND typeof(p.epoch)='integer' AND typeof(p.identity)='text' AND length(CAST(p.identity AS BLOB))<=1048576
+                AND typeof(p.observed)='integer' AND p.observed>0
+                AND (p.token_request IS NULL OR (typeof(p.token_request)='text' AND length(CAST(p.token_request AS BLOB))<=4096))
+                AND (p.token_response IS NULL OR (typeof(p.token_response)='blob' AND length(p.token_response)<=4096))
+                AND (p.token_digest IS NULL OR (typeof(p.token_digest)='text' AND length(p.token_digest)=64))""").fetchone()
+        if row is None or row[2] > int(time.time()) + 1:
+            raise _Invalid("no retained active planning evidence")
+        return row
+
+    def retain_token(self, epoch: int, identity: str, request: str, response: bytes) -> None:
+        if len(request.encode()) > 4096 or len(response) > 4096:
+            return
+        with self.connect() as conn:
+            conn.execute("UPDATE planning SET token_request=?,token_response=?,token_digest=? WHERE id=1 AND epoch=? AND identity=? AND epoch=(SELECT value FROM epoch WHERE id=1)", (request, response, hashlib.sha256(response).hexdigest(), epoch, identity))
+
     def clear(self) -> None:
         if not self.ready:
             raise _Invalid("cache database unavailable")
@@ -275,6 +321,7 @@ class _Store:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute("UPDATE epoch SET value=value+1 WHERE id=1")
             conn.execute("DELETE FROM entries")
+            conn.execute("DELETE FROM planning")
 
 
 class _Flight:
@@ -307,6 +354,12 @@ class CacheServer(ThreadingMixIn, HTTPServer):
         self.generations = threading.BoundedSemaphore(max_upstream)
         self.controls = threading.BoundedSemaphore(1)
         self.store = _Store(database)
+        try:
+            previous = _load(self.store.planning()[1].encode())
+            if not isinstance(previous, dict) or previous.get("upstream") != self.upstream.geturl():
+                self.store.clear()
+        except (sqlite3.Error, ValueError, TypeError, RecursionError):
+            pass
         self.flight_lock = threading.Lock()
         self.flights: dict[str, _Flight] = {}
         self.closing = False
@@ -389,6 +442,18 @@ class CacheServer(ThreadingMixIn, HTTPServer):
                 yield response
             finally:
                 response.close()
+        except (ssl.SSLError, _Deadline):
+            raise
+        except http.client.HTTPException as error:
+            if budget.expired and budget.parent is not None and not budget.parent.expired:
+                raise _Unavailable("upstream probe transport deadline") from error
+            raise
+        except OSError as error:
+            if budget.expired and budget.parent is not None and not budget.parent.expired:
+                raise _Unavailable("upstream probe transport deadline") from error
+            if isinstance(error, (ConnectionRefusedError, ConnectionResetError, ConnectionAbortedError, socket.timeout)) or error.errno in {errno.ENETUNREACH, errno.EHOSTUNREACH, errno.EPIPE}:
+                raise _Unavailable("upstream transport unavailable") from error
+            raise
         finally:
             if connection is not None:
                 connection.close()
@@ -403,17 +468,57 @@ class CacheServer(ThreadingMixIn, HTTPServer):
 
     def _observe(self, requested_model: object, authorization: str | None, budget: _Budget) -> str:
         values = []
+        retained = None
+        try:
+            retained = self.retained(requested_model)
+        except (ValueError, sqlite3.Error, TypeError, RecursionError):
+            pass
+        unavailable = False
         for path in ("/props", "/v1/models"):
-            with self.upstream_response("GET", path, None, authorization, budget) as response:
-                raw = _read(response, budget, min(self.response_limit, 1024 * 1024))
-                if response.status != 200:
-                    raise _Invalid("upstream identity unavailable")
-                values.append(_load(raw))
-        props, models = values
+            try:
+                with self.upstream_response("GET", path, None, authorization, budget) as response:
+                    headers = response.getheaders()
+                    representation = [item for item in headers if item[0].lower() in {"content-type", "content-encoding", "connection"}]
+                    if not _valid_headers(headers) or not _cacheable_headers(representation):
+                        raise _Invalid("invalid metadata headers")
+                    raw = _read(response, budget, min(self.response_limit, 1024 * 1024))
+                    if response.status in {502, 503, 504}:
+                        raise _Unavailable("upstream metadata unavailable")
+                    if response.status != 200:
+                        raise _Invalid("upstream identity rejected")
+                    value = _load(raw)
+            except _Unavailable:
+                value = None
+                unavailable = True
+            values.append(value)
+            if unavailable and budget.expired:
+                values.extend([None] * (2 - len(values)))
+                break
+        if unavailable:
+            if retained is not None:
+                old = _load(retained[1].encode())
+                props = values[0] if values[0] is not None else old["props"]
+                models = values[1] if values[1] is not None else {"data": [old["selected_model"]]}
+                try:
+                    matches = self.identity(props, models, None) == retained[1]
+                except (ValueError, TypeError, RecursionError):
+                    matches = False
+                if not matches:
+                    self.store.clear()
+                    raise _Invalid("partial metadata contradicts retained identity")
+            raise _Unavailable("upstream metadata unavailable")
+        identity = self.identity(*values, None)
+        self.store.activate(identity)
+        # A valid replacement model revokes old evidence even if this caller requested the old alias.
+        return self.identity(*values, requested_model)
+
+    def identity(self, props: object, models: object, requested_model: object) -> str:
         if not isinstance(props, dict) or not isinstance(models, dict) or not isinstance(models.get("data"), list):
             raise _Invalid("unknown upstream identity")
         build = props.get("build") or props.get("build_info")
         model = props.get("model_alias") or props.get("model")
+        if requested_model is None:
+            requested_model = model
         defaults = props.get("default_generation_settings")
         if not isinstance(defaults, dict):
             raise _Invalid("unknown upstream defaults")
@@ -434,10 +539,34 @@ class CacheServer(ThreadingMixIn, HTTPServer):
         context = defaults.get("n_ctx", props.get("n_ctx", props.get("total_context", metadata.get("n_ctx") if isinstance(metadata, dict) else None)))
         if type(build) is not str or not build or type(model) is not str or not model or selected is None or not complete_defaults or type(props.get("chat_template")) is not str or not props.get("chat_template") or not isinstance(context, _Number) or not context.isascii() or not context.isdigit() or int(context) <= 0:
             raise _Invalid("incomplete or mismatched upstream identity")
-        fields = ("version", "build", "build_info", "model", "model_alias", "model_path", "model_ftype", "chat_template", "chat_template_tool_use", "chat_template_caps", "n_ctx", "total_context", "n_ctx_per_seq", "n_ctx_slot", "n_parallel", "n_slots", "total_slots", "default_generation_settings", "modalities", "media_marker", "bos_token", "eos_token")
+        fields = ("version", "build", "build_info", "model", "model_alias", "model_path", "model_ftype", "chat_template", "chat_template_tool_use", "chat_template_caps", "n_ctx", "total_context", "n_ctx_per_seq", "n_ctx_slot", "n_parallel", "n_slots", "total_slots", "default_generation_settings", "modalities", "media_marker", "bos_token", "eos_token", "supports_streaming", "streaming", "supports_tokenization", "tokenization", "supports_structured_output", "structured_output", "grammar")
         stable_model = {key: selected[key] for key in ("id", "aliases", "architecture", "meta") if key in selected}
         # Observed metadata cannot detect an invisible in-place weights replacement: operator clear is required.
         return _canonical({"cache_schema": _SCHEMA, "prompt_schema": _PROMPT_SCHEMA, "upstream": self.upstream.geturl(), "props": {key: props[key] for key in fields if key in props}, "selected_model": stable_model})
+
+    def retained(self, requested_model: object) -> tuple[int, str, int, str | None, bytes | None, str | None]:
+        record = self.store.planning()
+        value = _load(record[1].encode())
+        if not isinstance(value, dict) or value.get("upstream") != self.upstream.geturl() or self.identity(value.get("props"), {"data": [value.get("selected_model")]}, requested_model) != record[1]:
+            raise _Invalid("invalid retained planning identity")
+        return record
+
+    def read_identity(self, requested_model: object, authorization: str | None, budget: _Budget) -> tuple[str, bool]:
+        if type(requested_model) is not str or not requested_model:
+            raise _Invalid("cache lookup requires an explicit model alias")
+        try:
+            return self.observe(requested_model, authorization, budget), True
+        except _Unavailable:
+            return self.retained(requested_model)[1], False
+
+
+def _single_token(raw: bytes) -> bool:
+    try:
+        value = _load(raw)
+        tokens = value.get("tokens") if isinstance(value, dict) else None
+        return isinstance(tokens, list) and len(tokens) == 1 and isinstance(tokens[0], _Number) and tokens[0].isascii() and tokens[0].isdigit() and int(tokens[0]) <= 0xFFFFFFFF
+    except (ValueError, TypeError, RecursionError):
+        return False
 
 
 def _read(response: http.client.HTTPResponse, budget: _Budget, limit: int) -> bytes:
@@ -495,11 +624,30 @@ class _Handler(BaseHTTPRequestHandler):
             self._reply(404, "UNKNOWN")
             return
         try:
-            with self.server.upstream_response("GET", self.path, None, self.headers.get("Authorization"), self.budget) as response:
-                raw = _read(response, self.budget, self.server.response_limit)
-                self._headers(response.status, response.getheaders(), "BYPASS", len(raw))
-                self.wfile.write(raw)
-        except (OSError, http.client.HTTPException, ValueError):
+            if self.headers.get("X-Hymt-Cache-Bypass") == "1" or self.headers.get("x-bf-eh-x-hymt-cache-bypass") == "1":
+                with self.server.upstream_response("GET", self.path, None, self.headers.get("Authorization"), self.budget) as response:
+                    raw = _read(response, self.budget, self.server.response_limit)
+                    self._headers(response.status, response.getheaders(), "BYPASS", len(raw))
+                    self.wfile.write(raw)
+                return
+            historical = False
+            try:
+                identity = self.server.observe(None, self.headers.get("Authorization"), self.budget)
+            except _Unavailable:
+                identity = self.server.retained(None)[1]
+                historical = True
+            record = self.server.retained(None)
+            if record[1] != identity:
+                raise _Invalid("planning identity changed")
+            value = _load(identity.encode())
+            body = value["props"] if self.path == "/props" else {"data": [value["selected_model"]]}
+            headers = [("Content-Type", "application/json")]
+            if historical:
+                headers += [("X-Hymt-Planning", "historical"), ("X-Hymt-Observed-At", str(record[2]))]
+            raw = _canonical(body).encode()
+            self._headers(200, headers, "HIT" if historical else "BYPASS", len(raw))
+            self.wfile.write(raw)
+        except (OSError, http.client.HTTPException, sqlite3.Error, ValueError, TypeError, RecursionError):
             if not self.started:
                 self._reply(502, "UNKNOWN")
 
@@ -529,10 +677,40 @@ class _Handler(BaseHTTPRequestHandler):
             if not isinstance(payload, dict):
                 raise _Invalid("request must be a JSON object")
             if self.path == "/tokenize":
-                with self.server.upstream_response("POST", self.path, raw, self.headers.get("Authorization"), self.budget) as response:
+                authorization = self.headers.get("Authorization")
+                bypass = self.headers.get("X-Hymt-Cache-Bypass") == "1" or self.headers.get("x-bf-eh-x-hymt-cache-bypass") == "1"
+                canonical_token = _canonical(payload)
+                identity = None
+                token_candidate = set(payload) == {"content"} and type(payload["content"]) is str and len(raw) <= 4096
+                if not bypass and token_candidate:
+                    try:
+                        identity = self.server.observe(None, authorization, self.budget)
+                    except _Unavailable:
+                        try:
+                            record = self.server.retained(None)
+                            body = record[4]
+                            if record[3] == canonical_token and body is not None and hashlib.sha256(body).hexdigest() == record[5] and _single_token(body):
+                                self._reply(200, "HIT", body)
+                                return
+                        except (sqlite3.Error, ValueError, TypeError, RecursionError):
+                            pass
+                    except (OSError, http.client.HTTPException, sqlite3.Error, ValueError, TypeError, RecursionError):
+                        pass
+                with self.server.upstream_response("POST", self.path, raw, authorization, self.budget) as response:
                     body = _read(response, self.budget, self.server.response_limit)
-                    self._headers(response.status, response.getheaders(), "BYPASS", len(body))
-                    self.wfile.write(body)
+                    headers = response.getheaders()
+                    status = response.status
+                if identity is not None and status == 200 and _cacheable_headers(headers) and _single_token(body):
+                    try:
+                        record = self.server.retained(None)
+                        props = _load(record[1].encode())["props"]
+                        # Retain only the advertised EOS mapping used by CLI planning, not arbitrary tokenization.
+                        if payload == {"content": props.get("eos_token")} and record[1] == identity and self.server.observe(None, authorization, self.budget) == identity:
+                            self.server.store.retain_token(record[0], identity, canonical_token, body)
+                    except (OSError, http.client.HTTPException, sqlite3.Error, ValueError, TypeError, RecursionError):
+                        pass
+                self._headers(status, headers, "BYPASS", len(body))
+                self.wfile.write(body)
                 return
             canonical = _canonical(payload)
             authorization = self.headers.get("Authorization")
@@ -543,20 +721,24 @@ class _Handler(BaseHTTPRequestHandler):
                 provenance = "BYPASS"
             else:
                 try:
-                    identity = self.server.observe(payload.get("model"), authorization, self.budget)
+                    identity, fresh = self.server.read_identity(payload.get("model"), authorization, self.budget)
                     epoch = self.server.store.epoch()
                     key = hashlib.sha256((identity + "\n" + str(epoch) + "\n" + canonical).encode()).hexdigest()
-                    with self.server.flight_lock:
-                        flight = self.server.flights.get(key)
-                        if flight is None:
-                            flight = _Flight()
-                            self.server.flights[key] = flight
-                            leader = True
-                    hit = self.server.store.read(key, epoch, canonical, identity, self.server.request_limit, self.server.response_limit) if leader else None
-                    if hit is not None:
-                        flight.reply = (200, hit[0], hit[1])
-                        flight.admitted = True
-                    provenance = "MISS" if leader else "HIT"
+                    if not fresh:
+                        hit = self.server.store.read(key, epoch, canonical, identity, self.server.request_limit, self.server.response_limit)
+                        identity = None
+                    else:
+                        with self.server.flight_lock:
+                            flight = self.server.flights.get(key)
+                            if flight is None:
+                                flight = _Flight()
+                                self.server.flights[key] = flight
+                                leader = True
+                        hit = self.server.store.read(key, epoch, canonical, identity, self.server.request_limit, self.server.response_limit) if leader else None
+                        if hit is not None:
+                            flight.reply = (200, hit[0], hit[1])
+                            flight.admitted = True
+                        provenance = "MISS" if leader else "HIT"
                 except (OSError, sqlite3.Error, ValueError, http.client.HTTPException, TypeError, RecursionError):
                     identity = None
                     provenance = "UNKNOWN"

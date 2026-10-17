@@ -13,6 +13,9 @@ use serde_json::{Map, Value};
 pub enum BackendVerificationStatus {
     /// The service returned a backend-specific response that parsed successfully.
     Verified,
+    /// Previously verified planning facts retained by the inference cache during an outage.
+    /// These limits may guide an exact replay, but do not attest to a live backend.
+    Historical,
     /// No trustworthy response is available; all missing values must remain unknown.
     Unverified,
 }
