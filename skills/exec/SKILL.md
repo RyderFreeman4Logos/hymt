@@ -27,11 +27,16 @@ Use `hymt exec` when an agent or user wants original command output preserved an
 
 ## Precache
 
-- Pre-cache translations for recently used commands: `hymt exec precache`
+- Pre-cache translations for recently used commands: `hymt exec precache`. This explicit operation populates application caches even when ordinary cache use defaults to off; `--no-cache` conflicts with it.
 
 ## Config
 
+Application output caches default to off. Set `[cache].enabled = true` to opt in; `--no-cache` bypasses reads and writes for ordinary exec/man/info use. History and the service inference cache remain independent.
+
 ```toml
+[cache]
+enabled = false
+
 [exec]
 shared_cache_path = "/usr/local/share/hymt/cache.db"
 translate_stderr = true

@@ -1,5 +1,5 @@
 use super::{DocumentLanguagePlan, SectionKind, Segmenter};
-use pulldown_cmark::{Event, LinkType, Parser, Tag};
+use pulldown_cmark::{Event, LinkType, Parser, Tag, TagEnd};
 use std::ops::Range;
 
 // Keep parser-resolved identity separate from the translated display label.
@@ -261,17 +261,69 @@ fn protected_markdown_structure_ranges(text: &str) -> Vec<Range<usize>> {
             index += 1;
         }
     }
+    let punctuation = |character: char| {
+        character.is_ascii_punctuation()
+            || (!character.is_ascii()
+                && !character.is_whitespace()
+                // Intraword underscores open only after parser-classified punctuation.
+                && Parser::new(&format!("a{character}_b_")).any(|event| {
+                    matches!(event, Event::Start(Tag::Emphasis))
+                }))
+    };
+    // Index maximal punctuation runs once: nested owners can share long flanks.
+    let mut punctuation_runs = Vec::<Range<usize>>::new();
+    for (offset, character) in text.char_indices() {
+        if punctuation(character) {
+            if let Some(run) = punctuation_runs.last_mut() {
+                if run.end == offset {
+                    run.end += character.len_utf8();
+                    continue;
+                }
+            }
+            punctuation_runs.push(offset..offset + character.len_utf8());
+        }
+    }
+    let punctuation_run = |offset| {
+        let index = punctuation_runs.partition_point(|run| run.end < offset);
+        punctuation_runs
+            .get(index)
+            .filter(|run| run.start <= offset)
+    };
+    // URLs are identity, including visible URL labels; only adjacent prose translates.
+    let source_urls = hymt_core::completeness::preserved_url_ranges(text);
+    for range in &source_urls {
+        // Keep punctuation separating the URL from translated adjacent text.
+        let left = punctuation_run(range.start).map_or(range.start, |run| run.start);
+        let right = punctuation_run(range.end).map_or(range.end, |run| run.end);
+        owned.push(left..right);
+    }
     let mut opaque = owned.clone();
     let mut editable = Vec::new();
+    let mut literal_delimiters = Vec::new();
+    let mut paragraph = None;
+    let mut table_paragraphs = Vec::new();
     for (event, range) in parser.into_offset_iter() {
         match event {
-            Event::Start(
-                Tag::Heading { .. }
-                | Tag::Emphasis
-                | Tag::Strong
-                | Tag::Strikethrough
-                | Tag::BlockQuote(_),
-            ) => owned.push(range),
+            Event::Start(Tag::Paragraph) => paragraph = Some(range),
+            Event::End(TagEnd::Paragraph) => paragraph = None,
+            Event::Start(Tag::Emphasis | Tag::Strong | Tag::Strikethrough) => {
+                let left = punctuation_run(range.start).map_or(range.start, |run| run.start);
+                let preceding = source_urls.partition_point(|url| url.end <= range.start);
+                // URL-adjacent formatting needs its source boundary even when
+                // ordinary Markdown could remain valid after that boundary vanished.
+                // Other prose punctuation stays editable under the renderer contract.
+                if preceding > 0 && source_urls[preceding - 1].end >= left {
+                    let right = punctuation_run(range.end).map_or(range.end, |run| run.end);
+                    for flank in [left..range.start, range.end..right] {
+                        if !flank.is_empty() {
+                            opaque.push(flank.clone());
+                            owned.push(flank);
+                        }
+                    }
+                }
+                owned.push(range);
+            }
+            Event::Start(Tag::Heading { .. } | Tag::BlockQuote(_)) => owned.push(range),
             Event::Start(Tag::CodeBlock(_))
             | Event::Code(_)
             | Event::Html(_)
@@ -294,6 +346,16 @@ fn protected_markdown_structure_ranges(text: &str) -> Vec<Range<usize>> {
             Event::Text(content) if text[range.clone()] == *content => {
                 // Flanking whitespace belongs to syntax, not trimmed model text.
                 let literal = &text[range.clone()];
+                if literal.contains('|') {
+                    if let Some(paragraph) = paragraph.take() {
+                        table_paragraphs.push(paragraph);
+                    }
+                }
+                literal_delimiters.extend(literal.char_indices().filter_map(
+                    |(offset, character)| {
+                        matches!(character, '*' | '_').then_some(range.start + offset)
+                    },
+                ));
                 let start = range.start + literal.len() - literal.trim_start().len();
                 let end = range.start + literal.trim_end().len();
                 if start < end {
@@ -302,6 +364,41 @@ fn protected_markdown_structure_ranges(text: &str) -> Vec<Range<usize>> {
             }
             _ => {}
         }
+    }
+    // Keep table-like prose malformed when present: models must not join headers
+    // or invent separators. Preserve every row boundary, including ragged rows.
+    for paragraph in table_paragraphs {
+        let mut offset = paragraph.start;
+        for line in text[paragraph].split_inclusive('\n') {
+            let separator = line.contains('-')
+                && line
+                    .chars()
+                    .all(|c| matches!(c, '|' | '-' | ':' | ' ' | '\t' | '\r' | '\n'));
+            if separator {
+                owned.push(offset..offset + line.len());
+                opaque.push(offset..offset + line.len());
+            } else {
+                for (index, character) in line.char_indices() {
+                    if matches!(character, '|' | '\r' | '\n') {
+                        owned.push(offset + index..offset + index + 1);
+                        opaque.push(offset + index..offset + index + 1);
+                    }
+                }
+            }
+            offset += line.len();
+        }
+    }
+    // Literal delimiters and their punctuation flanks must not become new emphasis.
+    let mut protected_end = 0;
+    for offset in literal_delimiters {
+        if offset < protected_end {
+            continue;
+        }
+        let start = text[..offset].trim_end_matches(punctuation).len();
+        let end = text.len() - text[offset..].trim_start_matches(punctuation).len();
+        owned.push(start..end);
+        opaque.push(start..end);
+        protected_end = end;
     }
     exclude_opaque(&mut editable, opaque);
     owned_gaps(text, owned, &editable)

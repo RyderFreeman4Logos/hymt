@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::language_spec::{language_spec_or_none, LanguageFamily};
 
+mod urls;
+pub use urls::preserved_url_ranges;
+use urls::urls;
+
 const MAX_CALIBRATED_DENSITY_RATIO: f64 = 8.0;
 
 /// Threshold configuration for completeness checks.
@@ -392,101 +396,6 @@ fn placeholder_tokens(text: &str) -> HashSet<String> {
 
 pub fn preserved_urls(text: &str) -> HashSet<String> {
     urls(text)
-}
-
-fn urls(text: &str) -> HashSet<String> {
-    let mut urls = HashSet::new();
-    let mut remaining = text;
-
-    while let Some(start) = earliest_url_scheme_start(remaining) {
-        let candidate = &remaining[start..];
-        let end = url_candidate_end(candidate);
-        let candidate = &candidate[..end];
-        if let Some(url) = normalize_url(candidate) {
-            urls.insert(url);
-        }
-        remaining = &remaining[start + end..];
-    }
-
-    urls
-}
-
-fn earliest_url_scheme_start(text: &str) -> Option<usize> {
-    match (text.find("http://"), text.find("https://")) {
-        (Some(http_start), Some(https_start)) => Some(http_start.min(https_start)),
-        (Some(start), None) | (None, Some(start)) => Some(start),
-        (None, None) => None,
-    }
-}
-
-fn url_candidate_end(candidate: &str) -> usize {
-    candidate
-        .char_indices()
-        .find_map(|(index, character)| {
-            (character.is_whitespace()
-                || is_fullwidth_url_punctuation(character)
-                || is_unmatched_closing_delimiter(
-                    &candidate[..index + character.len_utf8()],
-                    character,
-                ))
-            .then_some(index)
-        })
-        .unwrap_or(candidate.len())
-}
-
-fn normalize_url(candidate: &str) -> Option<String> {
-    let mut url = candidate;
-    while let Some((index, character)) = url.char_indices().last() {
-        if is_fullwidth_url_punctuation(character)
-            || matches!(character, ',' | '.' | ';' | ':' | '!' | '?')
-            || is_unmatched_closing_delimiter(url, character)
-        {
-            url = &url[..index];
-        } else {
-            break;
-        }
-    }
-    (!url.is_empty()).then(|| url.to_owned())
-}
-
-fn is_fullwidth_url_punctuation(character: char) -> bool {
-    matches!(
-        character,
-        '，' | '。'
-            | '；'
-            | '：'
-            | '！'
-            | '？'
-            | '）'
-            | '］'
-            | '｝'
-            | '＞'
-            | '》'
-            | '〉'
-            | '」'
-            | '』'
-            | '】'
-            | '、'
-    )
-}
-
-fn is_unmatched_closing_delimiter(url: &str, closing: char) -> bool {
-    let Some(opening) = (match closing {
-        ')' => Some('('),
-        ']' => Some('['),
-        '}' => Some('{'),
-        '>' => Some('<'),
-        _ => None,
-    }) else {
-        return false;
-    };
-    url.chars()
-        .filter(|character| *character == opening)
-        .count()
-        < url
-            .chars()
-            .filter(|character| *character == closing)
-            .count()
 }
 
 fn preserves_all(input: &HashSet<String>, output: &HashSet<String>) -> bool {

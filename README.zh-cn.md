@@ -14,7 +14,7 @@ Hy-MT2是一款实用的Rust命令行工具：具备分词器感知的分段处�
 
 - 通过一个命令即可翻译定位的文本、标准输入内容或文件。
 - 基于Hy-MT2分词器对长文本进行分段，而非盲目分割。
-- 在分段层面重用缓存翻译结果，使重复内容几乎能瞬间获取。
+- 可显式启用应用层翻译缓存，复用片段及整段输出。
 - 默认以流式方式输出分词结果，从而保证`| less`、`| bat`和`| tee`等操作流程的响应速度。
 - 使用具备结构识别能力的边界对Markdown文本进行分段；具体多语言处理限制见下文。
 - 可批量处理整个目录树，在写入前预览缓存状态及预计完成时间。
@@ -113,7 +113,7 @@ warn_only = false
 divergence_threshold = 2.0
 ```
 
-该配置支持热重载，但`[endpoint].profile`除外，它在启动时会被固定（详见[模型配置](#model-profile-endpointprofile)）。长时间运行的工作流无需重启即可应用其他更改。
+该配置支持热重载，但`[endpoint].profile`除外，它在启动时会被固定（详见[模型配置](#模型配置文件endpointprofile)）。长时间运行的工作流无需重启即可应用其他更改。
 
 ### 后端特定采样设置（`[endpoint].backend`）
 
@@ -122,7 +122,7 @@ divergence_threshold = 2.0
 | 后端类型 | 支持的覆盖字段 | 后端特定的数据传输规则 |
 |---|---|---|
 | `llama_cpp` | `temperature`、`top_p`、`top_k`、`repetition_penalty`、`min_p`、`repeat_last_n` | `repetition_penalty`以`repeat_penalty`形式发送；被禁用的`top_k`和`repeat_last_n`则发送为`0`。 |
-| `vllm` | `temperature`、`top_p`、`top_k`、`repetition_penalty`、`min_p` | `repetition_penalty`以`repetition_penalty`形式发送；被禁用的`top_k`发送为`-1`；`repeat_last_n`会被忽略。 |
+| `vllm` | `temperature`、`top_p`、`top_k`、`repetition_penalty`、`min_p` | `repetition_penalty`以`repetition_penalty`形式发送；被禁用的`top_k`发送为`-1`；显式设置的`repeat_last_n`会被拒绝。 |
 | `openai_compatible` | `temperature`、`top_p` | 仅发送常见的聊天完成相关字段；所有非标准的显式覆盖参数都会被拒绝，而不会被猜测。 |
 若省略了`[inference.override]`键，其值始终为`Setting::ServerDefault`，因此该键不会出现在JSON请求中，服务会使用自身配置的数值。所有Hy-MT2配置文件也是如此：配置文件中的采样值仅作为服务部署的参考，绝不会自动被注入到请求数据中。只有当客户端需要刻意替换服务默认值时，才应设置数值型覆盖值；`"disabled"`和数值属于语义配置状态，适配器会选择文档中规定的数值，而不会随意将`0`和`-1`进行转换。明确的覆盖值会被包含在诊断信息以及推理/缓存指纹中。直接位于`[inference]`下的旧版标量采样值在某个版本中仍可被视作明确覆盖值，但会触发启动迁移警告；建议将其移至`[inference.override]`下。验证错误会指出对应的语义值，并说明何时不存在后端对应的数值表示形式。流式请求与非流式请求使用相同的适配器策略。
 
@@ -132,11 +132,11 @@ divergence_threshold = 2.0
 
 在规划或缓存查找之前，翻译引擎会先检测配置的后端。llama.cpp使用`GET /props`；而vLLM及其他兼容OpenAI的服务在可用时会使用`GET /v1/models`。标准化的运行时状态包括服务版本/模型标识、上下文与槽位限制、采样器默认设置，以及明确声明的功能。缺失的字段将保持未知状态，不会被推测出来。
 
-当llama.cpp的 `/props` 返回单个ASCII标点符号`eos_token`，且聊天模板中包含`<|...|>`控制标记时，hymt会检测到矛盾：模板中的标记才是真正的结束符，而元数据中的标记则是假的。它会在预检阶段通过 `/tokenize` 处理这个错误的标记，并向llama.cpp发送`logit_bias`参数`{ "<token_id>": -100 }`，从而避免错误停止，同时不会屏蔽聊天模板中真正的结束符标记（如`}`）。聊天模板本身使用的单字符结束符则保持不变。
+当llama.cpp的 `/props` 返回单个ASCII标点符号`eos_token`，且聊天模板中包含`<|...|>`控制标记时，hymt会检测到矛盾：模板中的标记才是真正的结束符，而元数据中的标记则是假的。它会在预检阶段通过 `/tokenize` 处理这个错误的标记，并向llama.cpp发送`logit_bias`参数`{ "<token_id>": -100 }`，从而避免错误停止，同时不会屏蔽聊天模板中真正的结束符标记（如`<|eos|>`）。聊天模板本身使用的单字符结束符则保持不变。
 
 运行`hymt backend inspect`可并列显示配置值和服务检测到的值。该命令不会输出API密钥、端点凭证或请求头信息。警告信息会指出上下文/模型/配置文件不匹配、服务采样器状态异常，以及llama.cpp与vLLM之间的重复惩罚参数不一致问题。
 
-正常的预检机制为“失败即拒绝”模式：它会发出警告，标记推理指纹/缓存标识未被验证，并设置较为保守的上下文/输出限制。若无法验证身份或发现重大不匹配，可设置`[translation].strict_backend_preflight = true`，在查询缓存或调用模型之前直接拒绝请求。运行时状态会以TTL机制缓存60秒，当端点/后端/配置发生变化时会被刷新；新的服务身份将取代原有的解析状态和指纹。
+默认预检在失败时会发出警告，将推理指纹/缓存身份标记为未验证，并使用保守的上下文/输出限制继续规划。若无法验证身份或发现重大不匹配，可设置`[translation].strict_backend_preflight = true`，在查询缓存或调用模型之前直接拒绝请求。运行时状态会以TTL机制缓存60秒，当端点/后端/配置发生变化时会被刷新；新的服务身份将取代原有的解析状态和指纹。
 
 ## 模型配置文件（`[endpoint].profile`）
 
@@ -183,9 +183,9 @@ mode = "owners"         # "owners" | "groups"
 ### 翻译文本、标准输入内容或文件
 
 ```bash
-hymt "Hello world" -t zh
-printf 'Release notes go here.\n' | hymt -t ja
-hymt -f CHANGELOG.md -t fr -o CHANGELOG.fr.md
+hymt "Hello world" -l zh
+printf 'Release notes go here.\n' | hymt -l ja
+hymt CHANGELOG.md -l fr -o CHANGELOG.fr.md
 ```
 
 ### 目标语言代码
@@ -201,9 +201,9 @@ hymt -f CHANGELOG.md -t fr -o CHANGELOG.fr.md
 流式处理为默认启用状态。这意味着你可以继续使用常规的shell管道操作：
 
 ```bash
-hymt -f article.md -t zh | less
-hymt -f notes.txt -t ja | bat -l markdown
-hymt -f report.md -t zh | tee report.zh.preview.md
+hymt article.md -l zh | less
+hymt notes.txt -l ja | bat -l markdown
+hymt report.md -l zh | tee report.zh.preview.md
 ```
 
 如果需要完全缓冲的响应，请使用 `--no-stream`。
@@ -220,7 +220,7 @@ Markdown 标题、列表项、引文以及表格行也遵循相同的段落规�
 
 ```bash
 hymt --force-translate-all -l zh "English text\n\n已有中文段落"
-hymt --no-language-detection -l zh -f article.md
+hymt --no-language-detection -l zh article.md
 ```
 
 ```toml
@@ -233,14 +233,17 @@ force_translate_all = false    # default: false; set true to translate all non-c
 
 ## 智能分词与缓存复用
 
-hymt会根据Hy-MT2分词器及选定的提示模板来规划每次翻译任务。目前，每个翻译后的段落是通过以下信息进行缓存的：
+应用层片段缓存与整段输出缓存默认关闭。设置 `[cache].enabled = true` 可显式启用；普通翻译、batch、man/info、exec 和 Telegram 命令的 `--no-cache` 会覆盖该设置。关闭缓存不会删除旧缓存，也不影响翻译历史、耗时估计和 recall。服务层推理缓存独立复用完整且一致的 HTTP 请求与响应，并由服务自身配置保持启用。`hymt exec precache` 是显式填充应用缓存的操作，即使默认关闭也会执行；与 `--no-cache` 同用时会报错。
+
+hymt会根据Hy-MT2分词器及选定的提示模板来规划每次翻译任务。应用层缓存启用时，翻译片段按以下信息生成缓存键：
 - 段落内容哈希值
 - 目标语言
 - 模板类型
 - 模板选项
 - `profile_id`（标准配置文件ID）
+- 已验证的推理指纹
 
-因此可以实现配置文件的隔离。不过，段落缓存键目前还不包含端点/模型标识、分词器版本、量化设置或后端构建信息，以及推理采样参数（详见#115）。因此，这些参数的更改仍可复用旧版本配置文件中的缓存条目；`config_version`信息会记录在任务历史中，而非段落缓存键中。在这些参数实现自动隔离之前，需要先进行推理指纹识别。
+该指纹包含配置的端点、后端和模型、配置文件中的模型/分词器来源、显式采样设置，以及可用的运行时观测元数据。只有启用缓存且推理身份已验证时才会复用片段缓存；身份未验证时仍可继续翻译，但不会读写片段缓存。指纹无法证明观测元数据之外的模型文件内容或量化方式。若原地替换模型后这些可观测信息未变化，应在复用前运行`hymt history --clear`清除片段缓存与任务历史。`config_version`仅记录于任务历史，不属于片段缓存键。
 
 这样一来就能实现：
 - 在翻译过程中断后快速重新开始
@@ -259,8 +262,8 @@ hymt会根据Hy-MT2分词器及选定的提示模板来规划每次翻译任务�
 
 ```bash
 hymt translate-doc README.md
-hymt translate-doc README.md -t ja
-hymt translate-doc README.md -t zh -o README.zh-cn.md
+hymt translate-doc README.md -l ja
+hymt translate-doc README.md -l zh --output README.zh-cn.md
 hymt translate-doc docs/ --recursive
 ```
 
@@ -276,12 +279,12 @@ hymt translate-doc docs/ --recursive
 
 ## 批量翻译目录树结构
 
-若希望对`.md`和`.txt`文件采用先预览的流程，可使用`batch`命令：
+可用`batch`处理`.md`和`.txt`文件。添加`--dry-run`仅预览而不写入；否则命令会先显示预览，再写入选定的输出文件：
 
 ```bash
-hymt batch docs -t zh
-hymt batch docs -t zh --write --yes
-hymt batch docs -t zh --write --output-dir translated-docs
+hymt batch docs -l zh --dry-run
+hymt batch docs -l zh --yes
+hymt batch docs -l zh --output-dir translated-docs
 ```
 
 批量预览报告：
@@ -299,7 +302,7 @@ hymt batch docs -t zh --write --output-dir translated-docs
 ```bash
 hymt exec -- cargo test
 hymt exec -- git status
-hymt exec precache --recursive
+hymt exec precache
 ```
 
 `hymt exec` 会保留原始命令的输出，随后再添加翻译后的输出。它对于不熟悉的命令行工具、构建失败以及冗长的帮助文本非常有用。
@@ -310,7 +313,7 @@ hymt exec precache --recursive
 hymt man git-rebase
 hymt man --original git-rebase
 hymt info coreutils
-hymt info --refresh bash
+hymt info bash
 ```
 
 ## 回忆、历史记录及预计到达时间估算
@@ -321,9 +324,8 @@ hymt info --refresh bash
 
 ```bash
 hymt history
-hymt history --stats
+hymt history stats
 hymt recall
-hymt recall --list
 hymt estimate 10000 -l zh
 ```
 
@@ -358,7 +360,7 @@ hymt telegram --regenerate-claim-password
 
 ## 通过Tailscale实现远程Hy-MT2运行
 
-该仓库的`[services/`](services)目录下包含两个互不兼容的systemd用户服务示例。`-c`用于定义整个服务的上下文池；`--parallel`参数则用于将上下文分配给多个并发请求：
+该仓库的[`services/`](services)目录下包含两个互不兼容的systemd用户服务示例。`-c`用于定义整个服务的上下文池；`--parallel`参数则用于将上下文分配给多个并发请求：
 
 | 服务名称 | 模型量化级别 | KV缓存大小 | 总上下文容量 | 并发槽位数 | 每个槽位的上下文容量 |
 |---|---|---|---:|---:|---:|
@@ -367,7 +369,17 @@ hymt telegram --regenerate-claim-password
 
 这两个服务都仅绑定到Tailscale上的`100.78.159.38:8401`端口，而非`0.0.0.0`。它们均使用CUDA版本的`llama-server`；两个服务都使用`/home/obj/.local/share/llama-cpp-cuda/llama-server`处的本地持久化构建及其对应的库目录。这些绝对路径是特定于宿主机的，但替代的后端必须支持所指定的`llama-server`上下文配置、并行槽位设置以及KV缓存功能。
 
-两个服务配置均明确设置了`--temp 0.7`、`--top-k 20`、`--top-p 0.6`以及`--repeat-penalty 1.05`，这些均为Hy-MT2的推荐参数。同时，它们还设置了`--min-p 0`（禁用该仅适用于llama.cpp的扩展功能）和`--repeat-last-n 64`（这是为适配1.05版本的重复惩罚机制而特意采用的llama.cpp兼容设置，并非Hy-MT2的原始推荐值）。因此，这些参数不会从已安装的llama.cpp版本中随机继承任何采样配置。除非有`[inference.override]`指令明确指定替代值，否则HymT会忽略所有采样相关字段，所以修改服务默认参数也会改变默认的翻译结果。在启动时，llama.cpp客户端会发送`GET /props`请求，并输出其报告的原始`default_generation_settings`值；如果该接口不可用或版本过旧，系统会发出警告并仅忽略相关请求，不会报错。
+两个服务配置均明确设置了`--temp 0.7`、`--top-k 20`、`--top-p 0.6`以及`--repeat-penalty 1.05`，这些均为Hy-MT2的推荐参数。同时，它们还设置了`--min-p 0`（禁用该仅适用于llama.cpp的扩展功能）和`--repeat-last-n 64`（这是为适配1.05版本的重复惩罚机制而特意采用的llama.cpp兼容设置，并非Hy-MT2的原始推荐值）。因此，这些参数不会从已安装的llama.cpp版本中随机继承任何采样配置。除非有`[inference.override]`指令明确指定替代值，否则HymT会忽略所有采样相关字段，所以修改服务默认参数也会改变默认的翻译结果。普通翻译会通过`GET /props`预检llama.cpp服务并输出相关警告；`hymt backend inspect`会显示标准化的配置值与服务解析出的采样字段。若`/props`不可用或版本过旧，推理身份会保持未验证状态，除非启用严格后端预检，否则会继续采用保守规划。
+
+### 可选的共享推理缓存
+
+独立的明文缓存跨客户端和 API/VK 凭据保存完整的原始推理响应，包括 usage。缓存身份使用观测到的上游模型、构建、默认采样、模板和上下文元数据；身份检查仍需上游服务。它不替代 hymt 的译文验证或片段缓存。
+
+直接访问缓存仅限受信任的 Tailscale 客户端，或将缓存置于现有的身份验证网关之后。API/VK 凭据不隔离缓存命中。
+
+`just install-inference-cache` 将脚本与用户 unit 安装到稳定路径，重载 systemd，并在缓存已运行时重启它。首次启动执行 `systemctl --user enable --now hy-mt2-cache.service`。附带的 unit 绑定特定宿主机：监听 Tailscale 的 `100.78.159.38:8402`，并转发到 `100.78.159.38:8401` 的模型服务。需要使用缓存的客户端可设置 `[endpoint].url = "http://100.78.159.38:8402/v1"`，保留 `backend = "llama_cpp"`，并将 `[endpoint].model` 设为上游 `/v1/models` 公布的实际 ID 或别名。示例配置中的空 `model` 会使请求省略该字段，无法产生缓存命中。
+
+若在观测元数据不变的情况下替换了模型内容，执行 `python3 "$HOME/.local/share/hymt/inference-cache.py" clear --database "$HOME/.local/state/hymt/inference-cache.sqlite3"`；清理操作会使持久化条目及正在进行的写入失效。该缓存独立于 hymt 的翻译历史，且不提供离线重放。
 
 ## 架构
 
@@ -393,7 +405,7 @@ just pre-commit
 just pre-push-gate head
 ```
 
-快速提交钩子检查格式和锁定依赖的工作区Clippy。完整门禁还包括锁定依赖的工作区测试与编译检查、不启用Telegram的CLI检查和测试、每个受Git跟踪的Shell脚本的语法与ShellCheck检查、两个systemd服务单元的静态验证，以及所有受Git跟踪的TOML文件解析。所有诊断都会显示，仅允许未部署宿主机上两个已知服务单元的规范持久化可执行文件缺失诊断。
+快速提交钩子检查格式和锁定依赖的工作区Clippy。完整门禁还包括锁定依赖的工作区测试与编译检查、推理缓存的 Python 契约测试、不启用Telegram的CLI检查和测试、每个受Git跟踪的Shell脚本的语法与ShellCheck检查、三个systemd服务单元的静态验证，以及所有受Git跟踪的TOML文件解析。所有诊断都会显示，仅允许未部署宿主机上两个已知模型服务单元的规范持久化可执行文件缺失诊断。
 
 随后取得覆盖整个`main...HEAD`范围、结论为PASS且可处理问题数为零的独立原生审查。将`HYMT_LOCAL_GATE_RECEIPT`设为门禁打印的私有凭据路径，将`HYMT_NATIVE_REVIEW_RECEIPT`设为[原生审查回执格式](#原生审查回执格式)中说明的独立审查凭据。Lefthook会结合实际待推送的功能分支更新，验证凭据的精确HEAD/tree、审查范围及日志和报告内容；推送不会重复执行未变化的检查。源码变更后必须重新取得凭据。运行产物位于私有SSD任务目录`/mnt/ssd/mirror-rootfs/home/obj/tmp/hymt-stop-ai-20261012`；仓库不使用托管GitHub Actions工作流。
 

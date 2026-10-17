@@ -297,12 +297,14 @@ async fn malformed_multiline_link_repair_is_rejected_atomically_in_all_publicati
             .iter()
             .cloned()
             .enumerate()
-            .map(|(index, response)| {
-                if streaming && index == 0 {
-                    MockResponse::Sse(vec![response])
+            .flat_map(|(index, response)| {
+                let initial = if streaming && index == 0 {
+                    MockResponse::Sse(vec![response.clone()])
                 } else {
-                    MockResponse::Json(response)
-                }
+                    MockResponse::Json(response.clone())
+                };
+                let retry = (index == boundary_segment).then_some(MockResponse::Json(response));
+                [Some(initial), retry].into_iter().flatten()
             })
             .collect();
         let server = start_capturing_mock_server(responses).await;
@@ -377,8 +379,8 @@ async fn malformed_multiline_link_repair_is_rejected_atomically_in_all_publicati
         let requests = server.requests.lock().unwrap().clone();
         assert_eq!(
             requests.len(),
-            planned_inputs.len(),
-            "one mock response per planned segment"
+            planned_inputs.len() + 1,
+            "malformed boundary must use one structural retry"
         );
         let captured_inputs: Vec<_> = requests
             .iter()
@@ -402,7 +404,7 @@ async fn malformed_multiline_link_repair_is_rejected_atomically_in_all_publicati
                     .to_owned()
             })
             .collect();
-        assert_eq!(captured_inputs.len(), planned_inputs.len());
+        assert_eq!(captured_inputs.len(), planned_inputs.len() + 1);
         for planned in &planned_inputs {
             assert!(
                 captured_inputs
@@ -492,4 +494,228 @@ fn markdown_link_classification_preserves_valid_ownership_and_guards_unresolved_
     assert!(!has_unparsed_link_syntax(
         "ordinary Optimistic text without Markdown links"
     ));
+}
+
+#[tokio::test]
+async fn literal_emphasis_keeps_delimiters_and_flanking_punctuation() {
+    for source in [
+        "**Label:**Body continues here.",
+        "**Label：**Body continues here.",
+        "__Label:__Body continues here.",
+        "**Label:**Body continues.**Other:**More words follow.",
+        "**Label:** Body continues here.",
+        "**Label**: Body continues here.",
+        "A * B and C _ D.",
+        "tail*",
+        "_",
+        "some_name_here",
+        "**Label🫠**Body continues here.",
+    ] {
+        let (output, requests) = translated_source(source).await;
+        assert!(
+            requests.iter().all(|request| !request.contains(['*', '_'])),
+            "literal delimiters must not reach the model: {requests:?}"
+        );
+        assert_eq!(source.matches('*').count(), output.matches('*').count());
+        assert_eq!(source.matches('_').count(), output.matches('_').count());
+        assert_eq!(markdown_structure(source), markdown_structure(&output));
+        for flank in [":**", "：**", ":__", "🫠**"] {
+            if source.contains(flank) && markdown_structure(source).inline.is_empty() {
+                assert!(
+                    output.contains(flank),
+                    "source punctuation must stay adjacent"
+                );
+            }
+        }
+        if source.contains("Body") {
+            assert!(output.contains("译"), "text must still translate");
+            assert!(!output.contains("Label") && !output.contains("Body"));
+        }
+    }
+}
+
+#[test]
+fn literal_delimiter_ownership_keeps_bare_urls_intact() {
+    let config = make_stream_config("http://127.0.0.1:9/v1");
+    let segmenter = fallback_segmenter();
+    for url in [
+        "https://example.test/some_path",
+        "https://example.test/search?q=prefix*",
+    ] {
+        let source = format!("Read {url} for further details.");
+        let plan = plan_translation(
+            &source,
+            "zh",
+            &config,
+            &segmenter,
+            &TemplateType::Default,
+            &PromptOpts::default(),
+        )
+        .unwrap();
+        // A provider can preserve a URL only if its complete bytes reach one request.
+        let translations: Vec<_> = plan
+            .segments
+            .iter()
+            .map(|segment| {
+                if segment.contains(url) {
+                    format!("译文 {url} 译文")
+                } else {
+                    "译文".to_owned()
+                }
+            })
+            .collect();
+        assert!(
+            plan.reconstruct(&translations).contains(url),
+            "URL was split: {url}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn table_cells_translate_without_repairing_source_layout() {
+    for source in [
+        "Header one |\nHeader two |\n|---|---|\nRow one |\n| Value one | Value two |\n",
+        "Header one |\nHeader two |\n| Value one | Value two |\n",
+        "Header one | Header two\n--- | ---\nValue one | Value two\nRagged one\nRagged two\n",
+        "| Header one | Header two |\r\n| :--- | ---: |\r\n| Value one | Value two |\r\n",
+        "| [Visible label](https://example.com/a|b) | `keep | code` |\n| --- | --- |\n| Value one | Value two |\n",
+    ] {
+        let (output, requests) = translated_source(source).await;
+        assert_eq!(markdown_structure(source), markdown_structure(&output));
+        let layout = |text: &str| text.chars().filter(|c| matches!(c, '|' | '\n' | '\r')).collect::<String>();
+        assert_eq!(layout(source), layout(&output), "source table boundaries must survive");
+        assert!(!requests.is_empty());
+        assert!(requests.iter().all(|request| !request.contains('|') && !request.contains('\n')),
+            "only cell text may reach the provider: {requests:?}");
+        assert!(output.contains('译'));
+        assert!(!output.contains("Header") && !output.contains("Value") && !output.contains("Ragged") && !output.contains("Visible"));
+    }
+}
+
+#[tokio::test]
+async fn all_urls_remain_source_owned_while_adjacent_prose_translates() {
+    for source in [
+        "https://example.com/plain-path\n",
+        "[https://example.com/plain-path](https://example.com/plain-path)\n",
+        "Before https://example.com/plain-path, after.\n",
+        "Before https://example.com/some_path?q=prefix* after.\n",
+        "[Visible label](https://example.com/plain-path) after.\n",
+    ] {
+        let (output, requests) = translated_source(source).await;
+        assert_eq!(
+            hymt_core::completeness::preserved_urls(source),
+            hymt_core::completeness::preserved_urls(&output)
+        );
+        assert!(requests.iter().all(|request| !request.contains("https://")));
+        assert_eq!(markdown_structure(source), markdown_structure(&output));
+        if source.contains("Before") || source.contains("Visible") {
+            assert!(!requests.is_empty());
+            assert!(output.contains('译'));
+        } else {
+            assert!(requests.is_empty());
+            assert_eq!(output, source);
+        }
+    }
+}
+
+#[tokio::test]
+async fn adjacent_url_owners_leave_prose_translatable() {
+    let config = make_stream_config("http://127.0.0.1:9/v1");
+    let segmenter = fallback_segmenter();
+    let opts = PromptOpts {
+        document_translation_policy: Some(DocumentTranslationPolicy::TranslateAll),
+        ..PromptOpts::default()
+    };
+    for source in [
+        "|https://example.test/x|Visible|\n|---|---|\n",
+        "| https://example.test/x | Visible |\n| --- | --- |\n",
+        "https://example.test/x**Visible**",
+        "https://example.test/x **Visible**",
+        "https://example.test/x*Visible*",
+        "https://example.test/x`kept`Visible",
+        "https://example.test/x<span>Visible</span>",
+        "https://example.test/x|Visible",
+        "https://example.test/x**Visible**.",
+        "https://example.test/x*Visible*，",
+        "https://example.test/x**Visible**，Body",
+        "https://example.test/x**Visible**, Body",
+        "Body ，_Visible_",
+        "Body，_Visible_",
+        "_Visible_，Body",
+        "|https://example.test/x**Visible**|Other|\n|---|---|\n",
+        "https://example.test/x**Visible**[Other](https://other.test)",
+        "https://example.test/x**Visible**)Other",
+        "https://example.test/a_b_(c) **Visible**",
+        "https://example.test/x[Visible](https://example.test/a*b*c|d)",
+        "https://example.test/x![Visible](https://example.test/a*b*c|d)",
+    ] {
+        let plan = plan_translation(
+            source,
+            "zh",
+            &config,
+            &segmenter,
+            &TemplateType::Default,
+            &opts,
+        )
+        .unwrap();
+        assert!(
+            plan.segments
+                .iter()
+                .any(|segment| segment.contains("Visible")),
+            "adjacent prose must enter the real planner: {source:?}: {:?}",
+            plan.segments
+        );
+        assert_eq!(plan.reconstruct(&plan.segments), source);
+        let (output, requests) = translated_source(source).await;
+        assert!(requests.iter().any(|request| request.contains("Visible")));
+        assert!(requests.iter().all(|request| !request.contains("https://")));
+        assert!(!output.contains("Visible"), "{source:?}: {output:?}");
+        assert!(output.contains('译'));
+        assert_eq!(
+            hymt_core::completeness::preserved_urls(source),
+            hymt_core::completeness::preserved_urls(&output)
+        );
+        assert_eq!(markdown_structure(source), markdown_structure(&output));
+        if matches!(source, "Body，_Visible_" | "Body ，_Visible_") {
+            assert_eq!(output, "译译译 _译译译译_");
+        } else if source == "_Visible_，Body" {
+            assert_eq!(output, "_译译译译_ 译译译");
+        }
+        if source.contains("`kept`") {
+            assert!(output.contains("`kept`"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn paragraph_boundaries_are_source_owned() {
+    let source = "First paragraph contains the first factual claim.\n\nSecond paragraph contains a different factual claim.\n\nThird paragraph contains the final factual claim.\n";
+    let (output, requests) = translated_source(source).await;
+    assert_eq!(
+        requests.len(),
+        3,
+        "each paragraph needs an independently validated translation"
+    );
+    assert!(requests.iter().all(|request| !request.contains("\n\n")));
+    assert_eq!(output.matches("\n\n").count(), 2);
+    for label in ["First", "Second", "Third"] {
+        assert!(requests.iter().any(|request| request.contains(label)));
+        assert!(!output.contains(label));
+    }
+}
+
+#[test]
+fn adjacent_url_markup_keeps_complete_link_labels_translatable() {
+    let config = make_stream_config("http://127.0.0.1:1");
+    let segmenter = fallback_segmenter();
+    for (source, label) in [
+        ("__https://example.test/repo-one__[visible words before the next link](https://example.test/repo-two)", "visible words before the next link"),
+        ("__https://example.test/repo-two__[Figure A](#fig:sample)and all of", "Figure A"),
+        ("https://example.com/path[visible label](https://example.net/next)", "visible label"),
+    ] {
+        let plan = plan_translation(source, "fr", &config, &segmenter, &TemplateType::Default, &PromptOpts::default()).unwrap();
+        assert!(plan.segments.iter().any(|segment| segment.contains(label)), "link label swallowed: {:?}", plan.segments);
+        let output = plan.reconstruct(&vec!["Traduction".to_owned(); plan.segment_count()]);
+        assert!(!output.contains(label));
+    }
 }
