@@ -495,6 +495,110 @@ async fn coherent_http_request_keeps_context_and_roundtrips_offline_proof() {
 }
 
 #[tokio::test]
+async fn complex_paragraph_requests_cover_source_and_map_replies_in_order() {
+    const FIRST: &str = "Alpha repeats *common* [12] with a unique first marker.\n";
+    const LAST: &str = "Beta repeats *common* [12] with a unique last marker.\n";
+    const OPAQUE: &str = "```txt\nopaque [99]\n```\n";
+    const FIRST_REPLY: &str = "甲段重复 *共有* [12]，首标记。";
+    const LAST_REPLY: &str = "乙段重复 *共有* [12]，末标记。";
+    let source = format!("{FIRST}\n{OPAQUE}\n{LAST}");
+    let expected = format!("{FIRST_REPLY}\n\n{OPAQUE}\n{LAST_REPLY}\n");
+
+    for streaming in [false, true] {
+        let replies = [FIRST_REPLY, LAST_REPLY];
+        let responses = replies
+            .into_iter()
+            .enumerate()
+            .map(|(index, reply)| {
+                if streaming && index == 0 {
+                    MockResponse::Sse(vec![reply.to_owned()])
+                } else {
+                    MockResponse::Json(reply.to_owned())
+                }
+            })
+            .collect();
+        let server = start_capturing_mock_server(responses).await;
+        let config = coherent_config(&server.endpoint_url, false);
+        let segmenter = fallback_segmenter();
+        let opts = PromptOpts::default();
+        let plan = plan_translation(
+            &source,
+            "zh",
+            &config,
+            &segmenter,
+            &TemplateType::Default,
+            &opts,
+        )
+        .unwrap();
+        let document = plan.document_plan.as_ref().unwrap();
+        let mut offset = 0;
+        for section in &document.sections {
+            let end = offset + section.text.len();
+            assert_eq!(source.get(offset..end), Some(section.text.as_str()));
+            offset = end;
+        }
+        assert_eq!(offset, source.len());
+        assert_eq!(plan.segments, [FIRST, LAST]);
+        assert_eq!(plan.reconstruct(&plan.segments), source);
+
+        let client = TranslationClient::new(config.clone()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let history = HistoryDB::new(dir.path().join("history.db"));
+        let ctx = TranslationCtx {
+            config: &config,
+            client: &client,
+            segmenter: &segmenter,
+            history: &history,
+            cache_enabled: false,
+        };
+        let outcome = if streaming {
+            let (tx, mut rx) = mpsc::channel(16);
+            let outcome = translate_text_stream_with_mode(
+                &source,
+                "zh",
+                &TemplateType::Default,
+                &opts,
+                &ctx,
+                StreamOutputMode::Validated,
+                tx,
+            )
+            .await
+            .unwrap();
+            let mut tokens = String::new();
+            while let Some(event) = rx.recv().await {
+                if let StreamEvent::Token(text) = event {
+                    tokens.push_str(&text);
+                }
+            }
+            assert_eq!(tokens, outcome.text);
+            outcome
+        } else {
+            translate_text(&source, "zh", &TemplateType::Default, &opts, &ctx)
+                .await
+                .unwrap()
+        };
+        let requests = server.requests.lock().unwrap();
+        let captured: Vec<_> = requests
+            .iter()
+            .map(|request| {
+                let body: serde_json::Value =
+                    serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+                body["messages"].as_array().unwrap().last().unwrap()["content"]
+                    .as_str()
+                    .unwrap()
+                    .split_once("\n\n")
+                    .unwrap()
+                    .1
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(captured, [FIRST, LAST]);
+        assert_eq!(outcome.text, expected);
+        assert!(!outcome.is_completeness_degraded());
+    }
+}
+
+#[tokio::test]
 async fn coherent_payload_failure_is_retained_or_strict_before_stream_publication() {
     for retain in [false, true] {
         let invalid = format!("{COHERENT_TRANSLATION} {{{{forged}}}}");
