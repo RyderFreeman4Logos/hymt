@@ -292,10 +292,11 @@ async fn explicit_warn_only_retains_eligible_best_effort_compatibility() {
     let source = "Keep {{customer}} available throughout the complete migration process.";
     let server = start_mock_server(
         (0..2)
-            .map(|_| {
-                MockResponse::Json(
-                    "迁移过程中必须确保账户始终保持可用，所有相关服务也必须正常运行。".to_owned(),
-                )
+            .map(|_| MockResponse::JsonWithFinishReason {
+                content:
+                    "迁移过程中必须确保 {{customer}} 始终保持可用，所有相关服务也必须正常运行。"
+                        .to_owned(),
+                finish_reason: "length".to_owned(),
             })
             .collect(),
     )
@@ -318,4 +319,173 @@ async fn explicit_warn_only_retains_eligible_best_effort_compatibility() {
     .await
     .unwrap();
     assert!(outcome.completeness_degraded);
+}
+
+#[tokio::test]
+async fn identity_contract_rejects_loss_in_strict_warn_only_and_cache_admission() {
+    let cases = [
+        (
+            "Read {{customer}} throughout the complete migration process.",
+            "迁移过程中必须确保账户始终保持可用，并检查所有相关服务。",
+        ),
+        (
+            "Read https://example.test/a twice: https://example.test/a for complete instructions.",
+            "请完整阅读 https://example.test/a 的所有相关操作说明并检查服务。",
+        ),
+        (
+            "Read {{field}} twice: {{field}} throughout the complete migration process.",
+            "请确保 {{field}} 在迁移过程中保持可用，并检查所有相关的服务。",
+        ),
+        (
+            r#"{"message":"Read all migration instructions.","count":2,"enabled":true,"items":["First"]}"#,
+            r#"{"message":"请完整阅读所有迁移说明。","count":3,"enabled":false,"items":["第一项","新增项"]}"#,
+        ),
+    ];
+    let mut admitted = Vec::new();
+    for (source, candidate) in cases {
+        for warn_only in [false, true] {
+            let response = serde_json::to_string(candidate).unwrap();
+            let server = start_capturing_mock_server(
+                (0..2)
+                    .map(|_| MockResponse::Json(response[1..response.len() - 1].to_owned()))
+                    .collect(),
+            )
+            .await;
+            let config = make_stream_config(&server.endpoint_url);
+            let client = TranslationClient::new(config.clone()).unwrap();
+            let opts = PromptOpts {
+                warn_only_completeness: Some(warn_only),
+                ..PromptOpts::default()
+            };
+            let result = translate_segment_with_completeness(
+                0,
+                &client,
+                source,
+                "zh",
+                &TemplateType::Default,
+                &opts,
+                &config,
+            )
+            .await;
+            if result.is_ok() {
+                admitted.push((source, warn_only, "segment"));
+            }
+            if cached_document_is_complete(
+                source,
+                candidate,
+                "zh",
+                &config,
+                &opts,
+                &fallback_segmenter(),
+            ) {
+                admitted.push((source, warn_only, "cache"));
+            }
+        }
+    }
+    assert!(admitted.is_empty(), "identity loss admitted: {admitted:?}");
+}
+
+#[tokio::test]
+async fn ordinary_prose_failure_preserves_optimistic_prefix_without_success_admission() {
+    let source = "Keep the account available throughout the complete migration process and check every related service.";
+    let chunks = [
+        "迁移期间必须确保账户始终保持可用，",
+        "并持续检查所有相关服务的运行情况。",
+    ];
+    let expected_prefix = chunks.concat();
+    for mode in [StreamOutputMode::Optimistic, StreamOutputMode::Validated] {
+        let server = start_capturing_mock_server(vec![
+            MockResponse::SseWithFinishReason {
+                tokens: chunks.iter().map(|chunk| (*chunk).to_owned()).collect(),
+                finish_reason: "length".to_owned(),
+            },
+            MockResponse::JsonWithFinishReason {
+                content: expected_prefix.clone(),
+                finish_reason: "length".to_owned(),
+            },
+        ])
+        .await;
+        let config = make_stream_config(&server.endpoint_url);
+        let client = TranslationClient::new(config.clone()).unwrap();
+        let segmenter = fallback_segmenter();
+        let dir = tempfile::tempdir().unwrap();
+        let history = HistoryDB::new(dir.path().join("history.db"));
+        let opts = PromptOpts::default();
+        let plan = plan_translation(
+            source,
+            "zh",
+            &config,
+            &segmenter,
+            &TemplateType::Default,
+            &opts,
+        )
+        .unwrap();
+        assert_eq!(plan.segments, vec![source.to_owned()]);
+        let ctx = TranslationCtx {
+            config: &config,
+            client: &client,
+            segmenter: &segmenter,
+            history: &history,
+            cache_enabled: true,
+        };
+        let (tx, mut rx) = mpsc::channel(32);
+        let result = translate_text_stream_with_mode(
+            source,
+            "zh",
+            &TemplateType::Default,
+            &opts,
+            &ctx,
+            mode,
+            tx,
+        )
+        .await;
+        assert!(format!("{:#}", result.unwrap_err()).contains("finish_reason_length"));
+        let mut tokens = Vec::new();
+        while let Some(event) = rx.recv().await {
+            match event {
+                StreamEvent::Token(token) => tokens.push(token),
+                StreamEvent::SegmentDone(_) | StreamEvent::AllDone(_) => {
+                    panic!("failed translation reported success")
+                }
+            }
+        }
+        if mode == StreamOutputMode::Optimistic {
+            assert_eq!(tokens.concat(), expected_prefix);
+            assert!(
+                !tokens.is_empty(),
+                "ordinary prose must exercise actual emission"
+            );
+            assert_eq!(
+                server.requests.lock().unwrap().len(),
+                1,
+                "never retry after emitted output"
+            );
+        } else {
+            assert!(tokens.is_empty(), "validated output must remain withheld");
+            assert_eq!(
+                server.requests.lock().unwrap().len(),
+                2,
+                "only buffered attempts may retry"
+            );
+        }
+        assert!(history.fetch_recent(None).unwrap().is_empty());
+        let options_hash =
+            template_options_hash(&opts, effective_document_translation_policy(&opts, &config));
+        let fingerprint = config
+            .inference_fingerprint(TemplateType::Default.as_str(), &options_hash)
+            .unwrap();
+        let scope = SegmentCacheScope {
+            target_lang: "zh",
+            template_type: TemplateType::Default.as_str(),
+            options_hash: &options_hash,
+            profile_id: config.model_profile().unwrap().id(),
+            inference_fingerprint: fingerprint.hash(),
+        };
+        for segment in &plan.segments {
+            assert!(history
+                .find_segment_cached(&segment_cache_hash(segment), scope)
+                .unwrap()
+                .is_none());
+        }
+    }
 }

@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::language_spec::{language_spec_or_none, LanguageFamily};
 
+mod identity;
+pub use identity::{identity_preservation_failures, parse_json_document, preserved_urls};
 mod placeholders;
 pub use placeholders::{preserved_placeholder_ranges, preserved_placeholders};
 mod urls;
@@ -336,70 +338,6 @@ fn count_fenced_code_blocks(text: &str) -> usize {
         })
         .count()
         .div_ceil(2)
-}
-
-/// Identity failures independent of translation density and transport termination.
-/// Suitable for validating a reconstructed document with source-owned syntax.
-pub fn identity_preservation_failures(input_text: &str, output_text: &str) -> Vec<String> {
-    let mut checks_failed = Vec::new();
-    if !preserves_all(
-        &preserved_placeholders(input_text),
-        &preserved_placeholders(output_text),
-    ) {
-        checks_failed.push("placeholder_preservation".to_owned());
-    }
-    if !preserves_all(&urls(input_text), &urls(output_text)) {
-        checks_failed.push("url_preservation".to_owned());
-    }
-    if let Some(input_json) = parse_json_document(input_text) {
-        match serde_json::from_str::<serde_json::Value>(output_text.trim()) {
-            Ok(output_json) if preserves_json_object_keys(&input_json, &output_json) => {}
-            Ok(_) => checks_failed.push("json_key_preservation".to_owned()),
-            Err(_) => checks_failed.push("json_validity".to_owned()),
-        }
-    }
-    checks_failed
-}
-
-pub fn preserved_urls(text: &str) -> HashSet<String> {
-    urls(text)
-}
-
-fn preserves_all(input: &HashSet<String>, output: &HashSet<String>) -> bool {
-    input.iter().all(|token| output.contains(token))
-}
-
-/// Parse a complete JSON object or array using the completeness contract.
-pub fn parse_json_document(text: &str) -> Option<serde_json::Value> {
-    let trimmed = text.trim();
-    (trimmed.starts_with('{') || trimmed.starts_with('['))
-        .then(|| serde_json::from_str::<serde_json::Value>(trimmed).ok())
-        .flatten()
-}
-
-fn preserves_json_object_keys(input: &serde_json::Value, output: &serde_json::Value) -> bool {
-    match input {
-        serde_json::Value::Object(input) => {
-            let serde_json::Value::Object(output) = output else {
-                return false;
-            };
-            input.iter().all(|(key, input_value)| {
-                output.get(key).is_some_and(|output_value| {
-                    preserves_json_object_keys(input_value, output_value)
-                })
-            })
-        }
-        serde_json::Value::Array(input) => {
-            let serde_json::Value::Array(output) = output else {
-                return false;
-            };
-            input.len() <= output.len()
-                && input.iter().zip(output).all(|(input_value, output_value)| {
-                    preserves_json_object_keys(input_value, output_value)
-                })
-        }
-        _ => true,
-    }
 }
 
 fn count_paragraphs(text: &str) -> usize {
