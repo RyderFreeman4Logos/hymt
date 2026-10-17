@@ -62,6 +62,16 @@ class _Upstream(BaseHTTPRequestHandler):
         if self.headers.get("Authorization") == "Bearer denied":
             self._reply(401, b'{"error":"denied"}')
             return
+        if state.get("header_status"):
+            status, stalled = state["header_status"]
+            self.send_response(status)
+            self.send_header("Content-Length", "100" if stalled else "0")
+            self.end_headers()
+            self.wfile.flush()
+            if stalled:
+                state["probe_release"].wait(2)
+                self.close_connection = True
+            return
         if state["probe_stall"]:
             state["probe_release"].wait(2)
         status = state.get("metadata_status", {}).get(self.path)
@@ -450,6 +460,142 @@ class CacheContracts(unittest.TestCase):
                 self.assertEqual(self.request({"content": "."}, path="/tokenize")[1]["X-Hymt-Cache"], "HIT")
                 for stream in (False, True):
                     self.assertEqual(self.request({"model": "Hy-MT2-7B", "stream": stream})[1]["X-Hymt-Cache"], "HIT")
+
+    def test_older_paired_and_prefetched_observations_cannot_replace_newer_identity(self):
+        for prefetched in (False, True):
+            with self.subTest(prefetched=prefetched):
+                self.state["offline"] = False
+                self.state["props"]["build_info"] = "original"
+                self.request()
+                captured, release = threading.Event(), threading.Event()
+                original = self.cache.metadata
+                old_thread = []
+                def metadata(path, authorization, budget):
+                    result = original(path, authorization, budget)
+                    if old_thread and threading.get_ident() == old_thread[0] and path == ("/props" if prefetched else "/v1/models"):
+                        captured.set()
+                        self.assertTrue(release.wait(2))
+                    return result
+                def old_probe():
+                    if prefetched:
+                        return self.get_metadata()
+                    old_thread.append(threading.get_ident())
+                    budget = _MODULE._Budget(3)
+                    try:
+                        try:
+                            return self.cache.observe(None, None, budget)
+                        except (ValueError, sqlite3.Error):
+                            return None
+                    finally:
+                        budget.close()
+                # GET executes in its server thread, so identify its initial metadata call.
+                if prefetched:
+                    def metadata(path, authorization, budget):
+                        result = original(path, authorization, budget)
+                        if not old_thread:
+                            old_thread.append(threading.get_ident())
+                            captured.set()
+                            self.assertTrue(release.wait(2))
+                        return result
+                with patch.object(self.cache, "metadata", metadata), concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    future = pool.submit(old_probe)
+                    try:
+                        self.assertTrue(captured.wait(1))
+                        self.state["props"]["build_info"] = "replacement"
+                        self.assertEqual(self.get_metadata()[0], 200)
+                    finally:
+                        release.set()
+                    future.result(4)
+                self.state["offline"] = True
+                status, _headers, body = self.get_metadata()
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(body)["build_info"], "replacement")
+
+    def test_origin_switch_startup_must_commit_required_invalidation(self):
+        self.request()
+        self.stop_cache()
+        blocker = sqlite3.connect(self.db)
+        try:
+            blocker.execute("BEGIN IMMEDIATE")
+            with self.assertRaises((sqlite3.Error, ValueError)):
+                server = _MODULE.CacheServer(("127.0.0.1", 0), "http://127.0.0.1:1", self.db)
+                server.server_close()
+        finally:
+            blocker.close()
+        self.start_cache()
+        self.assertEqual(self.request()[1]["X-Hymt-Cache"], "HIT")
+
+    def test_unknown_prior_planning_and_failed_activation_deny_later_history(self):
+        self.request()
+        self.state["props"]["build_info"] = "replacement"
+        with patch.object(self.cache.store, "planning", side_effect=sqlite3.OperationalError("synthetic read failure")), patch.object(self.cache.store, "activate", side_effect=sqlite3.OperationalError("synthetic activation failure")):
+            self.assertEqual(self.get_metadata()[0], 200)
+        self.state["offline"] = True
+        self.assertEqual(self.get_metadata()[0], 502)
+        self.assertNotEqual(self.request()[1]["X-Hymt-Cache"], "HIT")
+
+    def test_metadata_status_precedes_error_representation_and_body(self):
+        self.stop_cache()
+        self.start_cache(timeout=4)
+        self.request()
+        self.state["offline"] = True
+        for status, stalled in ((502, False), (503, False), (504, False), (503, True), (401, True), (403, True)):
+            with self.subTest(status=status, stalled=stalled):
+                self.state["header_status"] = (status, stalled)
+                started = time.monotonic()
+                code, headers, _body = self.get_metadata()
+                generation = self.request()
+                if status in (502, 503, 504):
+                    self.assertEqual(code, 200)
+                    self.assertEqual(headers["X-Hymt-Planning"], "historical")
+                    self.assertEqual(generation[1]["X-Hymt-Cache"], "HIT")
+                else:
+                    self.assertEqual(code, status)
+                    self.assertNotIn("X-Hymt-Planning", headers)
+                    self.assertNotEqual(generation[1]["X-Hymt-Cache"], "HIT")
+                self.assertLess(time.monotonic() - started, 0.7)
+
+    def test_revocation_before_admission_denies_copied_get_token_and_generation(self):
+        for path in ("/props", "/tokenize", "/v1/chat/completions"):
+            with self.subTest(path=path):
+                self.state["offline"] = False
+                self.state["props"].update(build_info="original", eos_token=".")
+                self.request()
+                self.request({"content": "."}, path="/tokenize")
+                self.state["offline"] = True
+                copied, release = threading.Event(), threading.Event()
+                original = self.cache.retained
+                calls = {}
+                def retained(model):
+                    record = original(model)
+                    thread = threading.get_ident()
+                    calls[thread] = calls.get(thread, 0) + 1
+                    if calls[thread] == 2 and not copied.is_set():
+                        copied.set()
+                        self.assertTrue(release.wait(2))
+                    return record
+                def request():
+                    if path == "/props":
+                        return self.get_metadata()
+                    return self.request({"content": "."} if path == "/tokenize" else None, path=path)
+                with patch.object(self.cache, "retained", retained), concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    future = pool.submit(request)
+                    try:
+                        self.assertTrue(copied.wait(1))
+                        self.state["offline"] = False
+                        self.state["props"]["build_info"] = "replacement"
+                        blocker = sqlite3.connect(self.db)
+                        try:
+                            blocker.execute("BEGIN IMMEDIATE")
+                            self.assertEqual(self.get_metadata()[0], 200)
+                        finally:
+                            blocker.close()
+                        self.state["offline"] = True
+                    finally:
+                        release.set()
+                    status, headers, _body = future.result(4)
+                self.assertNotEqual(status, 200)
+                self.assertNotEqual(headers["X-Hymt-Cache"], "HIT")
 
     def test_live_partial_contradiction_revokes_before_other_endpoint_rejection(self):
         for path, other in (("/props", "/v1/models"), ("/v1/models", "/props")):
