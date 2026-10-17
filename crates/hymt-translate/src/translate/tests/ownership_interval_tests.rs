@@ -297,12 +297,14 @@ async fn malformed_multiline_link_repair_is_rejected_atomically_in_all_publicati
             .iter()
             .cloned()
             .enumerate()
-            .map(|(index, response)| {
-                if streaming && index == 0 {
-                    MockResponse::Sse(vec![response])
+            .flat_map(|(index, response)| {
+                let initial = if streaming && index == 0 {
+                    MockResponse::Sse(vec![response.clone()])
                 } else {
-                    MockResponse::Json(response)
-                }
+                    MockResponse::Json(response.clone())
+                };
+                let retry = (index == boundary_segment).then_some(MockResponse::Json(response));
+                [Some(initial), retry].into_iter().flatten()
             })
             .collect();
         let server = start_capturing_mock_server(responses).await;
@@ -377,8 +379,8 @@ async fn malformed_multiline_link_repair_is_rejected_atomically_in_all_publicati
         let requests = server.requests.lock().unwrap().clone();
         assert_eq!(
             requests.len(),
-            planned_inputs.len(),
-            "one mock response per planned segment"
+            planned_inputs.len() + 1,
+            "malformed boundary must use one structural retry"
         );
         let captured_inputs: Vec<_> = requests
             .iter()
@@ -402,7 +404,7 @@ async fn malformed_multiline_link_repair_is_rejected_atomically_in_all_publicati
                     .to_owned()
             })
             .collect();
-        assert_eq!(captured_inputs.len(), planned_inputs.len());
+        assert_eq!(captured_inputs.len(), planned_inputs.len() + 1);
         for planned in &planned_inputs {
             assert!(
                 captured_inputs
@@ -612,6 +614,75 @@ async fn all_urls_remain_source_owned_while_adjacent_prose_translates() {
         } else {
             assert!(requests.is_empty());
             assert_eq!(output, source);
+        }
+    }
+}
+
+#[tokio::test]
+async fn adjacent_url_owners_leave_prose_translatable() {
+    let config = make_stream_config("http://127.0.0.1:9/v1");
+    let segmenter = fallback_segmenter();
+    let opts = PromptOpts {
+        document_translation_policy: Some(DocumentTranslationPolicy::TranslateAll),
+        ..PromptOpts::default()
+    };
+    for source in [
+        "|https://example.test/x|Visible|\n|---|---|\n",
+        "| https://example.test/x | Visible |\n| --- | --- |\n",
+        "https://example.test/x**Visible**",
+        "https://example.test/x **Visible**",
+        "https://example.test/x*Visible*",
+        "https://example.test/x`kept`Visible",
+        "https://example.test/x<span>Visible</span>",
+        "https://example.test/x|Visible",
+        "https://example.test/x**Visible**.",
+        "https://example.test/x*Visible*，",
+        "https://example.test/x**Visible**，Body",
+        "https://example.test/x**Visible**, Body",
+        "Body ，_Visible_",
+        "Body，_Visible_",
+        "_Visible_，Body",
+        "|https://example.test/x**Visible**|Other|\n|---|---|\n",
+        "https://example.test/x**Visible**[Other](https://other.test)",
+        "https://example.test/x**Visible**)Other",
+        "https://example.test/a_b_(c) **Visible**",
+        "https://example.test/x[Visible](https://example.test/a*b*c|d)",
+        "https://example.test/x![Visible](https://example.test/a*b*c|d)",
+    ] {
+        let plan = plan_translation(
+            source,
+            "zh",
+            &config,
+            &segmenter,
+            &TemplateType::Default,
+            &opts,
+        )
+        .unwrap();
+        assert!(
+            plan.segments
+                .iter()
+                .any(|segment| segment.contains("Visible")),
+            "adjacent prose must enter the real planner: {source:?}: {:?}",
+            plan.segments
+        );
+        assert_eq!(plan.reconstruct(&plan.segments), source);
+        let (output, requests) = translated_source(source).await;
+        assert!(requests.iter().any(|request| request.contains("Visible")));
+        assert!(requests.iter().all(|request| !request.contains("https://")));
+        assert!(!output.contains("Visible"), "{source:?}: {output:?}");
+        assert!(output.contains('译'));
+        assert_eq!(
+            hymt_core::completeness::preserved_urls(source),
+            hymt_core::completeness::preserved_urls(&output)
+        );
+        assert_eq!(markdown_structure(source), markdown_structure(&output));
+        if matches!(source, "Body，_Visible_" | "Body ，_Visible_") {
+            assert_eq!(output, "译译译 _译译译译_");
+        } else if source == "_Visible_，Body" {
+            assert_eq!(output, "_译译译译_ 译译译");
+        }
+        if source.contains("`kept`") {
+            assert!(output.contains("`kept`"));
         }
     }
 }

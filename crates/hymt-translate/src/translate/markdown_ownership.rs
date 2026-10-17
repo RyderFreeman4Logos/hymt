@@ -381,11 +381,31 @@ fn protected_markdown_structure_ranges(text: &str) -> Vec<Range<usize>> {
                     matches!(event, Event::Start(Tag::Emphasis))
                 }))
     };
+    // Index maximal punctuation runs once: nested owners can share long flanks.
+    let mut punctuation_runs = Vec::<Range<usize>>::new();
+    for (offset, character) in text.char_indices() {
+        if punctuation(character) {
+            if let Some(run) = punctuation_runs.last_mut() {
+                if run.end == offset {
+                    run.end += character.len_utf8();
+                    continue;
+                }
+            }
+            punctuation_runs.push(offset..offset + character.len_utf8());
+        }
+    }
+    let punctuation_run = |offset| {
+        let index = punctuation_runs.partition_point(|run| run.end < offset);
+        punctuation_runs
+            .get(index)
+            .filter(|run| run.start <= offset)
+    };
     // URLs are identity, including visible URL labels; only adjacent prose translates.
-    for range in hymt_core::completeness::preserved_url_ranges(text) {
+    let source_urls = hymt_core::completeness::preserved_url_ranges(text);
+    for range in &source_urls {
         // Keep punctuation separating the URL from translated adjacent text.
-        let left = text[..range.start].trim_end_matches(punctuation).len();
-        let right = text.len() - text[range.end..].trim_start_matches(punctuation).len();
+        let left = punctuation_run(range.start).map_or(range.start, |run| run.start);
+        let right = punctuation_run(range.end).map_or(range.end, |run| run.end);
         owned.push(left..right);
     }
     let mut opaque = owned.clone();
@@ -397,13 +417,24 @@ fn protected_markdown_structure_ranges(text: &str) -> Vec<Range<usize>> {
         match event {
             Event::Start(Tag::Paragraph) => paragraph = Some(range),
             Event::End(TagEnd::Paragraph) => paragraph = None,
-            Event::Start(
-                Tag::Heading { .. }
-                | Tag::Emphasis
-                | Tag::Strong
-                | Tag::Strikethrough
-                | Tag::BlockQuote(_),
-            ) => owned.push(range),
+            Event::Start(Tag::Emphasis | Tag::Strong | Tag::Strikethrough) => {
+                let left = punctuation_run(range.start).map_or(range.start, |run| run.start);
+                let preceding = source_urls.partition_point(|url| url.end <= range.start);
+                // URL-adjacent formatting needs its source boundary even when
+                // ordinary Markdown could remain valid after that boundary vanished.
+                // Other prose punctuation stays editable under the renderer contract.
+                if preceding > 0 && source_urls[preceding - 1].end >= left {
+                    let right = punctuation_run(range.end).map_or(range.end, |run| run.end);
+                    for flank in [left..range.start, range.end..right] {
+                        if !flank.is_empty() {
+                            opaque.push(flank.clone());
+                            owned.push(flank);
+                        }
+                    }
+                }
+                owned.push(range);
+            }
+            Event::Start(Tag::Heading { .. } | Tag::BlockQuote(_)) => owned.push(range),
             Event::Start(Tag::CodeBlock(_))
             | Event::Code(_)
             | Event::Html(_)
