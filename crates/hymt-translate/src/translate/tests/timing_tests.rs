@@ -570,3 +570,108 @@ async fn completeness_retry_is_not_single_pass_cold_work() {
             .is_none());
     }
 }
+
+#[tokio::test]
+async fn reload_then_replay_or_direct_miss_cannot_reuse_old_client_runtime() {
+    let source = "This report explains why reliable translation timing matters.";
+    let segmenter = fallback_segmenter();
+    for replay_first in [false, true] {
+        let planning = make_stream_config("http://127.0.0.1:1/v1");
+        let plan = plan_translation(
+            source,
+            "zh",
+            &planning,
+            &segmenter,
+            &TemplateType::Default,
+            &PromptOpts::default(),
+        )
+        .unwrap();
+        let translation = planned_complete_zh_translations(&plan).remove(0);
+        let (server, requests) =
+            props_then_completion_server("test-model", translation.clone(), None).await;
+        let original = make_stream_config(&server.endpoint_url);
+        let raw = std::fs::read_to_string(original.path()).unwrap().replace(
+            "timeout = 5",
+            "timeout = 0.1\nstrict_backend_preflight = true",
+        );
+        std::fs::write(original.path(), &raw).unwrap();
+        let config = HotConfig::from_path(original.path()).unwrap();
+        let client = TranslationClient::new(config.clone()).unwrap();
+        // Populate the original client's runtime cache before the generation changes.
+        client.preflight_backend().await.unwrap();
+        assert!(config.backend_runtime_info().unwrap().is_verified());
+        let temp = tempfile::tempdir().unwrap();
+        let history = HistoryDB::new(temp.path().join("history.db"));
+        let ctx = TranslationCtx {
+            config: &config,
+            client: &client,
+            segmenter: &segmenter,
+            history: &history,
+            cache_enabled: true,
+        };
+        assert_eq!(
+            translate_text(
+                source,
+                "zh",
+                &TemplateType::Default,
+                &PromptOpts::default(),
+                &ctx
+            )
+            .await
+            .unwrap()
+            .text,
+            translation
+        );
+        while !server.handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        drop(server);
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        let generation = config.generation();
+        std::fs::write(
+            config.path(),
+            format!("{raw}\n# trigger reload without changing request identity\n"),
+        )
+        .unwrap();
+        std::fs::File::open(config.path())
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() + Duration::from_secs(2)),
+            )
+            .unwrap();
+        if replay_first {
+            assert_eq!(
+                translate_text(
+                    source,
+                    "zh",
+                    &TemplateType::Default,
+                    &PromptOpts::default(),
+                    &ctx
+                )
+                .await
+                .unwrap()
+                .text,
+                translation
+            );
+            assert!(config.generation() > generation);
+            assert!(config.backend_runtime_info().is_none());
+        }
+        let error = translate_text(
+            "A different report requires a new request.",
+            "zh",
+            &TemplateType::Default,
+            &PromptOpts::default(),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("strict backend preflight"),
+            "{error:#}"
+        );
+        assert!(config.generation() > generation);
+        assert!(config.backend_runtime_info().is_none());
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+    }
+}

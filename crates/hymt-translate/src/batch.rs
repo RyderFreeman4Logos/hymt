@@ -224,6 +224,39 @@ pub fn build_batch_plan(
 
         let output_path = build_output_path(&path, &root, None, output_dir, suffix);
 
+        if application_cache_enabled {
+            let replay_client =
+                TranslationClient::with_concurrency(config.clone(), concurrency as usize)?;
+            let replay_ctx = TranslationCtx {
+                config,
+                client: &replay_client,
+                segmenter,
+                history,
+                cache_enabled: true,
+            };
+            if let Ok(Some(replay)) = crate::translate::offline_replay::find_replay(
+                &text,
+                &effective_lang,
+                template,
+                prompt_opts,
+                &replay_ctx,
+                false,
+            ) {
+                files.push(BatchFilePlan {
+                    source_path: path,
+                    relative_path: relative,
+                    output_path,
+                    target_lang: effective_lang,
+                    text,
+                    source_tokens: replay.plan.source_tokens,
+                    segment_count: replay.plan.segment_count(),
+                    cached_segments: replay.plan.segment_count(),
+                    estimated_seconds: Some(0.0),
+                });
+                continue;
+            }
+        }
+
         let plan_result = plan_translation(
             &text,
             &effective_lang,

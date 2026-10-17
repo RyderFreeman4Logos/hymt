@@ -575,7 +575,23 @@ async fn run() -> Result<()> {
              total_context, parallel_slots, and optional per_request_context instead."
         );
     }
-    if should_run_backend_preflight(cli.cmd.as_ref()) {
+    let defer_translation_preflight = !cli.plan
+        && !matches!(
+            cli.cmd.as_ref(),
+            Some(Cmd::Batch(BatchArgs { dry_run: true, .. }))
+        )
+        && config.application_cache_enabled()
+        && !cli.no_cache
+        && matches!(
+            cli.cmd.as_ref(),
+            None | Some(Cmd::Text(_))
+                | Some(Cmd::Man(_))
+                | Some(Cmd::Info(_))
+                | Some(Cmd::Batch(_))
+                | Some(Cmd::TranslateDoc(_))
+                | Some(Cmd::Exec(ExecArgs { action: None, .. }))
+        );
+    if should_run_backend_preflight(cli.cmd.as_ref()) && !defer_translation_preflight {
         let preflight = TranslationClient::new(config.clone())?
             .preflight_backend()
             .await?;
@@ -852,7 +868,11 @@ fn make_client_with_concurrency(
         .unwrap_or_else(|| config.concurrency())
         .max(1) as usize;
     TranslationClient::with_concurrency(config.clone(), concurrency)
-        .map(|client| client.with_cache_bypass(no_cache))
+        .map(|client| {
+            client
+                .with_cache_bypass(no_cache)
+                .with_deferred_preflight(config.application_cache_enabled() && !no_cache)
+        })
         .map_err(|e| anyhow::anyhow!("{e}"))
 }
 

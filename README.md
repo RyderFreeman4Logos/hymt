@@ -74,8 +74,8 @@ timeout = 600
 # Refuse planning when the final chat template cannot be tokenized locally.
 # Otherwise hymt emits a warning and uses a conservative approximate budget.
 strict_token_budget = false
-# Refuse translation before cache lookup if the backend runtime cannot be verified
-# or differs materially from this configuration.
+# Except for verified local replay, refuse live work before segment-cache lookup
+# or model invocation when the backend runtime is unverified or incompatible.
 strict_backend_preflight = false
 # For Chinese-family targets, preserve confidently target-language paragraphs.
 language_detection = true
@@ -130,13 +130,13 @@ The supported extension names above are limited to the documented llama.cpp serv
 
 ### Runtime backend preflight and inspection
 
-Translation paths preflight the configured backend before planning or cache lookup. llama.cpp uses `GET /props`; vLLM and other OpenAI-compatible services use `GET /v1/models` when available. The normalized runtime state includes service build/model identity, context and slot limits, sampler defaults, and only explicitly advertised capabilities. Missing fields remain unknown rather than being inferred.
+Translation paths preflight the configured backend before live planning or segment-cache lookup; an explicitly enabled, validated local complete-output replay can return first. llama.cpp uses `GET /props`; vLLM and other OpenAI-compatible services use `GET /v1/models` when available. The normalized runtime state includes service build/model identity, context and slot limits, sampler defaults, and only explicitly advertised capabilities. Missing fields remain unknown rather than being inferred.
 
 When llama.cpp `/props` reports a single ASCII punctuation `eos_token` *and* the chat template contains a `<|...|>` control marker, hymt detects a contradiction: the template's marker is the real EOS, while the metadata token is false. It resolves the false token through `/tokenize` during preflight and sends llama.cpp-only `logit_bias` `{ "<token_id>": -100 }`, preventing the false stop without suppressing the actual chat-template EOS token (such as `<|eos|>`). A single-character EOS that the chat template itself uses is left untouched.
 
 Run `hymt backend inspect` to print configured and service-resolved values side by side. It never prints API keys, endpoint credentials, or request headers. Warnings identify context/model/profile mismatches, unexpected service sampler state, and a llama.cpp/vLLM repeat-penalty wire-key mismatch.
 
-Normal preflight is fail-open: it warns, marks the inference fingerprint/cache identity unverified, and plans with conservative context/output limits. Set `[translation].strict_backend_preflight = true` to refuse before cache lookup or model invocation when identity cannot be verified or a material mismatch is found. Runtime state is TTL-cached for 60 seconds and refreshed when the endpoint/backend/profile changes; a changed service identity replaces the old resolved state and fingerprint.
+Normal preflight is fail-open: it warns, marks the inference fingerprint/cache identity unverified, and plans with conservative context/output limits. Set `[translation].strict_backend_preflight = true` to refuse live work before segment-cache lookup or model invocation when identity cannot be verified or a material mismatch is found. Runtime state is TTL-cached for 60 seconds and refreshed when the endpoint/backend/profile changes; a changed service identity replaces the old resolved state and fingerprint.
 
 ## Model profile (`[endpoint].profile`)
 
@@ -238,6 +238,9 @@ force_translate_all = false    # default: false; set true to translate all non-c
 ## Smart segmentation and cache reuse
 
 Application segment and whole-output caches default to off. Set `[cache].enabled = true` to opt in; `--no-cache` overrides that setting for normal translation, batch, man/info, exec and Telegram commands. Disabling these caches preserves old cache entries, translation history, timing estimates and recall. The service inference cache independently reuses exact full HTTP requests/responses even when application caches are off. Explicit `--no-cache` bypasses both application and service cache reads and writes. Automatic validation retries also bypass service caching without changing sibling requests. `hymt exec precache` explicitly populates application caches even with the default setting; combining it with `--no-cache` is rejected.
+
+With `[cache].enabled = true`, eligible completed runs also retain a bounded proof alongside the task output. Matching source, target, current rendered prompts and adapter request bytes, tokenizer, ordered ownership plan, limits and validation policy can replay locally before remote preflight, including strict preflight, when the service is unreachable. Historical runtime evidence stays inside replay validation and never authorizes new requests or cold timing samples. Missing, legacy, corrupt or changed evidence falls through to normal live behavior without emitting a tentative prefix. Initial complete runs with Verified identity qualify; degraded results, completeness retries and legacy segment-cache hits do not populate proofs. Stream and buffered request contracts remain separate. `hymt history --clear` deletes these proofs with their tasks. This validates retained output mechanically, not semantic translation quality or the current backend.
+
 
 `hymt` plans each translation against the Hy-MT2 tokenizer and the selected prompt template. When application caching is enabled, translated segments are keyed by:
 

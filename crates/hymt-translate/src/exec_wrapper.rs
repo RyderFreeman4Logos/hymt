@@ -167,7 +167,16 @@ pub(crate) async fn translate_cached(
     ctx: &TranslationCtx<'_>,
 ) -> Result<String> {
     let document_policy = document_policy_for_exec_cache(prompt_opts, ctx.config);
-    if ctx.cache_enabled {
+    // Deferred CLI preflight can only be bypassed by a complete proof in the
+    // core translator. Legacy whole-output rows carry no runtime authority.
+    if ctx.cache_enabled
+        && !ctx.client.has_deferred_preflight()
+        && (!ctx.config.strict_backend_preflight()
+            || ctx
+                .config
+                .backend_runtime_info()
+                .is_some_and(|runtime| runtime.is_verified()))
+    {
         if let Ok(Some(cached)) =
             cache.find(command, subcommand, text, target_lang, document_policy)
         {

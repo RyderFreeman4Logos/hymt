@@ -300,6 +300,7 @@ impl TranslationOutcome {
 
 /// Single-segment translate result (internal).
 struct SegmentTranslateOutcome {
+    initial_request: bool,
     cold_generation: bool,
     text: String,
     completeness_degraded: bool,
@@ -950,6 +951,7 @@ type SegmentPlanResult = (Vec<String>, Vec<usize>, Vec<Vec<usize>>);
 
 mod cache_proof;
 mod completeness_admission;
+pub(crate) mod offline_replay;
 pub(crate) use completeness_admission::cached_document_is_complete;
 #[cfg(test)]
 use completeness_admission::reject_unrecoverably_incomplete_best_attempt;
@@ -1363,6 +1365,7 @@ async fn translate_segment_with_completeness<'a>(
             return Ok(SegmentTranslateOutcome {
                 text: candidate.text,
                 completeness_degraded: false,
+                initial_request: attempt == 0,
                 cold_generation: attempt == 0 && completion.cold_generation,
             });
         }
@@ -1400,6 +1403,7 @@ async fn translate_segment_with_completeness<'a>(
     Ok(SegmentTranslateOutcome {
         text: best.text,
         completeness_degraded: true,
+        initial_request: false,
         cold_generation: false,
     })
 }
@@ -1420,8 +1424,8 @@ async fn send_stream_event(tx: &StreamEventSink, event: StreamEvent) -> Result<(
 }
 
 fn joined_segment(
-    res: std::result::Result<Result<(usize, String, bool, bool)>, tokio::task::JoinError>,
-) -> Result<(usize, String, bool, bool)> {
+    res: std::result::Result<Result<(usize, SegmentTranslateOutcome)>, tokio::task::JoinError>,
+) -> Result<(usize, SegmentTranslateOutcome)> {
     match res {
         Ok(Ok(segment)) => Ok(segment),
         Ok(Err(e)) => Err(e.context("segment translation failed")),
@@ -1562,6 +1566,7 @@ async fn translate_segment_with_completeness_streaming(
         return Ok(SegmentTranslateOutcome {
             text: best.text,
             completeness_degraded: false,
+            initial_request: true,
             cold_generation,
         });
     }
@@ -1588,6 +1593,7 @@ async fn translate_segment_with_completeness_streaming(
         return Ok(SegmentTranslateOutcome {
             text: best.text,
             completeness_degraded: true,
+            initial_request: false,
             cold_generation: false,
         });
     }
@@ -1657,6 +1663,7 @@ async fn translate_segment_with_completeness_streaming(
             return Ok(SegmentTranslateOutcome {
                 text: candidate.text,
                 completeness_degraded: false,
+                initial_request: false,
                 cold_generation: false,
             });
         }
@@ -1710,6 +1717,7 @@ async fn translate_segment_with_completeness_streaming(
     Ok(SegmentTranslateOutcome {
         text: best.text,
         completeness_degraded: true,
+        initial_request: false,
         cold_generation: false,
     })
 }
@@ -1743,7 +1751,9 @@ async fn prepare_invocation(ctx: &TranslationCtx<'_>) -> Result<(HotConfig, Tran
     let reloaded = ctx.config.maybe_reload()?;
     let config = ctx.config.detached_snapshot();
     let client = ctx.client.with_config(config.clone())?;
-    if config.strict_backend_preflight() && (reloaded || config.backend_runtime_info().is_none()) {
+    if (config.strict_backend_preflight() || client.has_deferred_preflight())
+        && (reloaded || config.backend_runtime_info().is_none())
+    {
         if reloaded {
             client.refresh_backend_preflight().await?;
         } else {
@@ -1773,6 +1783,14 @@ pub async fn translate_text(
         });
     }
 
+    ctx.config.maybe_reload()?;
+    if ctx.cache_enabled {
+        if let Ok(Some(replay)) =
+            offline_replay::find_replay(text, target_lang, template, opts, ctx, false)
+        {
+            return replay.finish(ctx.history);
+        }
+    }
     let (config, client) = prepare_invocation(ctx).await?;
     let invocation = TranslationCtx {
         config: &config,
@@ -1903,6 +1921,7 @@ pub async fn translate_text(
     let mut cold_generation =
         !missing.is_empty() && cache_hits == 0 && inference_fingerprint.is_cache_verified();
     let mut cache_candidates = vec![false; plan.segment_count()];
+    let mut proof_eligible = cache_enabled && cache_hits == 0 && !missing.is_empty();
 
     // ── Phase 2: parallel translate missing segments ───────────────────────────
     #[cfg(test)]
@@ -1911,7 +1930,7 @@ pub async fn translate_text(
     let mut degraded_segments: Vec<usize> = Vec::new();
 
     if !missing.is_empty() {
-        let mut join_set: JoinSet<Result<(usize, String, bool, bool)>> = JoinSet::new();
+        let mut join_set: JoinSet<Result<(usize, SegmentTranslateOutcome)>> = JoinSet::new();
 
         for &idx in &missing {
             let client = ctx.client.clone();
@@ -1933,21 +1952,25 @@ pub async fn translate_text(
                     &cfg,
                 )
                 .await?;
-                Ok((
-                    idx,
-                    outcome.text,
-                    outcome.completeness_degraded,
-                    outcome.cold_generation,
-                ))
+                Ok((idx, outcome))
             });
         }
 
         while let Some(res) = join_set.join_next().await {
-            let (idx, translated, degraded, cold) = joined_segment(res)?;
+            let (
+                idx,
+                SegmentTranslateOutcome {
+                    text: translated,
+                    completeness_degraded: degraded,
+                    cold_generation: cold,
+                    initial_request,
+                },
+            ) = joined_segment(res)?;
             if degraded {
                 degraded_segments.push(idx + 1);
             }
             cold_generation &= cold;
+            proof_eligible &= initial_request;
             cache_candidates[idx] = !degraded;
             translations[idx] = Some(translated);
         }
@@ -2021,11 +2044,33 @@ pub async fn translate_text(
         input_chars: text.chars().count() as i64,
         output_chars: translated.chars().count() as i64,
         output_text: Some(translated.clone()),
-        input_hash: None,
+        input_hash: Some(segment_cache_hash(text)),
         config_version: ctx.config.config_version() as i64,
     };
 
-    if let Err(e) = ctx.history.insert_task(&record) {
+    let proof = if proof_eligible {
+        offline_replay::population_proof(
+            (text, &translated),
+            target_lang,
+            template,
+            opts,
+            ctx,
+            &plan,
+            false,
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("Warning: local replay proof unavailable: {error}");
+            None
+        })
+    } else {
+        None
+    };
+    if let Err(e) = ctx.history.insert_task_with_replay_proof(
+        &record,
+        proof
+            .as_ref()
+            .map(|(key, proof)| (key.as_str(), proof.as_str())),
+    ) {
         eprintln!("Warning: failed to record timing history: {e}");
     } else {
         eprintln!(
@@ -2149,6 +2194,34 @@ async fn translate_text_stream_inner(
     }
 
     let output_event_tx = event_tx.clone();
+    ctx.config.maybe_reload()?;
+    if ctx.cache_enabled {
+        if let Ok(Some(replay)) =
+            offline_replay::find_replay(text, target_lang, template, opts, ctx, true)
+        {
+            let output = replay
+                .record
+                .output_text
+                .as_deref()
+                .ok_or_else(|| anyhow!("missing replay output"))?;
+            event_tx
+                .send(StreamEvent::Token(output.to_owned()))
+                .await
+                .map_err(|_| anyhow!("stream event receiver dropped"))?;
+            let terminal = event_tx
+                .reserve()
+                .await
+                .map_err(|_| anyhow!("stream event receiver dropped"))?;
+            if event_tx.is_closed() {
+                anyhow::bail!("stream event receiver dropped");
+            }
+            let outcome = replay.finish(ctx.history)?;
+            terminal.send(StreamEvent::AllDone(outcome.text.clone()));
+            #[cfg(test)]
+            acknowledge_terminal_consumer_exit();
+            return Ok(outcome);
+        }
+    }
     let (config, client) = prepare_invocation(ctx).await?;
     let invocation = TranslationCtx {
         config: &config,
@@ -2290,6 +2363,7 @@ async fn translate_text_stream_inner(
     let mut cold_generation =
         !missing.is_empty() && cache_hits == 0 && inference_fingerprint.is_cache_verified();
     let mut cache_candidates = vec![false; plan.segment_count()];
+    let mut proof_eligible = cache_enabled && cache_hits == 0 && !missing.is_empty();
 
     let mut degraded_segments: Vec<usize> = Vec::new();
     #[cfg(test)]
@@ -2361,15 +2435,10 @@ async fn translate_text_stream_inner(
                     timing,
                 )
                 .await?;
-                Ok((
-                    chunk_idx,
-                    outcome.text,
-                    outcome.completeness_degraded,
-                    outcome.cold_generation,
-                ))
+                Ok((chunk_idx, outcome))
             });
 
-            let mut priority_done: Option<(usize, String, bool, bool)> = None;
+            let mut priority_done: Option<(usize, SegmentTranslateOutcome)> = None;
             if !missing.is_empty() {
                 tokio::select! {
                     _ = first_token_rx.recv() => {}
@@ -2378,7 +2447,8 @@ async fn translate_text_stream_inner(
                     }
                 }
 
-                let mut join_set: JoinSet<Result<(usize, String, bool, bool)>> = JoinSet::new();
+                let mut join_set: JoinSet<Result<(usize, SegmentTranslateOutcome)>> =
+                    JoinSet::new();
                 for &idx in &missing {
                     let client = ctx.client.clone();
                     let segment = plan.segments[idx].clone();
@@ -2402,16 +2472,19 @@ async fn translate_text_stream_inner(
                         )
                         .await?;
                         timing.log(idx, "complete");
-                        Ok((
-                            idx,
-                            outcome.text,
-                            outcome.completeness_degraded,
-                            outcome.cold_generation,
-                        ))
+                        Ok((idx, outcome))
                     });
                 }
 
-                let (idx, translated, degraded, cold) = if let Some(done) = priority_done {
+                let (
+                    idx,
+                    SegmentTranslateOutcome {
+                        text: translated,
+                        completeness_degraded: degraded,
+                        cold_generation: cold,
+                        initial_request,
+                    },
+                ) = if let Some(done) = priority_done {
                     done
                 } else {
                     joined_segment(
@@ -2425,6 +2498,7 @@ async fn translate_text_stream_inner(
                     degraded_segments.push(idx + 1);
                 }
                 cold_generation &= cold;
+                proof_eligible &= initial_request;
                 cache_candidates[idx] = !degraded;
                 translations[idx] = Some(translated);
                 // Priority segment already streamed its tokens (validated or
@@ -2449,11 +2523,20 @@ async fn translate_text_stream_inner(
                 .await?;
 
                 while let Some(res) = join_set.join_next().await {
-                    let (idx, translated, degraded, cold) = joined_segment(res)?;
+                    let (
+                        idx,
+                        SegmentTranslateOutcome {
+                            text: translated,
+                            completeness_degraded: degraded,
+                            cold_generation: cold,
+                            initial_request,
+                        },
+                    ) = joined_segment(res)?;
                     if degraded {
                         degraded_segments.push(idx + 1);
                     }
                     cold_generation &= cold;
+                    proof_eligible &= initial_request;
                     cache_candidates[idx] = !degraded;
                     translations[idx] = Some(translated);
                     flush_ready_stream_prefix(
@@ -2466,7 +2549,15 @@ async fn translate_text_stream_inner(
                     .await?;
                 }
             } else {
-                let (idx, translated, degraded, cold) = joined_segment(
+                let (
+                    idx,
+                    SegmentTranslateOutcome {
+                        text: translated,
+                        completeness_degraded: degraded,
+                        cold_generation: cold,
+                        initial_request,
+                    },
+                ) = joined_segment(
                     priority_tasks
                         .join_next()
                         .await
@@ -2476,6 +2567,7 @@ async fn translate_text_stream_inner(
                     degraded_segments.push(idx + 1);
                 }
                 cold_generation &= cold;
+                proof_eligible &= initial_request;
                 cache_candidates[idx] = !degraded;
                 translations[idx] = Some(translated);
                 advance_stream_cursor_past_segment(
@@ -2489,7 +2581,7 @@ async fn translate_text_stream_inner(
                 .await?;
             }
         } else {
-            let mut join_set: JoinSet<Result<(usize, String, bool, bool)>> = JoinSet::new();
+            let mut join_set: JoinSet<Result<(usize, SegmentTranslateOutcome)>> = JoinSet::new();
 
             for &idx in &missing {
                 let client = ctx.client.clone();
@@ -2514,21 +2606,25 @@ async fn translate_text_stream_inner(
                     )
                     .await?;
                     timing.log(idx, "complete");
-                    Ok((
-                        idx,
-                        outcome.text,
-                        outcome.completeness_degraded,
-                        outcome.cold_generation,
-                    ))
+                    Ok((idx, outcome))
                 });
             }
 
             while let Some(res) = join_set.join_next().await {
-                let (idx, translated, degraded, cold) = joined_segment(res)?;
+                let (
+                    idx,
+                    SegmentTranslateOutcome {
+                        text: translated,
+                        completeness_degraded: degraded,
+                        cold_generation: cold,
+                        initial_request,
+                    },
+                ) = joined_segment(res)?;
                 if degraded {
                     degraded_segments.push(idx + 1);
                 }
                 cold_generation &= cold;
+                proof_eligible &= initial_request;
                 cache_candidates[idx] = !degraded;
                 translations[idx] = Some(translated);
                 flush_ready_stream_prefix(
@@ -2634,11 +2730,33 @@ async fn translate_text_stream_inner(
         input_chars: text.chars().count() as i64,
         output_chars: translated.chars().count() as i64,
         output_text: Some(translated.clone()),
-        input_hash: None,
+        input_hash: Some(segment_cache_hash(text)),
         config_version: ctx.config.config_version() as i64,
     };
 
-    if let Err(e) = ctx.history.insert_task(&record) {
+    let proof = if proof_eligible {
+        offline_replay::population_proof(
+            (text, &translated),
+            target_lang,
+            template,
+            opts,
+            ctx,
+            &plan,
+            true,
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("Warning: local replay proof unavailable: {error}");
+            None
+        })
+    } else {
+        None
+    };
+    if let Err(e) = ctx.history.insert_task_with_replay_proof(
+        &record,
+        proof
+            .as_ref()
+            .map(|(key, proof)| (key.as_str(), proof.as_str())),
+    ) {
         eprintln!("Warning: failed to record timing history: {e}");
     } else {
         eprintln!(
