@@ -444,6 +444,10 @@ class CacheServer(ThreadingMixIn, HTTPServer):
                 response.close()
         except (ssl.SSLError, _Deadline):
             raise
+        except http.client.RemoteDisconnected as error:
+            if budget.expired and (budget.parent is None or budget.parent.expired):
+                raise
+            raise _Unavailable("upstream peer closed before HTTP status") from error
         except http.client.HTTPException as error:
             if budget.expired and budget.parent is not None and not budget.parent.expired:
                 raise _Unavailable("upstream probe transport deadline") from error
@@ -466,51 +470,59 @@ class CacheServer(ThreadingMixIn, HTTPServer):
         finally:
             probe.close()
 
-    def _observe(self, requested_model: object, authorization: str | None, budget: _Budget) -> str:
-        values = []
+    def metadata(self, path: str, authorization: str | None, budget: _Budget) -> tuple[int, list[tuple[str, str]], bytes]:
+        with self.upstream_response("GET", path, None, authorization, budget) as response:
+            return response.status, response.getheaders(), _read(response, budget, self.response_limit)
+
+    def _observe(self, requested_model: object, authorization: str | None, budget: _Budget, initial: tuple[str, tuple[int, list[tuple[str, str]], bytes] | None] | None = None) -> str:
+        values = {}
         retained = None
         try:
-            retained = self.retained(requested_model)
+            retained = self.retained(None)
         except (ValueError, sqlite3.Error, TypeError, RecursionError):
             pass
         unavailable = False
-        for path in ("/props", "/v1/models"):
+        paths = ("/props", "/v1/models")
+        if initial is not None:
+            paths = (initial[0], *(path for path in paths if path != initial[0]))
+        for path in paths:
             try:
-                with self.upstream_response("GET", path, None, authorization, budget) as response:
-                    headers = response.getheaders()
-                    representation = [item for item in headers if item[0].lower() in {"content-type", "content-encoding", "connection"}]
-                    if not _valid_headers(headers) or not _cacheable_headers(representation):
-                        raise _Invalid("invalid metadata headers")
-                    raw = _read(response, budget, min(self.response_limit, 1024 * 1024))
-                    if response.status in {502, 503, 504}:
-                        raise _Unavailable("upstream metadata unavailable")
-                    if response.status != 200:
-                        raise _Invalid("upstream identity rejected")
-                    value = _load(raw)
+                result = initial[1] if initial is not None and path == initial[0] else self.metadata(path, authorization, budget)
+                if result is None:
+                    raise _Unavailable("upstream metadata unavailable")
+                status, headers, raw = result
+                representation = [item for item in headers if item[0].lower() in {"content-type", "content-encoding", "connection"}]
+                if not _valid_headers(headers) or not _cacheable_headers(representation) or len(raw) > 1024 * 1024:
+                    raise _Invalid("invalid metadata representation")
+                if status in {502, 503, 504}:
+                    raise _Unavailable("upstream metadata unavailable")
+                if status != 200:
+                    raise _Invalid("upstream identity rejected")
+                value = _load(raw)
             except _Unavailable:
                 value = None
                 unavailable = True
-            values.append(value)
-            if unavailable and budget.expired:
-                values.extend([None] * (2 - len(values)))
-                break
-        if unavailable:
-            if retained is not None:
+            values[path] = value
+            if value is not None and retained is not None:
                 old = _load(retained[1].encode())
-                props = values[0] if values[0] is not None else old["props"]
-                models = values[1] if values[1] is not None else {"data": [old["selected_model"]]}
+                props = values.get("/props") if values.get("/props") is not None else old["props"]
+                models = values.get("/v1/models") if values.get("/v1/models") is not None else {"data": [old["selected_model"]]}
                 try:
                     matches = self.identity(props, models, None) == retained[1]
                 except (ValueError, TypeError, RecursionError):
                     matches = False
                 if not matches:
+                    # Revoke an observed contradiction before a later probe can fail, independent of caller alias.
                     self.store.clear()
-                    raise _Invalid("partial metadata contradicts retained identity")
+                    retained = None
+            if unavailable and budget.expired:
+                break
+        if unavailable:
             raise _Unavailable("upstream metadata unavailable")
-        identity = self.identity(*values, None)
+        identity = self.identity(values["/props"], values["/v1/models"], None)
         self.store.activate(identity)
         # A valid replacement model revokes old evidence even if this caller requested the old alias.
-        return self.identity(*values, requested_model)
+        return self.identity(values["/props"], values["/v1/models"], requested_model)
 
     def identity(self, props: object, models: object, requested_model: object) -> str:
         if not isinstance(props, dict) or not isinstance(models, dict) or not isinstance(models.get("data"), list):
@@ -630,22 +642,35 @@ class _Handler(BaseHTTPRequestHandler):
                     self._headers(response.status, response.getheaders(), "BYPASS", len(raw))
                     self.wfile.write(raw)
                 return
-            historical = False
+            probe = _Budget(min(2.0, self.budget.remaining() / 4), self.budget)
             try:
-                identity = self.server.observe(None, self.headers.get("Authorization"), self.budget)
-            except _Unavailable:
-                identity = self.server.retained(None)[1]
-                historical = True
-            record = self.server.retained(None)
-            if record[1] != identity:
-                raise _Invalid("planning identity changed")
-            value = _load(identity.encode())
+                live = None
+                try:
+                    live = self.server.metadata(self.path, self.headers.get("Authorization"), probe)
+                except _Unavailable:
+                    pass
+                if live is not None and live[0] not in {502, 503, 504}:
+                    try:
+                        self.server._observe(None, self.headers.get("Authorization"), probe, (self.path, live))
+                    except (OSError, http.client.HTTPException, sqlite3.Error, ValueError, TypeError, RecursionError):
+                        pass  # Optional historical proof must not replace a usable live response.
+                    status, headers, raw = live
+                    self._headers(status, headers, "BYPASS", len(raw))
+                    self.wfile.write(raw)
+                    return
+                try:
+                    self.server._observe(None, self.headers.get("Authorization"), probe, (self.path, live))
+                except _Unavailable:
+                    record = self.server.retained(None)
+                else:
+                    raise _Invalid("historical planning requires upstream unavailability")
+            finally:
+                probe.close()
+            value = _load(record[1].encode())
             body = value["props"] if self.path == "/props" else {"data": [value["selected_model"]]}
-            headers = [("Content-Type", "application/json")]
-            if historical:
-                headers += [("X-Hymt-Planning", "historical"), ("X-Hymt-Observed-At", str(record[2]))]
+            headers = [("Content-Type", "application/json"), ("X-Hymt-Planning", "historical"), ("X-Hymt-Observed-At", str(record[2]))]
             raw = _canonical(body).encode()
-            self._headers(200, headers, "HIT" if historical else "BYPASS", len(raw))
+            self._headers(200, headers, "HIT", len(raw))
             self.wfile.write(raw)
         except (OSError, http.client.HTTPException, sqlite3.Error, ValueError, TypeError, RecursionError):
             if not self.started:

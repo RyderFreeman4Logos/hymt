@@ -50,6 +50,15 @@ class _Upstream(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         state = self.server.state
+        with state["lock"]:
+            state.setdefault("gets", []).append(self.path)
+        if state.get("peer_close"):
+            self.close_connection = True
+            return
+        if state.get("bad_status"):
+            self.connection.sendall(b"malformed nonempty status\r\n\r\n")
+            self.close_connection = True
+            return
         if self.headers.get("Authorization") == "Bearer denied":
             self._reply(401, b'{"error":"denied"}')
             return
@@ -63,7 +72,7 @@ class _Upstream(BaseHTTPRequestHandler):
         elif self.path == "/props":
             self._reply(200, state.get("props_raw") or json.dumps(state["props"]).encode())
         elif self.path == "/v1/models":
-            self._reply(200, json.dumps({"data": [{"id": state.get("model_id", "Hy-MT2-7B"), "aliases": [state.get("model_id", "Hy-MT2-7B")], "created": state["generation"], "meta": state["meta"]}, *state["models_extra"]]}).encode())
+            self._reply(200, state.get("models_raw") or json.dumps({"data": [{"id": state.get("model_id", "Hy-MT2-7B"), "aliases": [state.get("model_id", "Hy-MT2-7B")], "created": state["generation"], "meta": state["meta"]}, *state["models_extra"]]}).encode())
         else:
             self._reply(404, b'{}')
 
@@ -314,12 +323,16 @@ class CacheContracts(unittest.TestCase):
         for status in (401, 403):
             self.state["metadata_status"] = {"/props": status}
             self.assertNotEqual(self.request()[1]["X-Hymt-Cache"], "HIT")
-            self.assertEqual(self.get_metadata()[0], 502)
+            live_status, live_headers, _raw = self.get_metadata()
+            self.assertEqual(live_status, status)
+            self.assertNotIn("X-Hymt-Planning", live_headers)
         self.state.pop("metadata_status")
         for raw in (b'not-json', b'{"build":1,"build":2}', b'{}'):
             self.state["props_raw"] = raw
             self.assertNotEqual(self.request()[1]["X-Hymt-Cache"], "HIT")
-            self.assertEqual(self.get_metadata()[0], 502)
+            live_status, live_headers, live_raw = self.get_metadata()
+            self.assertEqual((live_status, live_raw), (200, raw))
+            self.assertNotIn("X-Hymt-Planning", live_headers)
         self.state.pop("props_raw")
         self.state["unknown"] = True
         for headers in ([("Content-Encoding", "gzip")], [("Content-Type", "application/json")]):
@@ -362,6 +375,91 @@ class CacheContracts(unittest.TestCase):
                 self.state["unknown"] = True
                 self.assertEqual(self.get_metadata()[0], 502)
                 self.assertNotEqual(self.request()[1]["X-Hymt-Cache"], "HIT")
+
+    def test_partial_replacement_revokes_before_alias_or_later_probe_errors(self):
+        for later in (503, 401, b'not-json', b'{"data":[]}'):
+            with self.subTest(later=later):
+                self.cache.store.clear()
+                self.state.update(unknown=False, model_id="Hy-MT2-7B")
+                self.state["props"]["model_alias"] = "Hy-MT2-7B"
+                self.state.pop("metadata_status", None)
+                self.state.pop("models_raw", None)
+                self.assertEqual(self.request()[1]["X-Hymt-Cache"], "MISS")
+                self.state["props"]["model_alias"] = "replacement"
+                if isinstance(later, int):
+                    self.state["metadata_status"] = {"/v1/models": later}
+                else:
+                    self.state["models_raw"] = later
+                model = "replacement" if later == 503 else "Hy-MT2-7B"
+                self.assertNotEqual(self.request({"model": model})[1]["X-Hymt-Cache"], "HIT")
+                self.state.pop("metadata_status", None)
+                self.state.pop("models_raw", None)
+                self.state["unknown"] = True
+                self.assertEqual(self.get_metadata()[0], 502)
+                self.assertNotEqual(self.request()[1]["X-Hymt-Cache"], "HIT")
+
+    def test_live_metadata_survives_optional_planning_store_failures(self):
+        for method in ("activate", "planning"):
+            with self.subTest(method=method), patch.object(self.cache.store, method, side_effect=sqlite3.OperationalError("synthetic optional store failure")):
+                status, headers, raw = self.get_metadata()
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(raw), self.state["props"])
+                self.assertNotIn("X-Hymt-Planning", headers)
+
+    def test_live_partial_contradiction_revokes_before_other_endpoint_rejection(self):
+        for path, other in (("/props", "/v1/models"), ("/v1/models", "/props")):
+            with self.subTest(path=path):
+                self.state["unknown"] = False
+                self.state.pop("metadata_status", None)
+                self.request()
+                if path == "/props":
+                    self.state["props"]["build_info"] += "changed"
+                else:
+                    self.state["meta"]["n_params"] += 1
+                self.state["metadata_status"] = {other: 401}
+                self.assertEqual(self.get_metadata(path)[0], 200)
+                self.state.pop("metadata_status")
+                self.state["unknown"] = True
+                self.assertEqual(self.get_metadata()[0], 502)
+                self.assertNotEqual(self.request()[1]["X-Hymt-Cache"], "HIT")
+
+    def test_live_metadata_preserves_slots_and_uses_each_response_once(self):
+        self.state["props"]["slots"] = [{"id": 0, "is_processing": True}, {"id": 1, "is_processing": False}]
+        for path in ("/props", "/v1/models"):
+            self.state["gets"] = []
+            status, headers, raw = self.get_metadata(path)
+            self.assertEqual(status, 200)
+            self.assertEqual(self.state["gets"].count(path), 1)
+            if path == "/props":
+                self.assertEqual(json.loads(raw).get("slots"), self.state["props"]["slots"])
+            self.assertEqual(headers["X-Original"], "retained")
+
+    def test_live_metadata_survives_ineligible_identity_and_other_endpoint_failure(self):
+        del self.state["props"]["default_generation_settings"]["top_k"]
+        self.assertEqual(self.get_metadata()[2], json.dumps(self.state["props"]).encode())
+        self.state["props"]["default_generation_settings"]["top_k"] = 20
+        for path, other in (("/props", "/v1/models"), ("/v1/models", "/props")):
+            self.state["metadata_status"] = {other: 401}
+            self.assertEqual(self.get_metadata(path)[0], 200)
+        self.state.pop("metadata_status")
+        self.state["unknown"] = True
+        self.assertEqual(self.get_metadata()[0], 502)
+
+    def test_immediate_peer_close_replays_but_nonempty_bad_status_does_not(self):
+        for stream in (False, True):
+            self.assertEqual(self.request({"model": "Hy-MT2-7B", "stream": stream})[1]["X-Hymt-Cache"], "MISS")
+        self.state["peer_close"] = True
+        started = time.monotonic()
+        status, headers, _raw = self.get_metadata()
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["X-Hymt-Planning"], "historical")
+        for stream in (False, True):
+            self.assertEqual(self.request({"model": "Hy-MT2-7B", "stream": stream})[1]["X-Hymt-Cache"], "HIT")
+        self.assertLess(time.monotonic() - started, 1)
+        self.state["peer_close"] = False
+        self.state["bad_status"] = True
+        self.assertEqual(self.get_metadata()[0], 502)
+        self.assertNotEqual(self.request({"model": "Hy-MT2-7B", "stream": False})[1]["X-Hymt-Cache"], "HIT")
 
     def test_corrupt_oversized_and_legacy_planning_are_ineligible(self):
         self.request()
@@ -856,6 +954,9 @@ class CacheContracts(unittest.TestCase):
         del defaults["min_p"]
         self.assertEqual("UNKNOWN", self.request()[1]["X-Hymt-Cache"])
         defaults["min_p"] = 0.0
+        # Rejected observations revoked prior evidence; rewarm before testing transaction rollback.
+        self.assertEqual("MISS", self.request()[1]["X-Hymt-Cache"])
+        self.assertEqual("HIT", self.request()[1]["X-Hymt-Cache"])
         conn = sqlite3.connect(self.db)
         conn.execute("BEGIN IMMEDIATE")
         conn.execute("DELETE FROM entries")
