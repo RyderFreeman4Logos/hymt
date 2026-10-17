@@ -4615,9 +4615,14 @@ After ordinary prose must also be translated in document order.\n"
             "fixture must have translated segments"
         );
 
-        for (name, reply) in [("empty", ""), ("truncated", "译")] {
+        for (name, reply) in [
+            ("empty", ""),
+            ("whitespace", " \t\n\u{a0}"),
+            ("truncated", "译"),
+        ] {
+            let encoded = serde_json::to_string(reply).unwrap();
             let responses = (0..plan.segment_count() * 2)
-                .map(|_| MockResponse::Json(reply.to_owned()))
+                .map(|_| MockResponse::Json(encoded[1..encoded.len() - 1].to_owned()))
                 .collect();
             let server = start_mock_server(responses).await;
             let config = make_stream_config(&server.endpoint_url);

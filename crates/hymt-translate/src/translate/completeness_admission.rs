@@ -148,6 +148,10 @@ pub(super) fn validate_exhausted_attempt(
     opts: &PromptOpts,
     config: &HotConfig,
 ) -> Result<()> {
+    // Empty output has no Markdown events; preserve the missing-output diagnostic.
+    if best.text.trim().is_empty() {
+        return reject_unrecoverably_incomplete_best_attempt(index, source, &best.text);
+    }
     ensure_markdown_structure_preserved(source, &best.text)?;
     ensure_document_identities_preserved(source, &best.text)?;
     reject_unrecoverably_incomplete_best_attempt(index, source, &best.text)?;
