@@ -13,6 +13,8 @@ use crate::language_spec::{language_spec_or_none, LanguageFamily};
 
 mod identity;
 pub use identity::{identity_preservation_failures, parse_json_document, preserved_urls};
+mod json_content;
+pub use json_content::json_string_values;
 mod placeholders;
 pub use placeholders::{preserved_placeholder_ranges, preserved_placeholders};
 mod urls;
@@ -82,6 +84,9 @@ pub enum CompletionTermination {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompletenessContext {
     pub termination: CompletionTermination,
+    /// The source leaf starts after non-whitespace on its original line.
+    #[serde(default)]
+    pub markdown_inline_start: bool,
 }
 
 /// Indicates whether density bounds are calibrated for the selected target.
@@ -167,8 +172,26 @@ pub fn validate_completeness_with_context(
     context: &CompletenessContext,
 ) -> CompletenessResult {
     let thresholds = thresholds.cloned().unwrap_or_default();
-    let input_stats = compute_stats(input_text);
-    let output_stats = compute_stats(output_text);
+    let input_json = parse_json_document(input_text);
+    let output_json = input_json
+        .as_ref()
+        .and_then(|_| parse_json_document(output_text));
+    let mut input_stats = input_json
+        .as_ref()
+        .map_or_else(|| compute_stats(input_text), json_content::stats);
+    let mut output_stats = output_json
+        .as_ref()
+        .map_or_else(|| compute_stats(output_text), json_content::stats);
+    if input_json.is_none() && context.markdown_inline_start {
+        for (text, stats) in [
+            (input_text, &mut input_stats),
+            (output_text, &mut output_stats),
+        ] {
+            let framed = format!("x {text}");
+            stats.heading_count = count_markdown_headings(&framed);
+            stats.fenced_code_block_count = count_fenced_code_blocks(&framed);
+        }
+    }
     let density = density_check(&input_stats, &output_stats, target_lang, &thresholds);
     let mut checks_failed = Vec::new();
     let mut advisory_warnings = Vec::new();
@@ -224,6 +247,14 @@ pub fn validate_completeness_with_context(
         checks_failed.retain(|check| check != "token_ratio" && check != "paragraph_count");
         if checks_failed.len() != before {
             advisory_warnings.push("cli_help_density".to_owned());
+        }
+    }
+
+    if let (Some(input), Some(output)) = (&input_json, &output_json) {
+        for failure in json_content::string_failures(input, output, target_lang, &thresholds) {
+            if !checks_failed.contains(&failure) {
+                checks_failed.push(failure);
+            }
         }
     }
 
@@ -1105,6 +1136,7 @@ verbatim ask --no-generate --format json \"哪些证据是相关的？\"";
     fn finish_reason_length_is_retryable_transport_failure() {
         let context = CompletenessContext {
             termination: CompletionTermination::Length,
+            ..CompletenessContext::default()
         };
         let result = validate_completeness_with_context(
             "Source text.",

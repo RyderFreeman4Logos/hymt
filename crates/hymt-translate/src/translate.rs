@@ -288,76 +288,6 @@ struct SegmentTranslateOutcome {
     completeness_degraded: bool,
 }
 
-/// One failed candidate retained only long enough to select the safest available
-/// fallback. Its score ranks observable validation signals, not translation QE.
-#[derive(Debug)]
-struct ScoredAttempt {
-    attempt: usize,
-    text: String,
-    validation: CompletenessResult,
-    structure_preserved: bool,
-}
-
-impl ScoredAttempt {
-    fn new(
-        attempt: usize,
-        source: &str,
-        text: impl Into<String>,
-        validation: CompletenessResult,
-    ) -> Self {
-        let text = text.into();
-        Self {
-            attempt,
-            structure_preserved: ensure_markdown_structure_preserved(source, &text).is_ok(),
-            text,
-            validation,
-        }
-    }
-
-    fn selection_reason(&self) -> &'static str {
-        "structural_validity_then_validation_score"
-    }
-}
-
-fn score_provider_attempt(
-    attempt: usize,
-    source: &str,
-    text: String,
-    target_lang: &str,
-    config: &HotConfig,
-    termination: CompletionTermination,
-    unpublished: bool,
-) -> ScoredAttempt {
-    let text = if unpublished {
-        recover_generated_inline_code(source, &text).unwrap_or(text)
-    } else {
-        text
-    };
-    let validation = check_completeness(
-        source,
-        &text,
-        target_lang,
-        config,
-        &CompletenessContext { termination },
-    );
-    ScoredAttempt::new(attempt, source, text, validation)
-}
-
-/// Prefer structurally valid attempts, then the earliest highest-scoring one.
-fn select_best_attempt(current: Option<ScoredAttempt>, candidate: ScoredAttempt) -> ScoredAttempt {
-    match current {
-        Some(current) if current.structure_preserved != candidate.structure_preserved => {
-            if current.structure_preserved {
-                current
-            } else {
-                candidate
-            }
-        }
-        Some(current) if current.validation.score >= candidate.validation.score => current,
-        _ => candidate,
-    }
-}
-
 impl TranslationPlan {
     pub fn segment_count(&self) -> usize {
         self.segments.len()
@@ -1008,9 +938,11 @@ pub(crate) use completeness_admission::cached_document_is_complete;
 use completeness_admission::reject_unrecoverably_incomplete_best_attempt;
 use completeness_admission::{
     approx_source_tokens, cached_segment_is_complete, ensure_document_identities_preserved,
-    validate_exhausted_attempt,
+    score_provider_attempt, select_best_attempt, validate_exhausted_attempt, ScoredAttempt,
 };
 mod markdown_boundary;
+mod markdown_context;
+use markdown_context::{segment_contexts, SegmentSource};
 mod markdown_ownership;
 mod markdown_recovery;
 use markdown_recovery::recover_generated_inline_code;
@@ -1343,6 +1275,7 @@ struct SegmentTranslateRequest<'a> {
     index: usize,
     client: &'a TranslationClient,
     segment: &'a str,
+    context: markdown_context::MarkdownContext,
     target_lang: &'a str,
     template: &'a TemplateType,
     opts: &'a PromptOpts,
@@ -1362,15 +1295,17 @@ fn map_segment_http_error(
     )
 }
 
-async fn translate_segment_with_completeness(
+async fn translate_segment_with_completeness<'a>(
     index: usize,
     client: &TranslationClient,
-    segment: &str,
+    source: impl Into<SegmentSource<'a>>,
     target_lang: &str,
     template: &TemplateType,
     opts: &PromptOpts,
     config: &HotConfig,
 ) -> Result<SegmentTranslateOutcome> {
+    let source = source.into();
+    let segment = source.text;
     let max_retries = config.completeness_max_retries() as usize;
     let mut best: Option<ScoredAttempt> = None;
 
@@ -1389,7 +1324,7 @@ async fn translate_segment_with_completeness(
             .map_err(|e| map_segment_http_error(index, segment, e))?;
         let candidate = score_provider_attempt(
             attempt,
-            segment,
+            source,
             completion.text,
             target_lang,
             config,
@@ -1429,8 +1364,8 @@ async fn translate_segment_with_completeness(
     }
 
     let best = best.expect("a retry loop always has at least one attempt");
-    validate_exhausted_attempt(index, segment, &best, opts, config)?;
-    ensure_markdown_structure_preserved(segment, &best.text)?;
+    validate_exhausted_attempt(index, source, &best, opts, config)?;
+    source.structure_preserved(&best.text)?;
     eprintln!(
         "Warning: segment {} exceeded {} retries, selected attempt {}/{} \
          (score={}, reason={})",
@@ -1580,7 +1515,7 @@ async fn translate_segment_with_completeness_streaming(
 
     let mut best = score_provider_attempt(
         0,
-        request.segment,
+        SegmentSource::new(request.segment, request.context),
         translated,
         request.target_lang,
         request.config,
@@ -1612,7 +1547,7 @@ async fn translate_segment_with_completeness_streaming(
     if emitted_optimistically {
         validate_exhausted_attempt(
             request.index,
-            request.segment,
+            SegmentSource::new(request.segment, request.context),
             &best,
             request.opts,
             request.config,
@@ -1663,7 +1598,7 @@ async fn translate_segment_with_completeness_streaming(
 
         let candidate = score_provider_attempt(
             attempt,
-            request.segment,
+            SegmentSource::new(request.segment, request.context),
             completion.text,
             request.target_lang,
             request.config,
@@ -1717,12 +1652,12 @@ async fn translate_segment_with_completeness_streaming(
 
     validate_exhausted_attempt(
         request.index,
-        request.segment,
+        SegmentSource::new(request.segment, request.context),
         &best,
         request.opts,
         request.config,
     )?;
-    ensure_markdown_structure_preserved(request.segment, &best.text)?;
+    SegmentSource::new(request.segment, request.context).structure_preserved(&best.text)?;
     eprintln!(
         "Warning: segment {} exceeded {} retries, selected attempt {}/{} \
          (score={}, reason={})",
@@ -1837,6 +1772,7 @@ pub async fn translate_text(
         profile_id,
         inference_fingerprint: inference_fingerprint.hash(),
     };
+    let contexts = segment_contexts(&plan)?;
     let seg_hashes: Vec<String> = plan
         .segments
         .iter()
@@ -1862,14 +1798,16 @@ pub async fn translate_text(
                 Ok(Some(cached)) => {
                     if cached_segment_is_complete(
                         i,
-                        &plan.segments[i],
+                        SegmentSource::new(&plan.segments[i], contexts[i]),
                         &cached,
                         target_lang,
                         ctx.config,
                     ) {
                         translations[i] = Some(cached);
                     } else {
-                        if ensure_markdown_structure_preserved(&plan.segments[i], &cached).is_err()
+                        if SegmentSource::new(&plan.segments[i], contexts[i])
+                            .structure_preserved(&cached)
+                            .is_err()
                         {
                             evict_invalid_cached_segment(ctx.history, hash, cache_scope, &cached);
                         }
@@ -1908,6 +1846,7 @@ pub async fn translate_text(
         for &idx in &missing {
             let client = ctx.client.clone();
             let segment = plan.segments[idx].clone();
+            let context = contexts[idx];
             let target = target_lang.to_owned();
             let tmpl = template.clone();
             let cloned_opts = opts.clone();
@@ -1917,7 +1856,7 @@ pub async fn translate_text(
                 let outcome = translate_segment_with_completeness(
                     idx,
                     &client,
-                    &segment,
+                    SegmentSource::new(&segment, context),
                     &target,
                     &tmpl,
                     &cloned_opts,
@@ -2178,6 +2117,7 @@ async fn translate_text_stream_inner(
         profile_id,
         inference_fingerprint: inference_fingerprint.hash(),
     };
+    let contexts = segment_contexts(&plan)?;
     let seg_hashes: Vec<String> = plan
         .segments
         .iter()
@@ -2201,14 +2141,16 @@ async fn translate_text_stream_inner(
                 Ok(Some(cached)) => {
                     if cached_segment_is_complete(
                         i,
-                        &plan.segments[i],
+                        SegmentSource::new(&plan.segments[i], contexts[i]),
                         &cached,
                         target_lang,
                         ctx.config,
                     ) {
                         translations[i] = Some(cached);
                     } else {
-                        if ensure_markdown_structure_preserved(&plan.segments[i], &cached).is_err()
+                        if SegmentSource::new(&plan.segments[i], contexts[i])
+                            .structure_preserved(&cached)
+                            .is_err()
                         {
                             evict_invalid_cached_segment(ctx.history, hash, cache_scope, &cached);
                         }
@@ -2273,6 +2215,7 @@ async fn translate_text_stream_inner(
         if let Some(chunk_idx) = priority_chunk {
             let client = ctx.client.clone();
             let segment = plan.segments[chunk_idx].clone();
+            let context = contexts[chunk_idx];
             let target = target_lang.to_owned();
             let tmpl = template.clone();
             let cloned_opts = opts.clone();
@@ -2292,6 +2235,7 @@ async fn translate_text_stream_inner(
                         index: chunk_idx,
                         client: &client,
                         segment: &segment,
+                        context,
                         target_lang: &target,
                         template: &tmpl,
                         opts: &cloned_opts,
@@ -2319,6 +2263,7 @@ async fn translate_text_stream_inner(
                 for &idx in &missing {
                     let client = ctx.client.clone();
                     let segment = plan.segments[idx].clone();
+                    let context = contexts[idx];
                     let target = target_lang.to_owned();
                     let tmpl = template.clone();
                     let cloned_opts = opts.clone();
@@ -2330,7 +2275,7 @@ async fn translate_text_stream_inner(
                         let outcome = translate_segment_with_completeness(
                             idx,
                             &client,
-                            &segment,
+                            SegmentSource::new(&segment, context),
                             &target,
                             &tmpl,
                             &cloned_opts,
@@ -2422,6 +2367,7 @@ async fn translate_text_stream_inner(
             for &idx in &missing {
                 let client = ctx.client.clone();
                 let segment = plan.segments[idx].clone();
+                let context = contexts[idx];
                 let target = target_lang.to_owned();
                 let tmpl = template.clone();
                 let cloned_opts = opts.clone();
@@ -2433,7 +2379,7 @@ async fn translate_text_stream_inner(
                     let outcome = translate_segment_with_completeness(
                         idx,
                         &client,
-                        &segment,
+                        SegmentSource::new(&segment, context),
                         &target,
                         &tmpl,
                         &cloned_opts,
@@ -2666,6 +2612,7 @@ mod tests {
     mod app_cache_policy_tests;
     mod cache_admission_tests;
     mod completeness_terminal_tests;
+    mod context_json_tests;
     mod exec_cache_tests;
     mod identity_tests;
     pub(super) use identity_tests::record_placeholder_scan;
