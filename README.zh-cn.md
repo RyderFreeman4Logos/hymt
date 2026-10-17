@@ -74,8 +74,8 @@ timeout = 600
 # Refuse planning when the final chat template cannot be tokenized locally.
 # Otherwise hymt emits a warning and uses a conservative approximate budget.
 strict_token_budget = false
-# Refuse translation before cache lookup if the backend runtime cannot be verified
-# or differs materially from this configuration.
+# Except for verified local replay, refuse live work before segment-cache lookup
+# or model invocation when the backend runtime is unverified or incompatible.
 strict_backend_preflight = false
 # For Chinese-family targets, preserve confidently target-language paragraphs.
 language_detection = true
@@ -129,13 +129,13 @@ divergence_threshold = 2.0
 
 ### 运行时后端预检与检查
 
-在规划或缓存查找之前，翻译引擎会先检测配置的后端。llama.cpp使用`GET /props`；而vLLM及其他兼容OpenAI的服务在可用时会使用`GET /v1/models`。标准化的运行时状态包括服务版本/模型标识、上下文与槽位限制、采样器默认设置，以及明确声明的功能。缺失的字段将保持未知状态，不会被推测出来。
+在实时规划或片段缓存查找之前，翻译引擎会先检测配置的后端；显式启用且已完整验证的本地整段输出可以提前重放。llama.cpp使用`GET /props`；而vLLM及其他兼容OpenAI的服务在可用时会使用`GET /v1/models`。标准化的运行时状态包括服务版本/模型标识、上下文与槽位限制、采样器默认设置，以及明确声明的功能。缺失的字段将保持未知状态，不会被推测出来。
 
 当llama.cpp的 `/props` 返回单个ASCII标点符号`eos_token`，且聊天模板中包含`<|...|>`控制标记时，hymt会检测到矛盾：模板中的标记才是真正的结束符，而元数据中的标记则是假的。它会在预检阶段通过 `/tokenize` 处理这个错误的标记，并向llama.cpp发送`logit_bias`参数`{ "<token_id>": -100 }`，从而避免错误停止，同时不会屏蔽聊天模板中真正的结束符标记（如`<|eos|>`）。聊天模板本身使用的单字符结束符则保持不变。
 
 运行`hymt backend inspect`可并列显示配置值和服务检测到的值。该命令不会输出API密钥、端点凭证或请求头信息。警告信息会指出上下文/模型/配置文件不匹配、服务采样器状态异常，以及llama.cpp与vLLM之间的重复惩罚参数不一致问题。
 
-默认预检在失败时会发出警告，将推理指纹/缓存身份标记为未验证，并使用保守的上下文/输出限制继续规划。若无法验证身份或发现重大不匹配，可设置`[translation].strict_backend_preflight = true`，在查询缓存或调用模型之前直接拒绝请求。运行时状态会以TTL机制缓存60秒，当端点/后端/配置发生变化时会被刷新；新的服务身份将取代原有的解析状态和指纹。
+默认预检在失败时会发出警告，将推理指纹/缓存身份标记为未验证，并使用保守的上下文/输出限制继续规划。若无法验证身份或发现重大不匹配，可设置`[translation].strict_backend_preflight = true`，在查询片段缓存或调用模型之前直接拒绝实时请求。运行时状态会以TTL机制缓存60秒，当端点/后端/配置发生变化时会被刷新；新的服务身份将取代原有的解析状态和指纹。
 
 ## 模型配置文件（`[endpoint].profile`）
 
@@ -237,6 +237,9 @@ force_translate_all = false    # default: false; set true to translate all non-c
 ## 智能分词与缓存复用
 
 应用层片段缓存与整段输出缓存默认关闭。设置 `[cache].enabled = true` 可显式启用；普通翻译、batch、man/info、exec 和 Telegram 命令的 `--no-cache` 会覆盖该设置。关闭缓存不会删除旧缓存，也不影响翻译历史、耗时估计和 recall。服务层推理缓存独立复用完整且一致的 HTTP 请求与响应，即使应用层缓存关闭也继续使用。显式 `--no-cache` 会跳过应用层与服务层缓存的读取和写入。自动验证重试也会绕过服务层缓存，且不改变其他并发请求。`hymt exec precache` 是显式填充应用缓存的操作，即使默认关闭也会执行；与 `--no-cache` 同用时会报错。
+
+设置 `[cache].enabled = true` 后，合格的完整任务会在输出所在行保留有界凭证。源文、目标语言、当前实际提示词与适配器请求字节、分词器、分段归属及顺序、限制和验证策略一致时，即使服务无法连接，也可在远程预检（包括严格预检）之前本地重放。历史运行信息仅用于隔离的重放验证，不能授权新请求或生成冷耗时样本。缺失、旧版、损坏或不匹配的凭证会恢复普通实时流程，且不会预先发出输出前缀。仅 Verified 身份下首次完整性尝试成功的完整任务可生成凭证；降级结果、完整性重试和旧片段缓存命中均不生成凭证。流式与缓冲请求分别匹配。`hymt history --clear` 会随任务删除凭证。这些机械验证不证明翻译语义质量或后端当前状态。
+
 
 hymt会根据Hy-MT2分词器及选定的提示模板来规划每次翻译任务。应用层缓存启用时，翻译片段按以下信息生成缓存键：
 - 段落内容哈希值

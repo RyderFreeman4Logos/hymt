@@ -192,6 +192,18 @@ impl HistoryDB {
     }
 
     pub fn insert_task(&self, record: &TaskRecord) -> Result<(), CacheError> {
+        self.insert_task_with_replay_proof(record, None)
+    }
+
+    /// Insert complete output and optional bounded replay evidence in one row.
+    pub fn insert_task_with_replay_proof(
+        &self,
+        record: &TaskRecord,
+        proof: Option<(&str, &str)>,
+    ) -> Result<(), CacheError> {
+        if proof.is_some_and(|(digest, proof)| digest.len() != 64 || proof.len() > 16_384) {
+            return Err(CacheError::InvalidArg("invalid replay proof size".into()));
+        }
         let conn = self.connect_create()?;
         ensure_schema(&conn)?;
         conn.execute(
@@ -201,8 +213,8 @@ impl HistoryDB {
                 source_lang, target_lang, template_type, model,
                 tokens_per_second, input_chars, output_chars,
                 output_text, input_hash, config_version, profile_id, inference_fingerprint,
-                prompt_schema, cache_hits, cold_source_tokens, counting_source, estimated_seconds
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)",
+                prompt_schema, cache_hits, cold_source_tokens, counting_source, estimated_seconds, configured_request_digest, replay_proof
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26)",
             rusqlite::params![
                 record.started_at,
                 record.finished_at,
@@ -228,9 +240,34 @@ impl HistoryDB {
                 record.cold_source_tokens,
                 record.counting_source,
                 record.estimated_seconds,
+                proof.map(|(digest, _)| digest),
+                proof.map(|(_, proof)| proof),
             ],
         )?;
         Ok(())
+    }
+
+    /// Bounded candidates only; the caller must validate all evidence and output.
+    pub fn find_replay_candidates(
+        &self,
+        input_hash: &str,
+        configured_digest: &str,
+    ) -> Result<Vec<(TaskRecord, String)>, CacheError> {
+        let Some(conn) = self.connect_if_exists()? else {
+            return Ok(Vec::new());
+        };
+        ensure_schema(&conn)?;
+        let mut statement = conn.prepare(
+            "SELECT * FROM tasks WHERE input_hash=?1 AND configured_request_digest=?2
+             AND length(CAST(replay_proof AS BLOB)) BETWEEN 1 AND 16384
+             AND length(CAST(output_text AS BLOB)) BETWEEN 1 AND 16777216
+             ORDER BY id DESC LIMIT 8",
+        )?;
+        let rows = statement
+            .query_map(rusqlite::params![input_hash, configured_digest], |row| {
+                Ok((record_from_row(row)?, row.get("replay_proof")?))
+            })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     pub fn find_segment_cached(
@@ -678,6 +715,7 @@ fn ensure_schema(conn: &Connection) -> Result<(), CacheError> {
     let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     transaction.execute_batch(SCHEMA)?;
     migrate_tasks_columns(&transaction)?;
+    transaction.execute_batch("CREATE INDEX IF NOT EXISTS tasks_replay_request ON tasks(input_hash, configured_request_digest)")?;
     migrate_segment_cache_columns(&transaction)?;
     transaction.commit()?;
     Ok(())
@@ -709,6 +747,8 @@ fn migrate_tasks_columns(conn: &Connection) -> Result<(), CacheError> {
         ("cold_source_tokens", "INTEGER"),
         ("counting_source", "TEXT"),
         ("estimated_seconds", "REAL"),
+        ("configured_request_digest", "TEXT"),
+        ("replay_proof", "TEXT"),
     ] {
         if !cols.contains(name) {
             conn.execute_batch(&format!("ALTER TABLE tasks ADD COLUMN {name} {sql_type}"))?;

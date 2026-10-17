@@ -118,6 +118,15 @@ pub struct BackendPreflight {
     pub warnings: Vec<String>,
 }
 
+impl BackendPreflight {
+    /// Emit runtime diagnostics after either eager or deferred live preflight.
+    pub fn report_warnings(&self) {
+        for warning in &self.warnings {
+            eprintln!("Warning: {warning}");
+        }
+    }
+}
+
 // ── Serde types ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
@@ -369,6 +378,7 @@ struct Inner {
 pub struct TranslationClient {
     inner: Arc<Inner>,
     cache_bypass: bool,
+    deferred_preflight: bool,
 }
 
 impl TranslationClient {
@@ -398,6 +408,7 @@ impl TranslationClient {
         let http = reqwest::Client::builder().timeout(timeout).build()?;
         Ok(Self {
             cache_bypass: false,
+            deferred_preflight: false,
             inner: Arc::new(Inner {
                 config,
                 http,
@@ -419,7 +430,18 @@ impl TranslationClient {
         Self {
             inner: Arc::clone(&self.inner),
             cache_bypass: self.cache_bypass || bypass,
+            deferred_preflight: self.deferred_preflight,
         }
+    }
+
+    /// Defer CLI live preflight until the local complete-output replay misses.
+    pub fn with_deferred_preflight(mut self, deferred: bool) -> Self {
+        self.deferred_preflight = deferred;
+        self
+    }
+
+    pub fn has_deferred_preflight(&self) -> bool {
+        self.deferred_preflight
     }
 
     /// Bind a detached invocation configuration to the existing HTTP pool and limit.
@@ -434,6 +456,7 @@ impl TranslationClient {
             .and_then(|entry| entry.clone());
         Ok(Self {
             cache_bypass: self.cache_bypass,
+            deferred_preflight: self.deferred_preflight,
             inner: Arc::new(Inner {
                 config,
                 http: self.inner.http.clone(),
@@ -1018,6 +1041,12 @@ impl TranslationClient {
     }
 
     // ── Private helpers ────────────────────────────────────────────────────────
+
+    /// Exact adapter-produced request body, without headers or credentials.
+    /// Used to bind retained local output to the current request implementation.
+    pub fn request_bytes(&self, prompt: &str, stream: bool) -> Result<Vec<u8>, ClientError> {
+        Ok(serde_json::to_vec(&self.build_payload(prompt, stream)?)?)
+    }
 
     fn build_payload(&self, prompt: &str, stream: bool) -> Result<ChatPayload, ClientError> {
         let cfg = &self.inner.config;

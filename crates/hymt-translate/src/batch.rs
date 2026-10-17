@@ -118,19 +118,21 @@ pub struct BatchPlanOpts<'a> {
 
 /// Scan `directory`, plan translations for all supported text files, and check
 /// the cache to determine which segments still need translating.
-pub fn build_batch_plan(
+/// A client sharing `config` performs deferred live preflight on the first replay
+/// miss, before planning or segment-cache lookup. Replay needs no live backend.
+pub async fn build_batch_plan(
     directory: &Path,
     config: &HotConfig,
+    client: &TranslationClient,
     segmenter: &Segmenter,
     history: &HistoryDB,
     opts: &BatchPlanOpts<'_>,
 ) -> Result<BatchPlan> {
     config.maybe_reload()?;
-    let snapshot = config.detached_snapshot();
-    let config = &snapshot;
+    let mut snapshot = config.detached_snapshot();
     let concurrency = opts
         .concurrency_override
-        .unwrap_or_else(|| config.concurrency())
+        .unwrap_or_else(|| snapshot.concurrency())
         .max(1);
     let (output_dir, target_lang, template, prompt_opts, recursive, explicit_target) = (
         opts.output_dir,
@@ -148,16 +150,7 @@ pub fn build_batch_plan(
     eprintln!("Scanned {} files in {}", source_paths.len(), root.display());
 
     let template_name = template.as_str();
-    let options_hash = template_options_hash(
-        prompt_opts,
-        effective_document_translation_policy(prompt_opts, config),
-    );
-    let profile_id = config.model_profile()?.id();
-    let inference_fingerprint = config.inference_fingerprint(template_name, &options_hash)?;
-    // Incomplete Generic/server-default identities can change across a server
-    // restart, so they are never eligible for segment-cache reuse.
-    let application_cache_enabled = config.application_cache_enabled() && !opts.no_cache;
-    let cache_enabled = application_cache_enabled && inference_fingerprint.is_cache_verified();
+    let application_cache_enabled = snapshot.application_cache_enabled() && !opts.no_cache;
     let mut files = Vec::new();
     let mut skipped = Vec::new();
 
@@ -191,18 +184,10 @@ pub fn build_batch_plan(
             resolve_target_language(
                 &text,
                 target_lang,
-                &config.primary_lang(),
-                &config.secondary_lang(),
+                &snapshot.primary_lang(),
+                &snapshot.secondary_lang(),
                 false,
             )
-        };
-
-        let cache_scope = SegmentCacheScope {
-            target_lang: &effective_lang,
-            template_type: template_name,
-            options_hash: &options_hash,
-            profile_id,
-            inference_fingerprint: inference_fingerprint.hash(),
         };
 
         let suffix = target_lang_path_suffix(&effective_lang)?;
@@ -224,25 +209,67 @@ pub fn build_batch_plan(
 
         let output_path = build_output_path(&path, &root, None, output_dir, suffix);
 
-        let plan_result = plan_translation(
+        if application_cache_enabled {
+            let replay_ctx = TranslationCtx {
+                config: &snapshot,
+                client,
+                segmenter,
+                history,
+                cache_enabled: true,
+            };
+            if let Ok(Some(replay)) = crate::translate::offline_replay::find_replay(
+                &text,
+                &effective_lang,
+                template,
+                prompt_opts,
+                &replay_ctx,
+                false,
+            ) {
+                files.push(BatchFilePlan {
+                    source_path: path,
+                    relative_path: relative,
+                    output_path,
+                    target_lang: effective_lang,
+                    text,
+                    source_tokens: replay.plan.source_tokens,
+                    segment_count: replay.plan.segment_count(),
+                    cached_segments: replay.plan.segment_count(),
+                    estimated_seconds: Some(0.0),
+                });
+                continue;
+            }
+        }
+
+        if (snapshot.strict_backend_preflight() || client.has_deferred_preflight())
+            && snapshot.backend_runtime_info().is_none()
+        {
+            client.preflight_backend().await?.report_warnings();
+            snapshot = config.detached_snapshot();
+        }
+        let config = &snapshot;
+        let options_hash = template_options_hash(
+            prompt_opts,
+            effective_document_translation_policy(prompt_opts, config),
+        );
+        let profile_id = config.model_profile()?.id();
+        let inference_fingerprint = config.inference_fingerprint(template_name, &options_hash)?;
+        let cache_enabled = application_cache_enabled && inference_fingerprint.is_cache_verified();
+        let cache_scope = SegmentCacheScope {
+            target_lang: &effective_lang,
+            template_type: template_name,
+            options_hash: &options_hash,
+            profile_id,
+            inference_fingerprint: inference_fingerprint.hash(),
+        };
+        let plan = plan_translation(
             &text,
             &effective_lang,
             config,
             segmenter,
             template,
             prompt_opts,
-        );
-        let plan = match plan_result {
-            Ok(p) => p,
-            Err(e) => {
-                skipped.push(BatchSkippedFile {
-                    path: path.clone(),
-                    relative_path: relative,
-                    reason: format!("plan error: {e}"),
-                });
-                continue;
-            }
-        };
+        )
+        .with_context(|| format!("planning {}", path.display()))?;
 
         // Count how many segments are already cached
         let seg_hashes: Vec<String> = plan
@@ -448,8 +475,8 @@ max_retries = 1
         )
     }
 
-    #[test]
-    fn batch_preview_ignores_warm_cache_by_default_and_honors_opt_in_and_no_cache() {
+    #[tokio::test]
+    async fn batch_preview_ignores_warm_cache_by_default_and_honors_opt_in_and_no_cache() {
         for (setting, no_cache, expected_cached) in [
             (None, false, 0),
             (Some(true), false, 1),
@@ -513,8 +540,11 @@ max_retries = 1
                 concurrency_override: None,
                 no_cache,
             };
+            let client = TranslationClient::new(config.clone()).unwrap();
             let batch =
-                build_batch_plan(&source_dir, &config, &segmenter, &history, &opts).unwrap();
+                build_batch_plan(&source_dir, &config, &client, &segmenter, &history, &opts)
+                    .await
+                    .unwrap();
             assert_eq!(batch.total_cached_segments(), expected_cached);
             assert_eq!(batch.cache_enabled, expected_cached == 1);
             assert!(
@@ -527,8 +557,8 @@ max_retries = 1
         }
     }
 
-    #[test]
-    fn batch_plan_reloads_config_before_cache_lookup() {
+    #[tokio::test]
+    async fn batch_plan_reloads_config_before_cache_lookup() {
         let tmp = TempDir::new().unwrap();
         let source_dir = tmp.path().join("source");
         std::fs::create_dir(&source_dir).unwrap();
@@ -579,7 +609,10 @@ max_retries = 1
             concurrency_override: None,
             no_cache: false,
         };
-        let batch = build_batch_plan(&source_dir, &config, &segmenter, &history, &opts).unwrap();
+        let client = TranslationClient::new(config.clone()).unwrap();
+        let batch = build_batch_plan(&source_dir, &config, &client, &segmenter, &history, &opts)
+            .await
+            .unwrap();
 
         assert_eq!(batch.files.len(), 1);
         assert_eq!(

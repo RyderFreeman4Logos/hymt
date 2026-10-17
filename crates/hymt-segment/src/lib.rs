@@ -102,6 +102,8 @@ pub fn create_segmenter(profile: ModelProfile) -> Result<Segmenter, SegmentError
 pub struct Segmenter {
     #[cfg(feature = "tokenizer")]
     tokenizer: Option<HfTokenizer>,
+    #[cfg(feature = "tokenizer")]
+    tokenizer_identity: Option<String>,
     #[cfg(not(feature = "tokenizer"))]
     _marker: std::marker::PhantomData<()>,
 }
@@ -110,12 +112,23 @@ impl Segmenter {
     pub fn new(tokenizer_path: Option<PathBuf>) -> Result<Self, SegmentError> {
         #[cfg(feature = "tokenizer")]
         {
-            let tokenizer = tokenizer_path
+            use sha2::{Digest, Sha256};
+            let loaded = tokenizer_path
                 .map(|p| {
-                    HfTokenizer::from_file(p).map_err(|e| SegmentError::Tokenizer(e.to_string()))
+                    let bytes = std::fs::read(p)?;
+                    let tokenizer = HfTokenizer::from_bytes(&bytes)
+                        .map_err(|e| SegmentError::Tokenizer(e.to_string()))?;
+                    Ok::<_, SegmentError>((tokenizer, format!("{:x}", Sha256::digest(&bytes))))
                 })
                 .transpose()?;
-            Ok(Self { tokenizer })
+            let (tokenizer, tokenizer_identity) = match loaded {
+                Some((tokenizer, identity)) => (Some(tokenizer), Some(identity)),
+                None => (None, None),
+            };
+            Ok(Self {
+                tokenizer,
+                tokenizer_identity,
+            })
         }
         #[cfg(not(feature = "tokenizer"))]
         {
@@ -129,7 +142,10 @@ impl Segmenter {
     /// Create a `Segmenter` without a tokenizer; uses character-count fallback.
     pub fn fallback() -> Self {
         #[cfg(feature = "tokenizer")]
-        return Self { tokenizer: None };
+        return Self {
+            tokenizer: None,
+            tokenizer_identity: None,
+        };
         #[cfg(not(feature = "tokenizer"))]
         Self {
             _marker: std::marker::PhantomData,
@@ -145,6 +161,18 @@ impl Segmenter {
                 .unwrap_or_else(|_| estimate_token_count(text));
         }
         estimate_token_count(text)
+    }
+
+    /// Digest of the exact bytes loaded as the tokenizer; absent for approximation.
+    pub fn tokenizer_identity(&self) -> Option<&str> {
+        #[cfg(feature = "tokenizer")]
+        {
+            self.tokenizer_identity.as_deref()
+        }
+        #[cfg(not(feature = "tokenizer"))]
+        {
+            None
+        }
     }
 
     /// Whether this segmenter can use the selected local tokenizer rather than

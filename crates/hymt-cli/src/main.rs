@@ -575,13 +575,27 @@ async fn run() -> Result<()> {
              total_context, parallel_slots, and optional per_request_context instead."
         );
     }
-    if should_run_backend_preflight(cli.cmd.as_ref()) {
+    let defer_translation_preflight = !cli.plan
+        && !matches!(
+            cli.cmd.as_ref(),
+            Some(Cmd::Batch(BatchArgs { dry_run: true, .. }))
+        )
+        && config.application_cache_enabled()
+        && !cli.no_cache
+        && matches!(
+            cli.cmd.as_ref(),
+            None | Some(Cmd::Text(_))
+                | Some(Cmd::Man(_))
+                | Some(Cmd::Info(_))
+                | Some(Cmd::Batch(_))
+                | Some(Cmd::TranslateDoc(_))
+                | Some(Cmd::Exec(ExecArgs { action: None, .. }))
+        );
+    if should_run_backend_preflight(cli.cmd.as_ref()) && !defer_translation_preflight {
         let preflight = TranslationClient::new(config.clone())?
             .preflight_backend()
             .await?;
-        for warning in preflight.warnings {
-            eprintln!("Warning: {warning}");
-        }
+        preflight.report_warnings();
     } else if matches!(cli.cmd.as_ref(), Some(Cmd::Telegram(_)))
         && should_run_llama_cpp_props_diagnostic(cli.cmd.as_ref())
     {
@@ -852,7 +866,11 @@ fn make_client_with_concurrency(
         .unwrap_or_else(|| config.concurrency())
         .max(1) as usize;
     TranslationClient::with_concurrency(config.clone(), concurrency)
-        .map(|client| client.with_cache_bypass(no_cache))
+        .map(|client| {
+            client
+                .with_cache_bypass(no_cache)
+                .with_deferred_preflight(config.application_cache_enabled() && !no_cache)
+        })
         .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
@@ -1736,14 +1754,22 @@ async fn run_batch(
         concurrency_override,
         no_cache,
     };
-    let plan = build_batch_plan(&args.directory, config, &segmenter, &history, &plan_opts)?;
+    let client = make_client_with_concurrency(config, concurrency_override, no_cache)?;
+    let plan = build_batch_plan(
+        &args.directory,
+        config,
+        &client,
+        &segmenter,
+        &history,
+        &plan_opts,
+    )
+    .await?;
     show_batch_preview(&plan);
 
     if args.dry_run || show_plan {
         return Ok(());
     }
 
-    let client = make_client_with_concurrency(config, concurrency_override, no_cache)?;
     run_batch_translation(&plan, config, &client, &segmenter, &history, template, opts).await?;
     eprintln!("Batch translation complete: {} files", plan.files.len());
     Ok(())
