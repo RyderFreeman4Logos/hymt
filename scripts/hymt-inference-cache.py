@@ -2,6 +2,7 @@
 
 import argparse
 import errno
+import fcntl
 import hashlib
 import http.client
 import ipaddress
@@ -12,6 +13,7 @@ import signal
 import socket
 import sqlite3
 import ssl
+import stat
 import threading
 import time
 from collections.abc import Iterator
@@ -53,6 +55,10 @@ def _cacheable_headers(headers: list[tuple[str, str]] | list[list[str]]) -> bool
 
 class _Invalid(ValueError):
     """Unusable JSON, response or upstream identity."""
+
+
+class _NoPlanning(_Invalid):
+    """A readable store with no retained planning row, rather than unknown prior authority."""
 
 
 class _Deadline(TimeoutError):
@@ -305,6 +311,8 @@ class _Store:
                 AND (p.token_request IS NULL OR (typeof(p.token_request)='text' AND length(CAST(p.token_request AS BLOB))<=4096))
                 AND (p.token_response IS NULL OR (typeof(p.token_response)='blob' AND length(p.token_response)<=4096))
                 AND (p.token_digest IS NULL OR (typeof(p.token_digest)='text' AND length(p.token_digest)=64))""").fetchone()
+            if row is None and conn.execute("SELECT 1 FROM planning WHERE id=1").fetchone() is None:
+                raise _NoPlanning("no retained active planning evidence")
         if row is None or row[2] > int(time.time()) + 1:
             raise _Invalid("no retained active planning evidence")
         return row
@@ -359,21 +367,59 @@ class CacheServer(ThreadingMixIn, HTTPServer):
         self.planning_generation = 0
         self.observation_sequence = 0
         self.planning_observation = 0
-        self.store = _Store(database)
-        try:
-            previous = _load(self.store.planning()[1].encode())
-        except (sqlite3.Error, ValueError, TypeError, RecursionError):
-            pass
-        else:
-            if not isinstance(previous, dict) or previous.get("upstream") != self.upstream.geturl():
-                # A known origin switch must commit invalidation before this instance can start.
-                self.store.clear()
+        self.active_observations = 0
+        self.guard_fd: int | None = None
         self.flight_lock = threading.Lock()
         self.flights: dict[str, _Flight] = {}
         self.closing = False
         self.budget_lock = threading.Lock()
         self.budgets: dict[socket.socket, _Budget] = {}
-        super().__init__(address, _Handler)
+        try:
+            database.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            guard = database.with_name(database.name + ".guard")
+            flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK
+            created = True
+            try:
+                self.guard_fd = os.open(guard, flags | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                self.guard_fd = os.open(guard, flags)
+                created = False
+            info = os.fstat(self.guard_fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077 or info.st_size > 1:
+                raise _Invalid("cache guard must be a private one-byte regular file")
+            fcntl.flock(self.guard_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if not created:
+                self.planning_revoked = os.pread(self.guard_fd, 1, 0) != b"0"
+            # Write ahead of startup inspection and all identity-bearing network I/O.
+            # The guard only denies; SQLite remains the sole positive authority.
+            self._write_guard(b"1")
+            self.store = _Store(database)
+            try:
+                previous = _load(self.store.planning()[1].encode())
+            except _NoPlanning:
+                pass
+            except (sqlite3.Error, ValueError, TypeError, RecursionError):
+                self.planning_revoked = True
+            else:
+                if not isinstance(previous, dict) or previous.get("upstream") != self.upstream.geturl():
+                    self.planning_revoked = True
+                    # A known origin switch must commit invalidation before listener startup.
+                    self.store.clear()
+            if not self.planning_revoked:
+                self._write_guard(b"0")
+            super().__init__(address, _Handler)
+        except BaseException:
+            self._close_guard()
+            raise
+
+    def _write_guard(self, value: bytes) -> None:
+        if self.guard_fd is None or os.pwrite(self.guard_fd, value, 0) != 1:
+            raise _Invalid("cache guard unavailable")
+
+    def _close_guard(self) -> None:
+        if self.guard_fd is not None:
+            os.close(self.guard_fd)
+            self.guard_fd = None
 
     def process_request(self, request: socket.socket | tuple[bytes, socket.socket], client_address: tuple[str, int]) -> None:
         if not isinstance(request, socket.socket):
@@ -418,7 +464,10 @@ class CacheServer(ThreadingMixIn, HTTPServer):
             self.closing = True
             for budget in self.budgets.values():
                 budget.expire()
-        super().server_close()
+        try:
+            super().server_close()
+        finally:
+            self._close_guard()
 
     @contextmanager
     def upstream_response(self, method: str, path: str, raw: bytes | None, authorization: str | None, budget: _Budget) -> Iterator[http.client.HTTPResponse]:
@@ -473,28 +522,64 @@ class CacheServer(ThreadingMixIn, HTTPServer):
 
     def observe(self, requested_model: object, authorization: str | None, budget: _Budget) -> str:
         observation = self.begin_observation()
-        probe = _Budget(min(2.0, budget.remaining() / 4), budget)
+        probe = None
         try:
+            probe = _Budget(min(2.0, budget.remaining() / 4), budget)
             return self._observe(requested_model, authorization, probe, observation=observation)
         finally:
-            probe.close()
+            if probe is not None:
+                probe.close()
+            self.end_observation()
 
     def begin_observation(self) -> int:
         with self.planning_lock:
+            self._write_guard(b"1")
+            self.active_observations += 1
             self.observation_sequence += 1
             return self.observation_sequence
 
+    def end_observation(self) -> None:
+        with self.planning_lock:
+            self.active_observations -= 1
+            if self.active_observations == 0 and not self.planning_revoked:
+                try:
+                    self._write_guard(b"0")
+                except (OSError, ValueError):
+                    self.planning_revoked = True
+                    self.planning_generation += 1
+
+    def revoke_observation(self, observation: int, *, clear: bool = True) -> None:
+        with self.planning_lock:
+            if observation < self.planning_observation:
+                raise _Invalid("metadata observation was superseded")
+            self.planning_observation = observation
+            self.planning_revoked = True
+            self.planning_generation += 1
+            if clear:
+                self.store.clear()
+
     def metadata(self, path: str, authorization: str | None, budget: _Budget) -> tuple[int, list[tuple[str, str]], bytes]:
         with self.upstream_response("GET", path, None, authorization, budget) as response:
+            headers = response.getheaders()
+            if not _valid_headers(headers):
+                raise _Invalid("invalid upstream metadata headers")
             raw = b''
-            if response.status not in {502, 503, 504}:
+            read_body = True
+            if response.status in {502, 503, 504}:
+                try:
+                    self.retained(None)
+                except (sqlite3.Error, ValueError, TypeError, RecursionError):
+                    pass
+                else:
+                    read_body = False  # A potential historical hit must not wait on an error body.
+            if read_body:
                 try:
                     raw = _read(response, budget, self.response_limit)
                 except (OSError, http.client.HTTPException, ValueError):
                     if response.status == 200:
                         raise
                     # Preserve a known rejection even if its optional error body cannot be read.
-            return response.status, response.getheaders(), raw
+            return response.status, headers, raw
 
     def _observe(self, requested_model: object, authorization: str | None, budget: _Budget, initial: tuple[str, tuple[int, list[tuple[str, str]], bytes] | None] | None = None, *, observation: int) -> str:
         values = {}
@@ -502,10 +587,12 @@ class CacheServer(ThreadingMixIn, HTTPServer):
         unknown_prior = False
         try:
             retained = self.retained(None)
-        except sqlite3.Error:
-            unknown_prior = True
-        except (ValueError, TypeError, RecursionError):
+        except _NoPlanning:
             pass
+        except (sqlite3.Error, ValueError, TypeError, RecursionError):
+            unknown_prior = True
+            # Unreadable prior authority must stay denied even if every probe is unavailable.
+            self.revoke_observation(observation, clear=False)
         unavailable = False
         paths = ("/props", "/v1/models")
         if initial is not None:
@@ -529,13 +616,8 @@ class CacheServer(ThreadingMixIn, HTTPServer):
                 unavailable = True
             values[path] = value
             if value is not None and unknown_prior:
-                with self.planning_lock:
-                    if observation >= self.planning_observation:
-                        self.planning_observation = observation
-                        self.planning_revoked = True
-                        self.planning_generation += 1
-                        self.store.clear()
-                        unknown_prior = False
+                self.revoke_observation(observation)
+                unknown_prior = False
             if value is not None and retained is not None:
                 old = _load(retained[1].encode())
                 props = values.get("/props") if values.get("/props") is not None else old["props"]
@@ -546,13 +628,7 @@ class CacheServer(ThreadingMixIn, HTTPServer):
                     matches = False
                 if not matches:
                     # Revoke an observed contradiction before a later probe can fail, independent of caller alias.
-                    with self.planning_lock:
-                        if observation < self.planning_observation:
-                            raise _Invalid("metadata observation was superseded")
-                        self.planning_observation = observation
-                        self.planning_revoked = True
-                        self.planning_generation += 1
-                        self.store.clear()
+                    self.revoke_observation(observation)
                     retained = None
             if unavailable and budget.expired:
                 break
@@ -699,17 +775,19 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path not in {"/props", "/v1/models"}:
             self._reply(404, "UNKNOWN")
             return
+        live = None
         try:
             if self.headers.get("X-Hymt-Cache-Bypass") == "1" or self.headers.get("x-bf-eh-x-hymt-cache-bypass") == "1":
+                # Transparent bypass does not interpret identity or update cache authority.
                 with self.server.upstream_response("GET", self.path, None, self.headers.get("Authorization"), self.budget) as response:
                     raw = _read(response, self.budget, self.server.response_limit)
                     self._headers(response.status, response.getheaders(), "BYPASS", len(raw))
                     self.wfile.write(raw)
                 return
             observation = self.server.begin_observation()
-            probe = _Budget(min(2.0, self.budget.remaining() / 4), self.budget)
+            probe = None
             try:
-                live = None
+                probe = _Budget(min(2.0, self.budget.remaining() / 4), self.budget)
                 try:
                     live = self.server.metadata(self.path, self.headers.get("Authorization"), probe)
                 except _Unavailable:
@@ -730,7 +808,9 @@ class _Handler(BaseHTTPRequestHandler):
                 else:
                     raise _Invalid("historical planning requires upstream unavailability")
             finally:
-                probe.close()
+                if probe is not None:
+                    probe.close()
+                self.server.end_observation()
             value = _load(record[1].encode())
             body = value["props"] if self.path == "/props" else {"data": [value["selected_model"]]}
             headers = [("Content-Type", "application/json"), ("X-Hymt-Planning", "historical"), ("X-Hymt-Observed-At", str(record[2]))]
@@ -740,7 +820,12 @@ class _Handler(BaseHTTPRequestHandler):
             self.wfile.write(raw)
         except (OSError, http.client.HTTPException, sqlite3.Error, ValueError, TypeError, RecursionError):
             if not self.started:
-                self._reply(502, "UNKNOWN")
+                if live is not None and live[0] in {502, 503, 504}:
+                    status, headers, raw = live
+                    self._headers(status, headers, "BYPASS", len(raw))
+                    self.wfile.write(raw)
+                else:
+                    self._reply(502, "UNKNOWN")
 
     def do_POST(self) -> None:
         if self.path not in {"/v1/chat/completions", "/tokenize"}:

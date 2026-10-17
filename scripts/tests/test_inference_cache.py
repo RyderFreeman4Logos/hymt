@@ -300,7 +300,7 @@ class CacheContracts(unittest.TestCase):
         self.assertEqual(self.get_metadata()[0], 502)
         self.stop_cache()
         self.start_cache()
-        self.assertEqual(self.get_metadata()[0], 502, "switching back must not resurrect old evidence")
+        self.assertEqual(self.get_metadata()[0], 503, "switching back must not resurrect old evidence")
 
     def test_stalled_upstream_probe_can_replay_within_request_budget(self):
         self.stop_cache()
@@ -348,7 +348,7 @@ class CacheContracts(unittest.TestCase):
         for headers in ([("Content-Encoding", "gzip")], [("Content-Type", "application/json")]):
             self.state["extra_headers"] = headers
             self.assertNotEqual(self.request()[1]["X-Hymt-Cache"], "HIT")
-            self.assertEqual(self.get_metadata()[0], 502)
+            self.assertEqual(self.get_metadata()[0], 503)
         self.state.pop("extra_headers")
         self.state["unknown"] = False
         with patch.object(http.client.HTTPConnection, "getresponse", side_effect=http.client.BadStatusLine("synthetic malformed status")):
@@ -383,7 +383,7 @@ class CacheContracts(unittest.TestCase):
                 self.assertNotEqual(self.request()[1]["X-Hymt-Cache"], "HIT")
                 self.state.pop("metadata_status")
                 self.state["unknown"] = True
-                self.assertEqual(self.get_metadata()[0], 502)
+                self.assertEqual(self.get_metadata()[0], 503)
                 self.assertNotEqual(self.request()[1]["X-Hymt-Cache"], "HIT")
 
     def test_partial_replacement_revokes_before_alias_or_later_probe_errors(self):
@@ -405,7 +405,7 @@ class CacheContracts(unittest.TestCase):
                 self.state.pop("metadata_status", None)
                 self.state.pop("models_raw", None)
                 self.state["unknown"] = True
-                self.assertEqual(self.get_metadata()[0], 502)
+                self.assertEqual(self.get_metadata()[0], 503)
                 self.assertNotEqual(self.request()[1]["X-Hymt-Cache"], "HIT")
 
     def test_live_metadata_survives_optional_planning_store_failures(self):
@@ -439,9 +439,11 @@ class CacheContracts(unittest.TestCase):
                 with sqlite3.connect(self.db) as conn:
                     self.assertEqual(conn.execute("SELECT count(*) FROM entries").fetchone()[0], 2)
                 self.state["offline"] = True
+                self.stop_cache()
+                self.start_cache()
                 for path in ("/props", "/v1/models"):
                     status, headers, _body = self.get_metadata(path)
-                    self.assertEqual(status, 502)
+                    self.assertEqual(status, 503)
                     self.assertNotIn("X-Hymt-Planning", headers)
                 self.assertEqual(self.request({"content": "."}, path="/tokenize")[0], 503)
                 for stream in (False, True):
@@ -460,6 +462,259 @@ class CacheContracts(unittest.TestCase):
                 self.assertEqual(self.request({"content": "."}, path="/tokenize")[1]["X-Hymt-Cache"], "HIT")
                 for stream in (False, True):
                     self.assertEqual(self.request({"model": "Hy-MT2-7B", "stream": stream})[1]["X-Hymt-Cache"], "HIT")
+
+    def test_uncertain_prior_and_readiness_remain_denied_after_restart(self):
+        for mode in ("read-error", "not-ready", "partial-props", "partial-models"):
+            with self.subTest(mode=mode):
+                self.state.update(offline=False, unknown=False)
+                self.state.pop("metadata_status", None)
+                self.state["props"].update(build_info="original", eos_token=".")
+                self.request()
+                self.request({"content": "."}, path="/tokenize")
+                self.state["props"]["build_info"] = "replacement"
+                if mode == "not-ready":
+                    self.cache.store.ready = False
+                    self.assertEqual(self.get_metadata()[0], 200)
+                else:
+                    if mode.startswith("partial"):
+                        first = "/props" if mode == "partial-props" else "/v1/models"
+                        self.state["metadata_status"] = {"/v1/models" if first == "/props" else "/props": 503}
+                        self.state["meta"]["n_params"] += 1
+                    else:
+                        first = "/props"
+                    with patch.object(self.cache.store, "clear", side_effect=sqlite3.OperationalError("synthetic failed revocation")):
+                        if mode == "read-error":
+                            with patch.object(self.cache.store, "planning", side_effect=sqlite3.OperationalError("synthetic unreadable prior")):
+                                self.assertEqual(self.get_metadata()[0], 200)
+                        else:
+                            self.assertEqual(self.get_metadata(first)[0], 200)
+                self.state.pop("metadata_status", None)
+                self.state["offline"] = True
+                self.stop_cache()
+                self.start_cache()
+                self.assert_denied_history()
+                # Both same-identity and replacement recovery must purge old entries/token.
+                self.state["offline"] = False
+                self.state["props"]["build_info"] = "original" if mode in ("read-error", "partial-props") else "replacement"
+                self.assertEqual(self.get_metadata()[0], 200)
+                with sqlite3.connect(self.db) as conn:
+                    self.assertEqual(conn.execute("SELECT count(*) FROM entries").fetchone()[0], 0)
+                    self.assertIsNone(conn.execute("SELECT token_response FROM planning").fetchone()[0])
+                self.assertEqual(self.request()[1]["X-Hymt-Cache"], "MISS")
+
+    def assert_denied_history(self):
+        for path in ("/props", "/v1/models"):
+            status, headers, _body = self.get_metadata(path)
+            self.assertNotEqual(status, 200)
+            self.assertNotIn("X-Hymt-Planning", headers)
+        self.assertNotEqual(self.request({"content": "."}, path="/tokenize")[1]["X-Hymt-Cache"], "HIT")
+        for stream in (False, True):
+            self.assertNotEqual(self.request({"model": "Hy-MT2-7B", "stream": stream})[1]["X-Hymt-Cache"], "HIT")
+
+    def test_unreadable_origin_switch_cannot_resurrect_previous_origin(self):
+        self.request()
+        self.stop_cache()
+        with patch.object(_MODULE._Store, "planning", side_effect=sqlite3.OperationalError("synthetic startup read failure")):
+            other = _MODULE.CacheServer(("127.0.0.1", 0), "http://127.0.0.1:1", self.db)
+            other.server_close()
+        self.state["offline"] = True
+        self.start_cache()
+        self.assert_denied_history()
+
+    def test_uncertain_prior_during_outage_stays_denied_after_restart(self):
+        for mode in ("read-error", "not-ready"):
+            with self.subTest(mode=mode):
+                self.state["offline"] = False
+                self.request()
+                self.state["offline"] = True
+                if mode == "read-error":
+                    with patch.object(self.cache.store, "planning", side_effect=sqlite3.OperationalError("synthetic unreadable prior")):
+                        self.assertEqual(self.get_metadata()[0], 503)
+                else:
+                    self.cache.store.ready = False
+                    self.assertEqual(self.get_metadata()[0], 503)
+                self.stop_cache()
+                self.start_cache()
+                self.assert_denied_history()
+
+    def test_interrupted_observation_requires_durable_recovery(self):
+        child = '''import importlib.util, os, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("cache", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+server = module.CacheServer(("127.0.0.1", 0), sys.argv[3], Path(sys.argv[2]))
+stage = sys.argv[4]
+if stage == "prearm":
+    server.begin_observation()
+    os._exit(0)
+method = "activate" if stage == "activated" else "clear"
+original = getattr(server.store, method)
+def interrupt(*args):
+    if stage != "received":
+        original(*args)
+    os._exit(0)
+setattr(server.store, method, interrupt)
+budget = module._Budget(3)
+server.observe(None, None, budget)
+os._exit(99)
+'''
+        for stage in ("prearm", "received", "cleared", "activated"):
+            with self.subTest(stage=stage):
+                self.state.update(offline=False)
+                self.state["props"]["build_info"] = "original"
+                self.request()
+                self.stop_cache()
+                self.state["props"]["build_info"] = "replacement"
+                result = subprocess.run([sys.executable, "-B", "-c", child, str(_SCRIPT), str(self.db), f"http://127.0.0.1:{self.upstream.server_port}", stage], capture_output=True, timeout=6)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.state["offline"] = True
+                self.start_cache()
+                self.assert_denied_history()
+                self.state["offline"] = False
+                self.assertEqual(self.get_metadata()[0], 200)
+                self.assertEqual(self.request()[1]["X-Hymt-Cache"], "MISS")
+
+    def test_guard_lease_validation_failures_and_cleanup(self):
+        self.request()
+        def guard_descriptors():
+            descriptors = []
+            for fd in Path("/proc/self/fd").iterdir():
+                try:
+                    if os.readlink(fd) == str(self.db) + ".guard":
+                        descriptors.append(fd.name)
+                except FileNotFoundError:
+                    pass
+            return sorted(descriptors)
+        owned = guard_descriptors()
+        self.assertEqual(len(owned), 1)
+        for _ in range(3):
+            with self.assertRaises((OSError, ValueError)):
+                other = _MODULE.CacheServer(("127.0.0.1", 0), f"http://127.0.0.1:{self.upstream.server_port}", self.db)
+                other.server_close()
+        self.assertEqual(guard_descriptors(), owned)
+        self.assertEqual(self.request()[1]["X-Hymt-Cache"], "HIT")
+        self.stop_cache()
+        guard = self.db.with_name(self.db.name + ".guard")
+        for operation in ("pread", "pwrite"):
+            with self.subTest(operation=operation), patch.object(_MODULE.os, operation, side_effect=OSError("synthetic guard failure")):
+                with self.assertRaises(OSError):
+                    _MODULE.CacheServer(("127.0.0.1", 0), f"http://127.0.0.1:{self.upstream.server_port}", self.db)
+            self.assertEqual(guard_descriptors(), [])
+        for mode in ("oversize", "public", "symlink"):
+            with self.subTest(mode=mode):
+                if guard.exists() or guard.is_symlink():
+                    guard.unlink()
+                if mode == "symlink":
+                    guard.symlink_to(self.db)
+                else:
+                    guard.write_bytes(b"00" if mode == "oversize" else b"0")
+                    guard.chmod(0o644 if mode == "public" else 0o600)
+                with self.assertRaises((OSError, ValueError)):
+                    other = _MODULE.CacheServer(("127.0.0.1", 0), f"http://127.0.0.1:{self.upstream.server_port}", self.db)
+                    other.server_close()
+                self.assertEqual(guard_descriptors(), [])
+        guard.unlink()
+        guard.write_bytes(b"x")
+        self.state["offline"] = True
+        self.start_cache()
+        self.assert_denied_history()
+        self.stop_cache()
+        guard.write_bytes(b"0")
+        # An occupied listening socket must release the acquired guard lease on failure.
+        with socket.socket() as occupied:
+            occupied.bind(("127.0.0.1", 0))
+            occupied.listen()
+            for _ in range(3):
+                with self.assertRaises(OSError):
+                    _MODULE.CacheServer(occupied.getsockname(), f"http://127.0.0.1:{self.upstream.server_port}", self.db)
+        alias = Path(self.tmp.name) / "alias"
+        alias.symlink_to(Path(self.tmp.name), target_is_directory=True)
+        other = _MODULE.CacheServer(("127.0.0.1", 0), f"http://127.0.0.1:{self.upstream.server_port}", alias / self.db.name)
+        other.server_close()
+        self.assertTrue(alias.is_symlink())
+
+    def test_guard_write_failure_prevents_probe_and_failed_clean_stays_denied(self):
+        self.request()
+        gets = len(self.state.get("gets", []))
+        original = os.pwrite
+        with patch.object(_MODULE.os, "pwrite", side_effect=OSError("synthetic prearm failure")):
+            self.assertEqual(self.get_metadata()[0], 502)
+        self.assertEqual(len(self.state.get("gets", [])), gets)
+        clean_failed = threading.Event()
+        def fail_clean(fd, raw, offset):
+            if raw == b"0":
+                clean_failed.set()
+                raise OSError("synthetic clean failure")
+            return original(fd, raw, offset)
+        with patch.object(_MODULE.os, "pwrite", fail_clean):
+            self.assertEqual(self.get_metadata()[0], 200)
+            self.assertTrue(clean_failed.wait(2))
+        self.stop_cache()
+        self.state["offline"] = True
+        self.start_cache()
+        self.assert_denied_history()
+
+    def test_metadata_outage_preserves_known_status_without_usable_history(self):
+        for mode in ("cold", "corrupt", "revoked", "store-failed"):
+            for path in ("/props", "/v1/models"):
+                with self.subTest(mode=mode, path=path):
+                    self.state.update(offline=False)
+                    self.cache.store.clear()
+                    if mode != "cold":
+                        self.request()
+                    if mode == "corrupt":
+                        with sqlite3.connect(self.db) as conn:
+                            conn.execute("UPDATE planning SET identity='{}'")
+                    elif mode == "revoked":
+                        self.state["props"]["build_info"] += "changed"
+                        with patch.object(self.cache.store, "clear", side_effect=sqlite3.OperationalError("synthetic failed clear")):
+                            self.get_metadata()
+                    self.state["offline"] = True
+                    self.state["gets"] = []
+                    if mode == "store-failed":
+                        with patch.object(self.cache.store, "planning", side_effect=sqlite3.OperationalError("synthetic no planning")):
+                            code, headers, body = self.get_metadata(path)
+                    else:
+                        code, headers, body = self.get_metadata(path)
+                    self.assertEqual((code, body), (503, b'{"error":"unavailable"}'))
+                    self.assertEqual(headers["X-Original"], "retained")
+                    self.assertNotIn("X-Hymt-Planning", headers)
+                    self.assertEqual(self.state["gets"].count(path), 1)
+        self.cache.store.clear()
+        for status in (502, 504):
+            self.state["header_status"] = (status, False)
+            self.assertEqual(self.get_metadata()[0], status)
+        self.stop_cache()
+        self.start_cache(timeout=0.6)
+        self.state["header_status"] = (503, True)
+        started = time.monotonic()
+        code, _headers, body = self.get_metadata()
+        self.assertEqual((code, body), (503, b""))
+        self.assertLess(time.monotonic() - started, 0.7)
+        self.state["probe_release"].set()
+
+    def test_outage_with_invalid_headers_or_later_conflict_never_replays(self):
+        self.request()
+        self.state["offline"] = True
+        self.state["extra_headers"] = [("X-Bad", "invalid\x00value")]
+        for path in ("/props", "/v1/models"):
+            self.assertEqual(self.get_metadata(path)[0], 502)
+        self.assertNotEqual(self.request()[1]["X-Hymt-Cache"], "HIT")
+        self.state.pop("extra_headers")
+        for path, other in (("/props", "/v1/models"), ("/v1/models", "/props")):
+            with self.subTest(path=path):
+                self.state["offline"] = False
+                self.state.pop("metadata_status", None)
+                self.request()
+                self.state["props"]["build_info"] += "changed"
+                self.state["meta"]["n_params"] += 1
+                self.state["metadata_status"] = {path: 503}
+                self.state["gets"] = []
+                code, headers, body = self.get_metadata(path)
+                self.assertEqual((code, body), (503, b""))  # Potential hit skipped body before paired conflict.
+                self.assertNotIn("X-Hymt-Planning", headers)
+                self.assertEqual(self.state["gets"], [path, other])
 
     def test_older_paired_and_prefetched_observations_cannot_replace_newer_identity(self):
         for prefetched in (False, True):
@@ -503,9 +758,13 @@ class CacheContracts(unittest.TestCase):
                         self.assertTrue(captured.wait(1))
                         self.state["props"]["build_info"] = "replacement"
                         self.assertEqual(self.get_metadata()[0], 200)
+                        self.assertEqual(self.db.with_name(self.db.name + ".guard").read_bytes(), b"1", "older observation is still pending")
                     finally:
                         release.set()
                     future.result(4)
+                self.stop_cache()
+                self.assertEqual(self.db.with_name(self.db.name + ".guard").read_bytes(), b"0")
+                self.start_cache()
                 self.state["offline"] = True
                 status, _headers, body = self.get_metadata()
                 self.assertEqual(status, 200)
@@ -523,7 +782,7 @@ class CacheContracts(unittest.TestCase):
         finally:
             blocker.close()
         self.start_cache()
-        self.assertEqual(self.request()[1]["X-Hymt-Cache"], "HIT")
+        self.assertEqual(self.request()[1]["X-Hymt-Cache"], "MISS", "failed origin revocation requires durable recovery")
 
     def test_unknown_prior_planning_and_failed_activation_deny_later_history(self):
         self.request()
@@ -531,7 +790,9 @@ class CacheContracts(unittest.TestCase):
         with patch.object(self.cache.store, "planning", side_effect=sqlite3.OperationalError("synthetic read failure")), patch.object(self.cache.store, "activate", side_effect=sqlite3.OperationalError("synthetic activation failure")):
             self.assertEqual(self.get_metadata()[0], 200)
         self.state["offline"] = True
-        self.assertEqual(self.get_metadata()[0], 502)
+        self.stop_cache()
+        self.start_cache()
+        self.assertEqual(self.get_metadata()[0], 503)
         self.assertNotEqual(self.request()[1]["X-Hymt-Cache"], "HIT")
 
     def test_metadata_status_precedes_error_representation_and_body(self):
@@ -578,21 +839,17 @@ class CacheContracts(unittest.TestCase):
                 self.request({"content": "."}, path="/tokenize")
                 self.state["offline"] = True
                 copied, release = threading.Event(), threading.Event()
-                original = self.cache.retained
-                calls = {}
-                def retained(model):
-                    record = original(model)
-                    thread = threading.get_ident()
-                    calls[thread] = calls.get(thread, 0) + 1
-                    if calls[thread] == 2 and not copied.is_set():
+                original = self.cache.admit_replay
+                def admit(record, model):
+                    if not copied.is_set():
                         copied.set()
                         self.assertTrue(release.wait(2))
-                    return record
+                    return original(record, model)
                 def request():
                     if path == "/props":
                         return self.get_metadata()
                     return self.request({"content": "."} if path == "/tokenize" else None, path=path)
-                with patch.object(self.cache, "retained", retained), concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                with patch.object(self.cache, "admit_replay", admit), concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                     future = pool.submit(request)
                     try:
                         self.assertTrue(copied.wait(1))
@@ -611,6 +868,29 @@ class CacheContracts(unittest.TestCase):
                 self.assertNotEqual(status, 200)
                 self.assertNotEqual(headers["X-Hymt-Cache"], "HIT")
 
+    def test_admitted_replay_can_finish_after_later_revocation(self):
+        self.request()
+        self.state["offline"] = True
+        admitted, release = threading.Event(), threading.Event()
+        original = self.cache.admit_replay
+        def admit(record, model):
+            original(record, model)
+            admitted.set()
+            self.assertTrue(release.wait(2))
+        with patch.object(self.cache, "admit_replay", admit), concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(self.request)
+            try:
+                self.assertTrue(admitted.wait(1))
+                self.state["offline"] = False
+                self.state["props"]["build_info"] = "replacement"
+                self.assertEqual(self.get_metadata()[0], 200)
+                self.state["offline"] = True
+            finally:
+                release.set()
+            status, headers, body = future.result(4)
+        self.assertEqual((status, headers["X-Hymt-Cache"], body), (200, "HIT", _JSON))
+        self.assertNotEqual(self.request()[1]["X-Hymt-Cache"], "HIT")
+
     def test_live_partial_contradiction_revokes_before_other_endpoint_rejection(self):
         for path, other in (("/props", "/v1/models"), ("/v1/models", "/props")):
             with self.subTest(path=path):
@@ -625,7 +905,7 @@ class CacheContracts(unittest.TestCase):
                 self.assertEqual(self.get_metadata(path)[0], 200)
                 self.state.pop("metadata_status")
                 self.state["unknown"] = True
-                self.assertEqual(self.get_metadata()[0], 502)
+                self.assertEqual(self.get_metadata()[0], 503)
                 self.assertNotEqual(self.request()[1]["X-Hymt-Cache"], "HIT")
 
     def test_live_metadata_preserves_slots_and_uses_each_response_once(self):
@@ -648,7 +928,7 @@ class CacheContracts(unittest.TestCase):
             self.assertEqual(self.get_metadata(path)[0], 200)
         self.state.pop("metadata_status")
         self.state["unknown"] = True
-        self.assertEqual(self.get_metadata()[0], 502)
+        self.assertEqual(self.get_metadata()[0], 503)
 
     def test_immediate_peer_close_replays_but_nonempty_bad_status_does_not(self):
         for stream in (False, True):
@@ -677,11 +957,11 @@ class CacheContracts(unittest.TestCase):
                     conn.execute("INSERT INTO planning VALUES (?,?,?,?,?,?,?)", original)
                     conn.execute(f"UPDATE planning SET {assignment}=?", (value,))
                 self.state["unknown"] = True
-                self.assertEqual(self.get_metadata()[0], 502)
+                self.assertEqual(self.get_metadata()[0], 503)
                 self.assertNotEqual(self.request()[1]["X-Hymt-Cache"], "HIT")
         with sqlite3.connect(self.db) as conn:
             conn.execute("DELETE FROM planning")
-        self.assertEqual(self.get_metadata()[0], 502)
+        self.assertEqual(self.get_metadata()[0], 503)
 
     def test_failed_post_probe_cannot_admit_under_retained_identity(self):
         self.state["release"].clear()
