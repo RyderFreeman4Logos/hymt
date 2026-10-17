@@ -295,6 +295,28 @@ class CacheContracts(unittest.TestCase):
         self.assertEqual("MISS", self.request({"model": "Hy-MT2-7B", "messages": ["inflight"]})[1]["X-Hymt-Cache"])
 
     @unittest.skipUnless(_MODULE, "shared service not implemented yet")
+    def test_explicit_bypass_neither_reads_nor_writes_cache(self) -> None:
+        for name in ("X-Hymt-Cache-Bypass", "x-bf-eh-x-hymt-cache-bypass"):
+            with self.subTest(header=name):
+                payload = {"model": "Hy-MT2-7B", "messages": [{"role": "user", "content": name}]}
+                before = self.state["posts"]
+                self.assertEqual("BYPASS", self.request(payload, {name: "1"})[1]["X-Hymt-Cache"])
+                self.assertEqual(before + 1, self.state["posts"])
+                miss = self.request(payload)
+                self.assertEqual("MISS", miss[1]["X-Hymt-Cache"])
+                self.assertEqual("HIT", self.request(payload)[1]["X-Hymt-Cache"])
+                self.assertEqual(before + 2, self.state["posts"])
+                self.state["padding"] = 1
+                bypass = self.request(payload, {name: "1"})
+                self.assertEqual("BYPASS", bypass[1]["X-Hymt-Cache"])
+                self.assertNotEqual(miss[2], bypass[2])
+                hit = self.request(payload)
+                self.assertEqual("HIT", hit[1]["X-Hymt-Cache"])
+                self.assertEqual(miss[2], hit[2])
+                self.assertEqual(before + 3, self.state["posts"])
+                self.state["padding"] = 0
+
+    @unittest.skipUnless(_MODULE, "shared service not implemented yet")
     def test_stream_miss_is_live_and_hit_replays_exact_usage(self) -> None:
         self.state["stream_release"].clear()
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=2)

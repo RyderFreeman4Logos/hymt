@@ -176,3 +176,38 @@ fn streaming_and_non_streaming_use_the_same_llama_sampling_policy() {
         .remove("stream");
     assert_eq!(streaming, non_streaming);
 }
+
+#[test]
+fn inference_cache_bypass_preserves_identity_and_shared_io() {
+    use super::contract_test_support::config_fixture;
+    use super::TranslationClient;
+    use std::sync::Arc;
+
+    let fixture = config_fixture("http://127.0.0.1:1/v1", "llama_cpp", None, "", false);
+    let original = TranslationClient::new(fixture.config.clone()).unwrap();
+    let bypass = original
+        .with_cache_bypass(true)
+        .clone()
+        .with_config(fixture.config)
+        .unwrap()
+        .with_cache_bypass(false);
+    assert!(Arc::ptr_eq(
+        &original.inner.semaphore,
+        &bypass.inner.semaphore
+    ));
+    for name in ["x-hymt-cache-bypass", "x-bf-eh-x-hymt-cache-bypass"] {
+        assert!(original.build_headers().get(name).is_none());
+        assert!(original
+            .with_cache_bypass(false)
+            .build_headers()
+            .get(name)
+            .is_none());
+        assert_eq!(bypass.build_headers()[name], "1");
+    }
+    for stream in [false, true] {
+        assert_eq!(
+            serde_json::to_value(original.build_payload("same prompt", stream).unwrap()).unwrap(),
+            serde_json::to_value(bypass.build_payload("same prompt", stream).unwrap()).unwrap()
+        );
+    }
+}

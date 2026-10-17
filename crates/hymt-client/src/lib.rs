@@ -346,6 +346,7 @@ struct Inner {
 #[derive(Clone)]
 pub struct TranslationClient {
     inner: Arc<Inner>,
+    cache_bypass: bool,
 }
 
 impl TranslationClient {
@@ -374,6 +375,7 @@ impl TranslationClient {
         };
         let http = reqwest::Client::builder().timeout(timeout).build()?;
         Ok(Self {
+            cache_bypass: false,
             inner: Arc::new(Inner {
                 config,
                 http,
@@ -389,6 +391,15 @@ impl TranslationClient {
         self.inner.concurrency
     }
 
+    /// Clone with inference-cache bypass, retaining existing bypass and shared IO.
+    /// This request policy is independent of application-cache configuration.
+    pub fn with_cache_bypass(&self, bypass: bool) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            cache_bypass: self.cache_bypass || bypass,
+        }
+    }
+
     /// Bind a detached invocation configuration to the existing HTTP pool and limit.
     pub fn with_config(&self, config: HotConfig) -> Result<Self, ClientError> {
         config.generation_settings()?;
@@ -400,6 +411,7 @@ impl TranslationClient {
             .ok()
             .and_then(|entry| entry.clone());
         Ok(Self {
+            cache_bypass: self.cache_bypass,
             inner: Arc::new(Inner {
                 config,
                 http: self.inner.http.clone(),
@@ -981,6 +993,11 @@ impl TranslationClient {
         if !key.is_empty() {
             if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}")) {
                 map.insert(reqwest::header::AUTHORIZATION, val);
+            }
+        }
+        if self.cache_bypass {
+            for name in ["x-hymt-cache-bypass", "x-bf-eh-x-hymt-cache-bypass"] {
+                map.insert(name, reqwest::header::HeaderValue::from_static("1"));
             }
         }
         map

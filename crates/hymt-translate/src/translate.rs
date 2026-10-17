@@ -1338,6 +1338,7 @@ async fn translate_segment_with_completeness<'a>(
         }
 
         let completion = client
+            .with_cache_bypass(attempt > 0)
             .translate_with_completion(&prompt)
             .await
             .map_err(|e| map_segment_http_error(index, segment, e))?;
@@ -1617,6 +1618,7 @@ async fn translate_segment_with_completeness_streaming(
 
         let completion = request
             .client
+            .with_cache_bypass(true)
             .translate_with_completion(&prompt)
             .await
             .map_err(|e| map_segment_http_error(request.index, request.segment, e))?;
@@ -2852,6 +2854,7 @@ pub async fn translate_file(
 mod tests {
     mod app_cache_policy_tests;
     mod cache_admission_tests;
+    mod cache_bypass_tests;
     mod completeness_terminal_tests;
     mod context_json_tests;
     mod exec_cache_tests;
