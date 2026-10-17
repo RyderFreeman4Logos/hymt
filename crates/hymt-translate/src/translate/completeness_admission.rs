@@ -54,7 +54,7 @@ pub(crate) fn cached_document_is_complete(
         &TemplateType::Default,
         opts,
     )
-    .is_ok_and(|plan| cache_proof::cached_owned_payloads_match(&plan, cached))
+    .is_ok_and(|plan| cache_proof::cached_owned_payloads_match(&plan, cached, target_lang, config))
 }
 
 pub(super) fn cached_segment_is_complete<'a>(
@@ -241,7 +241,7 @@ pub(super) fn score_provider_attempt(
     unpublished: bool,
 ) -> ScoredAttempt {
     let text = if unpublished {
-        recover_generated_inline_code(source.text, &text).unwrap_or(text)
+        recover_generated_inline_code(source, &text).unwrap_or(text)
     } else {
         text
     };

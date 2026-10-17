@@ -3,6 +3,75 @@ use crate::exec_wrapper::translate_cached;
 use hymt_cache::ExecCache;
 
 #[tokio::test]
+async fn whole_cache_slots_cannot_borrow_completeness_from_other_content() {
+    let instruction = "Keep the account available throughout the complete migration process and check every related service.";
+    let complete = "迁移期间必须确保账户始终保持可用，并持续检查所有相关服务的运行情况。";
+    for opaque in [false, true] {
+        let padding = if opaque {
+            format!("```text\n{}\n```", "ORIGINAL ".repeat(40))
+        } else {
+            instruction.to_owned()
+        };
+        let source = format!("{instruction}\n\n{padding}");
+        let expected = source.replace(instruction, complete);
+        let poisoned = expected.replacen(complete, "译", 1);
+        for shared in [false, true] {
+            let calls = if opaque { 1 } else { 2 };
+            let server = start_capturing_mock_server(
+                (0..calls)
+                    .map(|_| MockResponse::Json(complete.to_owned()))
+                    .collect(),
+            )
+            .await;
+            let config = make_protected_block_config(&server.endpoint_url);
+            let client = TranslationClient::new(config.clone()).unwrap();
+            let segmenter = fallback_segmenter();
+            let dir = tempfile::tempdir().unwrap();
+            let history = HistoryDB::new(dir.path().join("history.db"));
+            let cache =
+                ExecCache::with_user_path(dir.path().join("shared.db"), dir.path().join("user.db"));
+            let opts = PromptOpts::default();
+            let policy = effective_document_translation_policy(&opts, &config);
+            let ctx = TranslationCtx {
+                config: &config,
+                client: &client,
+                segmenter: &segmenter,
+                history: &history,
+                cache_enabled: true,
+            };
+            if shared {
+                cache
+                    .store_shared("man", "fixture", &source, "zh", policy, &poisoned)
+                    .unwrap();
+            } else {
+                cache
+                    .store_user("man", "fixture", &source, "zh", policy, &poisoned)
+                    .unwrap();
+            }
+            assert_eq!(
+                translate_cached("man", "fixture", &source, "zh", &cache, &opts, &ctx)
+                    .await
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(server.requests.lock().unwrap().len(), calls);
+            assert_eq!(history.fetch_recent(None).unwrap().len(), 1);
+            assert_eq!(
+                translate_cached("man", "fixture", &source, "zh", &cache, &opts, &ctx)
+                    .await
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(
+                server.requests.lock().unwrap().len(),
+                calls,
+                "valid warm cache must make no request"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn whole_output_cache_revalidates_hits_and_never_stores_degraded_results() {
     let source =
         r#"{"customer": "Keep the account available throughout the entire migration process."}"#;

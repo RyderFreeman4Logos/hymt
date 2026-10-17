@@ -129,7 +129,12 @@ fn roles(text: &str, fixed: &[Range<usize>]) -> Option<Vec<Role>> {
 /// Admit only unambiguous source-template reconstructions. Candidate punctuation
 /// cannot enlarge owners. Arbitrary provider edge whitespace can conservatively
 /// miss this cache; the cold translation contract is unchanged.
-pub(super) fn cached_owned_payloads_match(plan: &TranslationPlan, candidate: &str) -> bool {
+pub(super) fn cached_owned_payloads_match(
+    plan: &TranslationPlan,
+    candidate: &str,
+    target_lang: &str,
+    config: &hymt_core::config::HotConfig,
+) -> bool {
     let Some(document) = &plan.document_plan else {
         return candidate.is_empty();
     };
@@ -227,6 +232,29 @@ pub(super) fn cached_owned_payloads_match(plan: &TranslationPlan, candidate: &st
         segment_section_indexes: groups.iter().map(|group| group[0]).collect(),
         segment_section_groups: groups,
     };
+    let Ok(contexts) = super::segment_contexts(&scratch) else {
+        return false;
+    };
+    // Other editable slots and opaque source bytes cannot subsidize a missing
+    // payload. Reuse cold/segment-cache admission in the original source context.
+    if !scratch
+        .segments
+        .iter()
+        .zip(&translations)
+        .zip(contexts)
+        .enumerate()
+        .all(|(index, ((source, translated), context))| {
+            super::cached_segment_is_complete(
+                index,
+                super::SegmentSource::new(source, context),
+                translated,
+                target_lang,
+                config,
+            )
+        })
+    {
+        return false;
+    }
     markdown_boundary::render_translations(&scratch, &mut translations)
         && scratch.reconstruct(&translations) == candidate
 }

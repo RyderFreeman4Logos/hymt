@@ -2,33 +2,32 @@ use super::*;
 use crate::exec_wrapper::translate_cached;
 use hymt_cache::ExecCache;
 
-fn verified_json_config(endpoint: &str) -> HotConfig {
-    let config = make_stream_config_with_fcp(endpoint, true);
-    let text = std::fs::read_to_string(config.path())
-        .unwrap()
-        .replace("context_window = 512", "context_window = 8192")
-        .replace("max_output_tokens = 40", "max_output_tokens = 4096");
-    std::fs::write(config.path(), text).unwrap();
-    HotConfig::from_path(config.path()).unwrap()
-}
-
 #[tokio::test]
-async fn contextual_markdown_leaves_publish_and_reuse_cache() {
-    for prefix in [">5 ", "# ", "- ", "1. ", "~~~ ", "--- ", "5 "] {
+async fn container_content_retries_structure_before_publication() {
+    let instruction = "Read the complete synthetic instruction.";
+    let complete = "请完整阅读这一条合成操作说明。";
+    for (prefix, inserted) in [
+        ("", "- "),
+        ("> ", "- "),
+        ("> > ", "# "),
+        ("- ", "> "),
+        ("1. ", "- "),
+        ("> - ", "# "),
+    ] {
         for streaming in [false, true] {
-            let source = format!("Count|{prefix}lines require a careful review.");
-            let expected = "数量|请仔细审查所有相关代码。";
+            let source = format!("{prefix}{instruction}");
+            let expected = format!("{prefix}{complete}");
+            let invalid = format!("{inserted}{complete}");
             let server = start_capturing_mock_server(vec![
                 if streaming {
-                    MockResponse::Sse(vec!["数量".to_owned()])
+                    MockResponse::Sse(vec![invalid.clone()])
                 } else {
-                    MockResponse::Json("数量".to_owned())
+                    MockResponse::Json(invalid.clone())
                 },
-                MockResponse::Json("请仔细审查所有相关代码。".to_owned()),
-                MockResponse::Json("请仔细审查所有相关代码。".to_owned()),
+                MockResponse::Json(complete.to_owned()),
             ])
             .await;
-            let config = make_stream_config_with_fcp(&server.endpoint_url, false);
+            let config = verified_json_config(&server.endpoint_url);
             let client = TranslationClient::new(config.clone()).unwrap();
             let segmenter = fallback_segmenter();
             let dir = tempfile::tempdir().unwrap();
@@ -53,24 +52,28 @@ async fn contextual_markdown_leaves_publish_and_reuse_cache() {
                     tx,
                 )
                 .await;
-                let mut tokens = String::new();
+                let mut text = String::new();
                 let mut done = 0;
                 while let Some(event) = rx.recv().await {
                     match event {
-                        StreamEvent::Token(token) => tokens.push_str(&token),
+                        StreamEvent::Token(token) => text.push_str(&token),
                         StreamEvent::AllDone(_) => done += 1,
                         _ => {}
                     }
                 }
-                assert!(result.is_ok(), "{prefix:?}: {result:?}");
-                assert_eq!(tokens, expected);
+                assert_eq!(text, expected, "{prefix:?}: {result:?}");
                 assert_eq!(done, 1);
                 result
             } else {
                 translate_text(&source, "zh", &TemplateType::Default, &opts, &ctx).await
             };
             assert_eq!(result.unwrap().text, expected, "{prefix:?}");
-            assert_eq!(server.requests.lock().unwrap().len(), 2);
+            assert_eq!(
+                server.requests.lock().unwrap().len(),
+                2,
+                "reject before losing the retry: {prefix:?}"
+            );
+            assert_eq!(history.fetch_recent(None).unwrap().len(), 1);
             assert_eq!(
                 translate_text(&source, "zh", &TemplateType::Default, &opts, &ctx)
                     .await
@@ -78,16 +81,175 @@ async fn contextual_markdown_leaves_publish_and_reuse_cache() {
                     .text,
                 expected
             );
-            assert_eq!(
-                server.requests.lock().unwrap().len(),
-                2,
-                "warm context must remain valid"
-            );
-            assert!(ensure_markdown_structure_preserved(&source, expected).is_ok());
+            assert_eq!(server.requests.lock().unwrap().len(), 2);
+            let plan = plan_translation(
+                &source,
+                "zh",
+                &config,
+                &segmenter,
+                &TemplateType::Default,
+                &opts,
+            )
+            .unwrap();
+            let contexts = segment_contexts(&plan).unwrap();
+            assert_eq!(plan.segment_count(), 1);
+            assert!(!cached_segment_is_complete(
+                0,
+                SegmentSource::new(&plan.segments[0], contexts[0]),
+                &invalid,
+                "zh",
+                &config
+            ));
         }
     }
 }
 
+fn verified_json_config(endpoint: &str) -> HotConfig {
+    let config = make_stream_config_with_fcp(endpoint, true);
+    let text = std::fs::read_to_string(config.path())
+        .unwrap()
+        .replace("context_window = 512", "context_window = 8192")
+        .replace("max_output_tokens = 40", "max_output_tokens = 4096");
+    std::fs::write(config.path(), text).unwrap();
+    HotConfig::from_path(config.path()).unwrap()
+}
+
+#[test]
+fn source_context_preserves_inline_and_heading_prefix_roles() {
+    let config = make_protected_block_config("http://127.0.0.1:9/v1");
+    let segmenter = fallback_segmenter();
+    for prefix in ["# ", "> # ", "- # ", "Count|", "*", "<b>"] {
+        let suffix = match prefix {
+            "*" => "*",
+            "<b>" => "</b>",
+            _ => "",
+        };
+        let source = format!("{prefix}Read the complete synthetic instruction.{suffix}");
+        let plan = plan_translation(
+            &source,
+            "zh",
+            &config,
+            &segmenter,
+            &TemplateType::Default,
+            &PromptOpts::default(),
+        )
+        .unwrap();
+        let contexts = segment_contexts(&plan).unwrap();
+        let index = plan
+            .segments
+            .iter()
+            .position(|segment| segment.starts_with("Read"))
+            .unwrap();
+        let leaf = SegmentSource::new(&plan.segments[index], contexts[index]);
+        assert!(
+            leaf.structure_preserved("- 请完整阅读这一条合成操作说明。")
+                .is_ok(),
+            "{prefix:?}"
+        );
+        assert_eq!(
+            recover_generated_inline_code(leaf, "请完整阅读 `合成` 操作说明。").as_deref(),
+            Some("请完整阅读 合成 操作说明。")
+        );
+        assert!(recover_generated_inline_code(leaf, "请完整阅读 `*合成*` 操作说明。").is_none());
+    }
+}
+
+#[tokio::test]
+async fn contextual_markdown_leaves_publish_and_reuse_cache() {
+    for prefix in [">5 ", "# ", "- ", "1. ", "~~~ ", "--- ", "5 "] {
+        assert_contextual_leaf(
+            prefix,
+            "请仔细审查所有相关代码。",
+            "请仔细审查所有相关代码。",
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn contextual_code_recovery_uses_original_leaf_context() {
+    for prefix in [">5 ", "# ", "- ", "1. ", "~~~ ", "--- ", "5 "] {
+        assert_contextual_leaf(
+            prefix,
+            "请仔细审查所有相关 `代码`。",
+            "请仔细审查所有相关 代码。",
+        )
+        .await;
+    }
+}
+
+async fn assert_contextual_leaf(prefix: &str, reply: &str, expected_leaf: &str) {
+    for streaming in [false, true] {
+        let source = format!("Count|{prefix}lines require a careful review.");
+        let expected = format!("数量|{expected_leaf}");
+        let server = start_capturing_mock_server(vec![
+            if streaming {
+                MockResponse::Sse(vec!["数量".to_owned()])
+            } else {
+                MockResponse::Json("数量".to_owned())
+            },
+            MockResponse::Json(reply.to_owned()),
+            MockResponse::Json(reply.to_owned()),
+        ])
+        .await;
+        let config = make_stream_config_with_fcp(&server.endpoint_url, false);
+        let client = TranslationClient::new(config.clone()).unwrap();
+        let segmenter = fallback_segmenter();
+        let dir = tempfile::tempdir().unwrap();
+        let history = HistoryDB::new(dir.path().join("history.db"));
+        let ctx = TranslationCtx {
+            config: &config,
+            client: &client,
+            segmenter: &segmenter,
+            history: &history,
+            cache_enabled: true,
+        };
+        let opts = PromptOpts::default();
+        let result = if streaming {
+            let (tx, mut rx) = mpsc::channel(32);
+            let result = translate_text_stream_with_mode(
+                &source,
+                "zh",
+                &TemplateType::Default,
+                &opts,
+                &ctx,
+                StreamOutputMode::Validated,
+                tx,
+            )
+            .await;
+            let mut tokens = String::new();
+            let mut done = 0;
+            while let Some(event) = rx.recv().await {
+                match event {
+                    StreamEvent::Token(token) => tokens.push_str(&token),
+                    StreamEvent::AllDone(_) => done += 1,
+                    _ => {}
+                }
+            }
+            assert!(result.is_ok(), "{prefix:?}: {result:?}");
+            assert_eq!(tokens, expected);
+            assert_eq!(done, 1);
+            result
+        } else {
+            translate_text(&source, "zh", &TemplateType::Default, &opts, &ctx).await
+        };
+        assert_eq!(result.unwrap().text, expected, "{prefix:?}");
+        assert_eq!(server.requests.lock().unwrap().len(), 2);
+        assert_eq!(
+            translate_text(&source, "zh", &TemplateType::Default, &opts, &ctx)
+                .await
+                .unwrap()
+                .text,
+            expected
+        );
+        assert_eq!(
+            server.requests.lock().unwrap().len(),
+            2,
+            "warm context must remain valid"
+        );
+        assert!(ensure_markdown_structure_preserved(&source, &expected).is_ok());
+    }
+}
 #[tokio::test]
 async fn json_content_admission_ignores_external_formatting_on_all_cache_paths() {
     let value = serde_json::json!({"message":"Read the complete synthetic instruction.","count":2,"enabled":true,"items":["First"]});

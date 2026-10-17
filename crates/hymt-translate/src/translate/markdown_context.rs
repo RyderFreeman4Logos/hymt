@@ -1,6 +1,8 @@
 //! Source position carried into every local structural admission.
 use super::TranslationPlan;
 use anyhow::{ensure, Result};
+use pulldown_cmark::{Event, Parser, Tag};
+use std::borrow::Cow;
 
 #[derive(Clone, Copy, Default)]
 pub(super) struct MarkdownContext {
@@ -32,15 +34,17 @@ impl<'a> SegmentSource<'a> {
         if hymt_core::completeness::parse_json_document(self.text).is_some() {
             return super::ensure_document_identities_preserved(self.text, translated);
         }
+        super::ensure_markdown_structure_preserved(&self.frame(self.text), &self.frame(translated))
+    }
+
+    pub(super) fn frame(self, text: &str) -> Cow<'_, str> {
+        // Only preceding inline content suppresses start-of-line grammar;
+        // source-owned quote/list markers still admit nested block syntax.
         if self.context.inline_start {
-            // A mid-line leaf cannot acquire start-of-line block grammar merely
-            // because source-owned syntax separated it from earlier prose.
-            return super::ensure_markdown_structure_preserved(
-                &format!("x {}", self.text),
-                &format!("x {translated}"),
-            );
+            Cow::Owned(format!("x {text}"))
+        } else {
+            Cow::Borrowed(text)
         }
-        super::ensure_markdown_structure_preserved(self.text, translated)
     }
 }
 
@@ -71,6 +75,24 @@ pub(super) fn segment_contexts(plan: &TranslationPlan) -> Result<Vec<MarkdownCon
         })
         .collect();
     let mut contexts = Vec::with_capacity(plan.segment_count());
+    // Parser roles distinguish container prefixes from actual inline content.
+    // Ranges arrive in source order and the cursor below consumes each once.
+    let content: Vec<_> = Parser::new(&source)
+        .into_offset_iter()
+        .filter_map(|(event, range)| match event {
+            Event::Text(_) | Event::Code(_) | Event::InlineHtml(_) => Some(range),
+            Event::Start(
+                Tag::Heading { .. }
+                | Tag::Emphasis
+                | Tag::Strong
+                | Tag::Strikethrough
+                | Tag::Link { .. }
+                | Tag::Image { .. },
+            ) => Some(range.start..range.start + 1),
+            _ => None,
+        })
+        .collect();
+    let mut content_cursor = 0;
     let mut previous = None;
     let mut consumed = 0;
     let mut scanned = 0;
@@ -87,11 +109,18 @@ pub(super) fn segment_contexts(plan: &TranslationPlan) -> Result<Vec<MarkdownCon
             "segment source position changed"
         );
         // Monotone source cursor: no per-leaf document-prefix rescans.
-        for character in source[scanned..start].chars() {
+        for (relative, character) in source[scanned..start].char_indices() {
+            let position = scanned + relative;
+            while content_cursor < content.len() && content[content_cursor].end <= position {
+                content_cursor += 1;
+            }
+            let is_content = content
+                .get(content_cursor)
+                .is_some_and(|range| range.start <= position);
             inline_start = if character == '\n' {
                 false
             } else {
-                inline_start || !character.is_whitespace()
+                inline_start || (is_content && !character.is_whitespace())
             };
         }
         #[cfg(test)]
