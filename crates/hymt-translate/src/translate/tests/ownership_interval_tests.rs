@@ -638,6 +638,8 @@ async fn adjacent_url_owners_leave_prose_translatable() {
         "https://example.test/x**Visible**.",
         "https://example.test/x*Visible*，",
         "https://example.test/x**Visible**，Body",
+        "https://example.test/x**Visible**, Body",
+        "Body ，_Visible_",
         "Body，_Visible_",
         "_Visible_，Body",
         "|https://example.test/x**Visible**|Other|\n|---|---|\n",
@@ -674,6 +676,11 @@ async fn adjacent_url_owners_leave_prose_translatable() {
             hymt_core::completeness::preserved_urls(&output)
         );
         assert_eq!(markdown_structure(source), markdown_structure(&output));
+        if matches!(source, "Body，_Visible_" | "Body ，_Visible_") {
+            assert_eq!(output, "译译译 _译译译译_");
+        } else if source == "_Visible_，Body" {
+            assert_eq!(output, "_译译译译_ 译译译");
+        }
         if source.contains("`kept`") {
             assert!(output.contains("`kept`"));
         }

@@ -290,7 +290,8 @@ fn protected_markdown_structure_ranges(text: &str) -> Vec<Range<usize>> {
             .filter(|run| run.start <= offset)
     };
     // URLs are identity, including visible URL labels; only adjacent prose translates.
-    for range in hymt_core::completeness::preserved_url_ranges(text) {
+    let source_urls = hymt_core::completeness::preserved_url_ranges(text);
+    for range in &source_urls {
         // Keep punctuation separating the URL from translated adjacent text.
         let left = punctuation_run(range.start).map_or(range.start, |run| run.start);
         let right = punctuation_run(range.end).map_or(range.end, |run| run.end);
@@ -306,13 +307,18 @@ fn protected_markdown_structure_ranges(text: &str) -> Vec<Range<usize>> {
             Event::Start(Tag::Paragraph) => paragraph = Some(range),
             Event::End(TagEnd::Paragraph) => paragraph = None,
             Event::Start(Tag::Emphasis | Tag::Strong | Tag::Strikethrough) => {
-                // Only punctuation flanks are opaque; the formatted prose stays editable.
                 let left = punctuation_run(range.start).map_or(range.start, |run| run.start);
-                let right = punctuation_run(range.end).map_or(range.end, |run| run.end);
-                for flank in [left..range.start, range.end..right] {
-                    if !flank.is_empty() {
-                        opaque.push(flank.clone());
-                        owned.push(flank);
+                let preceding = source_urls.partition_point(|url| url.end <= range.start);
+                // URL-adjacent formatting needs its source boundary even when
+                // ordinary Markdown could remain valid after that boundary vanished.
+                // Other prose punctuation stays editable under the renderer contract.
+                if preceding > 0 && source_urls[preceding - 1].end >= left {
+                    let right = punctuation_run(range.end).map_or(range.end, |run| run.end);
+                    for flank in [left..range.start, range.end..right] {
+                        if !flank.is_empty() {
+                            opaque.push(flank.clone());
+                            owned.push(flank);
+                        }
                     }
                 }
                 owned.push(range);
