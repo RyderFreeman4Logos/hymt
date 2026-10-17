@@ -1705,6 +1705,7 @@ async fn run_batch(
         prompt_opts: opts,
         recursive: args.recursive,
         explicit_target,
+        concurrency_override,
         no_cache,
     };
     let plan = build_batch_plan(&args.directory, config, &segmenter, &history, &plan_opts)?;

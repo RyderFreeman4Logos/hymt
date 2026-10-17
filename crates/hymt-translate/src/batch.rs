@@ -108,6 +108,8 @@ pub struct BatchPlanOpts<'a> {
     pub prompt_opts: &'a PromptOpts,
     pub recursive: bool,
     pub explicit_target: bool,
+    /// CLI override shared with the translation client; otherwise use config.
+    pub concurrency_override: Option<u32>,
     /// Bypass application cache reads and writes even when config enables them.
     pub no_cache: bool,
 }
@@ -124,6 +126,10 @@ pub fn build_batch_plan(
     opts: &BatchPlanOpts<'_>,
 ) -> Result<BatchPlan> {
     config.maybe_reload()?;
+    let concurrency = opts
+        .concurrency_override
+        .unwrap_or_else(|| config.concurrency())
+        .max(1);
     let (output_dir, target_lang, template, prompt_opts, recursive, explicit_target) = (
         opts.output_dir,
         opts.target_lang,
@@ -268,7 +274,7 @@ pub fn build_batch_plan(
                         .map(|(segment, _)| segmenter.count_tokens(segment) as i64)
                         .sum(),
                     missing as i64,
-                    config.concurrency() as i64,
+                    concurrency as i64,
                     EstimateScope {
                         target_lang: &effective_lang,
                         template_type: template_name,
@@ -505,6 +511,7 @@ max_retries = 1
                 prompt_opts: &prompt_opts,
                 recursive: false,
                 explicit_target: true,
+                concurrency_override: None,
                 no_cache,
             };
             let batch =
@@ -570,6 +577,7 @@ max_retries = 1
             prompt_opts: &prompt_opts,
             recursive: false,
             explicit_target: true,
+            concurrency_override: None,
             no_cache: false,
         };
         let batch = build_batch_plan(&source_dir, &config, &segmenter, &history, &opts).unwrap();
