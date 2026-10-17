@@ -237,7 +237,7 @@ force_translate_all = false    # default: false; set true to translate all non-c
 
 ## Smart segmentation and cache reuse
 
-Application segment and whole-output caches default to off. Set `[cache].enabled = true` to opt in; `--no-cache` overrides that setting for normal translation, batch, man/info, exec and Telegram commands. Disabling these caches preserves old cache entries, translation history, timing estimates and recall. The service inference cache independently reuses exact full HTTP requests/responses and stays enabled by its own service configuration. `hymt exec precache` explicitly populates application caches even with the default setting; combining it with `--no-cache` is rejected.
+Application segment and whole-output caches default to off. Set `[cache].enabled = true` to opt in; `--no-cache` overrides that setting for normal translation, batch, man/info, exec and Telegram commands. Disabling these caches preserves old cache entries, translation history, timing estimates and recall. The service inference cache independently reuses exact full HTTP requests/responses even when application caches are off. Explicit `--no-cache` bypasses both application and service cache reads and writes. Automatic validation retries also bypass service caching without changing sibling requests. `hymt exec precache` explicitly populates application caches even with the default setting; combining it with `--no-cache` is rejected.
 
 `hymt` plans each translation against the Hy-MT2 tokenizer and the selected prompt template. When application caching is enabled, translated segments are keyed by:
 

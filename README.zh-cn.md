@@ -236,7 +236,7 @@ force_translate_all = false    # default: false; set true to translate all non-c
 
 ## 智能分词与缓存复用
 
-应用层片段缓存与整段输出缓存默认关闭。设置 `[cache].enabled = true` 可显式启用；普通翻译、batch、man/info、exec 和 Telegram 命令的 `--no-cache` 会覆盖该设置。关闭缓存不会删除旧缓存，也不影响翻译历史、耗时估计和 recall。服务层推理缓存独立复用完整且一致的 HTTP 请求与响应，并由服务自身配置保持启用。`hymt exec precache` 是显式填充应用缓存的操作，即使默认关闭也会执行；与 `--no-cache` 同用时会报错。
+应用层片段缓存与整段输出缓存默认关闭。设置 `[cache].enabled = true` 可显式启用；普通翻译、batch、man/info、exec 和 Telegram 命令的 `--no-cache` 会覆盖该设置。关闭缓存不会删除旧缓存，也不影响翻译历史、耗时估计和 recall。服务层推理缓存独立复用完整且一致的 HTTP 请求与响应，即使应用层缓存关闭也继续使用。显式 `--no-cache` 会跳过应用层与服务层缓存的读取和写入。自动验证重试也会绕过服务层缓存，且不改变其他并发请求。`hymt exec precache` 是显式填充应用缓存的操作，即使默认关闭也会执行；与 `--no-cache` 同用时会报错。
 
 hymt会根据Hy-MT2分词器及选定的提示模板来规划每次翻译任务。应用层缓存启用时，翻译片段按以下信息生成缓存键：
 - 段落内容哈希值

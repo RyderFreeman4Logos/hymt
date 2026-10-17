@@ -151,7 +151,7 @@ struct Cli {
     #[arg(long = "context", global = true)]
     ctx: Option<String>,
 
-    /// Bypass application segment and whole-output cache reads and writes
+    /// Bypass application and shared inference cache reads and writes
     #[arg(long = "no-cache", alias = "disable-cache", global = true)]
     no_cache: bool,
 
@@ -846,11 +846,13 @@ fn should_run_backend_preflight(command: Option<&Cmd>) -> bool {
 fn make_client_with_concurrency(
     config: &HotConfig,
     concurrency_override: Option<u32>,
+    no_cache: bool,
 ) -> Result<TranslationClient> {
     let concurrency = concurrency_override
         .unwrap_or_else(|| config.concurrency())
         .max(1) as usize;
     TranslationClient::with_concurrency(config.clone(), concurrency)
+        .map(|client| client.with_cache_bypass(no_cache))
         .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
@@ -1108,7 +1110,7 @@ async fn run_translate_text(
         return Ok(());
     }
 
-    let client = make_client_with_concurrency(config, flags.concurrency_override)?;
+    let client = make_client_with_concurrency(config, flags.concurrency_override, flags.no_cache)?;
     let tctx = TranslationCtx {
         config,
         client: &client,
@@ -1180,7 +1182,7 @@ async fn run_translate_stdin(
         return Ok(());
     }
 
-    let client = make_client_with_concurrency(config, flags.concurrency_override)?;
+    let client = make_client_with_concurrency(config, flags.concurrency_override, flags.no_cache)?;
     let tctx = TranslationCtx {
         config,
         client: &client,
@@ -1243,7 +1245,7 @@ async fn run_translate_path(
         return Ok(());
     }
 
-    let client = make_client_with_concurrency(config, flags.concurrency_override)?;
+    let client = make_client_with_concurrency(config, flags.concurrency_override, flags.no_cache)?;
     let tctx = TranslationCtx {
         config,
         client: &client,
@@ -1422,7 +1424,7 @@ async fn run_man(
     }
     let segmenter = make_segmenter(config)?;
     let history = HistoryDB::default();
-    let client = make_client_with_concurrency(config, concurrency_override)?;
+    let client = make_client_with_concurrency(config, concurrency_override, no_cache)?;
     let str_args: Vec<&str> = args.args.iter().map(String::as_str).collect();
     let opts = ManInfoOpts {
         target_lang,
@@ -1455,7 +1457,7 @@ async fn run_info(
     }
     let segmenter = make_segmenter(config)?;
     let history = HistoryDB::default();
-    let client = make_client_with_concurrency(config, concurrency_override)?;
+    let client = make_client_with_concurrency(config, concurrency_override, no_cache)?;
     let str_args: Vec<&str> = args.args.iter().map(String::as_str).collect();
     let opts = ManInfoOpts {
         target_lang,
@@ -1497,7 +1499,7 @@ async fn run_exec(
         Some(ExecAction::Precache) => {
             let segmenter = make_segmenter(config)?;
             let history = HistoryDB::default();
-            let client = make_client_with_concurrency(config, concurrency_override)?;
+            let client = make_client_with_concurrency(config, concurrency_override, false)?;
             let summary = run_precache(
                 target_lang,
                 config,
@@ -1531,7 +1533,7 @@ async fn run_exec(
             }
             let segmenter = make_segmenter(config)?;
             let history = HistoryDB::default();
-            let client = make_client_with_concurrency(config, concurrency_override)?;
+            let client = make_client_with_concurrency(config, concurrency_override, no_cache)?;
             let exec_opts = ExecCommandOpts {
                 target_lang,
                 config,
@@ -1577,7 +1579,7 @@ async fn run_estimate(
     config.maybe_reload()?;
     let snapshot = config.detached_snapshot();
     let config = &snapshot;
-    let client = make_client_with_concurrency(config, concurrency_override)?;
+    let client = make_client_with_concurrency(config, concurrency_override, false)?;
     client.refresh_backend_preflight().await?;
     let segmenter = make_segmenter(config)?;
     let plan = plan_translation("sample", target_lang, config, &segmenter, template, opts)?;
@@ -1741,7 +1743,7 @@ async fn run_batch(
         return Ok(());
     }
 
-    let client = make_client_with_concurrency(config, concurrency_override)?;
+    let client = make_client_with_concurrency(config, concurrency_override, no_cache)?;
     run_batch_translation(&plan, config, &client, &segmenter, &history, template, opts).await?;
     eprintln!("Batch translation complete: {} files", plan.files.len());
     Ok(())
@@ -1826,7 +1828,7 @@ async fn run_translate_doc(
 ) -> Result<()> {
     let segmenter = make_segmenter(config)?;
     let history = HistoryDB::default();
-    let client = make_client_with_concurrency(config, flags.concurrency_override)?;
+    let client = make_client_with_concurrency(config, flags.concurrency_override, flags.no_cache)?;
     let doc_opts = DocTranslationOpts {
         target_lang,
         config,
@@ -2312,9 +2314,9 @@ timeout = 5
         .unwrap();
         let cfg = HotConfig::from_path(&path).unwrap();
         assert_eq!(cfg.concurrency(), 8);
-        let client = make_client_with_concurrency(&cfg, Some(2)).unwrap();
+        let client = make_client_with_concurrency(&cfg, Some(2), false).unwrap();
         assert_eq!(client.concurrency(), 2);
-        let default_client = make_client_with_concurrency(&cfg, None).unwrap();
+        let default_client = make_client_with_concurrency(&cfg, None, false).unwrap();
         assert_eq!(default_client.concurrency(), 8);
     }
 

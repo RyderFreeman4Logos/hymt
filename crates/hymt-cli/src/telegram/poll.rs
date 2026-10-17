@@ -373,7 +373,9 @@ pub async fn run_telegram_bot(config: &HotConfig, no_cache: bool) -> Result<()> 
         .context("build reqwest client")?;
     let segmenter = make_segmenter(config)?;
     let history = HistoryDB::default();
-    let client = TranslationClient::new(config.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let client = TranslationClient::new(config.clone())
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .with_cache_bypass(no_cache);
     let mut offset: i64 = 0;
 
     loop {
