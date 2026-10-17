@@ -280,9 +280,9 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        if self.cleanup_failed.load(Ordering::Relaxed) {
+        if self.cleanup_failed.load(Ordering::Relaxed) || std::thread::panicking() {
             eprintln!(
-                "unsettled fixture processes; paths retained: {}",
+                "failed fixture or unsettled processes; paths retained: {}",
                 self.root.display()
             );
             return;
@@ -525,6 +525,229 @@ impl Drop for OwnedChild<'_> {
         }
         self.register_artifacts();
     }
+}
+
+const PID_FIXTURE: &str = r#"
+import os, time
+from pathlib import Path
+
+def publish_pid(path):
+    path = Path(path)
+    pending = path.with_suffix('.pending')
+    with os.fdopen(os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'w') as output:
+        output.write(str(os.getpid()))
+    pending.rename(path)
+
+def read_pids(paths):
+    pids = []
+    for path in paths:
+        try:
+            with Path(path).open('rb') as source:
+                text = source.read(32)
+        except FileNotFoundError:
+            return None
+        if not text:
+            return None
+        if len(text) == 32 or not text.isdigit() or not 0 < int(text) <= 4294967295:
+            raise ValueError(f'invalid positive PID record: {path}')
+        pids.append(str(int(text)))
+    return pids
+
+def interrupt_ready(pid, signum, paths, ready, context):
+    deadline = time.monotonic() + 5
+    while True:
+        assert time.monotonic() < deadline, context
+        if ready():
+            pids = read_pids(paths)
+            if pids is not None:
+                os.kill(pid, signum)
+                return pids
+        time.sleep(0.01)
+"#;
+
+#[tokio::test]
+async fn local_gates_controller_requires_complete_pid_publication() {
+    let fixture = Fixture::new().await;
+    private_write(&fixture.root.join("fixture_pids.py"), PID_FIXTURE);
+    let mut command = fixture.command("/usr/bin/python3");
+    command.arg("-B").arg("-c").arg(r#"
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import fixture_pids
+parent, child = [Path(sys.argv[1]) / name for name in ('parent.pid', 'grandchild.pid')]
+parent.write_text('123')
+child.write_text('')
+signals = []
+def signal(pid, signum):
+    assert child.read_text() == '456', 'controller signaled before complete PID publication'
+    signals.append((pid, signum))
+def complete(_delay):
+    child.write_text('456')
+fixture_pids.os.kill = signal
+fixture_pids.time.sleep = complete
+assert fixture_pids.interrupt_ready(789, 2, (parent, child), lambda: True, 'readiness deadline') == ['123', '456']
+assert signals == [(789, 2)]
+child.unlink()
+assert fixture_pids.interrupt_ready(789, 2, (parent, child), lambda: True, 'readiness deadline') == ['123', '456']
+assert signals == [(789, 2), (789, 2)]
+for invalid in ('0', '+123', '12x', '123\n', '9' * 32, '4294967296'):
+    child.write_text(invalid)
+    try:
+        fixture_pids.interrupt_ready(789, 2, (parent, child), lambda: True, 'readiness deadline')
+    except ValueError as error:
+        assert 'invalid positive PID record' in str(error)
+    else:
+        raise AssertionError('invalid PID admitted')
+assert signals == [(789, 2), (789, 2)]
+"#).arg(&fixture.root);
+    let output = fixture.output(command).await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn local_gates_panicking_fixture_retains_owned_evidence() {
+    let fixture = Fixture::new().await;
+    let root = fixture.root.clone();
+    private_write(&root.join("sentinel"), "owned inactive controller evidence");
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _fixture = fixture;
+        panic!("injected controller assertion failure");
+    }));
+    assert!(failure.is_err());
+    assert_eq!(
+        std::fs::read_to_string(root.join("sentinel")).unwrap(),
+        "owned inactive controller evidence"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+fn pid_record(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut text = String::new();
+    std::fs::File::open(path)?
+        .take(32)
+        .read_to_string(&mut text)?;
+    if text.len() == 32 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "PID record exceeds limit",
+        ));
+    }
+    Ok(text)
+}
+
+fn fixture_pids(paths: [&Path; 2]) -> std::io::Result<Option<[String; 2]>> {
+    let mut pids = [String::new(), String::new()];
+    for (index, path) in paths.into_iter().enumerate() {
+        let text = match pid_record(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if text.is_empty() {
+            return Ok(None);
+        }
+        let pid = text.parse::<u32>().ok().filter(|pid| *pid > 0);
+        if !text.bytes().all(|byte| byte.is_ascii_digit()) || pid.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid positive PID record",
+            ));
+        }
+        pids[index] = pid.unwrap().to_string();
+    }
+    Ok(Some(pids))
+}
+
+impl Fixture {
+    fn retain_failure(&self, message: impl std::fmt::Display) -> ! {
+        self.cleanup_failed.store(true, Ordering::Relaxed);
+        panic!(
+            "{message}; fixture evidence retained at {}",
+            self.root.display()
+        );
+    }
+
+    fn ready_pids(&self, paths: [&Path; 2], context: &str) -> Option<[String; 2]> {
+        fixture_pids(paths).unwrap_or_else(|error| {
+            self.retain_failure(format!(
+                "{context}: {error}; ledger={:?}",
+                paths.map(pid_record)
+            ))
+        })
+    }
+}
+
+fn pid_identity(pid: &str) -> String {
+    use std::io::Read;
+    let mut stat = String::new();
+    let result = std::fs::File::open(Path::new("/proc").join(pid).join("stat"))
+        .and_then(|file| file.take(1024).read_to_string(&mut stat));
+    match result {
+        Ok(_) => {
+            let fields: Vec<_> = stat
+                .rsplit_once(')')
+                .map_or("", |(_, fields)| fields)
+                .split_whitespace()
+                .collect();
+            format!(
+                "pid={pid} state={:?} start_time={:?}",
+                fields.first(),
+                fields.get(19)
+            )
+        }
+        Err(error) => format!("pid={pid} stat_error={error}"),
+    }
+}
+
+#[tokio::test]
+async fn local_gates_pid_records_are_complete_before_readiness() {
+    let fixture = Fixture::new().await;
+    let parent = fixture.root.join("parent.pid");
+    let child = fixture.root.join("grandchild.pid");
+    private_write(&parent, "123");
+    private_write(&child, "");
+    assert!(fixture_pids([&parent, &child]).unwrap().is_none());
+    publish_control(&child, "456").unwrap();
+    assert_eq!(
+        fixture_pids([&parent, &child]).unwrap(),
+        Some(["123".into(), "456".into()])
+    );
+    for invalid in ["0", "12x", "+123"] {
+        private_write(&child, invalid);
+        assert_eq!(
+            fixture_pids([&parent, &child]).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+}
+
+#[tokio::test]
+async fn local_gates_invalid_pid_failure_retains_owned_evidence() {
+    let fixture = Fixture::new().await;
+    let root = fixture.root.clone();
+    let parent = root.join("parent.pid");
+    let child = root.join("grandchild.pid");
+    private_write(&parent, "123");
+    private_write(&child, "invalid");
+    private_write(&root.join("sentinel"), "owned inactive evidence");
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        fixture.ready_pids([&parent, &child], "deterministic inactive fixture");
+    }));
+    assert!(failure.is_err());
+    assert!(fixture.cleanup_failed.load(Ordering::Relaxed));
+    drop(fixture);
+    assert_eq!(std::fs::read_to_string(child).unwrap(), "invalid");
+    assert_eq!(
+        std::fs::read_to_string(root.join("sentinel")).unwrap(),
+        "owned inactive evidence"
+    );
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 fn publish_control(path: &Path, text: &str) -> std::io::Result<()> {
@@ -1215,7 +1438,6 @@ if other.stat().st_dev != Path('/mnt/ssd').stat().st_dev:
 
 #[tokio::test]
 async fn local_gates_blocked_output_and_wait_are_interruptible() {
-    let mut failures = Vec::new();
     for (mode, signum) in [
         ("pipe", 2),
         ("pipe", 15),
@@ -1224,6 +1446,7 @@ async fn local_gates_blocked_output_and_wait_are_interruptible() {
         ("eof", 14),
     ] {
         let fixture = Fixture::new().await;
+        private_write(&fixture.root.join("fixture_pids.py"), PID_FIXTURE);
         let worker = fixture.root.join("blocked-worker.py");
         let producer = fixture.root.join("blocked-producer.py");
         let controller = fixture.root.join("blocked-controller.py");
@@ -1235,15 +1458,15 @@ async fn local_gates_blocked_output_and_wait_are_interruptible() {
             &worker,
             r#"
 import os, sys, time
-from pathlib import Path
+from fixture_pids import publish_pid
 mode, worker_pid, grandchild_pid = sys.argv[1:]
 if os.fork() == 0:
     os.setsid()
-    Path(grandchild_pid).write_text(str(os.getpid()))
+    publish_pid(grandchild_pid)
     if mode == 'eof':
         os.close(1); os.close(2)
     while True: time.sleep(1)
-Path(worker_pid).write_text(str(os.getpid()))
+publish_pid(worker_pid)
 if mode == 'eof':
     os.close(1); os.close(2)
 else:
@@ -1286,25 +1509,20 @@ except BaseException as error:
 raise AssertionError('interrupted producer emitted success')
 "#).unwrap();
         std::fs::write(&controller, r#"
-import os, signal, subprocess, sys, time
+import subprocess, sys
 from pathlib import Path
+from fixture_pids import interrupt_ready
 producer, gate_path, settled, waiting, worker, mode, worker_pid, grandchild_pid, signum = sys.argv[1:]
 child = subprocess.Popen(['/usr/bin/python3', '-B', producer, gate_path, settled, waiting, worker, mode, worker_pid, grandchild_pid], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 announcement = child.stdout.readline().decode()
 assert announcement.startswith('local-gates: log: '), announcement
 print(announcement, end='', flush=True)
 log = Path(announcement.removeprefix('local-gates: log: ').strip())
-deadline = time.monotonic() + 5
-while True:
-    assert time.monotonic() < deadline, 'producer did not reach blocked boundary'
+def ready():
     if mode == 'pipe':
-        ready = log.exists() and log.stat().st_size >= 4096 and 'pipe_write' in Path(f'/proc/{child.pid}/wchan').read_text()
-    else:
-        ready = Path(waiting).exists()
-    if ready and Path(worker_pid).exists() and Path(grandchild_pid).exists():
-        break
-    time.sleep(0.01)
-os.kill(child.pid, int(signum))
+        return log.exists() and log.stat().st_size >= 4096 and 'pipe_write' in Path(f'/proc/{child.pid}/wchan').read_text()
+    return Path(waiting).exists()
+pids = interrupt_ready(child.pid, int(signum), (worker_pid, grandchild_pid), ready, 'producer did not reach blocked boundary')
 try:
     status = child.wait(timeout=6)
     bounded = True
@@ -1313,7 +1531,6 @@ except subprocess.TimeoutExpired:
     child.wait()
     status = -9
     bounded = False
-pids = [Path(worker_pid).read_text(), Path(grandchild_pid).read_text()]
 owned_gone = all(not Path('/proc', pid).exists() for pid in pids)
 receipt_absent = not log.with_name('gate.receipt.json').exists()
 print(f'ORACLE mode={mode} signal={signum} bounded={bounded} status={status} producer_settled={Path(settled).exists()} owned_gone={owned_gone} receipt_absent={receipt_absent}', flush=True)
@@ -1348,20 +1565,16 @@ print(f'ORACLE mode={mode} signal={signum} bounded={bounded} status={status} pro
             || !text.contains("receipt_absent=True")
             || !text.contains("status=1")
         {
-            failures.push(text);
+            fixture.retain_failure(text);
         }
     }
-    assert!(
-        failures.is_empty(),
-        "blocked cancellation failed: {failures:?}"
-    );
 }
 
 #[tokio::test]
 async fn local_gates_cli_diagnostics_do_not_block_settlement() {
-    let mut failures = Vec::new();
     for (signum, cleanup_error) in [(2, false), (15, false), (14, false), (15, true)] {
         let fixture = Fixture::new().await;
+        private_write(&fixture.root.join("fixture_pids.py"), PID_FIXTURE);
         let worker = fixture.root.join("diagnostic-worker.py");
         let controller = fixture.root.join("diagnostic-controller.py");
         let sitecustomize = fixture.root.join("sitecustomize.py");
@@ -1372,13 +1585,13 @@ async fn local_gates_cli_diagnostics_do_not_block_settlement() {
             &worker,
             r#"
 import os, sys, time
-from pathlib import Path
-worker_pid, grandchild_pid = map(Path, sys.argv[1:])
+from fixture_pids import publish_pid
+worker_pid, grandchild_pid = sys.argv[1:]
 if os.fork() == 0:
     os.setsid()
-    grandchild_pid.write_text(str(os.getpid()))
+    publish_pid(grandchild_pid)
     while True: time.sleep(1)
-worker_pid.write_text(str(os.getpid()))
+publish_pid(worker_pid)
 os.write(1, b'X' * 1048576)
 while True: time.sleep(1)
 "#,
@@ -1401,8 +1614,9 @@ def observe(frame, event, _arg):
 sys.setprofile(observe)
 "#).unwrap();
         std::fs::write(&controller, r#"
-import os, select, signal, subprocess, sys, time
+import os, select, subprocess, sys
 from pathlib import Path
+from fixture_pids import interrupt_ready
 gate, site_dir, settled, worker_pid, grandchild_pid, signum, cleanup_error = sys.argv[1:]
 env = os.environ.copy()
 env.update(PYTHONPATH=site_dir, HYMT_TEST_SETTLED=settled, HYMT_TEST_CLEANUP_ERROR=cleanup_error)
@@ -1411,14 +1625,9 @@ assert select.select([producer.stdout], [], [], 5)[0], 'CLI did not announce log
 announcement = producer.stdout.readline().decode()
 assert announcement.startswith('local-gates: log: '), announcement
 log = Path(announcement.removeprefix('local-gates: log: ').strip())
-deadline = time.monotonic() + 5
-while True:
-    assert time.monotonic() < deadline, 'CLI did not reach full output pipe'
-    ready = log.exists() and log.stat().st_size >= 4096 and 'pipe_write' in Path(f'/proc/{producer.pid}/wchan').read_text()
-    if ready and Path(worker_pid).exists() and Path(grandchild_pid).exists():
-        break
-    time.sleep(0.01)
-os.kill(producer.pid, int(signum))
+def ready():
+    return log.exists() and log.stat().st_size >= 4096 and 'pipe_write' in Path(f'/proc/{producer.pid}/wchan').read_text()
+pids = interrupt_ready(producer.pid, int(signum), (worker_pid, grandchild_pid), ready, 'CLI did not reach full output pipe')
 try:
     status = producer.wait(timeout=6)
     bounded = True
@@ -1427,7 +1636,6 @@ except subprocess.TimeoutExpired:
     producer.wait()
     status = -9
     bounded = False
-pids = [Path(worker_pid).read_text(), Path(grandchild_pid).read_text()]
 owned_gone = all(not Path('/proc', pid).exists() for pid in pids)
 receipt_absent = not log.with_name('gate.receipt.json').exists()
 print(f'ORACLE signal={signum} cleanup_error={cleanup_error} bounded={bounded} status={status} producer_settled={Path(settled).exists()} owned_gone={owned_gone} receipt_absent={receipt_absent} leaf={log.parent}', flush=True)
@@ -1476,17 +1684,15 @@ print(f'ORACLE signal={signum} cleanup_error={cleanup_error} bounded={bounded} s
             || !text.contains("owned_gone=True")
             || !text.contains("receipt_absent=True")
         {
-            failures.push(text);
+            fixture.retain_failure(text);
         }
         drop(fixture);
-        if leaf.exists() {
-            failures.push(format!("fixture retained gate leaf: {}", leaf.display()));
-        }
+        assert!(
+            !leaf.exists(),
+            "fixture retained gate leaf: {}",
+            leaf.display()
+        );
     }
-    assert!(
-        failures.is_empty(),
-        "terminal diagnostic blocked: {failures:?}"
-    );
 }
 
 #[tokio::test]
@@ -1707,11 +1913,12 @@ raise AssertionError('interrupted gate emitted success')
 async fn local_gates_interrupt_and_fixture_timeout_settle_descendants() {
     for (interrupt, block_ack) in [(2, false), (14, false), (9, false), (0, false), (0, true)] {
         let fixture = Fixture::new().await;
+        private_write(&fixture.root.join("fixture_pids.py"), PID_FIXTURE);
         let worker = fixture.root.join("worker.py");
         let parent_pid = fixture.root.join("parent.pid");
         let grandchild_pid = fixture.root.join("grandchild.pid");
         std::fs::write(&worker, format!(
-            "import os,signal,time\nfrom pathlib import Path\nsignal.signal(signal.SIGTERM,signal.SIG_IGN)\nif os.fork()==0:\n os.setsid()\n Path('{}').write_text(str(os.getpid()))\nelse:\n print('x'*4096,flush=True)\n print('fixture timeout marker',flush=True)\n Path('{}').write_text(str(os.getpid()))\nwhile True:time.sleep(1)\n",
+            "import os,signal,time\nfrom fixture_pids import publish_pid\nsignal.signal(signal.SIGTERM,signal.SIG_IGN)\nif os.fork()==0:\n os.setsid()\n publish_pid('{}')\nelse:\n print('x'*4096,flush=True)\n print('fixture timeout marker',flush=True)\n publish_pid('{}')\nwhile True:time.sleep(1)\n",
             grandchild_pid.display(), parent_pid.display()
         )).unwrap();
         fixture
@@ -1726,18 +1933,20 @@ async fn local_gates_interrupt_and_fixture_timeout_settle_descendants() {
         let mut command = fixture.command("/usr/bin/python3");
         command.args(["scripts/hooks/local-gates.py", "run", "head"]);
         let child = fixture.spawn(command);
+        let context = format!("interrupt={interrupt} block_ack={block_ack}");
         let ready = Instant::now();
-        while !parent_pid.exists() || !grandchild_pid.exists() {
-            assert!(
-                ready.elapsed() < Duration::from_secs(5),
-                "adversarial worker failed to start"
-            );
+        let pids = loop {
+            if let Some(pids) = fixture.ready_pids([&parent_pid, &grandchild_pid], &context) {
+                break pids;
+            }
+            if ready.elapsed() >= Duration::from_secs(5) {
+                fixture.retain_failure(format!(
+                    "{context}: adversarial worker failed to start; ledger={:?}",
+                    [&parent_pid, &grandchild_pid].map(|path| pid_record(path))
+                ));
+            }
             tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let pids: Vec<String> = [&parent_pid, &grandchild_pid]
-            .into_iter()
-            .map(|path| std::fs::read_to_string(path).unwrap())
-            .collect();
+        };
         let failed = child.failed.clone();
         if block_ack {
             // Settlement still runs, but positive acknowledgement cannot publish.
@@ -1758,6 +1967,14 @@ async fn local_gates_interrupt_and_fixture_timeout_settle_descendants() {
                 },
             )
             .await;
+        let output_evidence = match &result {
+            Ok(output) => format!(
+                "stdout_bytes={} stderr_tail={:?}",
+                output.stdout.len(),
+                String::from_utf8_lossy(&output.stderr[output.stderr.len().saturating_sub(1024)..])
+            ),
+            Err(error) => error.to_string(),
+        };
         assert!(
             began.elapsed() < Duration::from_secs(8),
             "cleanup exceeded its bound"
@@ -1792,11 +2009,10 @@ async fn local_gates_interrupt_and_fixture_timeout_settle_descendants() {
                 assert!(qualified, "uncertified cleanup after original {timeout}");
             }
         }
-        for pid in pids {
-            assert!(
-                !Path::new("/proc").join(pid).exists(),
-                "recorded descendant survived cleanup"
-            );
+        for pid in &pids {
+            if Path::new("/proc").join(pid).exists() {
+                fixture.retain_failure(format!("{context}: recorded descendant survived cleanup; {}; pids={pids:?} ledger={:?}; {output_evidence}", pid_identity(pid), [&parent_pid, &grandchild_pid].map(|path| pid_record(path))));
+            }
         }
         let artifacts = fixture.artifacts.lock().unwrap();
         assert_eq!(
