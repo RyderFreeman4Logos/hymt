@@ -103,11 +103,27 @@ fn clipped_ranges(
 /// existing AST and identity checks. Containers, references and opaque block
 /// syntax keep their source-owned reconstruction path.
 pub(super) fn is_coherent_inline_paragraph(source: &str) -> bool {
-    if source.contains(['|', '$', '\\', '{', '}']) || super::has_unparsed_link_syntax(source) {
+    if source.contains(['|', '$', '\\', '{', '}']) {
+        return false;
+    }
+    let citations = literal_numeric_citation_ranges(source);
+    let has_citation = !citations.is_empty();
+    if citations.iter().any(|range| {
+        source[..range.start].ends_with('!')
+            || source[range.end..].starts_with('[')
+            || source[range.end..].trim_start().starts_with('(')
+    }) {
+        return false;
+    }
+    let mut link_probe = source.as_bytes().to_vec();
+    for range in citations {
+        link_probe[range].fill(b' ');
+    }
+    if std::str::from_utf8(&link_probe).map_or(true, super::has_unparsed_link_syntax) {
         return false;
     }
     let mut paragraphs = 0;
-    let mut inline = false;
+    let mut inline = has_citation;
     for event in Parser::new(source) {
         match event {
             Event::Start(Tag::Paragraph) => paragraphs += 1,
@@ -140,12 +156,57 @@ pub(super) fn is_coherent_inline_paragraph(source: &str) -> bool {
     paragraphs == 1 && inline
 }
 
+/// A numeric citation is a literal text atom only when the Markdown parser has
+/// not already assigned it a link or another structural role.
+fn literal_numeric_citation_ranges(text: &str) -> Vec<Range<usize>> {
+    let mut literal_text: Vec<Range<usize>> = Vec::new();
+    for (event, range) in Parser::new(text).into_offset_iter() {
+        let Event::Text(content) = event else {
+            continue;
+        };
+        if text.get(range.clone()) != Some(content.as_ref()) {
+            continue;
+        }
+        if let Some(previous) = literal_text.last_mut() {
+            if previous.end == range.start {
+                previous.end = range.end;
+                continue;
+            }
+        }
+        literal_text.push(range);
+    }
+    let mut citations = Vec::new();
+    for range in literal_text {
+        let bytes = &text.as_bytes()[range.clone()];
+        let mut cursor = 0;
+        while cursor < bytes.len() {
+            if bytes[cursor] != b'[' {
+                cursor += 1;
+                continue;
+            }
+            let start = cursor;
+            cursor += 1;
+            let digits = cursor;
+            while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+                cursor += 1;
+            }
+            if cursor > digits && bytes.get(cursor) == Some(&b']') {
+                cursor += 1;
+                citations.push(range.start + start..range.start + cursor);
+            }
+        }
+    }
+    citations
+}
+
 /// Compare the same immutable atoms and parser roles used by leaf rendering.
 /// Prose byte offsets may change; the ordered protected atoms and their parser
 /// roles must retain exact syntax, URLs, placeholders and opaque payload bytes.
 pub(super) fn coherent_protected_bytes_preserved(source: &str, candidate: &str) -> bool {
     fn signature(text: &str) -> Option<(Vec<String>, Vec<super::cache_proof::Role>)> {
-        let fixed = merge_ranges(protected_markdown_structure_ranges(text));
+        let mut fixed = protected_markdown_structure_ranges(text);
+        fixed.extend(literal_numeric_citation_ranges(text));
+        let fixed = merge_ranges(fixed);
         let roles = super::cache_proof::roles(text, &fixed, &[])?;
         Some((
             fixed

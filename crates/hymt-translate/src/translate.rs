@@ -38,7 +38,7 @@ use hymt_core::language_spec::{language_spec_or_none, LanguageFamily};
 use hymt_core::model_profile::ModelProfile;
 use hymt_core::templates::{build_prompt, PromptOpts, TemplateType, PROMPT_SCHEMA_ID};
 use hymt_segment::Segmenter;
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Event, LinkType, Options, Parser, Tag, TagEnd};
 
 // ── TranslationCtx ────────────────────────────────────────────────────────────
 
@@ -987,12 +987,34 @@ fn coherent_paragraph_sections(
     options: &FinalRequestBudgetOptions<'_>,
     source_cap: usize,
 ) -> Result<BTreeSet<usize>> {
+    let source: String = document
+        .sections
+        .iter()
+        .map(|section| section.text.as_str())
+        .collect();
+    let reference_links: Vec<_> = Parser::new(&source)
+        .into_offset_iter()
+        .filter_map(|(event, range)| match event {
+            Event::Start(Tag::Link { link_type, .. } | Tag::Image { link_type, .. })
+                if link_type != LinkType::Inline =>
+            {
+                Some(range)
+            }
+            _ => None,
+        })
+        .collect();
     let mut selected = BTreeSet::new();
+    let mut offset = 0;
     for section in &document.sections {
+        let start = offset;
+        offset += section.text.len();
         if section.kind != SectionKind::Paragraph
             || !section.should_translate
             || options.segmenter.count_tokens(&section.text) > source_cap
             || !markdown_ownership::is_coherent_inline_paragraph(&section.text)
+            || reference_links
+                .iter()
+                .any(|range| range.start < offset && start < range.end)
             || !markdown_ownership::coherent_protected_bytes_preserved(&section.text, &section.text)
         {
             continue;

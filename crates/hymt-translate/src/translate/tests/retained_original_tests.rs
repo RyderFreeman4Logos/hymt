@@ -265,6 +265,92 @@ fn budget_fitting_inline_paragraph_is_one_coherent_request() {
 }
 
 #[test]
+fn numeric_citations_keep_complete_owner_and_exact_occurrences() {
+    let source = "Compare *the first result* [12] with *the second result* [34] before deciding.\n";
+    let translated = "比较 *第一项结果* [12] 与 *第二项结果* [34] 后再决定。";
+    let config = make_protected_block_config("http://127.0.0.1:1/v1");
+    let plan = plan_translation(
+        source,
+        "zh",
+        &config,
+        &fallback_segmenter(),
+        &TemplateType::Default,
+        &PromptOpts::default(),
+    )
+    .unwrap();
+    assert_eq!(plan.segments, vec![source]);
+    assert!(plan.coherent_paragraphs.contains(&1));
+    let plain = "Compare this finding [12] with that finding [34].\n";
+    let plain_plan = plan_translation(
+        plain,
+        "zh",
+        &config,
+        &fallback_segmenter(),
+        &TemplateType::Default,
+        &PromptOpts::default(),
+    )
+    .unwrap();
+    assert_eq!(plain_plan.segments, vec![plain]);
+    assert!(plain_plan.coherent_paragraphs.contains(&1));
+    assert!(markdown_ownership::coherent_protected_bytes_preserved(
+        source, translated
+    ));
+    for invalid in [
+        translated.replace("[12]", "[13]"),
+        translated.replace("[12]", ""),
+        translated.replace("[12]", "[12] [12]"),
+        translated
+            .replace("[12]", "[99]")
+            .replace("[34]", "[12]")
+            .replace("[99]", "[34]"),
+    ] {
+        assert!(!markdown_ownership::coherent_protected_bytes_preserved(
+            source, &invalid
+        ));
+    }
+    let repeated = "Compare *both results* [12] with [12] again.\n";
+    assert!(!markdown_ownership::coherent_protected_bytes_preserved(
+        repeated,
+        "比较 *两项结果* [12]。"
+    ));
+
+    let reference = format!("{source}\n[12]: https://example.test/reference\n");
+    let reference_plan = plan_translation(
+        &reference,
+        "zh",
+        &config,
+        &fallback_segmenter(),
+        &TemplateType::Default,
+        &PromptOpts::default(),
+    )
+    .unwrap();
+    assert!(!reference_plan.coherent_paragraphs.contains(&1));
+    let resolved = reference_plan.reconstruct(&reference_plan.segments);
+    assert!(resolved.contains("[12][12]"));
+    assert!(resolved.contains("[12]: https://example.test/reference"));
+    for unsupported in [
+        "Read *the result* [word] before deciding.",
+        "Read *the result* [12][] before deciding.",
+        "Read *the result* ![12] before deciding.",
+        "Read *the result* [12](broken before deciding.",
+        "Read *the result* [12] (broken before deciding.",
+        "Read *the result* \\[12] before deciding.",
+        "Read *the result* $12$ before deciding.",
+    ] {
+        let plan = plan_translation(
+            unsupported,
+            "zh",
+            &config,
+            &fallback_segmenter(),
+            &TemplateType::Default,
+            &PromptOpts::default(),
+        )
+        .unwrap();
+        assert!(plan.coherent_paragraphs.is_empty(), "{unsupported}");
+    }
+}
+
+#[test]
 fn coherent_paragraph_proof_rejects_extra_opaque_payloads() {
     let source = "Read *17 credits* and `--safe` carefully.";
     let config = make_protected_block_config("http://127.0.0.1:1/v1");
@@ -296,8 +382,8 @@ fn coherent_paragraph_proof_rejects_extra_opaque_payloads() {
     }
 }
 
-const COHERENT_SOURCE: &str = "Read *17 credits* beside [the public guide](https://example.test/guide) using `--safe` before choosing **the next action**.\n";
-const COHERENT_TRANSLATION: &str = "阅读 *17 点数* 并参看 [公共指南](https://example.test/guide) 使用 `--safe` 再选择 **下一步操作**.";
+const COHERENT_SOURCE: &str = "Read *17 credits* [12] beside [the public guide](https://example.test/guide) using `--safe` [34] before choosing **the next action**.\n";
+const COHERENT_TRANSLATION: &str = "阅读 *17 点数* [12] 并参看 [公共指南](https://example.test/guide) 使用 `--safe` [34] 再选择 **下一步操作**.";
 
 fn coherent_config(endpoint: &str, retain: bool) -> HotConfig {
     let config = make_protected_block_config(endpoint);
