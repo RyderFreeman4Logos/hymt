@@ -120,6 +120,8 @@ pub(super) fn block_structure(text: &str) -> Vec<String> {
                 Some(format!("end:{tag:?}"))
             }
             Event::Rule => Some("rule".to_owned()),
+            Event::Html(html) => Some(format!("html:{html}")),
+            Event::InlineHtml(html) => Some(format!("inline_html:{html}")),
             _ => None,
         })
         .collect()
@@ -242,14 +244,18 @@ pub(super) fn render_translations(plan: &TranslationPlan, translations: &mut [St
                 .collect::<String>()
         })
         .unwrap_or_default();
+    let reconstructed = plan.reconstruct(translations);
+    if hymt_core::completeness::parse_json_document(&source).is_some() {
+        return super::ensure_document_identities_preserved(&source, &reconstructed).is_ok();
+    }
+    let expected_blocks = block_structure(&source);
+    if block_structure(&reconstructed) != expected_blocks {
+        return false;
+    }
     let expected = spans(plan, &plan.segments);
     let mut actual = spans(plan, translations);
     if actual == expected {
         return true;
-    }
-    let expected_blocks = block_structure(&source);
-    if block_structure(&plan.reconstruct(translations)) != expected_blocks {
-        return false;
     }
     let document = plan
         .document_plan

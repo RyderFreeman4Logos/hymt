@@ -691,3 +691,85 @@ async fn rendered_document_is_identical_in_buffered_streamed_and_cached_paths() 
         assert_eq!(server.requests.lock().unwrap().len(), 2);
     }
 }
+
+#[test]
+fn shared_block_guard_checks_empty_spans_html_and_atomic_json() {
+    let config = make_stream_config("http://127.0.0.1:9/v1");
+    let segmenter = fallback_segmenter();
+    let opts = PromptOpts::default();
+    let prose = "30 Read the complete synthetic instruction.";
+    let mut admitted = Vec::new();
+    for (source, candidate) in [
+        (prose, "30. 请完整阅读这一条合成操作说明。"),
+        (prose, "<span>30 请完整阅读这一条合成操作说明。</span>"),
+        (
+            "Read <span class=\"original\">the complete instruction</span>.",
+            "阅读 <span class=\"changed\">这条完整的操作说明</span>。",
+        ),
+    ] {
+        if ensure_markdown_structure_preserved(source, candidate).is_ok() {
+            admitted.push((source, "shared guard"));
+        }
+        if source == prose {
+            let plan = plan_translation(
+                source,
+                "zh",
+                &config,
+                &segmenter,
+                &TemplateType::Default,
+                &opts,
+            )
+            .unwrap();
+            assert_eq!(plan.segments, [source]);
+            let mut leaves = vec![candidate.to_owned()];
+            if render_translations(&plan, &mut leaves) {
+                admitted.push((source, "empty-span renderer"));
+            }
+            assert_eq!(
+                leaves,
+                [candidate],
+                "rejected rendering must not rewrite text"
+            );
+        }
+    }
+    for (source, candidate) in [
+        (
+            "30. Read the complete synthetic instruction.",
+            "30. 请完整阅读这一条合成操作说明。",
+        ),
+        (
+            "Read <span class=\"original\">the complete instruction</span>.",
+            "阅读 <span class=\"original\">这条完整的操作说明</span>。",
+        ),
+    ] {
+        ensure_markdown_structure_preserved(source, candidate).unwrap();
+    }
+    let source = "{\n\n    \"message\": \"Read the complete instruction.\",\n    \"count\": 2,\n    \"items\": [\"First\"]\n}";
+    let valid = r#"{"message":"请完整阅读这一条操作说明。","count":2,"items":["第一项"]}"#;
+    let plan = plan_translation(
+        source,
+        "zh",
+        &config,
+        &segmenter,
+        &TemplateType::Default,
+        &opts,
+    )
+    .unwrap();
+    assert_eq!(plan.segments, [source]);
+    ensure_markdown_structure_preserved(source, valid).unwrap();
+    assert!(render_translations(&plan, &mut [valid.to_owned()]));
+    for candidate in [
+        "not JSON",
+        r#"{"wrong":"请完整阅读这一条操作说明。","count":2,"items":["第一项"]}"#,
+        r#"{"message":"请完整阅读这一条操作说明。","count":3,"items":["第一项"]}"#,
+        r#"{"message":"请完整阅读这一条操作说明。","count":2,"items":["第一项","额外"]}"#,
+    ] {
+        if ensure_markdown_structure_preserved(source, candidate).is_ok() {
+            admitted.push((candidate, "JSON shared guard"));
+        }
+        if render_translations(&plan, &mut [candidate.to_owned()]) {
+            admitted.push((candidate, "JSON renderer"));
+        }
+    }
+    assert!(admitted.is_empty(), "changed shape admitted: {admitted:?}");
+}

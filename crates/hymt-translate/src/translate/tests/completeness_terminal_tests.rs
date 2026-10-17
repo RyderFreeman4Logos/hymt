@@ -489,3 +489,168 @@ async fn ordinary_prose_failure_preserves_optimistic_prefix_without_success_admi
         }
     }
 }
+
+#[tokio::test]
+async fn shared_block_guard_retries_before_publication_and_rejects_exhaustion() {
+    for (source, invalid, valid) in [
+        (
+            "30 Read the complete synthetic instruction.",
+            "30. 请完整阅读这一条合成操作说明。",
+            "30 请完整阅读这一条合成操作说明。",
+        ),
+        (
+            "Read the complete synthetic instruction.",
+            "<span>请完整阅读这一条合成操作说明。</span>",
+            "请完整阅读这一条合成操作说明。",
+        ),
+    ] {
+        for (mode, repair, warn_only) in [
+            (None, true, false),
+            (None, false, true),
+            (Some(StreamOutputMode::Validated), true, false),
+            (Some(StreamOutputMode::Validated), false, false),
+            (Some(StreamOutputMode::Validated), false, true),
+            (Some(StreamOutputMode::Optimistic), false, true),
+        ] {
+            let first = if mode.is_some() {
+                MockResponse::Sse(vec![invalid.to_owned()])
+            } else {
+                MockResponse::Json(invalid.to_owned())
+            };
+            let server = start_capturing_mock_server(vec![
+                first,
+                MockResponse::Json(if repair { valid } else { invalid }.to_owned()),
+            ])
+            .await;
+            let config = make_stream_config(&server.endpoint_url);
+            let client = TranslationClient::new(config.clone()).unwrap();
+            let segmenter = fallback_segmenter();
+            let dir = tempfile::tempdir().unwrap();
+            let history = HistoryDB::new(dir.path().join("history.db"));
+            let opts = PromptOpts {
+                warn_only_completeness: Some(warn_only),
+                ..PromptOpts::default()
+            };
+            let plan = plan_translation(
+                source,
+                "zh",
+                &config,
+                &segmenter,
+                &TemplateType::Default,
+                &opts,
+            )
+            .unwrap();
+            assert_eq!(plan.segments, [source]);
+            let ctx = TranslationCtx {
+                config: &config,
+                client: &client,
+                segmenter: &segmenter,
+                history: &history,
+                cache_enabled: true,
+            };
+            let (tx, mut rx) = mpsc::channel(32);
+            let result = if let Some(mode) = mode {
+                translate_text_stream_with_mode(
+                    source,
+                    "zh",
+                    &TemplateType::Default,
+                    &opts,
+                    &ctx,
+                    mode,
+                    tx,
+                )
+                .await
+            } else {
+                drop(tx);
+                translate_text(source, "zh", &TemplateType::Default, &opts, &ctx).await
+            };
+            let mut tokens = String::new();
+            let mut segment_done = 0;
+            let mut all_done = Vec::new();
+            while let Some(event) = rx.recv().await {
+                match event {
+                    StreamEvent::Token(text) => tokens.push_str(&text),
+                    StreamEvent::SegmentDone(_) => segment_done += 1,
+                    StreamEvent::AllDone(text) => all_done.push(text),
+                }
+            }
+            let options_hash =
+                template_options_hash(&opts, effective_document_translation_policy(&opts, &config));
+            let fingerprint = config
+                .inference_fingerprint(TemplateType::Default.as_str(), &options_hash)
+                .unwrap();
+            let scope = SegmentCacheScope {
+                target_lang: "zh",
+                template_type: TemplateType::Default.as_str(),
+                options_hash: &options_hash,
+                profile_id: config.model_profile().unwrap().id(),
+                inference_fingerprint: fingerprint.hash(),
+            };
+            let cached = history
+                .find_segment_cached(&segment_cache_hash(source), scope)
+                .unwrap();
+            if repair {
+                assert_eq!(result.unwrap().text, valid);
+                assert_eq!(
+                    server.requests.lock().unwrap().len(),
+                    2,
+                    "invalid shape must retry before admission"
+                );
+                assert_eq!(history.fetch_recent(None).unwrap().len(), 1);
+                assert_eq!(cached.as_deref(), Some(valid));
+                if mode.is_some() {
+                    assert_eq!(tokens, valid);
+                    assert_eq!(segment_done, 1);
+                    assert_eq!(all_done, [valid]);
+                }
+            } else {
+                assert!(
+                    result.is_err(),
+                    "changed shape admitted: {source:?}, {mode:?}, warn={warn_only}"
+                );
+                assert!(history.fetch_recent(None).unwrap().is_empty());
+                assert!(cached.is_none());
+                assert_eq!(segment_done, 0);
+                assert!(all_done.is_empty());
+                if mode == Some(StreamOutputMode::Optimistic) {
+                    assert_eq!(tokens, invalid, "already emitted prefix remains visible");
+                    assert_eq!(
+                        server.requests.lock().unwrap().len(),
+                        1,
+                        "never retry after emission"
+                    );
+                } else {
+                    assert!(tokens.is_empty());
+                    assert_eq!(server.requests.lock().unwrap().len(), 2);
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn shared_block_guard_checks_html_attributes_in_cold_scoring() {
+    let source = "Read <span class=\"original\">the complete instruction</span>.";
+    let invalid = "阅读 <span class=\"changed\">这条完整的操作说明</span>。";
+    let valid = "阅读 <span class=\"original\">这条完整的操作说明</span>。";
+    let response = |s: &str| {
+        let escaped = serde_json::to_string(s).unwrap();
+        MockResponse::Json(escaped[1..escaped.len() - 1].to_owned())
+    };
+    let server = start_capturing_mock_server(vec![response(invalid), response(valid)]).await;
+    let config = make_stream_config(&server.endpoint_url);
+    let client = TranslationClient::new(config.clone()).unwrap();
+    let outcome = translate_segment_with_completeness(
+        0,
+        &client,
+        source,
+        "zh",
+        &TemplateType::Default,
+        &PromptOpts::default(),
+        &config,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.text, valid);
+    assert_eq!(server.requests.lock().unwrap().len(), 2);
+}

@@ -94,8 +94,8 @@ pub enum StreamOutputMode {
     Validated,
     /// Emit segment 0 tokens as soon as the streaming backend returns them,
     /// except when source text contains an unparsed inline-link delimiter or
-    /// unresolved reference candidate that could be repaired into a link. Such
-    /// input is held for validation before output.
+    /// unresolved reference candidate that could be repaired into a link, or
+    /// fixed inline delimiters that need validated rendering before output.
     Optimistic,
 }
 
@@ -1076,6 +1076,7 @@ fn segment_document_plan(
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct MarkdownStructure {
+    blocks: Vec<String>,
     headings: Vec<pulldown_cmark::HeadingLevel>,
     links: Vec<(String, String)>,
     images: Vec<(String, String)>,
@@ -1086,6 +1087,7 @@ struct MarkdownStructure {
 
 fn markdown_structure(text: &str) -> MarkdownStructure {
     let mut structure = MarkdownStructure {
+        blocks: markdown_boundary::block_structure(text),
         tables: table_shape::table_shapes(text),
         ..MarkdownStructure::default()
     };
@@ -1116,6 +1118,9 @@ fn markdown_structure(text: &str) -> MarkdownStructure {
 }
 
 fn ensure_markdown_structure_preserved(source: &str, translated: &str) -> Result<()> {
+    if hymt_core::completeness::parse_json_document(source).is_some() {
+        return ensure_document_identities_preserved(source, translated);
+    }
     if markdown_structure(source) != markdown_structure(translated) {
         anyhow::bail!("translated Markdown structure changed");
     }

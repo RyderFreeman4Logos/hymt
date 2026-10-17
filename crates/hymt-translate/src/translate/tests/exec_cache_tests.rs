@@ -433,3 +433,78 @@ fn cache_template_rejects_ambiguous_or_relocated_owners() {
         );
     }
 }
+
+#[tokio::test]
+async fn shared_block_guard_revalidates_user_and_shared_whole_cache_shape() {
+    let source = "30 Read the complete synthetic instruction.";
+    let valid = "30 请完整阅读这一条合成操作说明。";
+    let list_source = "30. Read the complete synthetic instruction.";
+    let list_valid = "30. 请完整阅读这一条合成操作说明。";
+    for poison in [list_valid, "<span>30 请完整阅读这一条合成操作说明。</span>"] {
+        for shared in [false, true] {
+            let server =
+                start_capturing_mock_server(vec![MockResponse::Json(valid.to_owned())]).await;
+            let config = make_stream_config(&server.endpoint_url);
+            let client = TranslationClient::new(config.clone()).unwrap();
+            let segmenter = fallback_segmenter();
+            let dir = tempfile::tempdir().unwrap();
+            let history = HistoryDB::new(dir.path().join("history.db"));
+            let cache =
+                ExecCache::with_user_path(dir.path().join("shared.db"), dir.path().join("user.db"));
+            let opts = PromptOpts::default();
+            let policy = effective_document_translation_policy(&opts, &config);
+            let store = |source, value| {
+                if shared {
+                    cache.store_shared("man", "shape", source, "zh", policy, value)
+                } else {
+                    cache.store_user("man", "shape", source, "zh", policy, value)
+                }
+                .unwrap();
+            };
+            store(source, poison);
+            let ctx = TranslationCtx {
+                config: &config,
+                client: &client,
+                segmenter: &segmenter,
+                history: &history,
+                cache_enabled: true,
+            };
+            assert_eq!(
+                translate_cached("man", "shape", source, "zh", &cache, &opts, &ctx)
+                    .await
+                    .unwrap(),
+                valid
+            );
+            assert_eq!(
+                server.requests.lock().unwrap().len(),
+                1,
+                "poison must regenerate from empty history"
+            );
+            assert_eq!(
+                cache
+                    .find("man", "shape", source, "zh", policy)
+                    .unwrap()
+                    .as_deref(),
+                Some(valid)
+            );
+            let warm_history = HistoryDB::new(dir.path().join("warm.db"));
+            store(list_source, list_valid);
+            let warm_ctx = TranslationCtx {
+                history: &warm_history,
+                ..ctx
+            };
+            assert_eq!(
+                translate_cached("man", "shape", list_source, "zh", &cache, &opts, &warm_ctx)
+                    .await
+                    .unwrap(),
+                list_valid
+            );
+            assert_eq!(
+                server.requests.lock().unwrap().len(),
+                1,
+                "valid source-list whole hit must make zero new requests"
+            );
+            assert!(warm_history.fetch_recent(None).unwrap().is_empty());
+        }
+    }
+}

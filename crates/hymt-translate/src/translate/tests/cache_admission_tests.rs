@@ -177,7 +177,10 @@ fn make_markdown_plan(
     assert!(!link_segment.contains(LINK_URL));
     assert_eq!(
         markdown_structure(link_segment),
-        MarkdownStructure::default()
+        MarkdownStructure {
+            blocks: vec!["start:Paragraph".to_owned(), "end:Paragraph".to_owned()],
+            ..MarkdownStructure::default()
+        }
     );
     assert_eq!(
         markdown_structure(SOURCE).headings,
@@ -637,7 +640,10 @@ fn markdown_owner_matrix_preserves_complete_inline_nodes() {
         let plan = plan_translation(source, "zh", &config, &segmenter, &TemplateType::Default, &PromptOpts::default()).unwrap();
         for segment in &plan.segments {
             assert!(!segment.contains("https://"), "destination leaked: source={source:?}, segment={segment:?}");
-            assert_eq!(markdown_structure(segment), MarkdownStructure::default(), "incomplete inline owner: source={source:?}, segment={segment:?}");
+            assert_eq!(markdown_structure(segment), MarkdownStructure {
+                blocks: vec!["start:Paragraph".to_owned(), "end:Paragraph".to_owned()],
+                ..MarkdownStructure::default()
+            }, "incomplete inline owner: source={source:?}, segment={segment:?}");
         }
         let output = plan.reconstruct(&vec!["Traduction".to_owned(); plan.segment_count()]);
         assert_eq!(markdown_structure(&output), markdown_structure(source), "syntax mismatch: source={source:?}, output={output:?}");
@@ -701,7 +707,10 @@ async fn markdown_inline_owners_preserve_syntax_and_translate_labels() {
         );
         assert_eq!(
             markdown_structure(segment),
-            MarkdownStructure::default(),
+            MarkdownStructure {
+                blocks: vec!["start:Paragraph".to_owned(), "end:Paragraph".to_owned()],
+                ..MarkdownStructure::default()
+            },
             "model input must be plain complete text: {segment:?}"
         );
         assert!(
