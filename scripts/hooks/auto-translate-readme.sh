@@ -68,8 +68,7 @@ if ! readme_source_is_current; then
   echo "post-commit: HEAD changed during translation; skipping auto-translation commit." >&2
   exit 0
 fi
-if [ -n "$(git diff --cached -- README.zh-cn.md)" ] ||
-  [ "$(sha256sum < "${repo_root}/README.zh-cn.md")" != "${published_readme_hash}" ]; then
+if [ -n "$(git diff --cached -- README.zh-cn.md)" ] || ! published_readme_is_current; then
   echo "post-commit: README.zh-cn.md changed during translation; skipping auto-translation commit." >&2
   exit 0
 fi

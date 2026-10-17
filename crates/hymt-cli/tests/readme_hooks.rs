@@ -1,4 +1,4 @@
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
@@ -50,11 +50,18 @@ case "$1" in
     fi
     if [ "$FIXTURE_CANCEL" = commit ]; then
       printf 'commit-cancel\n' >> "$FIXTURE_LOG"
-      /usr/bin/sleep 30 &
+      if [ "$FIXTURE_CANCEL_MODE" = resistant ]; then
+        /usr/bin/bash -c 'trap "" TERM; while :; do /usr/bin/sleep 1; done' &
+      else
+        /usr/bin/sleep 30 &
+      fi
       descendant=$!
-      printf '%s %s %s\n' "$BASHPID" "$(/usr/bin/awk '{print $22}' /proc/$BASHPID/stat)" "$descendant" > "$FIXTURE_ROOT/consumer-process"
+      group=$(/usr/bin/awk '{print $5}' /proc/$BASHPID/stat)
+      printf '%s %s %s %s\n' "$group" "$(/usr/bin/awk '{print $22}' /proc/$group/stat)" "$descendant" "$(/usr/bin/awk '{print $22}' /proc/$descendant/stat)" > "$FIXTURE_ROOT/consumer-process"
       trap 'wait "$descendant" 2>/dev/null; printf settled > "$FIXTURE_ROOT/consumer-settled"; exit 143' TERM
-      kill -TERM "$PPID"
+      hook=$PPID
+      [ "$group" = "$BASHPID" ] || hook=$(/usr/bin/awk '{print $4}' /proc/$PPID/stat)
+      kill -TERM "$hook"
       wait "$descendant"
       exit 98
     fi
@@ -71,11 +78,19 @@ const TRANSLATOR: &str = r#"#!/bin/bash
 cancel_if_requested() {
   [ "$FIXTURE_CANCEL" = "$1" ] || return 0
   printf '%s-cancel\n' "$1" >> "$FIXTURE_LOG"
-  /usr/bin/sleep 30 &
+  [ "$FIXTURE_CANCEL_MODE" = uncertain ] && exec >/dev/null 2>&1
+  if [ "$FIXTURE_CANCEL_MODE" = resistant ]; then
+    /usr/bin/bash -c 'trap "" TERM; while :; do /usr/bin/sleep 1; done' &
+  else
+    /usr/bin/sleep 30 &
+  fi
   descendant=$!
-  printf '%s %s %s\n' "$BASHPID" "$(/usr/bin/awk '{print $22}' /proc/$BASHPID/stat)" "$descendant" > "$FIXTURE_ROOT/consumer-process"
+  group=$(/usr/bin/awk '{print $5}' /proc/$BASHPID/stat)
+  printf '%s %s %s %s\n' "$group" "$(/usr/bin/awk '{print $22}' /proc/$group/stat)" "$descendant" "$(/usr/bin/awk '{print $22}' /proc/$descendant/stat)" > "$FIXTURE_ROOT/consumer-process"
   trap 'wait "$descendant" 2>/dev/null; printf settled > "$FIXTURE_ROOT/consumer-settled"; exit 143' TERM
-  kill -TERM "$PPID"
+  hook=$PPID
+  [ "$group" = "$BASHPID" ] || hook=$(/usr/bin/awk '{print $4}' /proc/$PPID/stat)
+  kill -TERM "$hook"
   wait "$descendant"
   exit 98
 }
@@ -151,6 +166,13 @@ if [ "$FIXTURE_TRANSLATE_EXIT" = 0 ]; then
     printf '%s' "$FIXTURE_RESULT" > "$6"
   fi
 fi
+if [ "$FIXTURE_CONSUMER_DESCENDANT" = leader-first ]; then
+  /usr/bin/bash -c 'trap "[ -d \"$HOME\" ] && printf settled > \"$FIXTURE_ROOT/descendant-settled\"; exit 0" TERM; while :; do /usr/bin/sleep 1; done' >/dev/null 2>&1 &
+  descendant=$!
+  group=$(/usr/bin/awk '{print $5}' /proc/$BASHPID/stat)
+  printf '%s %s %s %s\n' "$group" "$(/usr/bin/awk '{print $22}' /proc/$group/stat)" "$descendant" "$(/usr/bin/awk '{print $22}' /proc/$descendant/stat)" > "$FIXTURE_ROOT/consumer-process"
+  /usr/bin/sleep 0.05
+fi
 exit "$FIXTURE_TRANSLATE_EXIT"
 "#;
 
@@ -161,6 +183,14 @@ case "$*" in
   *just-tmp*) [ "$FIXTURE_PREP_FAIL" = followup-mkdir ] && exit 42 ;;
 esac
 /usr/bin/mkdir "$@" || exit $?
+if [[ "$*" == *just-tmp* ]]; then
+  output="$FIXTURE_ROOT/README.zh-cn.md"
+  case "$FIXTURE_POST_PUBLISH" in
+    inode) /usr/bin/mv "$output" "$output.saved"; /usr/bin/cp -p "$output.saved" "$output" ;;
+    symlink) /usr/bin/mv "$output" "$output.saved"; /usr/bin/ln -s "$output.saved" "$output" ;;
+    chmod) /usr/bin/chmod 0600 "$output" ;;
+  esac
+fi
 if [ "$FIXTURE_HEAD_CHANGE" = after-publication ] && [[ "$*" == *just-tmp* ]]; then
   printf 'Later committed English.\n' > "$FIXTURE_ROOT/README.md"
   /usr/bin/git -C "$FIXTURE_ROOT" add README.md || exit 97
@@ -206,13 +236,46 @@ if [ "$FIXTURE_REPLACE" = publication-mode ]; then
   printf foreign > "${@: -1}"
 fi
 [ "$FIXTURE_PREP_FAIL" = publish-chmod ] && exit 42
-exec /usr/bin/chmod "$@"
+/usr/bin/chmod "$@" || exit $?
+if [ "$FIXTURE_REPLACE" = destination-fifo ]; then
+  /usr/bin/mv "$FIXTURE_ROOT/README.zh-cn.md" "$FIXTURE_ROOT/old-output"
+  /usr/bin/mkfifo "$FIXTURE_ROOT/README.zh-cn.md"
+fi
 "#;
 
 const MOVE: &str = r#"#!/bin/bash
 printf 'publication-rename\n' >> "$FIXTURE_LOG"
 [ "$FIXTURE_PREP_FAIL" = publish-mv ] && exit 42
-exec /usr/bin/mv "$@"
+/usr/bin/mv "$@" || exit $?
+if [ "${@: -1}" = "$FIXTURE_ROOT/README.zh-cn.md" ]; then
+  output="$FIXTURE_ROOT/README.zh-cn.md"
+  case "$FIXTURE_POST_PUBLISH" in
+    helper-inode) /usr/bin/mv "$output" "$output.saved"; /usr/bin/cp -p "$output.saved" "$output" ;;
+    helper-symlink) /usr/bin/mv "$output" "$output.saved"; /usr/bin/ln -s "$output.saved" "$output" ;;
+    helper-chmod) /usr/bin/chmod 0600 "$output" ;;
+  esac
+fi
+"#;
+
+const BASH_ENV: &str = r#"# Test-only controlled failure to deliver group TERM/KILL.
+kill() {
+  if [ "${2:-}" = -- ] && [[ "${3:-}" = -* ]] &&
+    { [ "$1" = -TERM ] || [ "$1" = -KILL ]; } && [ -f "$FIXTURE_ROOT/consumer-process" ]; then
+    read -r leader original_start _ < "$FIXTURE_ROOT/consumer-process"
+    if [ "${3:-}" = "-$leader" ]; then
+      current_start=$(/usr/bin/awk '{print $22}' "/proc/$leader/stat" 2>/dev/null)
+      [ "$current_start" = "$original_start" ] || printf 'unsafe-group-signal\n' >> "$FIXTURE_LOG"
+    fi
+  fi
+  if [ "${2:-}" = -- ] && [[ "${3:-}" = -* ]] && [ "$1" = -KILL ]; then
+    printf 'group-kill\n' >> "$FIXTURE_LOG"
+  fi
+  if [ "$FIXTURE_FORCE_UNCERTAIN" = 1 ] && [ "${2:-}" = -- ] && [[ "${3:-}" = -* ]] &&
+    { [ "$1" = -TERM ] || [ "$1" = -KILL ]; }; then
+    return 0
+  fi
+  builtin kill "$@"
+}
 "#;
 
 const STAT: &str = r#"#!/bin/bash
@@ -261,6 +324,7 @@ impl Fixture {
             )
             .unwrap();
         }
+        Self::script(&root.join("bash-env"), BASH_ENV);
         for (name, script) in [
             ("git", GIT),
             ("mkdir", MKDIR),
@@ -339,6 +403,7 @@ impl Fixture {
             .env("TEMP", &self.root)
             .env("FIXTURE_ROOT", &self.root)
             .env("FIXTURE_LOG", self.root.join("events"))
+            .env("BASH_ENV", self.root.join("bash-env"))
             .env("FIXTURE_CHANGED", "README.md")
             .env("FIXTURE_ENGLISH_DIRTY", "0")
             .env("FIXTURE_ENGLISH_STAGED", "0")
@@ -351,6 +416,10 @@ impl Fixture {
             .env("FIXTURE_PARTIAL", "0")
             .env("FIXTURE_REPLACE", "")
             .env("FIXTURE_CANCEL", "")
+            .env("FIXTURE_CANCEL_MODE", "")
+            .env("FIXTURE_CONSUMER_DESCENDANT", "")
+            .env("FIXTURE_FORCE_UNCERTAIN", "0")
+            .env("FIXTURE_POST_PUBLISH", "")
             .env("FIXTURE_ROOT_FAULT", "")
             .env("FIXTURE_ATOMIC", "0")
             .env("FIXTURE_CAPABLE", "1")
@@ -398,22 +467,55 @@ impl Fixture {
             .status();
     }
 
-    fn kill_owned_consumer(&self) {
-        let Ok(record) = std::fs::read_to_string(self.root.join("consumer-process")) else {
-            return;
-        };
+    fn owned_consumer_group(&self) -> Option<u32> {
+        let record = std::fs::read_to_string(self.root.join("consumer-process")).ok()?;
         let mut fields = record.split_whitespace();
-        let (Some(pid), Some(start)) = (fields.next(), fields.next()) else {
-            return;
-        };
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-            return;
-        };
-        if stat.split_whitespace().nth(21) == Some(start) {
-            if let Ok(pid) = pid.parse() {
-                Self::kill_group(pid);
-            }
+        let leader: u32 = fields.next()?.parse().ok()?;
+        let leader_start = fields.next()?;
+        let descendant = fields.next()?;
+        let descendant_start = fields.next()?;
+        let leader_stat = std::fs::read_to_string(format!("/proc/{leader}/stat")).ok();
+        if leader_stat
+            .as_deref()
+            .and_then(|stat| stat.split_whitespace().nth(21))
+            == Some(leader_start)
+            && leader_stat
+                .as_deref()
+                .and_then(|stat| stat.rsplit_once(") "))
+                .and_then(|(_, tail)| tail.split_whitespace().next())
+                != Some("Z")
+        {
+            return Some(leader);
         }
+        let descendant_stat = std::fs::read_to_string(format!("/proc/{descendant}/stat")).ok()?;
+        let tail = descendant_stat.rsplit_once(") ")?.1;
+        let mut tail = tail.split_whitespace();
+        let state = tail.next()?;
+        let _parent = tail.next()?;
+        let group = tail.next()?;
+        let _session = tail.next()?;
+        let start = descendant_stat.split_whitespace().nth(21)?;
+        (state != "Z" && group == leader.to_string().as_str() && start == descendant_start)
+            .then_some(leader)
+    }
+
+    fn kill_owned_consumer(&self) {
+        if let Some(group) = self.owned_consumer_group() {
+            Self::kill_group(group);
+        }
+    }
+
+    fn assert_owned_consumer_settled(&self) {
+        for _ in 0..200 {
+            if self.owned_consumer_group().is_none() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            self.owned_consumer_group().is_none(),
+            "fixture consumer survived cleanup"
+        );
     }
 
     fn events(&self) -> String {
@@ -459,6 +561,16 @@ impl Fixture {
             .to_path_buf()
     }
 
+    fn private_workspace(&self) -> Option<PathBuf> {
+        std::fs::read_dir(&self.root).ok()?.find_map(|entry| {
+            let path = entry.ok()?.path();
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| name.starts_with("hymt-readme-"))
+                .map(|_| path.clone())
+        })
+    }
+
     fn assert_clean(&self) {
         for entry in std::fs::read_dir(&self.root).unwrap() {
             let name = entry.unwrap().file_name();
@@ -499,7 +611,16 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        std::fs::remove_dir_all(&self.root).unwrap();
+        self.kill_owned_consumer();
+        for _ in 0..200 {
+            if self.owned_consumer_group().is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if self.owned_consumer_group().is_none() {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
     }
 }
 
@@ -1233,4 +1354,200 @@ async fn readme_hook_publication_preserves_modes_and_new_file_umask() {
         assert!(events.contains("publication-rename\n"));
         fixture.assert_clean();
     }
+}
+
+#[tokio::test]
+async fn readme_hook_rejects_fifo_replacement_before_opening_destination() {
+    let fixture = Fixture::new(true, false);
+    fixture.use_real_git();
+    let before_head = fixture.git(&["rev-parse", "HEAD"]);
+    let before_index = fixture.git(&["show", ":README.zh-cn.md"]);
+    let result = fixture
+        .run(false, &[("FIXTURE_REPLACE", "destination-fifo")])
+        .await;
+    assert!(!result.status.success(), "{result:?}");
+    assert_eq!(fixture.translated(), 1);
+    assert!(fixture
+        .root
+        .join("README.zh-cn.md")
+        .symlink_metadata()
+        .unwrap()
+        .file_type()
+        .is_fifo());
+    assert_eq!(fixture.git(&["rev-parse", "HEAD"]), before_head);
+    assert_eq!(fixture.git(&["show", ":README.zh-cn.md"]), before_index);
+    assert!(!fixture.workspace().exists());
+}
+
+#[tokio::test]
+async fn readme_helper_rejects_postpublication_type_identity_and_mode_changes() {
+    for kind in ["inode", "symlink", "chmod"] {
+        let fixture = Fixture::new(true, false);
+        fixture.use_real_git();
+        let phase = format!("helper-{kind}");
+        let result = fixture
+            .run(false, &[("FIXTURE_POST_PUBLISH", phase.as_str())])
+            .await;
+        assert!(!result.status.success(), "{kind}: {result:?}");
+        assert_eq!(fixture.translated(), 1);
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("output changed after publication")
+        );
+        let output = fixture.root.join("README.zh-cn.md");
+        assert_eq!(std::fs::read_to_string(&output).unwrap(), NEW_CHINESE);
+        assert_eq!(output.is_symlink(), kind == "symlink");
+        if kind == "inode" {
+            assert_ne!(
+                output.metadata().unwrap().ino(),
+                fixture
+                    .root
+                    .join("README.zh-cn.md.saved")
+                    .metadata()
+                    .unwrap()
+                    .ino()
+            );
+        }
+        if kind == "chmod" {
+            assert_eq!(
+                output.metadata().unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert_eq!(
+            fixture.git(&["show", ":README.zh-cn.md"]),
+            OLD_CHINESE.as_bytes()
+        );
+        assert_eq!(
+            fixture.git(&["show", "HEAD:README.zh-cn.md"]),
+            OLD_CHINESE.as_bytes()
+        );
+        assert_eq!(fixture.git(&["rev-list", "--count", "HEAD"]), b"2\n");
+        assert!(!fixture.workspace().exists());
+    }
+}
+
+#[tokio::test]
+async fn readme_wrapper_rejects_postpublication_type_identity_and_mode_changes() {
+    for kind in ["inode", "symlink", "chmod"] {
+        let fixture = Fixture::new(true, false);
+        fixture.use_real_git();
+        let result = fixture.run(true, &[("FIXTURE_POST_PUBLISH", kind)]).await;
+        assert!(result.status.success(), "{kind}: {result:?}");
+        assert_eq!(fixture.translated(), 1);
+        assert!(String::from_utf8_lossy(&result.stderr).contains("changed during translation"));
+        let output = fixture.root.join("README.zh-cn.md");
+        assert_eq!(std::fs::read_to_string(&output).unwrap(), NEW_CHINESE);
+        assert_eq!(output.is_symlink(), kind == "symlink");
+        if kind == "inode" {
+            assert_ne!(
+                output.metadata().unwrap().ino(),
+                fixture
+                    .root
+                    .join("README.zh-cn.md.saved")
+                    .metadata()
+                    .unwrap()
+                    .ino()
+            );
+        }
+        if kind == "chmod" {
+            assert_eq!(
+                output.metadata().unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert_eq!(
+            fixture.git(&["show", ":README.zh-cn.md"]),
+            OLD_CHINESE.as_bytes()
+        );
+        assert_eq!(
+            fixture.git(&["show", "HEAD:README.zh-cn.md"]),
+            OLD_CHINESE.as_bytes()
+        );
+        assert_eq!(fixture.git(&["rev-list", "--count", "HEAD"]), b"2\n");
+        assert!(!fixture.workspace().exists());
+    }
+}
+
+#[tokio::test]
+async fn readme_hook_bounds_resistant_cancellation_and_leader_first_descendants() {
+    for phase in ["probe", "translation", "commit"] {
+        let fixture = Fixture::new(true, false);
+        let result = fixture
+            .run(
+                true,
+                &[
+                    ("FIXTURE_CANCEL", phase),
+                    ("FIXTURE_CANCEL_MODE", "resistant"),
+                ],
+            )
+            .await;
+        assert_eq!(result.status.code(), Some(143), "{phase}: {result:?}");
+        assert!(
+            fixture.events().contains("group-kill\n"),
+            "{phase}: no escalation"
+        );
+        assert!(
+            !fixture.events().contains("unsafe-group-signal\n"),
+            "{phase}: signalled an unverified group"
+        );
+        if fixture.private_workspace().is_some() {
+            assert!(String::from_utf8_lossy(&result.stderr).contains("settlement unconfirmed"));
+            fixture.kill_owned_consumer();
+            fixture.assert_owned_consumer_settled();
+        } else {
+            assert!(fixture.owned_consumer_group().is_none());
+            fixture.assert_clean();
+        }
+    }
+    let fixture = Fixture::new(true, false);
+    let result = fixture
+        .run(true, &[("FIXTURE_CONSUMER_DESCENDANT", "leader-first")])
+        .await;
+    assert!(
+        fixture.root.join("descendant-settled").exists(),
+        "{result:?}"
+    );
+    assert!(
+        !fixture.events().contains("unsafe-group-signal\n"),
+        "events={} record={} result={result:?}",
+        fixture.events(),
+        std::fs::read_to_string(fixture.root.join("consumer-process")).unwrap_or_default()
+    );
+    if fixture.private_workspace().is_some() {
+        assert!(String::from_utf8_lossy(&result.stderr).contains("settlement unconfirmed"));
+        fixture.kill_owned_consumer();
+        fixture.assert_owned_consumer_settled();
+    } else {
+        assert!(fixture.owned_consumer_group().is_none());
+        fixture.assert_clean();
+    }
+}
+
+#[tokio::test]
+async fn readme_hook_retains_runtime_when_group_settlement_is_unconfirmed() {
+    let fixture = Fixture::new(true, false);
+    let result = fixture
+        .run(
+            true,
+            &[
+                ("FIXTURE_CANCEL", "translation"),
+                ("FIXTURE_CANCEL_MODE", "uncertain"),
+                ("FIXTURE_FORCE_UNCERTAIN", "1"),
+            ],
+        )
+        .await;
+    assert_eq!(result.status.code(), Some(143), "{result:?}");
+    assert!(fixture.events().contains("group-kill\n"));
+    assert!(!fixture.events().contains("unsafe-group-signal\n"));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("settlement unconfirmed"));
+    assert!(
+        fixture.private_workspace().is_some(),
+        "private runtime was deleted before settlement"
+    );
+    assert!(
+        fixture.owned_consumer_group().is_some(),
+        "control consumer did not remain alive"
+    );
+    fixture.kill_owned_consumer();
+    fixture.assert_owned_consumer_settled();
 }
