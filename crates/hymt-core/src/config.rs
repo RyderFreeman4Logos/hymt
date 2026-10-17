@@ -1013,7 +1013,7 @@ impl HotConfig {
         self.state.write().unwrap().backend_runtime_info = None;
     }
 
-    /// Context available to the planner after applying verified service limits.
+    /// Context available to the planner after applying live or retained verified service limits.
     ///
     /// An unavailable preflight uses a deliberately conservative 4k context
     /// rather than promoting the configured maximum as verified service state.
@@ -1023,7 +1023,7 @@ impl HotConfig {
         let runtime = self.backend_runtime_info();
         match runtime {
             Some(info) if Some(info.backend) == backend => match info.verification_status {
-                BackendVerificationStatus::Verified => info
+                BackendVerificationStatus::Verified | BackendVerificationStatus::Historical => info
                     .per_slot_context
                     .map(|runtime_limit| configured.min(runtime_limit))
                     .unwrap_or(configured),
@@ -1047,14 +1047,14 @@ impl HotConfig {
         self.get_positive_u32("translation", "max_output_tokens", default)
     }
 
-    /// Output reservation after applying a verified server generation cap.
+    /// Output reservation after applying a live or retained verified server generation cap.
     pub fn resolved_max_output_tokens(&self) -> u32 {
         let configured = self.max_output_tokens();
         let backend = self.generation_backend().ok();
         let runtime = self.backend_runtime_info();
         match runtime {
             Some(info) if Some(info.backend) == backend => match info.verification_status {
-                BackendVerificationStatus::Verified => info
+                BackendVerificationStatus::Verified | BackendVerificationStatus::Historical => info
                     .default_max_generation_tokens
                     .map(|runtime_limit| configured.min(runtime_limit))
                     .unwrap_or(configured),

@@ -339,3 +339,104 @@ async fn live_reload_invalidates_preflight_ttl_even_at_the_same_endpoint() {
     );
     assert_eq!(after.runtime.per_slot_context, Some(4096));
 }
+
+#[tokio::test]
+async fn historical_planning_keeps_limits_without_fresh_verification() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
+    let address = listener.local_addr().expect("listener address");
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept props");
+        let request = read_http_request(&mut socket).await;
+        assert!(request.starts_with("GET /props HTTP/1.1"));
+        let body = r#"{"model_alias":"served-model","n_ctx":16384,"n_ctx_per_seq":8192,"default_generation_settings":{"n_predict":512}}"#;
+        socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Hymt-Planning: historical\r\nX-Hymt-Observed-At: 77\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.expect("write historical props");
+    });
+    let config = config_for(&format!("http://{address}/v1"), false);
+    let client = TranslationClient::new(config.clone()).expect("client");
+    let report = client
+        .preflight_backend()
+        .await
+        .expect("historical planning");
+    assert_eq!(
+        serde_json::to_value(report.runtime.verification_status).expect("status"),
+        "historical"
+    );
+    assert_eq!(report.runtime.observed_at_unix_secs, 77);
+    assert!(!report.runtime.is_verified());
+    assert_eq!(config.resolved_per_request_context(), 8192);
+    assert_eq!(config.resolved_max_output_tokens(), 512);
+    assert!(report
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("historical")));
+    server.await.expect("server task");
+}
+
+#[test]
+fn historical_provenance_rejects_missing_duplicate_and_future_timestamps() {
+    use reqwest::header::{HeaderMap, HeaderValue};
+    let mut headers = HeaderMap::new();
+    assert_eq!(historical_observation(&headers, 100), Ok(None));
+    headers.insert("x-hymt-planning", HeaderValue::from_static("historical"));
+    assert!(historical_observation(&headers, 100).is_err());
+    headers.insert("x-hymt-observed-at", HeaderValue::from_static("101"));
+    assert!(historical_observation(&headers, 100).is_err());
+    headers.insert("x-hymt-observed-at", HeaderValue::from_static("77"));
+    assert_eq!(historical_observation(&headers, 100), Ok(Some(77)));
+    headers.append("x-hymt-observed-at", HeaderValue::from_static("77"));
+    assert!(historical_observation(&headers, 100).is_err());
+}
+
+#[tokio::test]
+async fn historical_planning_without_required_token_evidence_is_unverified() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
+    let address = listener.local_addr().expect("listener address");
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept props");
+        read_http_request(&mut socket).await;
+        let body = r#"{"model_alias":"served-model","n_ctx":16384,"eos_token":".","chat_template":"<|eos|>"}"#;
+        socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Hymt-Planning: historical\r\nX-Hymt-Observed-At: 77\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.expect("write props");
+        let (mut socket, _) = listener.accept().await.expect("accept tokenize");
+        assert!(read_http_request(&mut socket)
+            .await
+            .starts_with("POST /tokenize "));
+        socket
+            .write_all(
+                b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .expect("write unavailable");
+    });
+    let client =
+        TranslationClient::new(config_for(&format!("http://{address}/v1"), false)).expect("client");
+    let report = client
+        .preflight_backend()
+        .await
+        .expect("ordinary preflight");
+    assert_eq!(
+        report.runtime.verification_status,
+        BackendVerificationStatus::Unverified
+    );
+    assert!(report
+        .runtime
+        .verification_message
+        .expect("reason")
+        .contains("tokenization"));
+    server.await.expect("server task");
+}
+
+#[test]
+fn strict_preflight_still_rejects_historical_planning() {
+    let config = config_for("http://127.0.0.1:1/v1", true);
+    let client = TranslationClient::new(config).expect("client");
+    let mut runtime = BackendRuntimeInfo::from_llama_cpp_props(
+        &serde_json::json!({"model_alias":"served-model","n_ctx":16384}),
+        77,
+    )
+    .expect("runtime");
+    runtime.verification_status = BackendVerificationStatus::Historical;
+    assert!(matches!(
+        client.backend_preflight_report(runtime, Vec::new(), true),
+        Err(ClientError::BackendPreflight(_))
+    ));
+}

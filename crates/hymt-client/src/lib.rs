@@ -16,6 +16,28 @@ use thiserror::Error;
 use tokio::sync::Semaphore;
 use tokio_stream::wrappers::ReceiverStream;
 
+/// Accept historical planning only with one explicit marker and a retained timestamp.
+fn historical_observation(
+    headers: &reqwest::header::HeaderMap,
+    now: u64,
+) -> Result<Option<u64>, &'static str> {
+    let markers: Vec<_> = headers.get_all("x-hymt-planning").iter().collect();
+    let observations: Vec<_> = headers.get_all("x-hymt-observed-at").iter().collect();
+    if markers.is_empty() && observations.is_empty() {
+        return Ok(None);
+    }
+    if markers.len() != 1 || markers[0] != "historical" || observations.len() != 1 {
+        return Err("invalid inference-cache planning provenance");
+    }
+    let observed = observations[0]
+        .to_str()
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0 && *value <= now)
+        .ok_or("invalid historical planning timestamp")?;
+    Ok(Some(observed))
+}
+
 // ── Error ─────────────────────────────────────────────────────────────────────
 
 /// All errors that can occur during a translation request.
@@ -539,41 +561,71 @@ impl TranslationClient {
             .send()
             .await
         {
-            Ok(response) if response.status().is_success() => match response.json().await {
-                Ok(body) => {
-                    let parsed = match backend {
-                        GenerationBackend::LlamaCpp => {
-                            BackendRuntimeInfo::from_llama_cpp_props(&body, observed_at_unix_secs)
-                        }
-                        GenerationBackend::Vllm | GenerationBackend::OpenAiCompatible => {
-                            BackendRuntimeInfo::from_openai_models(
+            Ok(response) if response.status().is_success() => {
+                let historical =
+                    match historical_observation(response.headers(), observed_at_unix_secs) {
+                        Ok(value) => value,
+                        Err(message) => {
+                            return BackendRuntimeInfo::unverified(
                                 backend,
-                                &body,
                                 observed_at_unix_secs,
+                                message,
                             )
                         }
                     };
-                    match parsed {
-                        Ok(mut runtime) => {
-                            if let Some(false_eos_token) = runtime.false_eos_token.clone() {
-                                runtime.false_eos_token_id =
-                                    self.llama_cpp_false_eos_token_id(&false_eos_token).await;
+                match response.json().await {
+                    Ok(body) => {
+                        let parsed = match backend {
+                            GenerationBackend::LlamaCpp => {
+                                BackendRuntimeInfo::from_llama_cpp_props(
+                                    &body,
+                                    observed_at_unix_secs,
+                                )
                             }
-                            runtime
+                            GenerationBackend::Vllm | GenerationBackend::OpenAiCompatible => {
+                                BackendRuntimeInfo::from_openai_models(
+                                    backend,
+                                    &body,
+                                    observed_at_unix_secs,
+                                )
+                            }
+                        };
+                        match parsed {
+                            Ok(mut runtime) => {
+                                if let Some(observed) = historical {
+                                    runtime.verification_status =
+                                        BackendVerificationStatus::Historical;
+                                    runtime.observed_at_unix_secs = observed;
+                                    runtime.verification_message = Some("historical inference-cache planning; live backend unavailable".to_owned());
+                                }
+                                if let Some(false_eos_token) = runtime.false_eos_token.clone() {
+                                    runtime.false_eos_token_id =
+                                        self.llama_cpp_false_eos_token_id(&false_eos_token).await;
+                                    if historical.is_some() && runtime.false_eos_token_id.is_none()
+                                    {
+                                        return BackendRuntimeInfo::unverified(
+                                            backend,
+                                            runtime.observed_at_unix_secs,
+                                            "historical false-EOS tokenization evidence is unavailable",
+                                        );
+                                    }
+                                }
+                                runtime
+                            }
+                            Err(error) => BackendRuntimeInfo::unverified(
+                                backend,
+                                observed_at_unix_secs,
+                                format!("malformed backend response: {error}"),
+                            ),
                         }
-                        Err(error) => BackendRuntimeInfo::unverified(
-                            backend,
-                            observed_at_unix_secs,
-                            format!("malformed backend response: {error}"),
-                        ),
                     }
+                    Err(_) => BackendRuntimeInfo::unverified(
+                        backend,
+                        observed_at_unix_secs,
+                        "backend returned invalid JSON",
+                    ),
                 }
-                Err(_) => BackendRuntimeInfo::unverified(
-                    backend,
-                    observed_at_unix_secs,
-                    "backend returned invalid JSON",
-                ),
-            },
+            }
             Ok(response) => BackendRuntimeInfo::unverified(
                 backend,
                 observed_at_unix_secs,
@@ -653,6 +705,9 @@ impl TranslationClient {
     fn preflight_warnings(&self, runtime: &BackendRuntimeInfo) -> Result<Vec<String>, ClientError> {
         let configured = self.configured_backend_info()?;
         let mut warnings = Vec::new();
+        if runtime.verification_status == BackendVerificationStatus::Historical {
+            warnings.push(format!("runtime planning is historical (last verified at Unix {}); live backend is unavailable", runtime.observed_at_unix_secs));
+        }
         if runtime.verification_status == BackendVerificationStatus::Unverified {
             warnings.push(format!(
                 "runtime preflight is unverified: {}",
