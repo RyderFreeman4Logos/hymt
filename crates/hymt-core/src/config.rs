@@ -80,8 +80,8 @@ min_paragraph_ratio = 0.5
 max_retries = 2
 # Failed completeness retries are rejected before output, cache, or success history.
 # Set true (or pass --warn-only-completeness) to explicitly allow eligible degraded
-# best attempts with warnings. Empty or below-33% candidates remain errors even
-# in this opt-in mode.
+# best attempts with warnings. Empty, below-33%, identity, and Markdown structure
+# failures remain errors even in this opt-in mode.
 warn_only = false
 
 [cache]
@@ -1319,10 +1319,10 @@ impl HotConfig {
         self.get_non_negative_u32("completeness", "max_retries", 2)
     }
 
-    /// When true, completeness best-attempt fallback only warns (exit 0).
+    /// Whether eligible best attempts may return with warnings after retries fail.
     ///
-    /// Default is `false`: top-level CLI translation reports non-success after
-    /// writing the best-effort output so scripts can detect degraded results.
+    /// Default is `false`: exhausted failures are errors before document output.
+    /// Opting in still rejects empty, below-floor, identity, and structure failures.
     pub fn completeness_warn_only(&self) -> bool {
         self.get_bool("completeness", "warn_only", false)
     }
