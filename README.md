@@ -188,6 +188,8 @@ printf 'Release notes go here.\n' | hymt -l ja
 hymt CHANGELOG.md -l fr -o CHANGELOG.fr.md
 ```
 
+File output from text, stdin, file, `batch`, and `translate-doc` uses an exclusively created temporary in the destination directory, writes and flushes all bytes, closes it, then renames it into place. Failed or cancelled writes preserve the previous file and its hard-link aliases; successful replacement leaves old aliases unchanged. Valid leaf symlinks to regular files and directory symlinks remain links. Dangling links, nonregular targets, and permission errors are rejected. Existing ordinary permission bits are retained; new files follow the process umask. ACLs, extended attributes, ownership, special mode bits, power-loss durability, and concurrent path replacement are outside this guarantee. Validated cache/history written before an output error is not rolled back.
+
 ### Target language codes
 
 All prompt construction, validation, detection, output filenames, CLI estimates, and Telegram routing use one canonical registry. Supported canonical codes are:

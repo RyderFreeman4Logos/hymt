@@ -20,7 +20,7 @@ use hymt_segment::Segmenter;
 use crate::doc_translate::{build_output_path, target_lang_path_suffix};
 use crate::translate::{
     effective_document_translation_policy, plan_translation, segment_cache_hash,
-    template_options_hash, translate_text, TranslationCtx,
+    template_options_hash, translate_text, write_translation_output, TranslationCtx,
 };
 
 // Supported source file extensions
@@ -400,10 +400,7 @@ pub async fn run_batch_translation(
             .with_context(|| format!("translating {}", file.source_path.display()))?;
         outcome.report_completeness_degraded();
 
-        if let Some(parent) = file.output_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        tokio::fs::write(&file.output_path, &outcome.text)
+        write_translation_output(&file.output_path, &outcome.text)
             .await
             .with_context(|| format!("writing {}", file.output_path.display()))?;
     }

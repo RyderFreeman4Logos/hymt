@@ -7,7 +7,8 @@
 //!      completeness with retry, reassemble, record history.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
@@ -2683,16 +2684,130 @@ async fn translate_text_stream_inner(
 
 // ── output writing ─────────────────────────────────────────────────────────────
 
-/// Write translated output to `output_path`, creating non-empty parent dirs.
+/// Replace output after a complete write, retaining ordinary permissions and valid leaf links.
+/// Failed or cancelled writes leave the previous destination and hard links unchanged.
 pub async fn write_translation_output(output_path: &Path, translated: &str) -> Result<()> {
-    if let Some(parent) = non_empty_parent(output_path) {
-        tokio::fs::create_dir_all(parent)
-            .await
+    use tokio::io::AsyncWriteExt;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let metadata = match std::fs::symlink_metadata(output_path) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspecting {}", output_path.display()))
+        }
+    };
+    let destination = if metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.is_symlink())
+    {
+        std::fs::canonicalize(output_path)
+            .with_context(|| format!("resolving {}", output_path.display()))?
+    } else {
+        output_path.to_owned()
+    };
+    anyhow::ensure!(
+        destination.file_name().is_some(),
+        "output must have a file name"
+    );
+    let mode = if metadata.is_some() {
+        let metadata = std::fs::metadata(&destination)?;
+        anyhow::ensure!(
+            metadata.is_file(),
+            "output must be a regular file: {}",
+            destination.display()
+        );
+        // Renaming requires parent permissions; retain the existing file's write-access check too.
+        std::fs::OpenOptions::new().write(true).open(&destination)?;
+        Some(metadata.mode() & 0o777)
+    } else {
+        None
+    };
+    if let Some(parent) = non_empty_parent(&destination) {
+        std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    tokio::fs::write(output_path, translated)
+    let temporary = destination.with_file_name(format!(
+        ".hymt-output-{}-{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let (mut owner, mut file) = OutputTemp::create(temporary, mode)?;
+    file.write_all(translated.as_bytes())
         .await
-        .with_context(|| format!("writing {}", output_path.display()))
+        .with_context(|| format!("writing {}", destination.display()))?;
+    file.flush()
+        .await
+        .with_context(|| format!("flushing {}", destination.display()))?;
+    drop(file);
+    drop(owner.file.take());
+    // No await after close: cancellation cannot detach an unfinished rename.
+    std::fs::rename(&owner.path, &destination)
+        .with_context(|| format!("replacing {}", destination.display()))?;
+    owner.published = true;
+    Ok(())
+}
+
+struct OutputTemp {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+    identity: Option<(u64, u64)>,
+    published: bool,
+}
+
+impl OutputTemp {
+    fn create(path: PathBuf, mode: Option<u32>) -> Result<(Self, tokio::fs::File)> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode.unwrap_or(0o666))
+            .open(&path)?;
+        let mut owner = Self {
+            path,
+            file: Some(file),
+            identity: None,
+            published: false,
+        };
+        let file = owner
+            .file
+            .as_ref()
+            .context("missing new output descriptor")?;
+        let metadata = file.metadata()?;
+        owner.identity = Some((metadata.dev(), metadata.ino()));
+        // The create mode already prevents widening; restore bits filtered by umask before writing.
+        if let Some(mode) = mode {
+            file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        }
+        let writer = tokio::fs::File::from_std(file.try_clone()?);
+        Ok((owner, writer))
+    }
+}
+
+impl Drop for OutputTemp {
+    fn drop(&mut self) {
+        if self.published {
+            return;
+        }
+        let identity = self.identity.or_else(|| {
+            self.file
+                .as_ref()?
+                .metadata()
+                .ok()
+                .map(|metadata| (metadata.dev(), metadata.ino()))
+        });
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(metadata)
+                if metadata.is_file() && identity == Some((metadata.dev(), metadata.ino())) =>
+            {
+                if let Err(error) = std::fs::remove_file(&self.path) {
+                    eprintln!("Warning: output temporary cleanup failed: {error}");
+                }
+            }
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                eprintln!("Warning: output temporary inspection failed: {error}")
+            }
+            _ => {}
+        }
+    }
 }
 
 fn non_empty_parent(path: &Path) -> Option<&Path> {
@@ -2743,6 +2858,7 @@ mod tests {
     mod identity_tests;
     pub(super) use identity_tests::record_placeholder_scan;
     mod markdown_boundary_tests;
+    mod output_tests;
     pub(super) use markdown_boundary_tests::record_semantic_bytes;
     pub(super) mod ownership_interval_tests;
     mod table_shape_tests;

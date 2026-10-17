@@ -16,7 +16,7 @@ use hymt_core::language_spec::{language_spec, normalize_language_code};
 use hymt_core::templates::{PromptOpts, TemplateType};
 use hymt_segment::Segmenter;
 
-use crate::translate::{translate_text, TranslationCtx};
+use crate::translate::{translate_text, write_translation_output, TranslationCtx};
 
 // ── Output path helpers ───────────────────────────────────────────────────────
 
@@ -248,9 +248,8 @@ pub struct DocTranslationOpts<'a> {
 
 /// Translate `source` (file or directory of `.md` files) to `target_lang`.
 ///
-/// Writes each translated file atomically via a uniquely-named temp file in
-/// the same directory, preventing races when multiple translations run in
-/// parallel.
+/// Publishes each complete document through the shared output replacement helper.
+/// Existing regular-file permissions and valid leaf symlinks are retained.
 pub async fn run_doc_translation(source: &Path, opts: &DocTranslationOpts<'_>) -> Result<()> {
     let targets = build_doc_translation_targets(
         source,
@@ -325,27 +324,9 @@ async fn run_doc_translation_target(
     )
     .await?;
     outcome.report_completeness_degraded();
-    let translated = outcome.text;
-
-    // Atomic write: PID + epoch-ns suffix prevents concurrent temp-file collisions.
-    if let Some(parent) = target.output_path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let uid = format!(
-        "tmp.{}.{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    );
-    let tmp = target.output_path.with_extension(uid);
-    tokio::fs::write(&tmp, &translated)
+    write_translation_output(&target.output_path, &outcome.text)
         .await
-        .with_context(|| format!("writing temp file {}", tmp.display()))?;
-    tokio::fs::rename(&tmp, &target.output_path)
-        .await
-        .with_context(|| format!("renaming to {}", target.output_path.display()))?;
+        .with_context(|| format!("writing {}", target.output_path.display()))?;
 
     Ok(())
 }
