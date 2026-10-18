@@ -1,12 +1,13 @@
+use std::cell::Cell;
 use std::path::PathBuf;
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 
 const SOURCE: &str = "This report explains reliable translation history and cache behavior.";
 const REPLY: &str = "这份报告说明可靠的翻译历史记录和缓存行为为什么重要。";
@@ -16,6 +17,7 @@ struct Fixture {
     endpoint: String,
     requests: Arc<Mutex<Vec<String>>>,
     provider: tokio::task::JoinHandle<()>,
+    retain: Cell<bool>,
 }
 
 impl Fixture {
@@ -81,6 +83,7 @@ impl Fixture {
             endpoint,
             requests,
             provider,
+            retain: Cell::new(false),
         }
     }
 
@@ -105,20 +108,61 @@ impl Fixture {
             .kill_on_drop(true)
             .spawn()
             .unwrap();
-        let status = tokio::time::timeout(Duration::from_secs(15), child.wait()).await;
-        if status.is_err() {
-            child.start_kill().unwrap();
-            tokio::time::timeout(Duration::from_secs(5), child.wait())
-                .await
-                .expect("timed out child must be reaped")
+        let status = self
+            .wait_for_child(label, &mut child, Duration::from_secs(15))
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        (
+            status.success(),
+            std::fs::read_to_string(stdout).unwrap(),
+            std::fs::read_to_string(stderr).unwrap(),
+        )
+    }
+
+    async fn wait_for_child(
+        &self,
+        label: &str,
+        child: &mut Child,
+        deadline: Duration,
+    ) -> Result<ExitStatus, String> {
+        let pid = child.id().expect("spawned fixture child");
+        let initial = child_snapshot(pid);
+        let started = Instant::now();
+        match tokio::time::timeout(deadline, child.wait()).await {
+            Ok(status) => status.map_err(|error| error.to_string()),
+            Err(error) => {
+                self.retain.set(true);
+                let before_kill = child_snapshot(pid);
+                let elapsed = started.elapsed();
+                let try_wait_before_kill = child.try_wait();
+                let kill = child.start_kill();
+                let reap = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+                let evidence = self.root.join(format!("{label}.timeout.json"));
+                std::fs::write(
+                    &evidence,
+                    serde_json::to_vec_pretty(&json!({
+                        "pid": pid,
+                        "initial": initial,
+                        "before_kill": before_kill,
+                        "after_reap": child_snapshot(pid),
+                        "wait_elapsed_ms": elapsed.as_millis(),
+                        "try_wait_before_kill": format!("{try_wait_before_kill:?}"),
+                        "kill": format!("{kill:?}"),
+                        "reap": format!("{reap:?}"),
+                        "try_wait_after_reap": format!("{:?}", child.try_wait()),
+                        "stdout": self.root.join(format!("{label}.stdout")),
+                        "stderr": self.root.join(format!("{label}.stderr")),
+                        "requests": self.requests.lock().unwrap().len(),
+                    }))
+                    .unwrap(),
+                )
                 .unwrap();
+                eprintln!("preflight timeout evidence: {}", evidence.display());
+                kill.expect("timed out child must be killed");
+                reap.expect("timed out child must be reaped").unwrap();
+                Err(format!("{error}; evidence: {}", evidence.display()))
+            }
         }
-        let stderr = std::fs::read_to_string(stderr).unwrap();
-        let success = status
-            .unwrap_or_else(|error| panic!("{error}: {stderr}"))
-            .unwrap()
-            .success();
-        (success, std::fs::read_to_string(stdout).unwrap(), stderr)
     }
 
     async fn stop(&mut self) {
@@ -132,8 +176,32 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.provider.abort();
-        std::fs::remove_dir_all(&self.root).expect("remove synthetic preflight fixture");
+        if self.retain.get() || std::thread::panicking() {
+            eprintln!("retained preflight fixture: {}", self.root.display());
+        } else {
+            std::fs::remove_dir_all(&self.root).expect("remove synthetic preflight fixture");
+        }
     }
+}
+
+// Process metadata only: never collect environment variables or command arguments.
+fn child_snapshot(pid: u32) -> Value {
+    let root = PathBuf::from(format!("/proc/{pid}"));
+    let stat = std::fs::read_to_string(root.join("stat")).ok();
+    let start_ticks = stat.as_deref().and_then(|stat| {
+        stat.rsplit_once(") ")?
+            .1
+            .split_whitespace()
+            .nth(19)?
+            .parse::<u64>()
+            .ok()
+    });
+    json!({
+        "start_ticks": start_ticks,
+        "stat": stat,
+        "status": std::fs::read_to_string(root.join("status")).ok(),
+        "wchan": std::fs::read_to_string(root.join("wchan")).ok(),
+    })
 }
 
 fn props(model: &str, cap: u32) -> Value {
@@ -249,4 +317,70 @@ async fn complete_replay_does_not_probe_or_emit_live_warnings() {
         2,
         "replay must not touch the live backend"
     );
+}
+
+#[tokio::test]
+async fn failed_fixture_retains_evidence_and_successful_fixture_cleans_up() {
+    let fixture = Fixture::new(json!([])).await;
+    let root = fixture.root.clone();
+    std::fs::write(root.join("failure.stderr"), "synthetic diagnostic").unwrap();
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _fixture = fixture;
+        panic!("synthetic fixture assertion");
+    }));
+    assert!(panic.is_err());
+    assert!(root.exists(), "failed fixture must preserve its evidence");
+    assert_eq!(
+        std::fs::read_to_string(root.join("failure.stderr")).unwrap(),
+        "synthetic diagnostic"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+
+    let fixture = Fixture::new(json!([])).await;
+    let root = fixture.root.clone();
+    drop(fixture);
+    assert!(!root.exists(), "successful fixture must be cleaned up");
+}
+
+#[tokio::test]
+async fn timeout_retains_child_identity_outputs_and_reap_result() {
+    let fixture = Fixture::new(json!([])).await;
+    let root = fixture.root.clone();
+    let stdout = root.join("timeout.stdout");
+    let stderr = root.join("timeout.stderr");
+    let mut child = Command::new("sh")
+        .args([
+            "-c",
+            "printf 'synthetic stdout'; printf 'synthetic stderr' >&2; exec sleep 30",
+        ])
+        .stdin(Stdio::null())
+        .stdout(std::fs::File::create_new(&stdout).unwrap())
+        .stderr(std::fs::File::create_new(&stderr).unwrap())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let pid = child.id().unwrap();
+    let result = fixture
+        .wait_for_child("timeout", &mut child, Duration::from_millis(250))
+        .await;
+    assert!(result.is_err());
+    let evidence: Value =
+        serde_json::from_slice(&std::fs::read(root.join("timeout.timeout.json")).unwrap()).unwrap();
+    assert_eq!(evidence["pid"], pid);
+    assert!(evidence["initial"]["start_ticks"].as_u64().is_some());
+    assert_eq!(
+        evidence["initial"]["start_ticks"],
+        evidence["before_kill"]["start_ticks"]
+    );
+    assert_eq!(evidence["try_wait_before_kill"], "Ok(None)");
+    assert_eq!(evidence["kill"], "Ok(())");
+    assert!(evidence["reap"].as_str().unwrap().starts_with("Ok(Ok("));
+    assert!(!child.try_wait().unwrap().unwrap().success());
+    assert!(evidence["after_reap"]["stat"].is_null());
+    assert_eq!(evidence["stdout"], stdout.to_str().unwrap());
+    assert_eq!(evidence["stderr"], stderr.to_str().unwrap());
+    drop(fixture);
+    assert_eq!(std::fs::read_to_string(stdout).unwrap(), "synthetic stdout");
+    assert_eq!(std::fs::read_to_string(stderr).unwrap(), "synthetic stderr");
+    std::fs::remove_dir_all(root).unwrap();
 }
