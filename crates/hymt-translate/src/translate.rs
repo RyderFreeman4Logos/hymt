@@ -3917,18 +3917,32 @@ mod tests {
     }
 
     fn temp_path(tag: &str) -> PathBuf {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        temp_path_at(tag, timestamp)
+    }
+
+    fn temp_path_at(tag: &str, timestamp: u128) -> PathBuf {
+        static NEXT_PATH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let unique = format!(
-            "{}-{}-{}",
+            "{}-{}-{}-{}",
             std::process::id(),
             tag,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            NEXT_PATH.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            timestamp
         );
         let dir = std::env::temp_dir().join(format!("hymt-translate-test-{unique}"));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("test-file")
+    }
+
+    #[test]
+    fn test_paths_remain_unique_when_the_clock_does_not_advance() {
+        let first = temp_path_at("fixed-clock", 7);
+        let second = temp_path_at("fixed-clock", 7);
+        assert_ne!(first, second);
     }
 
     fn make_stream_config(endpoint_url: &str) -> hymt_core::config::HotConfig {
