@@ -1589,8 +1589,7 @@ impl HotConfig {
     fn get_non_negative_u32(&self, section: &str, key: &str, default: u32) -> u32 {
         self.section_value(section, key)
             .and_then(|v| v.as_integer())
-            .filter(|&n| n >= 0)
-            .map(|n| n as u32)
+            .and_then(|n| u32::try_from(n).ok())
             .unwrap_or(default)
     }
 
@@ -1811,6 +1810,41 @@ mod tests {
         assert!(cfg.completeness_warn_only());
         assert!(!cfg.strict_token_budget());
         assert!(!cfg.application_cache_enabled());
+    }
+
+    #[test]
+    fn non_negative_u32_config_boundaries() {
+        let path = temp_config_path("non-negative-u32-boundaries");
+        for (value, expected) in [
+            ("0", Some(0)),
+            ("1", Some(1)),
+            ("4294967295", Some(u32::MAX)),
+            ("4294967296", None),
+            ("9223372036854775807", None),
+            ("-1", None),
+            ("'invalid'", None),
+        ] {
+            fs::write(
+                &path,
+                format!(
+                    "[completeness]\nmax_retries = {value}\n\
+                     [translation]\nmax_source_tokens_per_segment = {value}\n"
+                ),
+            )
+            .unwrap();
+            let cfg = HotConfig::from_path(&path).unwrap();
+            assert_eq!(
+                cfg.completeness_max_retries(),
+                expected.unwrap_or(2),
+                "max_retries = {value}"
+            );
+            assert_eq!(
+                cfg.max_source_tokens_per_segment(),
+                expected.unwrap_or(384),
+                "max_source_tokens_per_segment = {value}"
+            );
+        }
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
