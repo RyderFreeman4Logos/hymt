@@ -210,7 +210,7 @@ fn literal_numeric_citation_ranges(text: &str) -> Vec<Range<usize>> {
 /// roles must retain exact syntax, URLs, placeholders and opaque payload bytes.
 pub(super) fn coherent_protected_bytes_preserved(source: &str, candidate: &str) -> bool {
     fn signature(text: &str) -> Option<(Vec<String>, Vec<super::cache_proof::Role>)> {
-        let mut fixed = protected_markdown_structure_ranges(text);
+        let mut fixed = protected_markdown_structure_ranges(text, false);
         fixed.extend(literal_numeric_citation_ranges(text));
         let fixed = merge_ranges(fixed);
         let roles = super::cache_proof::roles(text, &fixed, &[])?;
@@ -252,7 +252,7 @@ pub(super) fn split_oversized_protected_blocks(
         .iter()
         .map(|section| section.text.as_str())
         .collect();
-    let structural_ranges = merge_ranges(protected_markdown_structure_ranges(&source));
+    let structural_ranges = merge_ranges(protected_markdown_structure_ranges(&source, true));
     let mut structural_cursor = 0;
     let mut offset = 0;
     let mut split_sections = Vec::with_capacity(doc_plan.sections.len());
@@ -387,7 +387,10 @@ pub(super) fn protected_markdown_block_ranges(text: &str) -> Vec<std::ops::Range
 
 /// Translate literal inline text leaves; keep their complete syntax source-owned.
 /// Parser byte ranges preserve nested delimiters without inventing Markdown grammar.
-fn protected_markdown_structure_ranges(text: &str) -> Vec<Range<usize>> {
+fn protected_markdown_structure_ranges(
+    text: &str,
+    include_flanking_whitespace: bool,
+) -> Vec<Range<usize>> {
     let parser = Parser::new(text);
     let mut owned: Vec<_> = parser
         .reference_definitions()
@@ -573,7 +576,7 @@ fn protected_markdown_structure_ranges(text: &str) -> Vec<Range<usize>> {
         opaque.push(range);
     }
     exclude_opaque(&mut editable, opaque);
-    owned_gaps(text, owned, &editable)
+    owned_gaps(text, owned, &editable, include_flanking_whitespace)
 }
 
 fn exclude_opaque(editable: &mut Vec<Range<usize>>, mut opaque: Vec<Range<usize>>) {
@@ -596,12 +599,15 @@ fn owned_gaps(
     text: &str,
     mut owned: Vec<Range<usize>>,
     editable: &[Range<usize>],
+    include_flanking_whitespace: bool,
 ) -> Vec<Range<usize>> {
-    for node in &mut owned {
-        // Syntax owns adjacent whitespace too: losing a reference definition's
-        // final newline or delimiter flanking space changes the parse.
-        node.start = text[..node.start].trim_end().len();
-        node.end = text.len() - text[node.end..].trim_start().len();
+    if include_flanking_whitespace {
+        for node in &mut owned {
+            // Section splitting must keep reference definitions and delimiter
+            // boundaries intact; coherent paragraphs compare syntax itself.
+            node.start = text[..node.start].trim_end().len();
+            node.end = text.len() - text[node.end..].trim_start().len();
+        }
     }
     owned.sort_by_key(|node| node.start);
     let mut protected = Vec::new();
@@ -660,7 +666,7 @@ fn is_markdown_table_line(line: &str) -> bool {
 
 fn is_markdown_table_separator(line: &str) -> bool {
     let line = line.trim();
-    if !line.starts_with('|') || !line.ends_with('|') {
+    if line.len() < 2 || !line.starts_with('|') || !line.ends_with('|') {
         return false;
     }
     let cells: Vec<_> = line[1..line.len() - 1].split('|').collect();
@@ -681,7 +687,7 @@ mod document_proof_tests {
         let source = format!("[label][id]\n\n[id]: ../first \"Title\"\n{hidden}");
         let start = source.find(hidden).unwrap();
         let end = start + hidden.len();
-        assert!(protected_markdown_structure_ranges(&source)
+        assert!(protected_markdown_structure_ranges(&source, true)
             .iter()
             .any(|range| range.start <= start && end <= range.end));
     }

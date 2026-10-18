@@ -436,7 +436,7 @@ async fn renderer_separators_survive_production_whole_cache_roundtrip() {
 }
 
 #[test]
-fn cache_separator_exception_does_not_normalize_owned_payloads() {
+fn cache_owner_check_allows_prose_spacing_but_rejects_payload_changes() {
     let config = make_stream_config("http://127.0.0.1:9/v1");
     let segmenter = fallback_segmenter();
     let opts = PromptOpts::default();
@@ -444,6 +444,13 @@ fn cache_separator_exception_does_not_normalize_owned_payloads() {
         ("Alpha*Title*Beta", "甲方  *《标题》* 乙方"),
         ("Alpha*Title*Beta", "甲方\t*《标题》* 乙方"),
         ("Alpha *Title* Beta", "甲方*标题*乙方"),
+    ] {
+        assert!(
+            cached_document_is_complete(source, candidate, "zh", &config, &opts, &segmenter),
+            "ordinary prose spacing must remain editable: {source:?} -> {candidate:?}"
+        );
+    }
+    for (source, candidate) in [
         ("Read ` value ` carefully.", "认真阅读 `value` 内容。"),
         ("Read `a*b` carefully.", "认真阅读 `a* b` 内容。"),
         (
