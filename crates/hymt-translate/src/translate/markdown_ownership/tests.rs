@@ -158,7 +158,7 @@ fn copy_only_reference_sections_keep_original_bytes() {
     for section in &mut plan.sections {
         section.should_translate = false;
     }
-    make_short_references_explicit(&mut plan);
+    make_short_references_explicit(&mut plan, &[]);
     let output: String = plan
         .sections
         .iter()

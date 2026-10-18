@@ -74,6 +74,186 @@ fn retention_config(endpoint: &str) -> HotConfig {
     HotConfig::from_path(config.path()).unwrap()
 }
 
+fn oversized_reference_table_source() -> (String, String) {
+    let table = format!(
+        "| Header | Detail |\n| --- | --- |\n| [guide] | ![icon][] {} |\n",
+        "padding ".repeat(300)
+    );
+    let source = format!(
+        "Before marker.\n{table}After marker.\n\n[guide]: https://example.test/guide\n[icon]: https://example.test/icon.png\n"
+    );
+    (source, table)
+}
+
+async fn successful_oversized_owner_case(
+    source: &str,
+    retain: bool,
+    streaming: bool,
+) -> (TranslationOutcome, String, Vec<String>, Vec<String>) {
+    let planning_config = if retain {
+        retention_config("http://127.0.0.1:1/v1")
+    } else {
+        make_protected_block_config("http://127.0.0.1:1/v1")
+    };
+    let segmenter = fallback_segmenter();
+    let opts = PromptOpts::default();
+    let plan = plan_translation(
+        source,
+        "zh",
+        &planning_config,
+        &segmenter,
+        &TemplateType::Default,
+        &opts,
+    )
+    .unwrap();
+    assert_eq!(plan.segments, ["Before marker.", "After marker."]);
+    let replies = planned_complete_translations(&plan);
+    let expected = plan.reconstruct(&replies);
+    let responses = replies
+        .iter()
+        .enumerate()
+        .map(|(index, reply)| {
+            if streaming && index == 0 {
+                MockResponse::Sse(vec![reply.clone()])
+            } else {
+                MockResponse::Json(reply.clone())
+            }
+        })
+        .collect();
+    let server = start_capturing_mock_server(responses).await;
+    let config = if retain {
+        retention_config(&server.endpoint_url)
+    } else {
+        make_protected_block_config(&server.endpoint_url)
+    };
+    let client = TranslationClient::new(config.clone()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let history = HistoryDB::new(dir.path().join("history.db"));
+    let ctx = TranslationCtx {
+        config: &config,
+        client: &client,
+        segmenter: &segmenter,
+        history: &history,
+        cache_enabled: false,
+    };
+    let (outcome, emitted) = if streaming {
+        let (tx, mut rx) = mpsc::channel(16);
+        let outcome = translate_text_stream_with_mode(
+            source,
+            "zh",
+            &TemplateType::Default,
+            &opts,
+            &ctx,
+            StreamOutputMode::Validated,
+            tx,
+        )
+        .await
+        .unwrap();
+        let mut emitted = String::new();
+        while let Some(event) = rx.recv().await {
+            if let StreamEvent::Token(text) = event {
+                emitted.push_str(&text);
+            }
+        }
+        (outcome, emitted)
+    } else {
+        let outcome = translate_text(source, "zh", &TemplateType::Default, &opts, &ctx)
+            .await
+            .unwrap();
+        let emitted = outcome.text.clone();
+        (outcome, emitted)
+    };
+    let requests = server
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|request| {
+            let body: serde_json::Value =
+                serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+            body["messages"].as_array().unwrap().last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .split_once("\n\n")
+                .unwrap()
+                .1
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(outcome.text, expected);
+    (outcome, emitted, replies, requests)
+}
+
+#[tokio::test]
+async fn oversized_copy_only_reference_table_keeps_original_bytes_in_strict_pipeline() {
+    let (source, table) = oversized_reference_table_source();
+    let (outcome, _, replies, requests) =
+        successful_oversized_owner_case(&source, false, false).await;
+    assert_eq!(requests, ["Before marker.", "After marker."]);
+    assert_eq!(outcome.text.matches(&table).count(), 1);
+    assert!(!outcome.text.contains("[guide][guide]"));
+    assert!(!outcome.text.contains("![icon][icon]"));
+    assert!(outcome.text.find(&replies[0]).unwrap() < outcome.text.find(&table).unwrap());
+    assert!(outcome.text.find(&table).unwrap() < outcome.text.find(&replies[1]).unwrap());
+}
+
+#[tokio::test]
+async fn oversized_owner_keeps_successful_surrounding_replies_and_failed_control_restores_original()
+{
+    let (source, table) = oversized_reference_table_source();
+    for retain in [true, false] {
+        for streaming in [false, true] {
+            let (outcome, emitted, replies, requests) =
+                successful_oversized_owner_case(&source, retain, streaming).await;
+            assert_eq!(requests, ["Before marker.", "After marker."]);
+            assert_eq!(emitted, outcome.text);
+            assert!(!outcome.is_completeness_degraded());
+            assert!(outcome.retained_regions.is_empty());
+            assert_eq!(outcome.text.matches(&table).count(), 1);
+            assert!(!outcome.text.contains("[guide][guide]"));
+            assert!(!outcome.text.contains("![icon][icon]"));
+            let before = outcome.text.find(&replies[0]).unwrap();
+            let protected = outcome.text.find(&table).unwrap();
+            let after = outcome.text.find(&replies[1]).unwrap();
+            assert!(before < protected && protected < after);
+        }
+    }
+
+    let server =
+        start_capturing_mock_server((0..4).map(|_| MockResponse::Json(String::new())).collect())
+            .await;
+    let config = retention_config(&server.endpoint_url);
+    let client = TranslationClient::new(config.clone()).unwrap();
+    let segmenter = fallback_segmenter();
+    let dir = tempfile::tempdir().unwrap();
+    let history = HistoryDB::new(dir.path().join("history.db"));
+    let ctx = TranslationCtx {
+        config: &config,
+        client: &client,
+        segmenter: &segmenter,
+        history: &history,
+        cache_enabled: false,
+    };
+    let outcome = translate_text(
+        &source,
+        "zh",
+        &TemplateType::Default,
+        &PromptOpts::default(),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert!(outcome.is_completeness_degraded());
+    assert_eq!(outcome.retained_regions.len(), 1);
+    let retained = &outcome.retained_regions[0];
+    assert_eq!(
+        &outcome.text[retained.output_bytes.clone()],
+        &source[retained.source_bytes.clone()]
+    );
+    assert_eq!(outcome.text.matches(&table).count(), 1);
+    assert_eq!(outcome.completeness_degraded_segments, [1, 2]);
+}
+
 #[test]
 fn owner_restoration_is_occurrence_bound_before_reference_normalization() {
     for source in [
@@ -108,7 +288,7 @@ fn owner_restoration_is_occurrence_bound_before_reference_normalization() {
 }
 
 #[test]
-fn structural_only_and_oversized_owners_have_safe_root_notice() {
+fn oversized_copy_only_owner_does_not_trigger_fallback_notice() {
     let source = format!(
         "---\ntitle: synthetic\n---\n\n| Heading | Other |\n| --- | --- |\n| {} | value |\n",
         "large ".repeat(100)
@@ -124,14 +304,12 @@ fn structural_only_and_oversized_owners_have_safe_root_notice() {
     )
     .unwrap();
     let mut completed = plan.segments.clone();
+    let mut degraded = Vec::new();
     let (output, regions) =
-        retained_original::finalize(&source, &plan, &mut completed, &mut Vec::new(), true).unwrap();
-    assert_eq!(regions.len(), 1);
-    assert!(output.starts_with("---\ntitle: synthetic\n---\n\nTranslation incomplete."));
-    assert_eq!(
-        &output[regions[0].output_bytes.clone()],
-        &source[regions[0].source_bytes.clone()]
-    );
+        retained_original::finalize(&source, &plan, &mut completed, &mut degraded, true).unwrap();
+    assert_eq!(output, source);
+    assert!(regions.is_empty());
+    assert!(degraded.is_empty());
 }
 
 #[test]

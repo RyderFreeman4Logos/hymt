@@ -675,7 +675,7 @@ pub fn plan_translation_with_policy(
     }
 
     let mut doc_plan = plan_document_translation(text, target_lang, document_policy);
-    let original_paragraphs = retained_original::source_paragraphs(&doc_plan, segmenter, available);
+    let original_paragraphs = retained_original::source_paragraphs(&doc_plan);
     let source_tokens = segmenter.count_tokens(text);
     let budget_options = FinalRequestBudgetOptions {
         target_lang,

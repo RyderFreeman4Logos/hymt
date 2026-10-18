@@ -7,7 +7,6 @@ use std::ops::Range;
 pub(super) struct SourceParagraph {
     index: usize,
     bytes: Range<usize>,
-    oversized: bool,
 }
 
 /// An untranslated original paragraph, indexed by its occurrence in the source.
@@ -18,11 +17,7 @@ pub struct RetainedRegion {
     pub output_bytes: Range<usize>,
 }
 
-pub(super) fn source_paragraphs(
-    document: &DocumentLanguagePlan,
-    segmenter: &Segmenter,
-    budget: usize,
-) -> Vec<SourceParagraph> {
+pub(super) fn source_paragraphs(document: &DocumentLanguagePlan) -> Vec<SourceParagraph> {
     let mut offset = 0;
     document
         .sections
@@ -33,10 +28,6 @@ pub(super) fn source_paragraphs(
             section.paragraph_index.map(|index| SourceParagraph {
                 index,
                 bytes: start..offset,
-                oversized: section.should_translate
-                    && markdown_ownership::protected_markdown_block_ranges(&section.text)
-                        .iter()
-                        .any(|range| segmenter.count_tokens(&section.text[range.clone()]) > budget),
             })
         })
         .collect()
@@ -123,14 +114,6 @@ pub(super) fn finalize(
             owner(plan, index - 1).context("failed segment has no original paragraph owner")
         })
         .collect::<Result<_>>()?;
-    if retain_original {
-        retained.extend(
-            plan.original_paragraphs
-                .iter()
-                .filter(|paragraph| paragraph.oversized)
-                .map(|paragraph| paragraph.index),
-        );
-    }
     reset_owners(plan, completed, &retained);
     let rendered = markdown_boundary::render_translations(plan, completed);
     let (mut body, mut regions) = reconstruct(source, plan, completed, &retained)?;

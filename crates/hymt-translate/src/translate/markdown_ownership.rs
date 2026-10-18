@@ -6,7 +6,10 @@ use std::ops::Range;
 // Parser IDs retain source escapes (only whitespace is normalized); do not
 // escape them again or normalize them independently of the definition lookup.
 // The existing explicit-reference ownership/reconstruction path handles both.
-fn make_short_references_explicit(plan: &mut DocumentLanguagePlan) {
+fn make_short_references_explicit(
+    plan: &mut DocumentLanguagePlan,
+    copy_only_ranges: &[Range<usize>],
+) {
     let source: String = plan
         .sections
         .iter()
@@ -42,7 +45,10 @@ fn make_short_references_explicit(plan: &mut DocumentLanguagePlan) {
             let mut normalized = String::with_capacity(section.text.len());
             let mut cursor = 0;
             for (node, range, id) in &edits[first..index] {
-                if node.start >= offset && range.end <= end {
+                let copy_only = copy_only_ranges
+                    .iter()
+                    .any(|copy| node.start < copy.end && copy.start < range.end);
+                if node.start >= offset && range.end <= end && !copy_only {
                     normalized.push_str(&section.text[cursor..range.start - offset]);
                     normalized.push_str(id);
                     cursor = range.end - offset;
@@ -229,7 +235,16 @@ pub(super) fn split_oversized_protected_blocks(
     max_tokens: usize,
     coherent_sections: &std::collections::BTreeSet<usize>,
 ) {
-    make_short_references_explicit(doc_plan);
+    let original: String = doc_plan
+        .sections
+        .iter()
+        .map(|section| section.text.as_str())
+        .collect();
+    let copy_only_ranges: Vec<_> = protected_markdown_block_ranges(&original)
+        .into_iter()
+        .filter(|range| segmenter.count_tokens(&original[range.clone()]) > max_tokens)
+        .collect();
+    make_short_references_explicit(doc_plan, &copy_only_ranges);
     // Reference definitions and Setext markers can live in another section.
     // Parse once in complete-document context, then intersect source byte ranges.
     let source: String = doc_plan
