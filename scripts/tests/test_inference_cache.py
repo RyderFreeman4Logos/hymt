@@ -312,6 +312,39 @@ class CacheContracts(unittest.TestCase):
         self.assertEqual(self.request()[1]["X-Hymt-Cache"], "HIT")
         self.assertLess(time.monotonic() - started, 1.2)
 
+    def test_probe_socket_deadline_before_timer_callback_keeps_replay(self):
+        self.stop_cache()
+        self.start_cache(timeout=0.6)
+        self.assertEqual(self.request()[1]["X-Hymt-Cache"], "MISS")
+        self.state["probe_stall"] = True
+        original_init = _MODULE._Budget.__init__
+
+        def socket_deadline_first(budget, timeout, parent=None):
+            original_init(budget, timeout, parent)
+            if parent is not None:
+                # Hold the child callback; real socket/monotonic deadlines and
+                # the parent request timer still expire at their original times.
+                budget.timer.cancel()
+                budget.timer.join()
+
+        with patch.object(_MODULE._Budget, "__init__", socket_deadline_first):
+            self.assertEqual(self.get_metadata()[0], 200)
+            self.assertEqual(self.request()[1]["X-Hymt-Cache"], "HIT")
+
+    def test_expired_parent_budget_cannot_become_probe_unavailability(self):
+        parent = _MODULE._Budget(1)
+        probe = _MODULE._Budget(1, parent)
+        observation = self.cache.begin_observation()
+        try:
+            parent.end = probe.end = time.monotonic() - 1
+            with patch.object(self.cache, "metadata", side_effect=_MODULE._Unavailable("upstream timed out")):
+                with self.assertRaises(_MODULE._Deadline):
+                    self.cache._observe("Hy-MT2-7B", None, probe, observation=observation)
+        finally:
+            self.cache.end_observation()
+            probe.close()
+            parent.close()
+
     def test_missing_model_remains_ineligible_online_and_offline(self):
         for _ in range(2):
             self.assertEqual(self.request({})[1]["X-Hymt-Cache"], "UNKNOWN")

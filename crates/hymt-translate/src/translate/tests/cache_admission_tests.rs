@@ -144,11 +144,12 @@ zh_to_en_min_ratio = 0.3
 en_to_zh_min_ratio = 0.3
 min_paragraph_ratio = 0.5
 max_retries = 1
+warn_only = false
 "#
         ),
     )
     .unwrap();
-    HotConfig::from_path(path).unwrap()
+    leaf_fixture_config(&HotConfig::from_path(path).unwrap(), SOURCE)
 }
 
 fn make_markdown_plan(
@@ -280,7 +281,7 @@ async fn degraded_termination_is_not_laundered_by_warm_cache() {
             .collect(),
     )
     .await;
-    let config = make_test_config(tmp.path(), &provider.endpoint_url);
+    let config = make_stream_config(&provider.endpoint_url);
     let opts = PromptOpts::default();
     let segmenter = Segmenter::fallback();
     let source = "This public guide explains the complete system clearly and accurately.";
@@ -637,6 +638,7 @@ fn markdown_owner_matrix_preserves_complete_inline_nodes() {
         "# First line\r\n\r\nText *soft* end.\r\n",
         "Before.\n\n~~~rust\nlet x = 1;\n~~~\n\nAfter.\n",
     ] {
+        let config = leaf_fixture_config(&config, source);
         let plan = plan_translation(source, "zh", &config, &segmenter, &TemplateType::Default, &PromptOpts::default()).unwrap();
         for segment in &plan.segments {
             assert!(!segment.contains("https://"), "destination leaked: source={source:?}, segment={segment:?}");
@@ -666,6 +668,13 @@ async fn image_destination_is_source_owned() {
         cache_enabled: true,
     };
     let source = "![A descriptive illustration of the system](https://example.test/diagram.png)";
+    let config = leaf_fixture_config(&config, source);
+    let client = TranslationClient::new(config.clone()).unwrap();
+    let ctx = TranslationCtx {
+        config: &config,
+        client: &client,
+        ..ctx
+    };
     let outcome = translate_text(
         source,
         "zh",
@@ -691,6 +700,7 @@ async fn markdown_inline_owners_preserve_syntax_and_translate_labels() {
     let opts = PromptOpts::default();
     let segmenter = Segmenter::fallback();
     let source = "# **Strong** rest\n\n![A descriptive illustration of the system](https://example.test/diagram.png \"Figure\")\n";
+    let config = leaf_fixture_config(&config, source);
     let plan = plan_translation(
         source,
         "zh",

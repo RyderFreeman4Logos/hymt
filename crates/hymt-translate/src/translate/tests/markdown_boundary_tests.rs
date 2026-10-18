@@ -633,7 +633,10 @@ async fn rendered_document_is_identical_in_buffered_streamed_and_cached_paths() 
             MockResponse::Json("58".to_owned()),
         ])
         .await;
-        let config = make_stream_config_with_fcp(&server.endpoint_url, false);
+        let config = leaf_fixture_config(
+            &make_stream_config_with_fcp(&server.endpoint_url, false),
+            source,
+        );
         let client = TranslationClient::new(config.clone()).unwrap();
         let segmenter = fallback_segmenter();
         let dir = tempfile::tempdir().unwrap();
@@ -772,4 +775,22 @@ fn shared_block_guard_checks_empty_spans_html_and_atomic_json() {
         }
     }
     assert!(admitted.is_empty(), "changed shape admitted: {admitted:?}");
+}
+
+fn plan_translation(
+    source: &str,
+    target: &str,
+    config: &HotConfig,
+    segmenter: &Segmenter,
+    template: &TemplateType,
+    opts: &PromptOpts,
+) -> Result<TranslationPlan> {
+    super::super::plan_translation(
+        source,
+        target,
+        &leaf_fixture_config(config, source),
+        segmenter,
+        template,
+        opts,
+    )
 }

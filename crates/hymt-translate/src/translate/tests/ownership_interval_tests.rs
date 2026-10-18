@@ -21,7 +21,7 @@ fn counted<T>(run: impl FnOnce() -> T) -> (T, [usize; 4]) {
 
 async fn translated_source(source: &str) -> (String, Vec<String>) {
     let segmenter = fallback_segmenter();
-    let planning_config = make_stream_config("http://127.0.0.1:9/v1");
+    let planning_config = leaf_fixture_config(&make_stream_config("http://127.0.0.1:9/v1"), source);
     let opts = PromptOpts {
         document_translation_policy: Some(DocumentTranslationPolicy::TranslateAll),
         ..PromptOpts::default()
@@ -48,7 +48,7 @@ async fn translated_source(source: &str) -> (String, Vec<String>) {
             .collect(),
     )
     .await;
-    let config = make_stream_config(&server.endpoint_url);
+    let config = leaf_fixture_config(&make_stream_config(&server.endpoint_url), source);
     let tmp = tempfile::tempdir().unwrap();
     let history = HistoryDB::new(tmp.path().join("history.db"));
     let client = TranslationClient::new(config.clone()).unwrap();

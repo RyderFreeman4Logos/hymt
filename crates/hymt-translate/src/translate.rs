@@ -6,7 +6,7 @@
 //!      (bounded by the concurrency semaphore inside `TranslationClient`), validate
 //!      completeness with retry, reassemble, record history.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -38,7 +38,7 @@ use hymt_core::language_spec::{language_spec_or_none, LanguageFamily};
 use hymt_core::model_profile::ModelProfile;
 use hymt_core::templates::{build_prompt, PromptOpts, TemplateType, PROMPT_SCHEMA_ID};
 use hymt_segment::Segmenter;
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Event, LinkType, Options, Parser, Tag, TagEnd};
 
 // ── TranslationCtx ────────────────────────────────────────────────────────────
 
@@ -147,17 +147,15 @@ const APPROXIMATE_CHAT_FRAMING_TOKENS: usize = 64;
 const APPROXIMATE_SAFETY_FACTOR: usize = 2;
 const COMPLETENESS_RETRY_INSTRUCTION: &str = "\n\nTranslate the COMPLETE input. Do not stop early.";
 
-fn completeness_retry_instruction(segment: &str, previous: &str) -> String {
+fn completeness_retry_instruction(segment: &str) -> String {
     let mut hint = COMPLETENESS_RETRY_INSTRUCTION.to_owned();
-    let omitted: Vec<String> = hymt_core::completeness::preserved_urls(segment)
-        .difference(&hymt_core::completeness::preserved_urls(previous))
-        .cloned()
+    let mut targets: Vec<String> = hymt_core::completeness::preserved_urls(segment)
+        .into_iter()
         .collect();
-    if !omitted.is_empty() {
-        let mut omitted = omitted;
-        omitted.sort();
+    if !targets.is_empty() {
+        targets.sort();
         hint.push_str(" Preserve these targets exactly: ");
-        hint.push_str(&omitted.join(" "));
+        hint.push_str(&targets.join(" "));
     }
     hint
 }
@@ -249,19 +247,24 @@ pub struct TranslationPlan {
     pub segment_section_indexes: Vec<usize>,
     /// For each segment: all section indexes in its group (for correct reconstruction).
     pub segment_section_groups: Vec<Vec<usize>>,
+    original_paragraphs: Vec<retained_original::SourceParagraph>,
+    /// Original paragraph occurrences admitted as complete, budget-fitting requests.
+    coherent_paragraphs: BTreeSet<usize>,
 }
 
 /// Result of a full translation pipeline run.
 ///
-/// Failed completeness retries are errors by default. Explicit warn-only mode
-/// may return eligible best-effort text, marked in `completeness_degraded_segments`.
+/// Exhausted content validation retains marked complete original paragraphs by
+/// default. Explicit strict mode rejects them before publication.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TranslationOutcome {
-    /// Reconstructed translation text (best-effort when degraded).
+    /// Reconstructed text, with a visible notice when originals were retained.
     pub text: String,
     /// 1-based segment indexes that exhausted completeness retries and fell back
-    /// to the best attempt.
+    /// to complete original paragraphs; every piece of each retained owner is listed.
     pub completeness_degraded_segments: Vec<usize>,
+    /// Exact source and final output byte ranges of untranslated paragraphs.
+    pub retained_regions: Vec<RetainedRegion>,
 }
 
 impl TranslationOutcome {
@@ -275,12 +278,12 @@ impl TranslationOutcome {
     }
 
     pub fn is_completeness_degraded(&self) -> bool {
-        !self.completeness_degraded_segments.is_empty()
+        !self.completeness_degraded_segments.is_empty() || !self.retained_regions.is_empty()
     }
 
     /// Emit a machine-readable summary on stderr when any segment was degraded.
     pub fn report_completeness_degraded(&self) {
-        if self.completeness_degraded_segments.is_empty() {
+        if !self.is_completeness_degraded() {
             return;
         }
         let list = self
@@ -289,11 +292,11 @@ impl TranslationOutcome {
             .map(|i| i.to_string())
             .collect::<Vec<_>>()
             .join(",");
-        eprintln!("completeness_status=degraded_best_effort");
+        eprintln!("completeness_status=degraded_original_retained");
         eprintln!("completeness_degraded_segments={list}");
         eprintln!(
-            "Warning: {} segment(s) used best attempt after completeness retries exhausted",
-            self.completeness_degraded_segments.len()
+            "Warning: {} original paragraph(s) retained after content validation failed",
+            self.retained_regions.len()
         );
     }
 }
@@ -666,26 +669,27 @@ pub fn plan_translation_with_policy(
             document_plan: None,
             segment_section_indexes: Vec::new(),
             segment_section_groups: Vec::new(),
+            original_paragraphs: Vec::new(),
+            coherent_paragraphs: BTreeSet::new(),
         });
     }
 
     let mut doc_plan = plan_document_translation(text, target_lang, document_policy);
+    let original_paragraphs = retained_original::source_paragraphs(&doc_plan);
     let source_tokens = segmenter.count_tokens(text);
-    let (segments, indexes, groups) = segment_document_plan(&mut doc_plan, segmenter, available)?;
-    let fitted = fit_segments_to_final_request_budget(
-        segments,
-        indexes,
-        groups,
-        FinalRequestBudgetOptions {
-            target_lang,
-            template,
-            prompt_opts: opts,
-            config,
-            segmenter,
-            profile,
-            input_capacity,
-        },
-    )?;
+    let budget_options = FinalRequestBudgetOptions {
+        target_lang,
+        template,
+        prompt_opts: opts,
+        config,
+        segmenter,
+        profile,
+        input_capacity,
+    };
+    let coherent_sections = coherent_paragraph_sections(&doc_plan, &budget_options, available)?;
+    let (segments, indexes, groups) =
+        segment_document_plan(&mut doc_plan, segmenter, available, &coherent_sections)?;
+    let fitted = fit_segments_to_final_request_budget(segments, indexes, groups, budget_options)?;
     let counting_source =
         if overhead.source == TokenCountingSource::Approximate || fitted.used_approximate {
             TokenCountingSource::Approximate
@@ -716,6 +720,8 @@ pub fn plan_translation_with_policy(
         document_plan: Some(doc_plan),
         segment_section_indexes: fitted.indexes,
         segment_section_groups: fitted.groups,
+        original_paragraphs,
+        coherent_paragraphs: coherent_sections,
     })
 }
 
@@ -768,10 +774,10 @@ fn prompt_for_budget(
     config: &HotConfig,
 ) -> Result<String> {
     let mut prompt = build_prompt(segment, target_lang, template, opts)?;
-    // Completeness retries append this exact instruction. Reserve it up front so
-    // a retry cannot turn an otherwise valid plan into an over-context request.
+    // Execution uses this exact retry prompt, including every source URL, so
+    // response-dependent hints cannot exceed the reservation or change tokenization.
     if config.completeness_max_retries() > 0 {
-        prompt.push_str(COMPLETENESS_RETRY_INSTRUCTION);
+        prompt.push_str(&completeness_retry_instruction(segment));
     }
     Ok(prompt)
 }
@@ -959,6 +965,8 @@ use completeness_admission::{
     approx_source_tokens, cached_segment_is_complete, ensure_document_identities_preserved,
     score_provider_attempt, select_best_attempt, validate_exhausted_attempt, ScoredAttempt,
 };
+mod retained_original;
+pub use retained_original::RetainedRegion;
 mod markdown_boundary;
 mod markdown_context;
 use markdown_context::{segment_contexts, SegmentSource};
@@ -970,10 +978,68 @@ mod table_shape;
 use markdown_ownership::protected_markdown_block_ranges;
 use markdown_ownership::split_oversized_protected_blocks;
 
+// Select before inline ownership refitting. The exact existing prompt (including
+// its retry reserve) must fit, so an admitted paragraph cannot later be split.
+fn coherent_paragraph_sections(
+    document: &DocumentLanguagePlan,
+    options: &FinalRequestBudgetOptions<'_>,
+    source_cap: usize,
+) -> Result<BTreeSet<usize>> {
+    let source: String = document
+        .sections
+        .iter()
+        .map(|section| section.text.as_str())
+        .collect();
+    let reference_links: Vec<_> = Parser::new(&source)
+        .into_offset_iter()
+        .filter_map(|(event, range)| match event {
+            Event::Start(Tag::Link { link_type, .. } | Tag::Image { link_type, .. })
+                if link_type != LinkType::Inline =>
+            {
+                Some(range)
+            }
+            _ => None,
+        })
+        .collect();
+    let mut selected = BTreeSet::new();
+    let mut offset = 0;
+    for section in &document.sections {
+        let start = offset;
+        offset += section.text.len();
+        if section.kind != SectionKind::Paragraph
+            || !section.should_translate
+            || options.segmenter.count_tokens(&section.text) > source_cap
+            || !markdown_ownership::is_coherent_inline_paragraph(&section.text)
+            || reference_links
+                .iter()
+                .any(|range| range.start < offset && start < range.end)
+            || !markdown_ownership::coherent_protected_bytes_preserved(&section.text, &section.text)
+        {
+            continue;
+        }
+        let prompt = prompt_for_budget(
+            &section.text,
+            options.target_lang,
+            options.template,
+            options.prompt_opts,
+            options.config,
+        )?;
+        let request = count_final_request(options.profile, options.segmenter, &prompt);
+        if request.tokens <= options.input_capacity {
+            reject_approximate_budget_if_strict(request.source, options.config)?;
+            if let Some(owner) = section.paragraph_index {
+                selected.insert(owner);
+            }
+        }
+    }
+    Ok(selected)
+}
+
 fn segment_document_plan(
     doc_plan: &mut DocumentLanguagePlan,
     segmenter: &Segmenter,
     max_tokens: usize,
+    coherent_sections: &BTreeSet<usize>,
 ) -> Result<SegmentPlanResult> {
     let source: String = doc_plan
         .sections
@@ -1002,7 +1068,7 @@ fn segment_document_plan(
         }
         return Ok((vec![source], vec![0], vec![vec![0]]));
     }
-    split_oversized_protected_blocks(doc_plan, segmenter, max_tokens);
+    split_oversized_protected_blocks(doc_plan, segmenter, max_tokens, coherent_sections);
     let mut segments: Vec<String> = Vec::new();
     let mut indexes: Vec<usize> = Vec::new();
     let mut groups: Vec<Vec<usize>> = Vec::new();
@@ -1115,6 +1181,11 @@ fn translation_section_groups(plan: &DocumentLanguagePlan) -> Vec<Vec<usize>> {
 
     for (i, section) in sections.iter().enumerate() {
         if section.should_translate {
+            if current.last().is_some_and(|&previous| {
+                sections[previous].paragraph_index != section.paragraph_index
+            }) {
+                groups.push(std::mem::take(&mut current));
+            }
             current.push(i);
             continue;
         }
@@ -1331,13 +1402,11 @@ async fn translate_segment_with_completeness<'a>(
     let mut best: Option<ScoredAttempt> = None;
 
     for attempt in 0..=max_retries {
-        let mut prompt = build_prompt(segment, target_lang, template, opts)?;
-        if attempt > 0 {
-            prompt.push_str(&completeness_retry_instruction(
-                segment,
-                &best.as_ref().expect("prior attempt").text,
-            ));
-        }
+        let prompt = if attempt > 0 {
+            prompt_for_budget(segment, target_lang, template, opts, config)?
+        } else {
+            build_prompt(segment, target_lang, template, opts)?
+        };
 
         let completion = client
             .with_cache_bypass(attempt > 0)
@@ -1389,10 +1458,9 @@ async fn translate_segment_with_completeness<'a>(
 
     let best = best.expect("a retry loop always has at least one attempt");
     validate_exhausted_attempt(index, source, &best, opts, config)?;
-    source.structure_preserved(&best.text)?;
     eprintln!(
-        "Warning: segment {} exceeded {} retries, selected attempt {}/{} \
-         (score={}, reason={})",
+        "Warning: segment {} exceeded {} retries; retaining its complete original paragraph \
+         (discarded attempt {}/{}, score={}, reason={})",
         index + 1,
         max_retries,
         best.attempt + 1,
@@ -1401,7 +1469,7 @@ async fn translate_segment_with_completeness<'a>(
         best.selection_reason(),
     );
     Ok(SegmentTranslateOutcome {
-        text: best.text,
+        text: source.text.to_owned(),
         completeness_degraded: true,
         initial_request: false,
         cold_generation: false,
@@ -1614,13 +1682,13 @@ async fn translate_segment_with_completeness_streaming(
 
     for attempt in 1..=max_retries {
         timing.log(request.index, "completeness_retry_begin");
-        prompt = build_prompt(
+        prompt = prompt_for_budget(
             request.segment,
             request.target_lang,
             request.template,
             request.opts,
+            request.config,
         )?;
-        prompt.push_str(&completeness_retry_instruction(request.segment, &best.text));
 
         let completion = request
             .client
@@ -1692,10 +1760,10 @@ async fn translate_segment_with_completeness_streaming(
         request.opts,
         request.config,
     )?;
-    SegmentSource::new(request.segment, request.context).structure_preserved(&best.text)?;
+
     eprintln!(
-        "Warning: segment {} exceeded {} retries, selected attempt {}/{} \
-         (score={}, reason={})",
+        "Warning: segment {} exceeded {} retries; retaining its complete original paragraph \
+         (discarded attempt {}/{}, score={}, reason={})",
         request.index + 1,
         max_retries,
         best.attempt + 1,
@@ -1703,19 +1771,10 @@ async fn translate_segment_with_completeness_streaming(
         best.validation.score,
         best.selection_reason(),
     );
-    if !best.text.is_empty()
-        && (output_mode == StreamOutputMode::Validated || !emitted_optimistically)
-    {
-        send_stream_event(event_tx, StreamEvent::Token(best.text.clone())).await?;
-        if let Some(tx) = first_token_tx.take() {
-            timing.log(request.index, "first_token");
-            let _ = tx.try_send(());
-        }
-    }
     send_stream_event(event_tx, StreamEvent::SegmentDone(request.index)).await?;
     timing.log(request.index, "complete");
     Ok(SegmentTranslateOutcome {
-        text: best.text,
+        text: request.segment.to_owned(),
         completeness_degraded: true,
         initial_request: false,
         cold_generation: false,
@@ -1781,6 +1840,7 @@ pub async fn translate_text(
         return Ok(TranslationOutcome {
             text: String::new(),
             completeness_degraded_segments: Vec::new(),
+            retained_regions: Vec::new(),
         });
     }
 
@@ -1985,12 +2045,20 @@ pub async fn translate_text(
         .map(|(i, t)| t.ok_or_else(|| anyhow!("missing translated segment {i}")))
         .collect::<Result<_>>()?;
 
-    if !markdown_boundary::render_translations(&plan, &mut completed) {
-        anyhow::bail!("translated Markdown inline boundaries changed");
+    let (translated, retained_regions) = retained_original::finalize(
+        text,
+        &plan,
+        &mut completed,
+        &mut degraded_segments,
+        opts.warn_only_completeness
+            .unwrap_or_else(|| ctx.config.completeness_warn_only()),
+    )?;
+    let degraded = !retained_regions.is_empty();
+    cold_generation &= !degraded;
+    proof_eligible &= !degraded;
+    for &index in &degraded_segments {
+        cache_candidates[index - 1] = false;
     }
-    let translated = plan.reconstruct(&completed);
-    ensure_markdown_structure_preserved(text, &translated)?;
-    ensure_document_identities_preserved(text, &translated)?;
     if cache_enabled {
         let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
         for (index, candidate) in completed.iter().enumerate() {
@@ -2008,7 +2076,7 @@ pub async fn translate_text(
     }
     let duration = wall_start.elapsed().as_secs_f64();
     let output_tokens = ctx.segmenter.count_tokens(&translated);
-    let tps = if duration > 0.0 {
+    let tps = if !degraded && duration > 0.0 {
         output_tokens as f64 / duration
     } else {
         0.0
@@ -2040,7 +2108,10 @@ pub async fn translate_text(
         cache_hits: Some(cache_hits),
         cold_source_tokens: cold_generation.then_some(source_tokens),
         counting_source: Some(counting_source.to_owned()),
-        estimated_seconds: estimate.as_ref().map(|forecast| forecast.seconds),
+        estimated_seconds: estimate
+            .as_ref()
+            .filter(|_| !degraded)
+            .map(|forecast| forecast.seconds),
         tokens_per_second: tps,
         input_chars: text.chars().count() as i64,
         output_chars: translated.chars().count() as i64,
@@ -2112,6 +2183,7 @@ pub async fn translate_text(
     Ok(TranslationOutcome {
         text: translated,
         completeness_degraded_segments: degraded_segments,
+        retained_regions,
     })
 }
 
@@ -2157,12 +2229,16 @@ pub async fn translate_text_stream_with_mode(
         anyhow::bail!("stream event receiver dropped");
     }
     // Keep a provider repair of literal link syntax behind the document guard.
-    let output_mode =
-        if output_mode == StreamOutputMode::Optimistic && has_unparsed_link_syntax(text) {
-            StreamOutputMode::Validated
-        } else {
-            output_mode
-        };
+    let output_mode = if output_mode == StreamOutputMode::Optimistic
+        && (has_unparsed_link_syntax(text)
+            || opts
+                .warn_only_completeness
+                .unwrap_or_else(|| ctx.config.completeness_warn_only()))
+    {
+        StreamOutputMode::Validated
+    } else {
+        output_mode
+    };
     let closed = event_tx.clone();
     tokio::select! {
         biased;
@@ -2191,6 +2267,7 @@ async fn translate_text_stream_inner(
         return Ok(TranslationOutcome {
             text: String::new(),
             completeness_degraded_segments: Vec::new(),
+            retained_regions: Vec::new(),
         });
     }
 
@@ -2237,7 +2314,10 @@ async fn translate_text_stream_inner(
     // A source-owned delimiter can change its parse when adjacent translated
     // punctuation arrives. Wait for the complete rendered document before emit.
     let output_mode = if output_mode == StreamOutputMode::Optimistic
-        && markdown_boundary::requires_validated_rendering(&plan)
+        && (markdown_boundary::requires_validated_rendering(&plan)
+            || opts
+                .warn_only_completeness
+                .unwrap_or_else(|| ctx.config.completeness_warn_only()))
     {
         StreamOutputMode::Validated
     } else {
@@ -2651,21 +2731,36 @@ async fn translate_text_stream_inner(
         .map(|(i, t)| t.ok_or_else(|| anyhow!("missing translated segment {i}")))
         .collect::<Result<_>>()?;
 
-    if !markdown_boundary::render_translations(&plan, &mut completed) {
-        anyhow::bail!("translated Markdown inline boundaries changed");
+    let (translated, retained_regions) = retained_original::finalize(
+        text,
+        &plan,
+        &mut completed,
+        &mut degraded_segments,
+        opts.warn_only_completeness
+            .unwrap_or_else(|| ctx.config.completeness_warn_only()),
+    )?;
+    let degraded = !retained_regions.is_empty();
+    cold_generation &= !degraded;
+    proof_eligible &= !degraded;
+    for &index in &degraded_segments {
+        cache_candidates[index - 1] = false;
     }
-    let translated = plan.reconstruct(&completed);
-    ensure_markdown_structure_preserved(text, &translated)?;
-    ensure_document_identities_preserved(text, &translated)?;
     let output = StreamEventSink::Immediate(output_event_tx.clone());
     if output_mode == StreamOutputMode::Validated {
-        let replay: Vec<_> = completed.iter().map(|text| Some(text.as_str())).collect();
-        let mut section = 0;
-        let mut segment = 0;
-        flush_ready_stream_prefix(&plan, &replay, &mut section, &mut segment, &output).await?;
-        let suffix = untranslated_text_after_segments(&plan, section);
-        if !suffix.is_empty() {
-            send_stream_event(&output, StreamEvent::Token(suffix)).await?;
+        if degraded {
+            send_stream_event(&output, StreamEvent::Token(translated.clone())).await?;
+            for index in 0..plan.segment_count() {
+                send_stream_event(&output, StreamEvent::SegmentDone(index)).await?;
+            }
+        } else {
+            let replay: Vec<_> = completed.iter().map(|text| Some(text.as_str())).collect();
+            let mut section = 0;
+            let mut segment = 0;
+            flush_ready_stream_prefix(&plan, &replay, &mut section, &mut segment, &output).await?;
+            let suffix = untranslated_text_after_segments(&plan, section);
+            if !suffix.is_empty() {
+                send_stream_event(&output, StreamEvent::Token(suffix)).await?;
+            }
         }
     }
     // Respect terminal backpressure before admitting persistence. No await after
@@ -2694,7 +2789,7 @@ async fn translate_text_stream_inner(
     }
     let duration = wall_start.elapsed().as_secs_f64();
     let output_tokens = ctx.segmenter.count_tokens(&translated);
-    let tps = if duration > 0.0 {
+    let tps = if !degraded && duration > 0.0 {
         output_tokens as f64 / duration
     } else {
         0.0
@@ -2726,7 +2821,10 @@ async fn translate_text_stream_inner(
         cache_hits: Some(cache_hits),
         cold_source_tokens: cold_generation.then_some(source_tokens),
         counting_source: Some(counting_source.to_owned()),
-        estimated_seconds: estimate.as_ref().map(|forecast| forecast.seconds),
+        estimated_seconds: estimate
+            .as_ref()
+            .filter(|_| !degraded)
+            .map(|forecast| forecast.seconds),
         tokens_per_second: tps,
         input_chars: text.chars().count() as i64,
         output_chars: translated.chars().count() as i64,
@@ -2800,6 +2898,7 @@ async fn translate_text_stream_inner(
     Ok(TranslationOutcome {
         text: translated,
         completeness_degraded_segments: degraded_segments,
+        retained_regions,
     })
 }
 
@@ -2978,6 +3077,7 @@ mod tests {
     mod context_json_tests;
     mod exec_cache_tests;
     mod identity_tests;
+    mod retained_original_tests;
     pub(super) use identity_tests::record_placeholder_scan;
     mod markdown_boundary_tests;
     mod output_tests;
@@ -3114,17 +3214,68 @@ mod tests {
         assert!(expected_output_tokens > 0);
     }
 
+    // Leaf renderer tests must exercise the real over-budget branch now that
+    // fitting inline paragraphs travel as complete requests by default.
+    fn leaf_fixture_config(config: &HotConfig, source: &str) -> HotConfig {
+        if hymt_core::completeness::parse_json_document(source).is_some() {
+            return config.clone();
+        }
+        let segmenter = fallback_segmenter();
+        let mut document =
+            plan_document_translation(source, "zh", DocumentTranslationPolicy::TranslateAll);
+        if !document
+            .sections
+            .iter()
+            .any(|section| markdown_ownership::is_coherent_inline_paragraph(&section.text))
+        {
+            return config.clone();
+        }
+        split_oversized_protected_blocks(&mut document, &segmenter, usize::MAX, &BTreeSet::new());
+        let cap = translation_section_groups(&document)
+            .iter()
+            .map(|group| {
+                segmenter.count_tokens(
+                    &group
+                        .iter()
+                        .map(|&i| document.sections[i].text.as_str())
+                        .collect::<String>(),
+                )
+            })
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let text = std::fs::read_to_string(config.path())
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                !line
+                    .trim_start()
+                    .starts_with("max_source_tokens_per_segment")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            .replace(
+                "[translation]\n",
+                &format!("[translation]\nmax_source_tokens_per_segment = {cap}\n"),
+            );
+        let path = temp_path("leaf-budget-config.toml");
+        std::fs::write(&path, text).unwrap();
+        HotConfig::from_path(path).unwrap()
+    }
+
     fn fallback_segmenter() -> Segmenter {
         Segmenter::fallback()
     }
 
     #[test]
-    fn completeness_retry_names_each_omitted_url() {
-        let source = "See [report](https://example.test/missing?q=1) and keep it.";
-        let hint = completeness_retry_instruction(source, "See the report and keep it.");
-        assert!(
-            hint.contains("https://example.test/missing?q=1"),
-            "url retry must name the omitted target, got {hint:?}"
+    fn completeness_retry_names_each_source_url_once_in_stable_order() {
+        let source = "See [report](https://example.test/z?q=1), [guide](https://example.test/a), and [report again](https://example.test/z?q=1).";
+        let hint = completeness_retry_instruction(source);
+        assert_eq!(
+            hint,
+            format!(
+                "{COMPLETENESS_RETRY_INSTRUCTION} Preserve these targets exactly: https://example.test/a https://example.test/z?q=1"
+            )
         );
         assert!(
             !hint.contains("url_preservation"),
@@ -3766,18 +3917,32 @@ mod tests {
     }
 
     fn temp_path(tag: &str) -> PathBuf {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        temp_path_at(tag, timestamp)
+    }
+
+    fn temp_path_at(tag: &str, timestamp: u128) -> PathBuf {
+        static NEXT_PATH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let unique = format!(
-            "{}-{}-{}",
+            "{}-{}-{}-{}",
             std::process::id(),
             tag,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            NEXT_PATH.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            timestamp
         );
         let dir = std::env::temp_dir().join(format!("hymt-translate-test-{unique}"));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("test-file")
+    }
+
+    #[test]
+    fn test_paths_remain_unique_when_the_clock_does_not_advance() {
+        let first = temp_path_at("fixed-clock", 7);
+        let second = temp_path_at("fixed-clock", 7);
+        assert_ne!(first, second);
     }
 
     fn make_stream_config(endpoint_url: &str) -> hymt_core::config::HotConfig {
@@ -3808,6 +3973,7 @@ zh_to_en_min_ratio = 0.3
 en_to_zh_min_ratio = 0.3
 min_paragraph_ratio = 0.5
 max_retries = 1
+warn_only = false
 "#
             ),
         )
@@ -3864,6 +4030,7 @@ zh_to_en_min_ratio = 0.3
 en_to_zh_min_ratio = 0.3
 min_paragraph_ratio = 0.5
 max_retries = 1
+warn_only = false
 "#
             ),
         )
@@ -3938,6 +4105,7 @@ zh_to_en_min_ratio = 0.3
 en_to_zh_min_ratio = 0.3
 min_paragraph_ratio = 0.5
 max_retries = 1
+warn_only = false
 "#
             ),
         )
@@ -5785,6 +5953,8 @@ After ordinary prose must also be translated in document order.\n"
             document_plan: None,
             segment_section_indexes: vec![],
             segment_section_groups: vec![],
+            original_paragraphs: Vec::new(),
+            coherent_paragraphs: BTreeSet::new(),
         };
         let result = plan.reconstruct(&["A".to_owned(), "B".to_owned(), "C".to_owned()]);
         assert_eq!(result, "ABC");
@@ -5825,6 +5995,8 @@ After ordinary prose must also be translated in document order.\n"
             document_plan: Some(document_plan),
             segment_section_indexes: vec![groups[0][0], groups[1][0]],
             segment_section_groups: groups,
+            original_paragraphs: Vec::new(),
+            coherent_paragraphs: BTreeSet::new(),
         };
 
         let translated = plan.reconstruct(&["# 标题".to_owned(), "正文保持分段。".to_owned()]);
@@ -7053,6 +7225,7 @@ zh_to_en_min_ratio = 0.3
 en_to_zh_min_ratio = 10.0
 min_paragraph_ratio = 0.5
 max_retries = 1
+warn_only = false
 "#,
         )
         .unwrap();
@@ -7270,6 +7443,7 @@ zh_to_en_min_ratio = 0.3
 en_to_zh_min_ratio = 0.3
 min_paragraph_ratio = 0.5
 max_retries = 1
+warn_only = false
 "#,
                 endpoint = server.endpoint_url
             ),

@@ -141,6 +141,9 @@ async fn whole_output_cache_revalidates_hits_and_never_stores_degraded_results()
         );
     }
 
+    // Plain paragraphs may retain their complete original; atomic JSON above stays strict.
+    let source =
+        "Keep the complete synthetic migration instructions available throughout the process.";
     let server = start_capturing_mock_server(
         (0..4)
             .map(|_| MockResponse::JsonWithFinishReason {
@@ -172,12 +175,11 @@ async fn whole_output_cache_revalidates_hits_and_never_stores_degraded_results()
         warn_only_completeness: Some(true),
         ..PromptOpts::default()
     };
-    assert_eq!(
-        translate_cached("man", "test", source, "zh", &cache, &warn, &ctx)
-            .await
-            .unwrap(),
-        complete
-    );
+    let retained = translate_cached("man", "test", source, "zh", &cache, &warn, &ctx)
+        .await
+        .unwrap();
+    assert!(retained.contains("Untranslated original"));
+    assert!(retained.ends_with(source));
     assert!(
         cache
             .find("man", "test", source, "zh", policy)
@@ -255,7 +257,7 @@ async fn whole_output_cache_preserves_owned_payloads_and_production_warm_output(
         for shared in [false, true] {
             let server =
                 start_capturing_mock_server(vec![MockResponse::Json(translated.to_owned())]).await;
-            let config = make_stream_config(&server.endpoint_url);
+            let config = leaf_fixture_config(&make_stream_config(&server.endpoint_url), &source);
             let client = TranslationClient::new(config.clone()).unwrap();
             let segmenter = fallback_segmenter();
             let dir = tempfile::tempdir().unwrap();
@@ -374,7 +376,7 @@ async fn renderer_separators_survive_production_whole_cache_roundtrip() {
                     .collect(),
             )
             .await;
-            let config = make_stream_config(&server.endpoint_url);
+            let config = leaf_fixture_config(&make_stream_config(&server.endpoint_url), source);
             let client = TranslationClient::new(config.clone()).unwrap();
             let segmenter = fallback_segmenter();
             let dir = tempfile::tempdir().unwrap();

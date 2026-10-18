@@ -203,7 +203,7 @@ async fn fixture_reader_rejects_malformed_and_excessive_framing() {
 }
 
 #[tokio::test]
-async fn redirected_stdin_retries_added_code_spans_and_rejects_exhaustion() {
+async fn redirected_stdin_retries_or_retains_original_and_honors_strict_mode() {
     let source = "Usage: run the translator. Options: read the guide before continuing.\n\nThe property name is ordinary prose and should remain ordinary prose after translation.";
     let first = "用法：运行翻译程序。选项：继续之前阅读说明。";
     let invalid =
@@ -211,8 +211,9 @@ async fn redirected_stdin_retries_added_code_spans_and_rejects_exhaustion() {
     let decorated = "属性 `name` 是普通文字，翻译之后 `property` 仍应保持普通文字。";
     let recovered = "属性 name 是普通文字，翻译之后 property 仍应保持普通文字。";
     let valid = "属性名称是普通文字，翻译之后仍应保持普通文字。";
-    for case in [0, 1, 2] {
-        let recover = case != 1;
+    for case in [0, 1, 2, 3] {
+        let recover = matches!(case, 0 | 2);
+        let strict = case == 3;
         let direct_recovery = case == 2;
         let home = TestHome::new();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -225,7 +226,7 @@ async fn redirected_stdin_retries_added_code_spans_and_rejects_exhaustion() {
         std::fs::write(
             home.0.join(".config/hymt/config.toml"),
             format!(
-                "[endpoint]\nurl = \"http://{address}/v1\"\nbackend = \"openai_compatible\"\nmodel = \"test-model\"\n\n[translation]\ncontext_window = 512\nmax_output_tokens = 40\nconcurrency = 1\nfirst_chunk_priority = false\ntimeout = 5\n\n[completeness]\nmax_retries = 1\n"
+                "[endpoint]\nurl = \"http://{address}/v1\"\nbackend = \"openai_compatible\"\nmodel = \"test-model\"\n\n[translation]\ncontext_window = 512\nmax_output_tokens = 40\nconcurrency = 1\nfirst_chunk_priority = false\ntimeout = 5\n\n[completeness]\nmax_retries = 1\n{}", if strict { "warn_only = false\n" } else { "" }
             ),
         )
         .unwrap();
@@ -404,6 +405,22 @@ async fn redirected_stdin_retries_added_code_spans_and_rejects_exhaustion() {
             );
             assert!(!stdout.contains(invalid), "{diagnostic}");
             assert!(!stdout.contains(decorated), "{diagnostic}");
+        } else if !strict {
+            assert!(status.success(), "{diagnostic}");
+            let stdout = String::from_utf8(stdout).unwrap();
+            assert!(
+                stdout.contains("Untranslated original: paragraph 2"),
+                "{diagnostic}"
+            );
+            assert!(stdout.contains(first), "{diagnostic}");
+            assert!(
+                stdout
+                    .strip_suffix('\n')
+                    .unwrap_or(&stdout)
+                    .ends_with(source.split_once("\n\n").unwrap().1),
+                "{diagnostic}"
+            );
+            assert!(!stdout.contains(invalid), "{diagnostic}");
         } else {
             assert!(!status.success(), "{diagnostic}");
             assert!(stdout.is_empty(), "{diagnostic}");
