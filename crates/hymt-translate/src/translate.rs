@@ -56,6 +56,13 @@ pub struct TranslationCtx<'a> {
     pub cache_enabled: bool,
 }
 
+impl TranslationCtx<'_> {
+    /// Refresh writes eligible results but never consumes old application entries.
+    pub fn cache_reads_enabled(&self) -> bool {
+        self.cache_enabled && !self.client.app_cache_refresh()
+    }
+}
+
 /// Incremental translation output emitted by [`translate_text_stream`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StreamEvent {
@@ -1785,7 +1792,7 @@ pub async fn translate_text(
     }
 
     ctx.config.maybe_reload()?;
-    if ctx.cache_enabled {
+    if ctx.cache_reads_enabled() {
         if let Ok(Some(replay)) =
             offline_replay::find_replay(text, target_lang, template, opts, ctx, false)
         {
@@ -1847,7 +1854,7 @@ pub async fn translate_text(
     let mut translations: Vec<Option<String>> = vec![None; plan.segment_count()];
     let mut missing: Vec<usize> = Vec::new();
 
-    if cache_enabled {
+    if cache_enabled && ctx.cache_reads_enabled() {
         for (i, hash) in seg_hashes.iter().enumerate() {
             match ctx.history.find_segment_cached(hash, cache_scope) {
                 Ok(Some(cached)) => {
@@ -2211,7 +2218,7 @@ async fn translate_text_stream_inner(
 
     let output_event_tx = event_tx.clone();
     ctx.config.maybe_reload()?;
-    if ctx.cache_enabled {
+    if ctx.cache_reads_enabled() {
         if let Ok(Some(replay)) =
             offline_replay::find_replay(text, target_lang, template, opts, ctx, true)
         {
@@ -2307,7 +2314,7 @@ async fn translate_text_stream_inner(
     let mut translations: Vec<Option<String>> = vec![None; plan.segment_count()];
     let mut missing: Vec<usize> = Vec::new();
 
-    if cache_enabled {
+    if cache_enabled && ctx.cache_reads_enabled() {
         for (i, hash) in seg_hashes.iter().enumerate() {
             match ctx.history.find_segment_cached(hash, cache_scope) {
                 Ok(Some(cached)) => {

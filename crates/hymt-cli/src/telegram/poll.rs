@@ -336,7 +336,11 @@ async fn deliver_stream_events<A: TelegramMessageApi>(
 }
 
 /// Run the Telegram long-poll loop until SIGINT / process exit.
-pub async fn run_telegram_bot(config: &HotConfig, no_cache: bool) -> Result<()> {
+pub async fn run_telegram_bot(
+    config: &HotConfig,
+    no_cache: bool,
+    refresh_app_cache: bool,
+) -> Result<()> {
     config.maybe_reload()?;
     if !config.telegram_enabled() {
         bail!(
@@ -375,7 +379,8 @@ pub async fn run_telegram_bot(config: &HotConfig, no_cache: bool) -> Result<()> 
     let history = HistoryDB::default();
     let client = TranslationClient::new(config.clone())
         .map_err(|e| anyhow::anyhow!("{e}"))?
-        .with_cache_bypass(no_cache);
+        .with_cache_bypass(no_cache)
+        .with_app_cache_refresh(refresh_app_cache);
     let mut offset: i64 = 0;
 
     loop {
@@ -414,8 +419,8 @@ pub async fn run_telegram_bot(config: &HotConfig, no_cache: bool) -> Result<()> 
     Ok(())
 }
 
-fn telegram_cache_enabled(config: &HotConfig, no_cache: bool) -> bool {
-    config.application_cache_enabled() && !no_cache
+fn telegram_cache_enabled(config: &HotConfig, no_cache: bool, client: &TranslationClient) -> bool {
+    (config.application_cache_enabled() || client.app_cache_refresh()) && !no_cache
 }
 
 async fn handle_update(
@@ -479,7 +484,7 @@ async fn handle_update(
                     client,
                     segmenter,
                     history,
-                    cache_enabled: telegram_cache_enabled(config, no_cache),
+                    cache_enabled: telegram_cache_enabled(config, no_cache, client),
                 };
                 let chat_action_repeater =
                     spawn_chat_action_repeater(api.clone(), incoming.chat_id, CHAT_ACTION_TYPING);
@@ -618,7 +623,7 @@ async fn handle_document_update(
                         client,
                         segmenter,
                         history,
-                        cache_enabled: telegram_cache_enabled(config, no_cache),
+                        cache_enabled: telegram_cache_enabled(config, no_cache, client),
                     };
                     let outcome =
                         translate_text(&source, &target_lang, &TemplateType::Default, &opts, &ctx)
@@ -1137,8 +1142,12 @@ mod tests {
             ));
             std::fs::write(&path, config_body).unwrap();
             let config = HotConfig::from_path(&path).unwrap();
-            assert_eq!(telegram_cache_enabled(&config, false), expected);
-            assert!(!telegram_cache_enabled(&config, true));
+            let client = TranslationClient::new(config.clone()).unwrap();
+            assert_eq!(telegram_cache_enabled(&config, false, &client), expected);
+            assert!(!telegram_cache_enabled(&config, true, &client));
+            let refresh = client.with_app_cache_refresh(true);
+            assert!(telegram_cache_enabled(&config, false, &refresh));
+            assert!(!telegram_cache_enabled(&config, true, &refresh));
             std::fs::remove_file(path).unwrap();
         }
     }
