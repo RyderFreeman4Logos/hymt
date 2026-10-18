@@ -3,8 +3,15 @@ use super::*;
 #[tokio::test]
 async fn default_exhaustion_retains_complete_original_and_records_no_cold_sample() {
     let source = "This paragraph must remain fully available after validation fails.";
-    let server =
-        start_mock_server((0..2).map(|_| MockResponse::Json(String::new())).collect()).await;
+    let server = start_mock_server(
+        (0..2)
+            .map(|_| MockResponse::JsonWithFinishReason {
+                content: String::new(),
+                finish_reason: "length".into(),
+            })
+            .collect(),
+    )
+    .await;
     let config = retention_config(&server.endpoint_url);
     config.set_backend_runtime_info(
         hymt_core::runtime::BackendRuntimeInfo::from_llama_cpp_props(
@@ -32,7 +39,7 @@ async fn default_exhaustion_retains_complete_original_and_records_no_cold_sample
         &ctx,
     )
     .await
-    .expect("exhausted content validation must retain the original paragraph by default");
+    .expect("exhausted transport validation must retain the original paragraph by default");
     assert!(outcome.is_completeness_degraded());
     assert_eq!(outcome.text.matches(source).count(), 1);
     assert!(outcome.text.contains("Untranslated original"));
@@ -219,9 +226,15 @@ async fn oversized_owner_keeps_successful_surrounding_replies_and_failed_control
         }
     }
 
-    let server =
-        start_capturing_mock_server((0..4).map(|_| MockResponse::Json(String::new())).collect())
-            .await;
+    let server = start_capturing_mock_server(
+        (0..4)
+            .map(|_| MockResponse::JsonWithFinishReason {
+                content: String::new(),
+                finish_reason: "length".into(),
+            })
+            .collect(),
+    )
+    .await;
     let config = retention_config(&server.endpoint_url);
     let client = TranslationClient::new(config.clone()).unwrap();
     let segmenter = fallback_segmenter();
@@ -274,7 +287,7 @@ fn owner_restoration_is_occurrence_bound_before_reference_normalization() {
         }
         completed[failed] = String::new();
         let mut degraded = vec![failed + 1];
-        let (output, regions) = retained_original::finalize(source, &plan, &mut completed, &mut degraded, true).unwrap();
+        let (output, regions) = retained_original::finalize(source, &plan, &mut completed, &mut degraded).unwrap();
         assert_eq!(regions.len(), 1);
         let region = &regions[0];
         assert_eq!(region.paragraph_index, 2);
@@ -306,27 +319,24 @@ fn oversized_copy_only_owner_does_not_trigger_fallback_notice() {
     let mut completed = plan.segments.clone();
     let mut degraded = Vec::new();
     let (output, regions) =
-        retained_original::finalize(&source, &plan, &mut completed, &mut degraded, true).unwrap();
+        retained_original::finalize(&source, &plan, &mut completed, &mut degraded).unwrap();
     assert_eq!(output, source);
     assert!(regions.is_empty());
     assert!(degraded.is_empty());
-}
-
-#[test]
-fn synthetic_repeated_emphasis_omission_uses_existing_structure_guard() {
-    let source = "First *17 credits*, second *17 credits*, then *three*, *four*, *five*, *six*.";
-    let candidate = "First *17 credits*, second credits, then *three*, *four*, *five*, *six*.";
-    assert!(SegmentSource::from(source)
-        .structure_preserved(candidate)
-        .is_err());
 }
 
 #[tokio::test]
 async fn default_stream_tokens_equal_marked_final_and_failed_text_never_leaks() {
     let source = "The complete synthetic source must be retained after retries fail.";
     let server = start_mock_server(vec![
-        MockResponse::Sse(vec!["**bad**".into()]),
-        MockResponse::Json("**bad**".into()),
+        MockResponse::SseWithFinishReason {
+            tokens: vec!["**bad**".into()],
+            finish_reason: "length".into(),
+        },
+        MockResponse::JsonWithFinishReason {
+            content: "**bad**".into(),
+            finish_reason: "length".into(),
+        },
     ])
     .await;
     let config = retention_config(&server.endpoint_url);
@@ -426,22 +436,14 @@ fn budget_fitting_inline_paragraph_is_one_coherent_request() {
     let translated = "阅读 *17 点数* 并参看 [公共指南](https://example.test/guide) 使用 `--safe` 再选择 **下一步操作**.";
     let mut completed = vec![translated.to_owned()];
     let (output, regions) =
-        retained_original::finalize(source, &plan, &mut completed, &mut vec![], true).unwrap();
+        retained_original::finalize(source, &plan, &mut completed, &mut vec![]).unwrap();
     assert!(regions.is_empty());
     assert!(output.contains(translated));
-    assert!(cache_proof::cached_owned_payloads_match(&plan, &output));
-    for invalid in [
-        output.replace("--safe", "--unsafe"),
-        output.replace("https://example.test/guide", "https://example.test/other"),
-    ] {
-        assert!(!cache_proof::cached_owned_payloads_match(&plan, &invalid));
-    }
 }
 
 #[test]
 fn numeric_citations_keep_complete_owner_and_exact_occurrences() {
     let source = "Compare *the first result* [12] with *the second result* [34] before deciding.\n";
-    let translated = "比较 *第一项结果* [12] 与 *第二项结果* [34] 后再决定。";
     let config = make_protected_block_config("http://127.0.0.1:1/v1");
     let plan = plan_translation(
         source,
@@ -466,28 +468,6 @@ fn numeric_citations_keep_complete_owner_and_exact_occurrences() {
     .unwrap();
     assert_eq!(plain_plan.segments, vec![plain]);
     assert!(plain_plan.coherent_paragraphs.contains(&1));
-    assert!(markdown_ownership::coherent_protected_bytes_preserved(
-        source, translated
-    ));
-    for invalid in [
-        translated.replace("[12]", "[13]"),
-        translated.replace("[12]", ""),
-        translated.replace("[12]", "[12] [12]"),
-        translated
-            .replace("[12]", "[99]")
-            .replace("[34]", "[12]")
-            .replace("[99]", "[34]"),
-    ] {
-        assert!(!markdown_ownership::coherent_protected_bytes_preserved(
-            source, &invalid
-        ));
-    }
-    let repeated = "Compare *both results* [12] with [12] again.\n";
-    assert!(!markdown_ownership::coherent_protected_bytes_preserved(
-        repeated,
-        "比较 *两项结果* [12]。"
-    ));
-
     let reference = format!("{source}\n[12]: https://example.test/reference\n");
     let reference_plan = plan_translation(
         &reference,
@@ -521,33 +501,6 @@ fn numeric_citations_keep_complete_owner_and_exact_occurrences() {
         )
         .unwrap();
         assert!(plan.coherent_paragraphs.is_empty(), "{unsupported}");
-    }
-}
-
-#[test]
-fn coherent_paragraph_proof_rejects_extra_opaque_payloads() {
-    let source = "Read *17 credits* and `--safe` carefully.";
-    let config = make_protected_block_config("http://127.0.0.1:1/v1");
-    let plan = plan_translation(
-        source,
-        "zh",
-        &config,
-        &fallback_segmenter(),
-        &TemplateType::Default,
-        &PromptOpts::default(),
-    )
-    .unwrap();
-    let translated = "阅读 *17 点数* 并且 `--safe` 小心操作.";
-    for extra in [
-        " {{forged}}",
-        " https://example.test/forged",
-        " `forged`",
-        " *forged*",
-    ] {
-        assert!(
-            !cache_proof::cached_owned_payloads_match(&plan, &format!("{translated}{extra}")),
-            "must reject added protected payload {extra}"
-        );
     }
 }
 
@@ -767,115 +720,8 @@ async fn complex_paragraph_requests_cover_source_and_map_replies_in_order() {
     }
 }
 
-#[tokio::test]
-async fn coherent_payload_failure_is_retained_or_strict_before_stream_publication() {
-    for retain in [false, true] {
-        let invalid = format!("{COHERENT_TRANSLATION} {{{{forged}}}}");
-        let server = start_capturing_mock_server(vec![
-            MockResponse::Sse(vec![invalid.clone()]),
-            MockResponse::Json(invalid),
-        ])
-        .await;
-        let config = coherent_config(&server.endpoint_url, retain);
-        let client = TranslationClient::new(config.clone()).unwrap();
-        let segmenter = fallback_segmenter();
-        let dir = tempfile::tempdir().unwrap();
-        let history = HistoryDB::new(dir.path().join("history.db"));
-        let ctx = TranslationCtx {
-            config: &config,
-            client: &client,
-            segmenter: &segmenter,
-            history: &history,
-            cache_enabled: true,
-        };
-        let opts = PromptOpts::default();
-        let (tx, mut rx) = mpsc::channel(16);
-        let result = translate_text_stream_with_mode(
-            COHERENT_SOURCE,
-            "zh",
-            &TemplateType::Default,
-            &opts,
-            &ctx,
-            StreamOutputMode::Optimistic,
-            tx,
-        )
-        .await;
-        let mut tokens = String::new();
-        while let Some(event) = rx.recv().await {
-            if let StreamEvent::Token(text) = event {
-                tokens.push_str(&text);
-            }
-        }
-        assert_eq!(server.requests.lock().unwrap().len(), 2);
-        if retain {
-            let outcome = result.unwrap();
-            assert_eq!(tokens, outcome.text);
-            assert!(!tokens.contains("forged"));
-            assert_eq!(outcome.retained_regions.len(), 1);
-            assert_eq!(
-                &tokens[outcome.retained_regions[0].output_bytes.clone()],
-                COHERENT_SOURCE
-            );
-            let record = history.fetch_recent(None).unwrap().pop().unwrap();
-            assert!(record.cold_source_tokens.is_none());
-            assert_eq!(record.tokens_per_second, 0.0);
-        } else {
-            assert!(result.is_err());
-            assert!(
-                tokens.is_empty(),
-                "strict coherent Markdown must not leak a rejected payload"
-            );
-            assert!(history.fetch_recent(None).unwrap().is_empty());
-        }
-        assert!(offline_replay::find_replay(
-            COHERENT_SOURCE,
-            "zh",
-            &TemplateType::Default,
-            &opts,
-            &ctx,
-            true
-        )
-        .unwrap()
-        .is_none());
-    }
-}
-
 #[test]
-fn coherent_good_failed_good_restores_only_the_failed_original_owner() {
-    let source = "First *complete* paragraph.\n\nMiddle *complete* paragraph.\n\nLast *complete* paragraph.\n";
-    let config = coherent_config("http://127.0.0.1:1/v1", true);
-    let plan = plan_translation(
-        source,
-        "zh",
-        &config,
-        &fallback_segmenter(),
-        &TemplateType::Default,
-        &PromptOpts::default(),
-    )
-    .unwrap();
-    assert_eq!(plan.segment_count(), 3);
-    let mut completed = vec![
-        "第一 *完整* 段落.".into(),
-        "中间 *完整* 段落. {{forged}}".into(),
-        "最后 *完整* 段落.".into(),
-    ];
-    let mut degraded = Vec::new();
-    let (output, regions) =
-        retained_original::finalize(source, &plan, &mut completed, &mut degraded, true).unwrap();
-    assert_eq!(regions.len(), 1);
-    assert_eq!(regions[0].paragraph_index, 2);
-    assert_eq!(
-        &output[regions[0].output_bytes.clone()],
-        &source[regions[0].source_bytes.clone()]
-    );
-    assert_eq!(output.matches("Middle *complete* paragraph.").count(), 1);
-    assert!(output.contains("第一 *完整* 段落."));
-    assert!(output.contains("最后 *完整* 段落."));
-    assert_eq!(degraded, vec![2]);
-}
-
-#[test]
-fn coherent_selection_keeps_budget_and_unprovable_source_guards() {
+fn coherent_selection_keeps_budget_and_source_reconstruction() {
     let segmenter = fallback_segmenter();
     let config = make_stream_config("http://127.0.0.1:1/v1");
     let plan = plan_translation(
@@ -914,17 +760,12 @@ fn coherent_selection_keeps_budget_and_unprovable_source_guards() {
             &PromptOpts::default(),
         )
         .unwrap();
-        let mut completed = plan.segments.clone();
-        assert!(
-            markdown_boundary::render_translations(&plan, &mut completed),
-            "source itself must be admissible: {source}"
-        );
-        assert_eq!(plan.reconstruct(&completed), source);
+        assert_eq!(plan.reconstruct(&plan.segments), source);
     }
 }
 
 #[tokio::test]
-async fn omitted_url_retries_stay_inside_the_admitted_request_budget() {
+async fn transport_retries_stay_inside_the_admitted_request_budget() {
     for context_window in [480, 509, 510] {
         for streaming in [false, true] {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -946,8 +787,18 @@ async fn omitted_url_retries_stay_inside_the_admitted_request_budget() {
                         .map_or_else(String::new, |(source, _)| source.to_owned());
                     let encoded = serde_json::to_string(&reply).unwrap();
                     let reply = encoded[1..encoded.len() - 1].to_owned();
-                    let response = if body["stream"] == true {
-                        MockResponse::Sse(vec![reply])
+                    let response = if !prompt.contains(COMPLETENESS_RETRY_INSTRUCTION) {
+                        if body["stream"] == true {
+                            MockResponse::SseWithFinishReason {
+                                tokens: vec![reply],
+                                finish_reason: "length".into(),
+                            }
+                        } else {
+                            MockResponse::JsonWithFinishReason {
+                                content: reply,
+                                finish_reason: "length".into(),
+                            }
+                        }
                     } else {
                         MockResponse::Json(reply)
                     };

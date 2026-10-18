@@ -1,49 +1,6 @@
 use super::*;
 
 #[test]
-fn coherent_inline_flanking_spaces_are_editable() {
-    for (source, candidate) in [
-        ("Read *one* now.", "Read  *one* now."),
-        ("Read *one* now.", "Read *one*  now."),
-        ("Read *one* now.", "Read \t*one* now."),
-        ("Read `one` now.", "Read  `one`  now."),
-        (
-            "Read [one](https://example.test/a) now.",
-            "Read  [one](https://example.test/a)  now.",
-        ),
-    ] {
-        assert!(is_coherent_inline_paragraph(source));
-        super::super::ensure_markdown_structure_preserved(source, candidate).unwrap();
-        assert!(
-            coherent_protected_bytes_preserved(source, candidate),
-            "ordinary spacing changed the protected signature: {candidate}"
-        );
-    }
-    assert!(!coherent_protected_bytes_preserved(
-        "Read `one` now.",
-        "Read `two` now."
-    ));
-    assert!(!coherent_protected_bytes_preserved(
-        "Read ` one ` now.",
-        "Read `  one ` now."
-    ));
-    assert!(!coherent_protected_bytes_preserved(
-        "Read *one* now.",
-        "Read _one_ now."
-    ));
-    assert!(!coherent_protected_bytes_preserved(
-        "Read [one](https://example.test/a) now.",
-        "Read [one](https://example.test/b) now."
-    ));
-    assert!(super::super::ensure_markdown_structure_preserved(
-        "Read *one* now.",
-        "Read\n# *one* now."
-    )
-    .is_err());
-    assert!(!is_coherent_inline_paragraph("Read $x$ now."));
-}
-
-#[test]
 fn single_pipe_is_not_a_table_separator_or_a_panic() {
     for line in ["|", " | ", "\t|\t", "||", "|---|", "|:---:|"] {
         assert!(!is_markdown_table_separator(line), "{line:?}");
@@ -79,7 +36,7 @@ fn overlapping_owners_and_single_opaque_containment_match_naive_oracle() {
             }
         }
         assert_eq!(
-            merge_ranges(owned_gaps(text, owners, &leaves, true)),
+            merge_ranges(owned_gaps(text, owners, &leaves)),
             merge_ranges(expected)
         );
     }

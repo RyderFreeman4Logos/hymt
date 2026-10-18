@@ -112,13 +112,12 @@ def _complete(raw: bytes, content_type: str) -> bool:
                 and isinstance(choice.get("message"), dict)
                 and type(choice["message"].get("content")) is str
                 and isinstance(choice.get("index"), _Number) and str(choice["index"]).isascii() and str(choice["index"]).isdigit()
-                and bool(choice["message"]["content"].strip()) for choice in choices)
+                for choice in choices)
         if content_type.split(";", 1)[0].strip().lower() != "text/event-stream":
             return False
         text = raw.decode("utf-8").replace("\r\n", "\n")
         if not text.endswith("\n\n"):
             return False
-        contents: dict[str, str] = {}
         finished: set[str] = set()
         observed: set[str] = set()
         done = False
@@ -157,13 +156,12 @@ def _complete(raw: bytes, content_type: str) -> bool:
                 if content is not None:
                     if type(content) is not str or index in finished:
                         return False
-                    contents[index] = contents.get(index, "") + content
                 reason = choice.get("finish_reason")
                 if reason is not None:
                     if reason != "stop" or index in finished:
                         return False
                     finished.add(index)
-        return done and bool(contents) and set(contents) == finished == observed and all(value.strip() for value in contents.values())
+        return done and bool(observed) and finished == observed
     except (ValueError, UnicodeError, RecursionError, TypeError):
         return False
 

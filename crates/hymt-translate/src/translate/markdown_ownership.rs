@@ -105,9 +105,9 @@ fn clipped_ranges(
         .collect()
 }
 
-/// Ordinary inline Markdown can be validated as a complete paragraph by the
-/// existing AST and identity checks. Containers, references and opaque block
-/// syntax keep their source-owned reconstruction path.
+/// Ordinary inline Markdown can travel as a complete source paragraph.
+/// Containers, references and opaque block syntax keep their source-owned
+/// reconstruction path.
 pub(super) fn is_coherent_inline_paragraph(source: &str) -> bool {
     if source.contains(['|', '$', '\\', '{', '}']) {
         return false;
@@ -205,28 +205,6 @@ fn literal_numeric_citation_ranges(text: &str) -> Vec<Range<usize>> {
     citations
 }
 
-/// Compare the same immutable atoms and parser roles used by leaf rendering.
-/// Prose byte offsets may change; the ordered protected atoms and their parser
-/// roles must retain exact syntax, URLs, placeholders and opaque payload bytes.
-pub(super) fn coherent_protected_bytes_preserved(source: &str, candidate: &str) -> bool {
-    fn signature(text: &str) -> Option<(Vec<String>, Vec<super::cache_proof::Role>)> {
-        let mut fixed = protected_markdown_structure_ranges(text, false);
-        fixed.extend(literal_numeric_citation_ranges(text));
-        let fixed = merge_ranges(fixed);
-        let roles = super::cache_proof::roles(text, &fixed, &[])?;
-        Some((
-            fixed
-                .iter()
-                .map(|range| text[range.clone()].to_owned())
-                .collect(),
-            roles,
-        ))
-    }
-    let mut rendered = candidate.to_owned();
-    super::restore_trailing_newlines(&mut rendered, source);
-    signature(source).is_some_and(|expected| signature(&rendered).as_ref() == Some(&expected))
-}
-
 /// Keep oversized atomic Markdown blocks out of model input while preserving
 /// translatable text around them as independently segmentable sections.
 pub(super) fn split_oversized_protected_blocks(
@@ -252,7 +230,7 @@ pub(super) fn split_oversized_protected_blocks(
         .iter()
         .map(|section| section.text.as_str())
         .collect();
-    let structural_ranges = merge_ranges(protected_markdown_structure_ranges(&source, true));
+    let structural_ranges = merge_ranges(protected_markdown_structure_ranges(&source));
     let mut structural_cursor = 0;
     let mut offset = 0;
     let mut split_sections = Vec::with_capacity(doc_plan.sections.len());
@@ -387,10 +365,7 @@ pub(super) fn protected_markdown_block_ranges(text: &str) -> Vec<std::ops::Range
 
 /// Translate literal inline text leaves; keep their complete syntax source-owned.
 /// Parser byte ranges preserve nested delimiters without inventing Markdown grammar.
-fn protected_markdown_structure_ranges(
-    text: &str,
-    include_flanking_whitespace: bool,
-) -> Vec<Range<usize>> {
+fn protected_markdown_structure_ranges(text: &str) -> Vec<Range<usize>> {
     let parser = Parser::new(text);
     let mut owned: Vec<_> = parser
         .reference_definitions()
@@ -576,7 +551,7 @@ fn protected_markdown_structure_ranges(
         opaque.push(range);
     }
     exclude_opaque(&mut editable, opaque);
-    owned_gaps(text, owned, &editable, include_flanking_whitespace)
+    owned_gaps(text, owned, &editable)
 }
 
 fn exclude_opaque(editable: &mut Vec<Range<usize>>, mut opaque: Vec<Range<usize>>) {
@@ -599,15 +574,11 @@ fn owned_gaps(
     text: &str,
     mut owned: Vec<Range<usize>>,
     editable: &[Range<usize>],
-    include_flanking_whitespace: bool,
 ) -> Vec<Range<usize>> {
-    if include_flanking_whitespace {
-        for node in &mut owned {
-            // Section splitting must keep reference definitions and delimiter
-            // boundaries intact; coherent paragraphs compare syntax itself.
-            node.start = text[..node.start].trim_end().len();
-            node.end = text.len() - text[node.end..].trim_start().len();
-        }
+    for node in &mut owned {
+        // Source section splitting keeps reference definitions and delimiter boundaries intact.
+        node.start = text[..node.start].trim_end().len();
+        node.end = text.len() - text[node.end..].trim_start().len();
     }
     owned.sort_by_key(|node| node.start);
     let mut protected = Vec::new();
@@ -687,7 +658,7 @@ mod document_proof_tests {
         let source = format!("[label][id]\n\n[id]: ../first \"Title\"\n{hidden}");
         let start = source.find(hidden).unwrap();
         let end = start + hidden.len();
-        assert!(protected_markdown_structure_ranges(&source, true)
+        assert!(protected_markdown_structure_ranges(&source)
             .iter()
             .any(|range| range.start <= start && end <= range.end));
     }

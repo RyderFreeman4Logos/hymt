@@ -75,7 +75,7 @@ divergence_threshold = 2.0
 
 [completeness]
 max_retries = 2
-# Retain marked complete original paragraphs after mechanical validation retries fail.
+# Retain marked complete original paragraphs after transport completion retries fail.
 # Set false for strict failure instead. Runtime errors and atomic JSON remain strict.
 warn_only = true
 
@@ -1319,7 +1319,7 @@ impl HotConfig {
         self.get_non_negative_u32("completeness", "max_retries", 2)
     }
 
-    /// Retain complete original paragraphs after exhausted mechanical validation.
+    /// Retain complete original paragraphs after exhausted transport completion retries.
     /// Missing settings default to true; explicit false preserves strict failure.
     pub fn completeness_warn_only(&self) -> bool {
         self.get_bool("completeness", "warn_only", true)

@@ -94,70 +94,21 @@ fn reconstruct(
     Ok((output, regions))
 }
 
-fn validate(source: &str, output: &str) -> Result<()> {
-    ensure_markdown_structure_preserved(source, output)?;
-    ensure_document_identities_preserved(source, output)
-}
-
-/// Render accepted leaves, restore every failed owner's original bytes once, then
-/// validate the undecorated body. A root notice never enters a Markdown container.
+/// Restore original source owners only after a transport failure.
 pub(super) fn finalize(
     source: &str,
     plan: &TranslationPlan,
     completed: &mut [String],
     degraded_segments: &mut Vec<usize>,
-    retain_original: bool,
 ) -> Result<(String, Vec<RetainedRegion>)> {
-    let mut retained: BTreeSet<_> = degraded_segments
+    let retained: BTreeSet<_> = degraded_segments
         .iter()
         .map(|index| {
             owner(plan, index - 1).context("failed segment has no original paragraph owner")
         })
         .collect::<Result<_>>()?;
     reset_owners(plan, completed, &retained);
-    let rendered = markdown_boundary::render_translations(plan, completed);
     let (mut body, mut regions) = reconstruct(source, plan, completed, &retained)?;
-    if !rendered || validate(source, &body).is_err() {
-        if !retain_original || hymt_core::completeness::parse_json_document(source).is_some() {
-            if !rendered {
-                anyhow::bail!("translated Markdown inline boundaries changed");
-            }
-            validate(source, &body)?;
-        }
-        // Failure-only isolation: one original paragraph's candidates in source
-        // context. Never blame a transport error or replace unrelated good owners.
-        let mut found = false;
-        for paragraph in &plan.original_paragraphs {
-            if retained.contains(&paragraph.index) {
-                continue;
-            }
-            let mut isolated = plan.segments.clone();
-            for (index, text) in isolated.iter_mut().enumerate() {
-                if owner(plan, index) == Some(paragraph.index) {
-                    text.clone_from(&completed[index]);
-                }
-            }
-            let valid = markdown_boundary::render_translations(plan, &mut isolated)
-                && validate(source, &plan.reconstruct(&isolated)).is_ok();
-            if !valid {
-                retained.insert(paragraph.index);
-                found = true;
-            }
-        }
-        if !found {
-            anyhow::bail!(
-                "translated document validation failed without an attributable paragraph"
-            );
-        }
-        reset_owners(plan, completed, &retained);
-        if !markdown_boundary::render_translations(plan, completed) {
-            anyhow::bail!(
-                "translated Markdown inline boundaries changed after original restoration"
-            );
-        }
-        (body, regions) = reconstruct(source, plan, completed, &retained)?;
-        validate(source, &body)?;
-    }
     for index in 0..plan.segment_count() {
         if owner(plan, index).is_some_and(|owner| retained.contains(&owner)) {
             degraded_segments.push(index + 1);

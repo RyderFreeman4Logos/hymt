@@ -1,4 +1,4 @@
-//! Shared placeholder recognition for document ownership and identity validation.
+//! Source placeholder recognition for document ownership.
 use std::{collections::HashSet, ops::Range};
 
 /// Complete placeholder identities, with the same grammar as source ownership.

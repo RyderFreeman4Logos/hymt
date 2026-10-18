@@ -203,25 +203,27 @@ async fn fixture_reader_rejects_malformed_and_excessive_framing() {
 }
 
 #[tokio::test]
-async fn redirected_stdin_retries_or_retains_original_and_honors_strict_mode() {
+async fn redirected_stdin_publishes_model_content_and_handles_transport_failures() {
     let source = "Usage: run the translator. Options: read the guide before continuing.\n\nThe property name is ordinary prose and should remain ordinary prose after translation.";
     let first = "用法：运行翻译程序。选项：继续之前阅读说明。";
-    let invalid =
+    let changed =
         "属性 `[name](https://example.test)` 是普通文字，翻译之后 `property` 仍应保持普通文字。";
     let decorated = "属性 `name` 是普通文字，翻译之后 `property` 仍应保持普通文字。";
-    let recovered = "属性 name 是普通文字，翻译之后 property 仍应保持普通文字。";
     let valid = "属性名称是普通文字，翻译之后仍应保持普通文字。";
-    for case in [0, 1, 2, 3] {
-        let recover = matches!(case, 0 | 2);
-        let strict = case == 3;
-        let direct_recovery = case == 2;
+    for case in 0..6 {
+        let completed = matches!(case, 2 | 4 | 5);
+        let strict = matches!(case, 3..=5);
         let home = TestHome::new();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let requests = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&requests);
-        let reply = if recover { valid } else { invalid }.to_owned();
-        let first_reply = if direct_recovery { decorated } else { invalid };
+        let reply = if case == 0 { valid } else { changed }.to_owned();
+        let first_reply = match case {
+            2 => decorated,
+            5 => "",
+            _ => changed,
+        };
         std::fs::create_dir_all(home.0.join(".config/hymt")).unwrap();
         std::fs::write(
             home.0.join(".config/hymt/config.toml"),
@@ -251,11 +253,16 @@ async fn redirected_stdin_retries_or_retains_original_and_honors_strict_mode() {
                             "text/event-stream",
                             format!(
                                 "data: {}\n\ndata: [DONE]\n\n",
-                                serde_json::json!({"choices": [{"finish_reason": null, "delta": {"content": first}}]})
+                                serde_json::json!({"choices": [{"index": 0, "finish_reason": null, "delta": {"content": first}}]})
                             ),
                         )
                     } else {
-                        ("application/json", serde_json::json!({"choices": [{"finish_reason": "stop", "message": {"content": if attempt == 1 { first_reply } else { &reply }}}]}).to_string())
+                        let reason = if completed || (case == 0 && attempt == 2) {
+                            "stop"
+                        } else {
+                            "length"
+                        };
+                        ("application/json", serde_json::json!({"choices": [{"finish_reason": reason, "message": {"content": if attempt == 1 { first_reply } else { &reply }}}]}).to_string())
                     }
                 };
                 let response = format!(
@@ -392,19 +399,18 @@ async fn redirected_stdin_retries_or_retains_original_and_honors_strict_mode() {
         );
         assert_eq!(
             requests.load(Ordering::SeqCst),
-            if direct_recovery { 2 } else { 3 },
+            if completed { 2 } else { 3 },
             "{diagnostic}"
         );
-        if recover {
+        if completed || case == 0 {
             assert!(status.success(), "{diagnostic}");
             let stdout = String::from_utf8(stdout).unwrap();
-            assert!(stdout.contains(first), "{diagnostic}");
-            assert!(
-                stdout.contains(if direct_recovery { recovered } else { valid }),
-                "{diagnostic}"
-            );
-            assert!(!stdout.contains(invalid), "{diagnostic}");
-            assert!(!stdout.contains(decorated), "{diagnostic}");
+            let expected = if completed { first_reply } else { valid };
+            let mut expected = format!("{first}\n\n{expected}");
+            if !expected.ends_with('\n') {
+                expected.push('\n');
+            }
+            assert_eq!(stdout, expected, "{diagnostic}");
         } else if !strict {
             assert!(status.success(), "{diagnostic}");
             let stdout = String::from_utf8(stdout).unwrap();
@@ -420,7 +426,7 @@ async fn redirected_stdin_retries_or_retains_original_and_honors_strict_mode() {
                     .ends_with(source.split_once("\n\n").unwrap().1),
                 "{diagnostic}"
             );
-            assert!(!stdout.contains(invalid), "{diagnostic}");
+            assert!(!stdout.contains(changed), "{diagnostic}");
         } else {
             assert!(!status.success(), "{diagnostic}");
             assert!(stdout.is_empty(), "{diagnostic}");

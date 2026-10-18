@@ -341,6 +341,19 @@ struct ChoiceContent {
     content: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct StreamResponse {
+    choices: Vec<StreamChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamChoice {
+    index: u32,
+    finish_reason: Option<String>,
+    delta: Option<ChoiceContent>,
+    text: Option<String>,
+}
+
 // ── Inner shared state ────────────────────────────────────────────────────────
 
 const BACKEND_PREFLIGHT_TTL: Duration = Duration::from_secs(60);
@@ -1305,6 +1318,7 @@ async fn parse_sse_with_completion(
     let mut buf: Vec<u8> = Vec::new();
     let mut data_lines: Vec<String> = Vec::new();
     let mut saw_terminal = false;
+    let mut saw_choice = false;
 
     loop {
         match byte_stream.next().await {
@@ -1316,7 +1330,13 @@ async fn parse_sse_with_completion(
                         .trim_end_matches(['\r', '\n'])
                         .to_owned();
                     if line.is_empty() {
-                        if !flush_completion_sse_data(&mut data_lines, &tx, &mut saw_terminal).await
+                        if !flush_completion_sse_data(
+                            &mut data_lines,
+                            &tx,
+                            &mut saw_terminal,
+                            &mut saw_choice,
+                        )
+                        .await
                         {
                             return;
                         }
@@ -1343,7 +1363,7 @@ async fn parse_sse_with_completion(
             data_lines.push(data.trim_start().to_owned());
         }
     }
-    if !flush_completion_sse_data(&mut data_lines, &tx, &mut saw_terminal).await {
+    if !flush_completion_sse_data(&mut data_lines, &tx, &mut saw_terminal, &mut saw_choice).await {
         return;
     }
     if !saw_terminal {
@@ -1359,6 +1379,7 @@ async fn flush_completion_sse_data(
     data_lines: &mut Vec<String>,
     tx: &tokio::sync::mpsc::Sender<Result<TranslationStreamEvent, ClientError>>,
     saw_terminal: &mut bool,
+    saw_choice: &mut bool,
 ) -> bool {
     if data_lines.is_empty() {
         return true;
@@ -1366,6 +1387,10 @@ async fn flush_completion_sse_data(
     let data = data_lines.join("\n");
     data_lines.clear();
     if data == "[DONE]" {
+        if !*saw_choice {
+            let _ = tx.send(Err(ClientError::MissingChoices)).await;
+            return false;
+        }
         if !*saw_terminal {
             *saw_terminal = true;
             return tx
@@ -1378,13 +1403,20 @@ async fn flush_completion_sse_data(
         return true;
     }
 
-    let events = match serde_json::from_str::<ChatResponse>(&data) {
+    let (observed_choice, events) = match serde_json::from_str::<StreamResponse>(&data) {
         Ok(response) => match extract_stream_completion_events(response) {
             Ok(events) => events,
-            Err(error) => return tx.send(Err(error)).await.is_ok(),
+            Err(error) => {
+                let _ = tx.send(Err(error)).await;
+                return false;
+            }
         },
-        Err(error) => return tx.send(Err(ClientError::Json(error))).await.is_ok(),
+        Err(error) => {
+            let _ = tx.send(Err(ClientError::Json(error))).await;
+            return false;
+        }
     };
+    *saw_choice |= observed_choice;
     for event in events {
         if matches!(event, TranslationStreamEvent::Finished(_)) {
             *saw_terminal = true;
@@ -1507,12 +1539,21 @@ fn extract_stream_token(resp: ChatResponse) -> Result<String, ClientError> {
 }
 
 fn extract_stream_completion_events(
-    resp: ChatResponse,
-) -> Result<Vec<TranslationStreamEvent>, ClientError> {
-    let choices = resp.choices.unwrap_or_default();
-    let Some(first) = choices.into_iter().next() else {
-        return Ok(Vec::new());
+    resp: StreamResponse,
+) -> Result<(bool, Vec<TranslationStreamEvent>), ClientError> {
+    if resp.choices.len() > 1 {
+        return Err(ClientError::MissingChoices);
+    }
+    let Some(first) = resp.choices.into_iter().next() else {
+        return Ok((false, Vec::new()));
     };
+    // Requests ask for one completion, whose response slot is index zero.
+    if first.index != 0 {
+        return Err(ClientError::MissingChoices);
+    }
+    if first.delta.is_none() && first.text.is_none() {
+        return Err(ClientError::MissingContent);
+    }
     let termination = first
         .finish_reason
         .as_deref()
@@ -1529,7 +1570,7 @@ fn extract_stream_completion_events(
     if let Some(termination) = termination {
         events.push(TranslationStreamEvent::Finished(termination));
     }
-    Ok(events)
+    Ok((true, events))
 }
 
 // ── Retry helpers ─────────────────────────────────────────────────────────────
@@ -1640,6 +1681,25 @@ mod tests {
         let resp =
             parse_chat(r#"{"choices":[{"finish_reason":"stop","message":{"content":"Hello"}}]}"#);
         assert_eq!(extract_from_response(resp).unwrap(), "Hello");
+    }
+
+    #[test]
+    fn completed_empty_content_is_distinct_from_absent_or_invalid_content() {
+        let empty =
+            parse_chat(r#"{"choices":[{"finish_reason":"stop","message":{"content":""}}]}"#);
+        assert_eq!(extract_from_response(empty).unwrap(), "");
+        for raw in [
+            r#"{"choices":[{"finish_reason":"stop","message":{}}]}"#,
+            r#"{"choices":[{"finish_reason":"stop","message":{"content":null}}]}"#,
+        ] {
+            assert!(matches!(
+                extract_from_response(parse_chat(raw)),
+                Err(ClientError::MissingContent)
+            ));
+        }
+        for raw in ["not JSON", r#"{"choices":[{"message":{"content":123}}]}"#] {
+            assert!(serde_json::from_str::<ChatResponse>(raw).is_err());
+        }
     }
 
     #[test]
