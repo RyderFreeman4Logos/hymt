@@ -630,8 +630,17 @@ class CacheServer(ThreadingMixIn, HTTPServer):
                     # Revoke an observed contradiction before a later probe can fail, independent of caller alias.
                     self.revoke_observation(observation)
                     retained = None
-            if unavailable and budget.expired:
-                break
+            if unavailable:
+                try:
+                    budget.remaining()
+                except _Deadline:
+                    # A socket timeout can precede the child timer callback.
+                    # Only a scoped probe may expire into historical replay;
+                    # a genuine parent request deadline must still propagate.
+                    if budget.parent is None:
+                        raise
+                    budget.parent.remaining()
+                    break
         if unavailable:
             raise _Unavailable("upstream metadata unavailable")
         identity = self.identity(values["/props"], values["/v1/models"], None)
