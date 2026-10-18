@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use chrono::{SecondsFormat, Utc};
+use hymt_core::completeness::OUTPUT_ADMISSION_VERSION;
 use hymt_core::language::DocumentTranslationPolicy;
 use rusqlite::{Connection, OpenFlags};
 use sha2::{Digest, Sha256};
@@ -214,6 +215,8 @@ fn document_policy_key(policy: DocumentTranslationPolicy) -> &'static str {
 /// exec-cache entry created under a different translation plan.
 fn hash_text_with_document_policy(source_text: &str, document_policy: &str) -> String {
     let mut hasher = Sha256::new();
+    hasher.update(OUTPUT_ADMISSION_VERSION);
+    hasher.update([0]);
     hasher.update(document_policy.as_bytes());
     hasher.update([0]);
     hasher.update(source_text.as_bytes());
@@ -319,6 +322,31 @@ mod tests {
             .find("ls", "-la", "some source", "en", DEFAULT_DOCUMENT_POLICY)
             .unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn legacy_output_hash_cannot_replay_a_prefix() {
+        let tmp = TempDir::new().unwrap();
+        let cache = make_cache(&tmp);
+        let source = "source text";
+        let policy = document_policy_key(DEFAULT_DOCUMENT_POLICY);
+        let mut legacy = Sha256::new();
+        legacy.update(policy.as_bytes());
+        legacy.update([0]);
+        legacy.update(source.as_bytes());
+        let key = ExecCacheKey {
+            command: "translate".into(),
+            subcommand: "text".into(),
+            output_hash: hex::encode(legacy.finalize()),
+            target_lang: "zh".into(),
+            document_policy: policy.into(),
+        };
+        let conn = Connection::open(cache.user_path()).unwrap();
+        store_in_conn(&conn, &key, source, "prefix").unwrap();
+        assert!(cache
+            .find("translate", "text", source, "zh", DEFAULT_DOCUMENT_POLICY)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

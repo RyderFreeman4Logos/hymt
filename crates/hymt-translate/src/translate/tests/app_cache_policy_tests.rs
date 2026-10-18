@@ -571,6 +571,13 @@ async fn replay_rejects_changed_request_and_policy() {
 async fn replay_denies_corrupt_legacy_historical_and_wrong_eos_proofs() {
     let fixture = OfflineFixture::warm(false).await;
     let offline = fixture.fresh();
+    let mut prior_admission: serde_json::Value = serde_json::from_str(&fixture.proof).unwrap();
+    prior_admission["version"] = serde_json::json!(1);
+    fixture.replace(&prior_admission.to_string(), &fixture.record);
+    assert!(
+        !fixture.candidate(&offline, false),
+        "prior admission version"
+    );
     for (field, replacement) in [
         ("version", serde_json::json!(99)),
         ("requests", serde_json::json!("wrong")),
@@ -1023,6 +1030,73 @@ async fn completeness_retry_cannot_populate_offline_proof() {
         &ctx,
         &plan,
         false,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(history
+        .find_replay_candidates(&segment_cache_hash(SOURCE), &key)
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn terminal_less_stream_retry_cannot_populate_offline_proof() {
+    let fixture = OfflineFixture::warm(false).await;
+    let server = start_capturing_mock_server(vec![
+        MockResponse::SseWithoutTerminal(vec!["译".into()]),
+        MockResponse::Json(REPLY.into()),
+    ])
+    .await;
+    let config = make_stream_config(&server.endpoint_url);
+    config.set_backend_runtime_info(fixture.config.backend_runtime_info().unwrap());
+    let client = TranslationClient::new(config.clone()).unwrap();
+    let history = HistoryDB::new(fixture._dir.path().join("terminal-retried.db"));
+    let ctx = TranslationCtx {
+        config: &config,
+        client: &client,
+        segmenter: &fixture.segmenter,
+        history: &history,
+        cache_enabled: true,
+    };
+    let opts = PromptOpts::default();
+    let (tx, mut rx) = mpsc::channel(16);
+    let result = translate_text_stream_with_mode(
+        SOURCE,
+        "zh",
+        &TemplateType::Default,
+        &opts,
+        &ctx,
+        StreamOutputMode::Validated,
+        tx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.text, REPLY);
+    assert_eq!(server.requests.lock().unwrap().len(), 2);
+    let mut published = String::new();
+    while let Some(event) = rx.recv().await {
+        if let StreamEvent::Token(text) = event {
+            published.push_str(&text);
+        }
+    }
+    assert_eq!(published, REPLY);
+    let plan = plan_translation(
+        SOURCE,
+        "zh",
+        &config,
+        &fixture.segmenter,
+        &TemplateType::Default,
+        &opts,
+    )
+    .unwrap();
+    let (key, _) = offline_replay::population_proof(
+        (SOURCE, REPLY),
+        "zh",
+        &TemplateType::Default,
+        &opts,
+        &ctx,
+        &plan,
+        true,
     )
     .unwrap()
     .unwrap();

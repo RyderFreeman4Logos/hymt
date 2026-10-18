@@ -1201,6 +1201,8 @@ fn translation_section_groups(plan: &DocumentLanguagePlan) -> Vec<Vec<usize>> {
 
 pub(crate) fn segment_cache_hash(text: &str) -> String {
     let mut h = Sha256::new();
+    h.update(hymt_core::completeness::OUTPUT_ADMISSION_VERSION);
+    h.update([0]);
     h.update(text.as_bytes());
     hex::encode(h.finalize())
 }
@@ -3224,6 +3226,7 @@ mod tests {
             finish_reason: String,
         },
         Sse(Vec<String>),
+        SseWithoutTerminal(Vec<String>),
         SseWithFinishReason {
             tokens: Vec<String>,
             finish_reason: String,
@@ -3830,6 +3833,10 @@ mod tests {
                 body.push_str("data: [DONE]\n\n");
                 ("text/event-stream", body)
             }
+            MockResponse::SseWithoutTerminal(tokens) => {
+                let body = tokens.iter().map(|token| sse_token_body(token)).collect();
+                ("text/event-stream", body)
+            }
             MockResponse::SseWithFinishReason {
                 tokens,
                 finish_reason,
@@ -4126,6 +4133,12 @@ warn_only = false
     #[test]
     fn segment_hash_is_deterministic() {
         assert_eq!(segment_cache_hash("test"), segment_cache_hash("test"));
+    }
+
+    #[test]
+    fn segment_hash_does_not_reuse_legacy_prefix_entries() {
+        let legacy = hex::encode(Sha256::digest(b"test"));
+        assert_ne!(segment_cache_hash("test"), legacy);
     }
 
     #[test]

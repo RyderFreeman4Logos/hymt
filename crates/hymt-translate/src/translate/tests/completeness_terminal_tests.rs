@@ -1,6 +1,54 @@
 use super::*;
 
 #[tokio::test]
+async fn terminal_less_sse_retries_before_validated_publication() {
+    let source = "Read this complete source instruction and preserve its detailed meaning.";
+    let complete = "请完整阅读并保留这条说明。";
+    let server = start_capturing_mock_server(vec![
+        MockResponse::SseWithoutTerminal(vec!["译".to_owned()]),
+        MockResponse::Json(complete.to_owned()),
+    ])
+    .await;
+    let config = make_stream_config(&server.endpoint_url);
+    let client = TranslationClient::new(config.clone()).unwrap();
+    let segmenter = fallback_segmenter();
+    let dir = tempfile::tempdir().unwrap();
+    let history = HistoryDB::new(dir.path().join("history.db"));
+    let ctx = TranslationCtx {
+        config: &config,
+        client: &client,
+        segmenter: &segmenter,
+        history: &history,
+        cache_enabled: true,
+    };
+    let (tx, mut rx) = mpsc::channel(32);
+    let result = translate_text_stream_with_mode(
+        source,
+        "zh",
+        &TemplateType::Default,
+        &PromptOpts::default(),
+        &ctx,
+        StreamOutputMode::Validated,
+        tx,
+    )
+    .await
+    .unwrap();
+    let mut published = String::new();
+    let mut done = 0;
+    while let Some(event) = rx.recv().await {
+        match event {
+            StreamEvent::Token(text) => published.push_str(&text),
+            StreamEvent::AllDone(_) => done += 1,
+            _ => {}
+        }
+    }
+    assert_eq!(result.text, complete);
+    assert_eq!(published, complete);
+    assert_eq!(done, 1);
+    assert_eq!(server.requests.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn exhausted_known_missing_content_preserves_file_and_history() {
     let source =
         r#"{"customer": "Keep the account available throughout the entire migration process."}"#;

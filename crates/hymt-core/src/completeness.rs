@@ -14,6 +14,9 @@ mod urls;
 pub use urls::preserved_url_ranges;
 use urls::urls;
 
+/// Bump app-cache keys when mechanical output admission changes.
+pub const OUTPUT_ADMISSION_VERSION: &[u8] = b"terminal-required-v2";
+
 /// Final document state; this is not a translation quality assessment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -31,6 +34,7 @@ pub enum CompletionTermination {
     Stop,
     Length,
     Timeout,
+    MissingTerminal,
 }
 
 /// Mechanical failures that require repair or original-source retention.
@@ -58,6 +62,7 @@ pub fn validate_completeness_with_termination(
     match termination {
         CompletionTermination::Length => checks_failed.push("finish_reason_length".to_owned()),
         CompletionTermination::Timeout => checks_failed.push("timeout".to_owned()),
+        CompletionTermination::MissingTerminal => checks_failed.push("missing_terminal".to_owned()),
         CompletionTermination::Unknown | CompletionTermination::Stop => {}
     }
     checks_failed.extend(identity_preservation_failures(input_text, output_text));

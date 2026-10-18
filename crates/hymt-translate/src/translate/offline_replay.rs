@@ -4,7 +4,7 @@ use hymt_core::runtime::BackendRuntimeInfo;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-const VERSION: u64 = 1;
+const VERSION: u64 = 2;
 
 fn digest(bytes: impl AsRef<[u8]>) -> String {
     format!("{:x}", Sha256::digest(bytes.as_ref()))
@@ -186,7 +186,7 @@ pub(crate) fn find_replay(
     let configured = configured_digest(source, target, template, opts, ctx, streaming)?;
     for (record, bytes) in ctx
         .history
-        .find_replay_candidates(&digest(source), &configured)?
+        .find_replay_candidates(&segment_cache_hash(source), &configured)?
     {
         let validate = || -> Result<Option<Replay>> {
             let proof: Value = serde_json::from_str(&bytes)?;
