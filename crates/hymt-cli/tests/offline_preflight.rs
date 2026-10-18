@@ -351,14 +351,28 @@ async fn timeout_retains_child_identity_outputs_and_reap_result() {
     let mut child = Command::new("sh")
         .args([
             "-c",
-            "printf 'synthetic stdout'; printf 'synthetic stderr' >&2; exec sleep 30",
+            "read -r start; printf 'synthetic stdout' > \"$1\"; printf 'synthetic stderr' >&2; printf R; exec sleep 30",
+            "synthetic-timeout",
         ])
-        .stdin(Stdio::null())
-        .stdout(std::fs::File::create_new(&stdout).unwrap())
+        .arg(&stdout)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
         .stderr(std::fs::File::create_new(&stderr).unwrap())
         .kill_on_drop(true)
         .spawn()
         .unwrap();
+    // Release the startup barrier, then wait for both diagnostic writes before timing out.
+    let readiness = tokio::time::timeout(Duration::from_secs(15), async {
+        child.stdin.take().unwrap().write_all(b"start\n").await?;
+        child.stdout.take().unwrap().read_u8().await
+    })
+    .await;
+    if !matches!(readiness, Ok(Ok(b'R'))) {
+        let _ = fixture
+            .wait_for_child("timeout", &mut child, Duration::ZERO)
+            .await;
+        panic!("synthetic child did not become ready: {readiness:?}");
+    }
     let pid = child.id().unwrap();
     let result = fixture
         .wait_for_child("timeout", &mut child, Duration::from_millis(250))
