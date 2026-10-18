@@ -98,11 +98,8 @@ force_translate_all = false
 # repeat_last_n = 64 # llama.cpp only
 
 [completeness]
-zh_to_en_min_ratio = 0.3
-en_to_zh_min_ratio = 0.3
-min_paragraph_ratio = 0.5
 max_retries = 2
-# Retain marked complete original paragraphs after content validation retries fail.
+# Retain marked complete original paragraphs after mechanical validation retries fail.
 # Set false for strict failure instead. Runtime errors and atomic JSON remain strict.
 warn_only = true
 
@@ -278,9 +275,9 @@ Behavior:
 
 - Default target is `zh`, and Markdown outputs normalize to `.zh-cn.md`.
 - Directory mode translates Markdown files and preserves relative paths when `--output-dir` is used.
-- Completeness validation is a fast, layered truncation/structure guard — **not** translation quality estimation (QE) or proof of semantic correctness. For calibrated English/Chinese targets, density is the output/input ratio of the same `ceil(utf8_bytes / 4)` estimate the segmenter uses when its tokenizer is absent. A Unicode-scalar ratio rejects complete English-to-Chinese prose because Chinese uses fewer scalars per word. Other targets explicitly report `unverified_density` rather than silently claiming density has passed. It also checks empty/terminated responses when supplied by a caller, paragraphs, Markdown headings and fenced blocks, placeholders, URLs, and valid JSON templates. Cached segments are revalidated with the current guard before reuse.
+- Output admission checks empty responses, transport truncation, repeated URL/placeholder identities, JSON structure and source-owned Markdown assembly. Translation wording, length and paragraph reflow belong to the model and do not trigger retries. Protected bytes and input coverage remain harness contracts. Cached segments use the same mechanical checks before reuse.
 - Ordinary paragraphs containing emphasis, inline links/images, or inline code use one complete request when the final request budget and protected-byte check permit it. Protected syntax, payload bytes and parser roles remain exact; references, math, escaped syntax, block containers and oversized paragraphs keep the existing source-owned splitting path. Complete inline paragraphs use Validated streaming even in strict mode.
-- Failed segments retry up to `[completeness].max_retries` across normal, streaming, batch, and `translate-doc` paths. By default, exhausted content or Markdown validation retains the complete original paragraph unchanged and continues translating other paragraphs. A visible notice outside Markdown containers identifies retained paragraphs by source byte and body line ranges; stderr reports `completeness_status=degraded_original_retained` and `completeness_degraded_segments=…`. Source ownership is fixed before reference expansion and long-paragraph splitting: failure of any piece restores its whole original paragraph once. Retained pieces are excluded from accepted segment and exec caches; degraded documents never populate offline replay proofs or cold timing samples. Streaming with retention enabled waits for validation and emits exactly the final marked output. Set `[completeness].warn_only = false` for strict failure, or use `--warn-only-completeness` to override strict configuration. Runtime, network, authentication, configuration, and cancellation errors remain errors. These mechanical checks do not prove semantic translation accuracy.
+- Failed segments retry up to `[completeness].max_retries` across normal, streaming, batch, and `translate-doc` paths. By default, exhausted mechanical validation retains the complete original paragraph unchanged and continues translating other paragraphs. A visible notice outside Markdown containers identifies retained paragraphs by source byte and body line ranges; stderr reports `completeness_status=degraded_original_retained` and `completeness_degraded_segments=…`. Source ownership is fixed before reference expansion and long-paragraph splitting: failure of any piece restores its whole original paragraph once. Retained pieces are excluded from accepted segment and exec caches; degraded documents never populate offline replay proofs or cold timing samples. Streaming with retention enabled waits for validation and emits exactly the final marked output. Set `[completeness].warn_only = false` for strict failure, or use `--warn-only-completeness` to override strict configuration. Runtime, network, authentication, configuration, and cancellation errors remain errors. These mechanical checks do not prove semantic translation accuracy.
 - Repeated URLs and placeholders retain every source occurrence. Atomic JSON keeps the same object keys, array lengths, value types, and non-string scalar values; only string values may translate. JSON validation exhaustion remains an error in every mode.
 - Source segments are bounded by the expansion/context budget and `[translation].max_source_tokens_per_segment` (default `384`, `0` disables). The conservative default avoids 7B models ending a long translation before their requested output limit; raise it only after validating complete output on the deployed endpoint. For a pinned Hy-MT2 profile with its tokenizer downloaded, the planner renders and counts the complete chat request (role framing, prompt/context, assistant marker, and the completeness-retry reservation) before reserving output tokens. `--plan` reports the counting source, profile/tokenizer/template identity, per-slot capacity, input/output breakdown, and any segment revisions.
 - If the active profile/template or tokenizer is unavailable, hymt prints an explicit stderr warning and applies a conservative `2x` input estimate plus a `64`-token chat-framing allowance. Set `[translation].strict_token_budget = true` to reject that approximate path instead; configure `[endpoint].profile` and run `hymt tokenizer download` for local budgeting.
@@ -392,11 +389,11 @@ Run `python3 "$HOME/.local/share/hymt/inference-cache.py" clear --database "$HOM
 
 ## Architecture
 
-- `crates/hymt-core`: hot-reloadable TOML configuration, prompt templates, CJK language utilities, and completeness heuristics.
+- `crates/hymt-core`: hot-reloadable TOML configuration, prompt templates, CJK language utilities, and mechanical output checks.
 - `crates/hymt-segment`: Hy-MT2 tokenizer integration plus hierarchical and Markdown-aware segmentation.
 - `crates/hymt-client`: asynchronous OpenAI-compatible HTTP client, retry handling, concurrency limiting, and SSE streaming.
 - `crates/hymt-cache`: SQLite segment and exec caches, task history, recall, and ETA statistics.
-- `crates/hymt-translate`: translation orchestration, completeness retries, batch/document workflows, and translated docs.
+- `crates/hymt-translate`: translation orchestration, mechanical repair retries, batch/document workflows, and translated docs.
 - `crates/hymt-cli`: the Clap `hymt` binary, command dispatch, shell-facing behavior, and optional Telegram subcommand.
 
 ## Development

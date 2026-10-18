@@ -1,12 +1,11 @@
 //! Shared terminal and cached completeness admission; no publication happens here.
 use super::{
-    cache_proof, check_completeness, ensure_markdown_structure_preserved,
-    markdown_context::SegmentSource, plan_translation, recover_generated_inline_code,
+    cache_proof, ensure_markdown_structure_preserved, markdown_context::SegmentSource,
+    plan_translation, recover_generated_inline_code, validate_completeness_with_termination,
     CompletenessResult, CompletionTermination,
 };
 use anyhow::Result;
 use hymt_core::{
-    completeness::CompletenessContext,
     config::HotConfig,
     language::is_cjk_char,
     templates::{PromptOpts, TemplateType},
@@ -30,14 +29,8 @@ pub(crate) fn cached_document_is_complete(
     segmenter: &Segmenter,
 ) -> bool {
     if ensure_markdown_structure_preserved(source, cached).is_err()
-        || !check_completeness(
-            source,
-            cached,
-            target_lang,
-            config,
-            &CompletenessContext::default(),
-        )
-        .is_complete
+        || !validate_completeness_with_termination(source, cached, CompletionTermination::Unknown)
+            .is_complete
     {
         return false;
     }
@@ -54,15 +47,13 @@ pub(crate) fn cached_document_is_complete(
         &TemplateType::Default,
         opts,
     )
-    .is_ok_and(|plan| cache_proof::cached_owned_payloads_match(&plan, cached, target_lang, config))
+    .is_ok_and(|plan| cache_proof::cached_owned_payloads_match(&plan, cached))
 }
 
 pub(super) fn cached_segment_is_complete<'a>(
     index: usize,
     segment: impl Into<SegmentSource<'a>>,
     cached: &str,
-    target_lang: &str,
-    config: &HotConfig,
 ) -> bool {
     let source = segment.into();
     let segment = source.text;
@@ -73,20 +64,8 @@ pub(super) fn cached_segment_is_complete<'a>(
         );
         return false;
     }
-    let result = check_completeness(
-        segment,
-        cached,
-        target_lang,
-        config,
-        &source.completeness_context(CompletionTermination::Unknown),
-    );
-    if !result.advisory_warnings.is_empty() {
-        eprintln!(
-            "Note: cached segment {} has advisory warnings: {:?}",
-            index + 1,
-            result.advisory_warnings
-        );
-    }
+    let result =
+        validate_completeness_with_termination(segment, cached, CompletionTermination::Unknown);
     if result.is_complete {
         return true;
     }
@@ -126,56 +105,10 @@ fn approx_plain_tokens(segment: &str) -> usize {
     cjk + other.div_ceil(4)
 }
 
-/// A best-effort fallback must retain enough source material to remain usable.
-/// Explicit warn-only mode still rejects empty responses and outputs below this
-/// floor before any document can be published.
-const MIN_BEST_EFFORT_OUTPUT_RATIO_DENOMINATOR: usize = 3;
-const MIN_BEST_EFFORT_OUTPUT_RATIO_PERCENT: usize = 100 / MIN_BEST_EFFORT_OUTPUT_RATIO_DENOMINATOR;
-
-pub(super) fn reject_unrecoverably_incomplete_best_attempt(
-    index: usize,
-    source: &str,
-    translated: &str,
-) -> Result<()> {
-    if let (Some(source), Some(translated)) = (
-        hymt_core::completeness::parse_json_document(source),
-        hymt_core::completeness::parse_json_document(translated),
-    ) {
-        for (source, translated) in hymt_core::completeness::json_string_values(&source)
-            .into_iter()
-            .zip(hymt_core::completeness::json_string_values(&translated))
-        {
-            if !source.trim().is_empty() {
-                reject_content_floor(index, source, translated)?;
-            }
-        }
-        return Ok(());
-    }
-    reject_content_floor(index, source, translated)
-}
-
-fn reject_content_floor(index: usize, source: &str, translated: &str) -> Result<()> {
-    let source_tokens = approx_source_tokens(source);
-    let output_tokens = approx_source_tokens(translated);
-    let empty = translated.trim().is_empty();
-    let severely_truncated =
-        output_tokens.saturating_mul(MIN_BEST_EFFORT_OUTPUT_RATIO_DENOMINATOR) < source_tokens;
-    if empty || severely_truncated {
-        anyhow::bail!(
-            "segment {} best attempt is unrecoverably incomplete \
-             (output_tokens={}, source_tokens={}, minimum_output_ratio={MIN_BEST_EFFORT_OUTPUT_RATIO_PERCENT}%)",
-            index + 1,
-            output_tokens,
-            source_tokens,
-        );
-    }
-    Ok(())
-}
-
 pub(super) fn validate_exhausted_attempt(
     index: usize,
     source: SegmentSource<'_>,
-    best: &ScoredAttempt,
+    attempt: &CheckedAttempt,
     opts: &PromptOpts,
     config: &HotConfig,
 ) -> Result<()> {
@@ -187,89 +120,39 @@ pub(super) fn validate_exhausted_attempt(
         return Ok(());
     }
     // Atomic JSON and explicit strict mode never publish a failed candidate.
-    if best.text.trim().is_empty() {
-        return reject_unrecoverably_incomplete_best_attempt(index, source.text, &best.text);
+    if !attempt.text.trim().is_empty() {
+        source.structure_preserved(&attempt.text)?;
+        ensure_document_identities_preserved(source.text, &attempt.text)?;
     }
-    source.structure_preserved(&best.text)?;
-    ensure_document_identities_preserved(source.text, &best.text)?;
-    reject_unrecoverably_incomplete_best_attempt(index, source.text, &best.text)?;
     anyhow::bail!(
         "segment {} failed completeness after retries: {:?}",
         index + 1,
-        best.validation.checks_failed,
+        attempt.validation.checks_failed,
     );
 }
 
-/// One failed candidate retained only long enough to select the safest available
-/// fallback. Its score ranks observable validation signals, not translation QE.
+/// A provider response checked only for protocol and source-owned structure.
 #[derive(Debug)]
-pub(super) struct ScoredAttempt {
-    pub(super) attempt: usize,
+pub(super) struct CheckedAttempt {
     pub(super) text: String,
     pub(super) validation: CompletenessResult,
     pub(super) structure_preserved: bool,
 }
 
-impl ScoredAttempt {
-    pub(super) fn new<'a>(
-        attempt: usize,
-        source: impl Into<SegmentSource<'a>>,
-        text: impl Into<String>,
-        validation: CompletenessResult,
-    ) -> Self {
-        let source = source.into();
-        let text = text.into();
-        Self {
-            attempt,
-            structure_preserved: source.structure_preserved(&text).is_ok(),
-            text,
-            validation,
-        }
-    }
-
-    pub(super) fn selection_reason(&self) -> &'static str {
-        "structural_validity_then_validation_score"
-    }
-}
-
-pub(super) fn score_provider_attempt(
-    attempt: usize,
+pub(super) fn validate_provider_attempt(
     source: SegmentSource<'_>,
     text: String,
-    target_lang: &str,
-    config: &HotConfig,
     termination: CompletionTermination,
     unpublished: bool,
-) -> ScoredAttempt {
+) -> CheckedAttempt {
     let text = if unpublished {
         recover_generated_inline_code(source, &text).unwrap_or(text)
     } else {
         text
     };
-    let validation = check_completeness(
-        source.text,
-        &text,
-        target_lang,
-        config,
-        &source.completeness_context(termination),
-    );
-    ScoredAttempt::new(attempt, source, text, validation)
-}
-
-/// Prefer structurally valid attempts, then the earliest highest-scoring one.
-pub(super) fn select_best_attempt(
-    current: Option<ScoredAttempt>,
-    candidate: ScoredAttempt,
-) -> ScoredAttempt {
-    match current {
-        Some(current) if current.structure_preserved != candidate.structure_preserved => {
-            if current.structure_preserved {
-                current
-            } else {
-                candidate
-            }
-        }
-        Some(current) if current.validation.score >= candidate.validation.score => current,
-        _ => candidate,
+    CheckedAttempt {
+        structure_preserved: source.structure_preserved(&text).is_ok(),
+        validation: validate_completeness_with_termination(source.text, &text, termination),
+        text,
     }
 }

@@ -140,9 +140,6 @@ first_chunk_priority = true
 timeout = 5
 
 [completeness]
-zh_to_en_min_ratio = 0.3
-en_to_zh_min_ratio = 0.3
-min_paragraph_ratio = 0.5
 max_retries = 1
 warn_only = false
 "#
@@ -178,10 +175,7 @@ fn make_markdown_plan(
     assert!(!link_segment.contains(LINK_URL));
     assert_eq!(
         markdown_structure(link_segment),
-        MarkdownStructure {
-            blocks: vec!["start:Paragraph".to_owned(), "end:Paragraph".to_owned()],
-            ..MarkdownStructure::default()
-        }
+        MarkdownStructure::default()
     );
     assert_eq!(
         markdown_structure(SOURCE).headings,
@@ -230,7 +224,7 @@ fn seed_segment_cache(
     for (index, segment) in plan.segments.iter().enumerate() {
         let translation = translation_for(segment, broken);
         assert!(
-            cached_segment_is_complete(index, segment, &translation, "zh", config),
+            cached_segment_is_complete(index, segment, &translation),
             "seed translation is incomplete: index={index}, source={segment:?}, translation={translation:?}"
         );
         let hash = segment_cache_hash(segment);
@@ -286,12 +280,10 @@ async fn degraded_termination_is_not_laundered_by_warm_cache() {
     let segmenter = Segmenter::fallback();
     let source = "This public guide explains the complete system clearly and accurately.";
     assert!(
-        check_completeness(
+        validate_completeness_with_termination(
             source,
             OTHER_TRANSLATION,
-            "zh",
-            &config,
-            &CompletenessContext::default()
+            CompletionTermination::Unknown
         )
         .is_complete
     );
@@ -642,10 +634,7 @@ fn markdown_owner_matrix_preserves_complete_inline_nodes() {
         let plan = plan_translation(source, "zh", &config, &segmenter, &TemplateType::Default, &PromptOpts::default()).unwrap();
         for segment in &plan.segments {
             assert!(!segment.contains("https://"), "destination leaked: source={source:?}, segment={segment:?}");
-            assert_eq!(markdown_structure(segment), MarkdownStructure {
-                blocks: vec!["start:Paragraph".to_owned(), "end:Paragraph".to_owned()],
-                ..MarkdownStructure::default()
-            }, "incomplete inline owner: source={source:?}, segment={segment:?}");
+            assert_eq!(markdown_structure(segment), MarkdownStructure::default(), "incomplete inline owner: source={source:?}, segment={segment:?}");
         }
         let output = plan.reconstruct(&vec!["Traduction".to_owned(); plan.segment_count()]);
         assert_eq!(markdown_structure(&output), markdown_structure(source), "syntax mismatch: source={source:?}, output={output:?}");
@@ -717,10 +706,7 @@ async fn markdown_inline_owners_preserve_syntax_and_translate_labels() {
         );
         assert_eq!(
             markdown_structure(segment),
-            MarkdownStructure {
-                blocks: vec!["start:Paragraph".to_owned(), "end:Paragraph".to_owned()],
-                ..MarkdownStructure::default()
-            },
+            MarkdownStructure::default(),
             "model input must be plain complete text: {segment:?}"
         );
         assert!(
@@ -778,9 +764,7 @@ async fn multi_hit_cache_recovery_makes_progress() {
             1 | 3 => format!("](https://example.test/poison-{i}){OTHER_TRANSLATION}"),
             _ => OTHER_TRANSLATION.to_owned(),
         };
-        assert!(cached_segment_is_complete(
-            i, segment, &reply, "zh", &config
-        ));
+        assert!(cached_segment_is_complete(i, segment, &reply));
         assert!(cached_segment_preserves_source_owned_structure(
             &source, &plan, i, &reply
         ));

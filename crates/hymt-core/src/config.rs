@@ -74,11 +74,8 @@ secondary = "en"
 divergence_threshold = 2.0
 
 [completeness]
-zh_to_en_min_ratio = 0.3
-en_to_zh_min_ratio = 0.3
-min_paragraph_ratio = 0.5
 max_retries = 2
-# Retain marked complete original paragraphs after content validation retries fail.
+# Retain marked complete original paragraphs after mechanical validation retries fail.
 # Set false for strict failure instead. Runtime errors and atomic JSON remain strict.
 warn_only = true
 
@@ -1220,24 +1217,10 @@ impl HotConfig {
         );
         fields.insert(
             "completeness".to_owned(),
-            canonical_object([
-                (
-                    "en_to_zh_min_ratio".to_owned(),
-                    serde_json::Value::from(self.completeness_en_to_zh_min_ratio()),
-                ),
-                (
-                    "max_retries".to_owned(),
-                    serde_json::Value::from(self.completeness_max_retries()),
-                ),
-                (
-                    "min_paragraph_ratio".to_owned(),
-                    serde_json::Value::from(self.completeness_min_paragraph_ratio()),
-                ),
-                (
-                    "zh_to_en_min_ratio".to_owned(),
-                    serde_json::Value::from(self.completeness_zh_to_en_min_ratio()),
-                ),
-            ]),
+            canonical_object([(
+                "max_retries".to_owned(),
+                serde_json::Value::from(self.completeness_max_retries()),
+            )]),
         );
         fields.insert(
             "endpoint_url".to_owned(),
@@ -1332,38 +1315,11 @@ impl HotConfig {
 
     // ── completeness ────────────────────────────────────────────────────────
 
-    pub fn completeness_zh_to_en_min_ratio(&self) -> f64 {
-        let v = self.get_number_as_f64("completeness", "zh_to_en_min_ratio", 0.3);
-        if v > 0.0 {
-            v
-        } else {
-            0.3
-        }
-    }
-
-    pub fn completeness_en_to_zh_min_ratio(&self) -> f64 {
-        let v = self.get_number_as_f64("completeness", "en_to_zh_min_ratio", 0.3);
-        if v > 0.0 {
-            v
-        } else {
-            0.3
-        }
-    }
-
-    pub fn completeness_min_paragraph_ratio(&self) -> f64 {
-        let v = self.get_number_as_f64("completeness", "min_paragraph_ratio", 0.5);
-        if v > 0.0 {
-            v
-        } else {
-            0.5
-        }
-    }
-
     pub fn completeness_max_retries(&self) -> u32 {
         self.get_non_negative_u32("completeness", "max_retries", 2)
     }
 
-    /// Retain complete original paragraphs after exhausted content validation.
+    /// Retain complete original paragraphs after exhausted mechanical validation.
     /// Missing settings default to true; explicit false preserves strict failure.
     pub fn completeness_warn_only(&self) -> bool {
         self.get_bool("completeness", "warn_only", true)
@@ -1626,15 +1582,14 @@ impl HotConfig {
         self.section_value(section, key)
             .and_then(|v| v.as_integer())
             .filter(|&n| n > 0)
-            .map(|n| n as u32)
+            .and_then(|n| u32::try_from(n).ok())
             .unwrap_or(default)
     }
 
     fn get_non_negative_u32(&self, section: &str, key: &str, default: u32) -> u32 {
         self.section_value(section, key)
             .and_then(|v| v.as_integer())
-            .filter(|&n| n >= 0)
-            .map(|n| n as u32)
+            .and_then(|n| u32::try_from(n).ok())
             .unwrap_or(default)
     }
 
@@ -1851,13 +1806,109 @@ mod tests {
         assert!(cfg.stream());
         assert!((cfg.timeout() - 600.0).abs() < f64::EPSILON);
         assert_eq!(cfg.max_source_tokens_per_segment(), 384);
-        assert!((cfg.completeness_zh_to_en_min_ratio() - 0.3).abs() < f64::EPSILON);
-        assert!((cfg.completeness_en_to_zh_min_ratio() - 0.3).abs() < f64::EPSILON);
-        assert!((cfg.completeness_min_paragraph_ratio() - 0.5).abs() < f64::EPSILON);
         assert_eq!(cfg.completeness_max_retries(), 2);
         assert!(cfg.completeness_warn_only());
         assert!(!cfg.strict_token_budget());
         assert!(!cfg.application_cache_enabled());
+    }
+
+    #[test]
+    fn positive_u32_config_boundaries() {
+        let path = temp_config_path("positive-u32-boundaries");
+        for (value, expected) in [
+            ("0", None),
+            ("1", Some(1)),
+            ("4294967295", Some(u32::MAX)),
+            ("4294967296", None),
+            ("4294967297", None),
+            ("9223372036854775807", None),
+            ("-1", None),
+            ("'invalid'", None),
+        ] {
+            fs::write(
+                &path,
+                format!(
+                    "[translation]\ncontext_window = {value}\nmax_output_tokens = {value}\n\
+                     concurrency = {value}\nconfig_version = {value}\n"
+                ),
+            )
+            .unwrap();
+            let cfg = HotConfig::from_path(&path).unwrap();
+            for (key, actual, default) in [
+                ("context_window", cfg.context_window(), 16_384),
+                ("total_context", cfg.total_context(), 16_384),
+                ("max_output_tokens", cfg.max_output_tokens(), 4_096),
+                ("concurrency", cfg.concurrency(), 1),
+                ("config_version", cfg.config_version(), 1),
+            ] {
+                assert_eq!(actual, expected.unwrap_or(default), "{key} = {value}");
+            }
+            assert_eq!(cfg.parallel_slots(), 1);
+
+            for key in BACKEND_CONTEXT_KEYS {
+                let backend = if *key == "total_context" {
+                    format!("[backend]\ntotal_context = {value}\n")
+                } else {
+                    format!("[backend]\ntotal_context = 4294967295\n{key} = {value}\n")
+                };
+                fs::write(&path, backend).unwrap();
+                match expected {
+                    Some(expected) => {
+                        let cfg = HotConfig::from_path(&path).unwrap();
+                        let actual = match *key {
+                            "total_context" => cfg.total_context(),
+                            "parallel_slots" => cfg.parallel_slots(),
+                            "per_request_context" => cfg.per_request_context(),
+                            _ => unreachable!(),
+                        };
+                        assert_eq!(actual, expected, "backend.{key} = {value}");
+                    }
+                    None => {
+                        let error = HotConfig::from_path(&path).unwrap_err();
+                        assert!(
+                            error.to_string().contains(&format!("backend.{key}")),
+                            "backend.{key} = {value}: {error}"
+                        );
+                    }
+                }
+            }
+        }
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn non_negative_u32_config_boundaries() {
+        let path = temp_config_path("non-negative-u32-boundaries");
+        for (value, expected) in [
+            ("0", Some(0)),
+            ("1", Some(1)),
+            ("4294967295", Some(u32::MAX)),
+            ("4294967296", None),
+            ("9223372036854775807", None),
+            ("-1", None),
+            ("'invalid'", None),
+        ] {
+            fs::write(
+                &path,
+                format!(
+                    "[completeness]\nmax_retries = {value}\n\
+                     [translation]\nmax_source_tokens_per_segment = {value}\n"
+                ),
+            )
+            .unwrap();
+            let cfg = HotConfig::from_path(&path).unwrap();
+            assert_eq!(
+                cfg.completeness_max_retries(),
+                expected.unwrap_or(2),
+                "max_retries = {value}"
+            );
+            assert_eq!(
+                cfg.max_source_tokens_per_segment(),
+                expected.unwrap_or(384),
+                "max_source_tokens_per_segment = {value}"
+            );
+        }
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]

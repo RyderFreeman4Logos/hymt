@@ -143,12 +143,7 @@ pub(super) fn roles(
 /// Admit only unambiguous source-template reconstructions. Candidate punctuation
 /// cannot enlarge owners. Arbitrary provider edge whitespace can conservatively
 /// miss this cache; the cold translation contract is unchanged.
-pub(super) fn cached_owned_payloads_match(
-    plan: &TranslationPlan,
-    candidate: &str,
-    target_lang: &str,
-    config: &hymt_core::config::HotConfig,
-) -> bool {
+pub(super) fn cached_owned_payloads_match(plan: &TranslationPlan, candidate: &str) -> bool {
     let Some(document) = &plan.document_plan else {
         return candidate.is_empty();
     };
@@ -273,8 +268,6 @@ pub(super) fn cached_owned_payloads_match(
                 index,
                 super::SegmentSource::new(source, context),
                 translated,
-                target_lang,
-                config,
             )
         })
     {

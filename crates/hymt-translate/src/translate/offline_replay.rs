@@ -4,7 +4,7 @@ use hymt_core::runtime::BackendRuntimeInfo;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-const VERSION: u64 = 1;
+const VERSION: u64 = 2;
 
 fn digest(bytes: impl AsRef<[u8]>) -> String {
     format!("{:x}", Sha256::digest(bytes.as_ref()))
@@ -95,7 +95,7 @@ pub(super) fn population_proof(
     if !inference.is_cache_verified()
         || output.is_empty()
         || output.len() > 16_777_216
-        || !complete(source, output, target, ctx.config, plan)
+        || !complete(source, output, plan)
     {
         return Ok(None);
     }
@@ -124,25 +124,13 @@ fn valid_runtime(runtime: &BackendRuntimeInfo) -> bool {
         }
 }
 
-fn complete(
-    source: &str,
-    output: &str,
-    target: &str,
-    config: &HotConfig,
-    plan: &TranslationPlan,
-) -> bool {
+fn complete(source: &str, output: &str, plan: &TranslationPlan) -> bool {
     ensure_document_identities_preserved(source, output).is_ok()
         && ensure_markdown_structure_preserved(source, output).is_ok()
-        && check_completeness(
-            source,
-            output,
-            target,
-            config,
-            &CompletenessContext::default(),
-        )
-        .is_complete
+        && validate_completeness_with_termination(source, output, CompletionTermination::Unknown)
+            .is_complete
         && (hymt_core::completeness::parse_json_document(source).is_some()
-            || cache_proof::cached_owned_payloads_match(plan, output, target, config))
+            || cache_proof::cached_owned_payloads_match(plan, output))
 }
 
 pub(crate) struct Replay {
@@ -198,7 +186,7 @@ pub(crate) fn find_replay(
     let configured = configured_digest(source, target, template, opts, ctx, streaming)?;
     for (record, bytes) in ctx
         .history
-        .find_replay_candidates(&digest(source), &configured)?
+        .find_replay_candidates(&segment_cache_hash(source), &configured)?
     {
         let validate = || -> Result<Option<Replay>> {
             let proof: Value = serde_json::from_str(&bytes)?;
@@ -229,7 +217,7 @@ pub(crate) fn find_replay(
             if proof["output"] != digest(output)
                 || proof["requests"]
                     != request_plan_digest(&plan, target, template, opts, &client, streaming)?
-                || !complete(source, output, target, &isolated, &plan)
+                || !complete(source, output, &plan)
             {
                 return Ok(None);
             }

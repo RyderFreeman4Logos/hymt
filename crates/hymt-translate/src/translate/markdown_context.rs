@@ -21,16 +21,6 @@ impl<'a> SegmentSource<'a> {
         Self { text, context }
     }
 
-    pub(super) fn completeness_context(
-        self,
-        termination: super::CompletionTermination,
-    ) -> hymt_core::completeness::CompletenessContext {
-        hymt_core::completeness::CompletenessContext {
-            termination,
-            markdown_inline_start: self.context.inline_start,
-        }
-    }
-
     pub(super) fn structure_preserved(self, translated: &str) -> Result<()> {
         if hymt_core::completeness::parse_json_document(self.text).is_some() {
             return super::ensure_document_identities_preserved(self.text, translated);

@@ -1334,7 +1334,7 @@ async fn parse_sse_with_completion(
     if !saw_terminal {
         let _ = tx
             .send(Ok(TranslationStreamEvent::Finished(
-                CompletionTermination::Unknown,
+                CompletionTermination::MissingTerminal,
             )))
             .await;
     }

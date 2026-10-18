@@ -2,7 +2,8 @@ use futures_core::Stream;
 use tokio_stream::StreamExt as _;
 
 use super::contract_test_support::{config_fixture, start_one_shot_server, MockReply};
-use super::{ClientError, TranslationClient};
+use super::{ClientError, TranslationClient, TranslationStreamEvent};
+use hymt_core::completeness::CompletionTermination;
 
 async fn stream_results(
     mut stream: impl Stream<Item = Result<String, ClientError>> + Unpin,
@@ -23,6 +24,50 @@ fn client_for(
     let fixture = config_fixture(server_endpoint, "llama_cpp", None, "", true);
     let client = TranslationClient::new(fixture.config.clone()).expect("client");
     (fixture, client)
+}
+
+#[tokio::test]
+async fn completion_stream_distinguishes_eof_only_done_and_explicit_finish() {
+    let token =
+        "data: {\"choices\":[{\"finish_reason\":null,\"delta\":{\"content\":\"prefix\"}}]}\n\n";
+    for (suffix, expected) in [
+        ("", CompletionTermination::MissingTerminal),
+        ("data: [DONE]\n\n", CompletionTermination::Stop),
+        (
+            "data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{\"content\":\"\"}}]}\n\n",
+            CompletionTermination::Stop,
+        ),
+        (
+            "data: {\"choices\":[{\"finish_reason\":\"length\",\"delta\":{\"content\":\"\"}}]}\n\n",
+            CompletionTermination::Length,
+        ),
+        (
+            "data: {\"choices\":[{\"finish_reason\":\"custom\",\"delta\":{\"content\":\"\"}}]}\n\n",
+            CompletionTermination::Unknown,
+        ),
+    ] {
+        let server =
+            start_one_shot_server(MockReply::sse(
+                vec![format!("{token}{suffix}").into_bytes()],
+            ))
+            .await;
+        let (_fixture, client) = client_for(&server.endpoint);
+        let events = client
+            .translate_stream_with_completion("terminal fixture")
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(events.contains(&TranslationStreamEvent::Token("prefix".into())));
+        assert!(
+            events.contains(&TranslationStreamEvent::Finished(expected)),
+            "{events:?}"
+        );
+        server.received_request().await;
+    }
 }
 
 #[tokio::test]

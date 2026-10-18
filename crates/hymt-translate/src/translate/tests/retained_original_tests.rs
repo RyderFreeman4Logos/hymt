@@ -325,8 +325,8 @@ fn synthetic_repeated_emphasis_omission_uses_existing_structure_guard() {
 async fn default_stream_tokens_equal_marked_final_and_failed_text_never_leaks() {
     let source = "The complete synthetic source must be retained after retries fail.";
     let server = start_mock_server(vec![
-        MockResponse::Sse(vec!["bad".into()]),
-        MockResponse::Json("bad".into()),
+        MockResponse::Sse(vec!["**bad**".into()]),
+        MockResponse::Json("**bad**".into()),
     ])
     .await;
     let config = retention_config(&server.endpoint_url);
@@ -429,16 +429,12 @@ fn budget_fitting_inline_paragraph_is_one_coherent_request() {
         retained_original::finalize(source, &plan, &mut completed, &mut vec![], true).unwrap();
     assert!(regions.is_empty());
     assert!(output.contains(translated));
-    assert!(cache_proof::cached_owned_payloads_match(
-        &plan, &output, "zh", &config
-    ));
+    assert!(cache_proof::cached_owned_payloads_match(&plan, &output));
     for invalid in [
         output.replace("--safe", "--unsafe"),
         output.replace("https://example.test/guide", "https://example.test/other"),
     ] {
-        assert!(!cache_proof::cached_owned_payloads_match(
-            &plan, &invalid, "zh", &config
-        ));
+        assert!(!cache_proof::cached_owned_payloads_match(&plan, &invalid));
     }
 }
 
@@ -549,12 +545,7 @@ fn coherent_paragraph_proof_rejects_extra_opaque_payloads() {
         " *forged*",
     ] {
         assert!(
-            !cache_proof::cached_owned_payloads_match(
-                &plan,
-                &format!("{translated}{extra}"),
-                "zh",
-                &config
-            ),
+            !cache_proof::cached_owned_payloads_match(&plan, &format!("{translated}{extra}")),
             "must reject added protected payload {extra}"
         );
     }

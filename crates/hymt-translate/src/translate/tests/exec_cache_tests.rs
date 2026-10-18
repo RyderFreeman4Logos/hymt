@@ -3,7 +3,7 @@ use crate::exec_wrapper::translate_cached;
 use hymt_cache::ExecCache;
 
 #[tokio::test]
-async fn whole_cache_slots_cannot_borrow_completeness_from_other_content() {
+async fn whole_cache_slots_cannot_omit_source_owners() {
     let instruction = "Keep the account available throughout the complete migration process and check every related service.";
     let complete = "迁移期间必须确保账户始终保持可用，并持续检查所有相关服务的运行情况。";
     for opaque in [false, true] {
@@ -14,7 +14,7 @@ async fn whole_cache_slots_cannot_borrow_completeness_from_other_content() {
         };
         let source = format!("{instruction}\n\n{padding}");
         let expected = source.replace(instruction, complete);
-        let poisoned = expected.replacen(complete, "译", 1);
+        let poisoned = expected.replacen(complete, "", 1);
         for shared in [false, true] {
             let calls = if opaque { 1 } else { 2 };
             let server = start_capturing_mock_server(
