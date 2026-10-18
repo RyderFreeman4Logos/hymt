@@ -96,9 +96,7 @@ async fn container_content_retries_structure_before_publication() {
             assert!(!cached_segment_is_complete(
                 0,
                 SegmentSource::new(&plan.segments[0], contexts[0]),
-                &invalid,
-                "zh",
-                &config
+                &invalid
             ));
         }
     }
@@ -115,13 +113,11 @@ fn verified_json_config(endpoint: &str) -> HotConfig {
 }
 
 #[tokio::test]
-async fn json_newline_paragraph_loss_retries_before_publication_and_cache() {
+async fn json_empty_value_retries_before_publication_and_cache() {
     for streaming in [false, true] {
         let source = serde_json::json!({"message": "First complete instruction.\r\n \t\nSecond complete instruction.\r\n\r\nThird complete instruction."}).to_string();
         let complete = serde_json::json!({"message": "请完整保留第一条操作说明。\n\n请完整保留第二条操作说明。\n\n请完整保留第三条操作说明。"}).to_string();
-        let missing =
-            serde_json::json!({"message": "请完整保留第一条操作说明，并保持所有样本完整可用。"})
-                .to_string();
+        let missing = serde_json::json!({"message": ""}).to_string();
         let response = |text: &str, stream: bool| {
             let encoded = serde_json::to_string(text).unwrap();
             let content = encoded[1..encoded.len() - 1].to_owned();
@@ -486,83 +482,23 @@ async fn assert_json_translation_and_cache_paths(source: &str, complete: &str) {
 }
 
 #[test]
-fn json_density_measures_each_string_instead_of_keys_and_layout() {
-    let mut source =
-        serde_json::json!({"other":"Keep this entire additional instruction available."});
-    source.as_object_mut().unwrap().insert(
-        "long_unchanged_key_padding".repeat(100),
-        serde_json::json!(
-            "Read the complete synthetic instruction. Another complete sentence must also survive."
-        ),
-    );
-    let mut missing = source.clone();
-    *missing
-        .as_object_mut()
-        .unwrap()
-        .values_mut()
-        .next()
-        .unwrap() = serde_json::json!("译");
-    let missing = validate_completeness_with_context(
-        &source.to_string(),
-        &missing.to_string(),
-        "zh",
-        None,
-        &CompletenessContext::default(),
-    );
+fn json_nonempty_values_may_change_length_and_paragraph_layout() {
+    let source = serde_json::json!({"message":"First instruction.\n\nSecond instruction.\n\nThird instruction.","other":"Read all instructions.","count":7});
+    for output in ["译", "One merged paragraph.", "无法翻译"] {
+        let translated = serde_json::json!({"message":output,"other":"内容","count":7});
+        assert!(validate_completeness(&source.to_string(), &translated.to_string()).is_complete);
+    }
+    let empty = serde_json::json!({"message":" ","other":"内容","count":7});
     assert!(
-        !missing.is_complete,
-        "unchanged keys or another long value must not hide string truncation"
+        validate_completeness(&source.to_string(), &empty.to_string())
+            .checks_failed
+            .iter()
+            .any(|code| code == "empty_output")
     );
-    assert!(missing.checks_failed.iter().any(|s| s == "token_ratio"));
-}
-
-#[test]
-fn json_string_paragraphs_remain_content_and_other_values_cannot_mask_loss() {
-    let source = serde_json::json!({"message":"First complete instruction.\n\nSecond complete instruction.\n\nThird complete instruction.","other":"Keep this additional instruction available."});
-    let complete = serde_json::json!({"message":"请完整保留第一条操作说明。\n\n请完整保留第二条操作说明。\n\n请完整保留第三条操作说明。","other":"请完整保留这一条额外操作说明。"});
-    assert!(
-        validate_completeness_with_context(
-            &source.to_string(),
-            &complete.to_string(),
-            "zh",
-            None,
-            &CompletenessContext::default()
-        )
-        .is_complete
-    );
-    let mut flattened = complete.clone();
-    flattened["message"] = serde_json::json!(
-        "请完整保留第一条操作说明。请完整保留第二条操作说明。请完整保留第三条操作说明。"
-    );
-    let result = validate_completeness_with_context(
-        &source.to_string(),
-        &flattened.to_string(),
-        "zh",
-        None,
-        &CompletenessContext::default(),
-    );
-    assert!(result
-        .checks_failed
-        .iter()
-        .any(|code| code == "paragraph_count"));
-    let mut truncated = complete;
-    truncated["message"] = serde_json::json!("译");
-    truncated["other"] = serde_json::json!("请始终保留另一条很长的额外操作说明。".repeat(8));
-    let result = validate_completeness_with_context(
-        &source.to_string(),
-        &truncated.to_string(),
-        "zh",
-        None,
-        &CompletenessContext::default(),
-    );
-    assert!(result
-        .checks_failed
-        .iter()
-        .any(|code| code == "token_ratio"));
 }
 
 #[tokio::test]
-async fn json_string_truncation_revalidates_whole_cache_and_retries_before_success() {
+async fn json_empty_string_revalidates_whole_cache_and_retries_before_success() {
     let mut source = serde_json::json!({"message":"Read this complete instruction. Keep all important details available throughout the entire migration.","other":"Keep this additional instruction available throughout the migration."});
     source
         .as_object_mut()
@@ -574,7 +510,7 @@ async fn json_string_truncation_revalidates_whole_cache_and_retries_before_succe
     complete["other"] =
         serde_json::json!("迁移过程中请始终保留这一条额外操作说明，并持续检查所有相关服务。");
     let mut missing = complete.clone();
-    missing["message"] = serde_json::json!("译");
+    missing["message"] = serde_json::json!("");
     let (source, complete, missing) = (
         source.to_string(),
         complete.to_string(),
@@ -616,12 +552,12 @@ async fn json_string_truncation_revalidates_whole_cache_and_retries_before_succe
                 .await
                 .unwrap(),
             complete,
-            "truncated JSON value must be regenerated"
+            "empty JSON value must be regenerated"
         );
         assert_eq!(
             server.requests.lock().unwrap().len(),
             2,
-            "reject cached truncation, retry invalid response, then admit complete response"
+            "reject cached empty value, retry invalid response, then admit complete response"
         );
         assert_eq!(history.fetch_recent(None).unwrap().len(), 1);
         assert_eq!(
@@ -661,9 +597,9 @@ fn fragment_context_scans_source_once() {
 }
 
 #[tokio::test]
-async fn warn_only_json_cannot_hide_one_truncated_string() {
+async fn warn_only_json_cannot_hide_one_empty_string() {
     let source = serde_json::json!({"message":"Read the complete instruction and retain every important detail throughout the entire migration.","other":"Keep this additional complete instruction available."});
-    let missing = serde_json::json!({"message":"译","other":"请始终保留另一条额外操作说明，并在整个迁移过程中检查所有相关服务。"});
+    let missing = serde_json::json!({"message":"","other":"请始终保留另一条额外操作说明，并在整个迁移过程中检查所有相关服务。"});
     let encoded = serde_json::to_string(&missing.to_string()).unwrap();
     let server = start_capturing_mock_server(
         (0..2)
@@ -696,7 +632,7 @@ async fn warn_only_json_cannot_hide_one_truncated_string() {
     )
     .await
     .unwrap_err();
-    assert!(format!("{error:#}").contains("unrecoverably incomplete"));
+    assert!(format!("{error:#}").contains("empty_output"));
     assert_eq!(server.requests.lock().unwrap().len(), 2);
     assert!(history.fetch_recent(None).unwrap().is_empty());
 }

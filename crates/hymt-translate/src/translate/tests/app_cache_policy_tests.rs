@@ -485,7 +485,6 @@ async fn replay_rejects_changed_request_and_policy() {
             "first_chunk_priority = false",
         ),
         ("max_retries = 1", "max_retries = 0"),
-        ("min_paragraph_ratio = 0.5", "min_paragraph_ratio = 0.8"),
         ("concurrency = 1", "concurrency = 2"),
         (
             "concurrency = 1",
@@ -983,7 +982,7 @@ async fn request_binding_uses_actual_rendered_content_adapter_bytes_and_order() 
 async fn completeness_retry_cannot_populate_offline_proof() {
     let fixture = OfflineFixture::warm(false).await;
     let server = start_capturing_mock_server(vec![
-        MockResponse::Json("x".into()),
+        MockResponse::Json(String::new()),
         MockResponse::Json(REPLY.into()),
     ])
     .await;

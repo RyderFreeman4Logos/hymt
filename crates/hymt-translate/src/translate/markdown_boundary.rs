@@ -90,12 +90,14 @@ pub(super) fn block_structure(text: &str) -> Vec<String> {
         let (calls, bytes) = work.get();
         work.set((calls + 1, bytes + text.len()));
     });
+    // Paragraph reflow is model-owned; syntax and container roles still guard assembly.
     Parser::new(text)
         .filter_map(|event| match event {
             Event::Start(tag)
                 if !matches!(
                     tag,
-                    Tag::Emphasis
+                    Tag::Paragraph
+                        | Tag::Emphasis
                         | Tag::Strong
                         | Tag::Strikethrough
                         | Tag::Superscript
@@ -109,7 +111,8 @@ pub(super) fn block_structure(text: &str) -> Vec<String> {
             Event::End(tag)
                 if !matches!(
                     tag,
-                    TagEnd::Emphasis
+                    TagEnd::Paragraph
+                        | TagEnd::Emphasis
                         | TagEnd::Strong
                         | TagEnd::Strikethrough
                         | TagEnd::Superscript

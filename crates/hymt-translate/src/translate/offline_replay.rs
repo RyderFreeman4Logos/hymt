@@ -95,7 +95,7 @@ pub(super) fn population_proof(
     if !inference.is_cache_verified()
         || output.is_empty()
         || output.len() > 16_777_216
-        || !complete(source, output, target, ctx.config, plan)
+        || !complete(source, output, plan)
     {
         return Ok(None);
     }
@@ -124,25 +124,13 @@ fn valid_runtime(runtime: &BackendRuntimeInfo) -> bool {
         }
 }
 
-fn complete(
-    source: &str,
-    output: &str,
-    target: &str,
-    config: &HotConfig,
-    plan: &TranslationPlan,
-) -> bool {
+fn complete(source: &str, output: &str, plan: &TranslationPlan) -> bool {
     ensure_document_identities_preserved(source, output).is_ok()
         && ensure_markdown_structure_preserved(source, output).is_ok()
-        && check_completeness(
-            source,
-            output,
-            target,
-            config,
-            &CompletenessContext::default(),
-        )
-        .is_complete
+        && validate_completeness_with_termination(source, output, CompletionTermination::Unknown)
+            .is_complete
         && (hymt_core::completeness::parse_json_document(source).is_some()
-            || cache_proof::cached_owned_payloads_match(plan, output, target, config))
+            || cache_proof::cached_owned_payloads_match(plan, output))
 }
 
 pub(crate) struct Replay {
@@ -229,7 +217,7 @@ pub(crate) fn find_replay(
             if proof["output"] != digest(output)
                 || proof["requests"]
                     != request_plan_digest(&plan, target, template, opts, &client, streaming)?
-                || !complete(source, output, target, &isolated, &plan)
+                || !complete(source, output, &plan)
             {
                 return Ok(None);
             }

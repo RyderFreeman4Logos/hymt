@@ -98,11 +98,8 @@ force_translate_all = false
 # repeat_last_n = 64 # llama.cpp only
 
 [completeness]
-zh_to_en_min_ratio = 0.3
-en_to_zh_min_ratio = 0.3
-min_paragraph_ratio = 0.5
 max_retries = 2
-# Retain marked complete original paragraphs after content validation retries fail.
+# Retain marked complete original paragraphs after mechanical validation retries fail.
 # Set false for strict failure instead. Runtime errors and atomic JSON remain strict.
 warn_only = true
 
@@ -275,9 +272,9 @@ hymt translate-doc docs/ --recursive
 
 - 默认目标语言为`zh`，Markdown输出文件会自动转换为`.zh-cn.md`格式。
 - 当使用`--output-dir`参数时，目录模式会翻译Markdown文件并保留相对路径。
-- 完整性验证采用快速的分层截断/结构检测机制——**并非**翻译质量评估或语义正确性验证。对于已校准的英语/中文目标语言，密度指的是输出内容与输入内容的比例，该比例采用分段工具在缺少分词器时的相同计算方式，即`ceil(utf8_bytes / 4)`。由于中文每个单词对应的Unicode标量值更少，因此这种基于标量值的比率无法用于判断完整的英语到中文文本转换结果。其他目标语言会明确标注`unverified_density`，而不会默认认为密度验证已通过。该机制还会检查调用方提供的空响应或终止响应、段落、Markdown标题和代码块、占位符、URL以及有效的JSON模板。缓存的分段内容在再次使用前会通过当前的验证机制进行重新检查。
+- 输出验收只检查空响应、协议截断、重复 URL/占位符身份、JSON 结构和原文所有的 Markdown 组装。措辞、译文长度和段落重排由模型负责，不触发重试。受保护字节和输入覆盖仍由 hymt 保证；缓存复用执行相同的机械检查。
 - 包含强调、行内链接/图片或行内代码的普通段落，在最终请求预算和受保护字节检查允许时作为一个完整请求发送。受保护语法、载荷字节和解析角色必须保持一致；引用、数学、转义语法、块容器和超限段落继续沿用源字节所有权拆分路径。完整行内段落即使在严格模式下也使用验证后流式发布。
-- 普通、流式、批处理和 `translate-doc` 共用 `[completeness].max_retries`。内容或 Markdown 验证反复失败后，默认完整保留该原始段落并继续翻译其他段落；任一拆分片段失败都会恢复整个原段一次，字节所有权在引用展开和长段拆分前建立。Markdown 容器外的可见提示标明原段、源字节和正文行范围；stderr 输出 `completeness_status=degraded_original_retained` 与 `completeness_degraded_segments=…`。保留原段的所有片段不进入翻译缓存；降级文档不进入 exec 整文缓存、离线重放证明或冷计时样本。启用保留时流式输出等待验证，与最终带标记文档完全一致。设置 `[completeness].warn_only = false` 可恢复严格失败；`--warn-only-completeness` 可覆盖严格配置。运行时、网络、鉴权、配置和取消错误仍报错。机械检查不能证明翻译语义准确。
+- 普通、流式、批处理和 `translate-doc` 共用 `[completeness].max_retries`。机械验证反复失败后，默认完整保留该原始段落并继续翻译其他段落；任一拆分片段失败都会恢复整个原段一次，字节所有权在引用展开和长段拆分前建立。Markdown 容器外的可见提示标明原段、源字节和正文行范围；stderr 输出 `completeness_status=degraded_original_retained` 与 `completeness_degraded_segments=…`。保留原段的所有片段不进入翻译缓存；降级文档不进入 exec 整文缓存、离线重放证明或冷计时样本。启用保留时流式输出等待验证，与最终带标记文档完全一致。设置 `[completeness].warn_only = false` 可恢复严格失败；`--warn-only-completeness` 可覆盖严格配置。运行时、网络、鉴权、配置和取消错误仍报错。机械检查不能证明翻译语义准确。
 - 重复 URL 和占位符保留源文中的全部出现次数。完整 JSON 保留相同的对象键、数组长度、值类型及非字符串标量值，只允许翻译字符串值。JSON 验证耗尽在所有模式下仍报错。
 - 源文本段受扩展量/上下文预算以及`[translation].max_source_tokens_per_segment`（默认值为384，设为0则禁用该限制）的约束。这一保守的默认设置可避免7B模型在达到预设输出长度前就结束长文本翻译；只有在确认部署后的接口能生成完整输出后，才可提高该限制值。对于已下载对应分词器的固定Hy-MT2配置文件，规划器会在预留输出令牌之前，先处理并统计完整的聊天请求内容（角色设定、提示语/上下文、助手标识以及完整性重试相关信息）。「--plan」选项会显示统计来源、配置文件/分词器/模板信息、各字段容量、输入/输出数据分布，以及任何文本段修改情况。
 - 若当前使用的配置文件/模板或分词器不可用，hymt会输出明确的标准错误警告，并采用保守的2倍输入量估算值，同时额外预留64个令牌用于聊天内容格式处理。如需拒绝这种近似处理方式，可设置`[translation].strict_token_budget = true`；若需本地进行预算控制，则需配置`[endpoint].profile`并运行`hymt tokenizer download`命令。
@@ -389,11 +386,11 @@ hymt telegram --regenerate-claim-password
 
 ## 架构
 
-- `crates/hymt-core`：支持热重载的TOML配置、提示词模板、CJK语言处理工具以及完整性检测算法。
+- `crates/hymt-core`：支持热重载的TOML配置、提示词模板、CJK语言处理工具以及机械输出检查。
 - `crates/hymt-segment`：集成Hy-MT2分词器，同时具备分层分割和Markdown兼容的分割功能。
 - `crates/hymt-client`：异步的OpenAI兼容HTTP客户端，支持重试处理、并发限制以及SSE流式传输。
 - `crates/hymt-cache`：SQLite格式的片段缓存与执行缓存，以及任务历史记录、召回率统计和预计完成时间数据。
-- `crates/hymt-translate`：翻译任务协调功能、完整性检测重试机制、批量/文档处理流程以及翻译后的文档输出。
+- `crates/hymt-translate`：翻译任务协调功能、机械修复重试机制、批量/文档处理流程以及翻译后的文档输出。
 - `crates/hymt-cli`：基于Clap框架的`hymt`命令行工具，负责命令分发、Shell交互功能，还支持可选的Telegram子命令。
 
 ## 开发指南

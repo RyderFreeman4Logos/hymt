@@ -91,7 +91,7 @@ async fn identical_rejected_retries_bypass_cached_bad_output() {
                             let text = if generations == 3 {
                                 good.clone()
                             } else {
-                                "short".into()
+                                "**invalid**".into()
                             };
                             if !bypass {
                                 cache.insert(body.to_owned(), text.clone());

@@ -271,18 +271,14 @@ async fn incomplete_stream_never_reports_document_success() {
 
 #[test]
 fn cached_missing_content_is_revalidated() {
-    let config = make_stream_config("http://127.0.0.1:9/v1");
     for source in [
         "Keep {{customer}} available throughout the complete migration process.",
         "Visit https://example.com/important for the complete instructions.",
-        "First factual claim.\n\nSecond factual claim.\n\nThird factual claim.",
     ] {
         assert!(!cached_segment_is_complete(
             0,
             source,
-            "迁移过程中账户必须始终保持可用，所有相关服务也必须继续正常运行。",
-            "zh",
-            &config
+            "迁移过程中账户必须始终保持可用，所有相关服务也必须继续正常运行。"
         ));
     }
 }
@@ -666,4 +662,90 @@ async fn shared_block_guard_checks_html_attributes_in_cold_scoring() {
     .unwrap();
     assert_eq!(outcome.text, valid);
     assert_eq!(server.requests.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn model_wording_passes_once_in_buffered_and_streaming_modes() {
+    let source = "Read this complete source instruction and preserve its detailed meaning throughout the migration.";
+    for translated in [
+        "译",
+        "cannot translate",
+        "无法翻译",
+        "First model paragraph.\n\nSecond model paragraph.",
+    ] {
+        for retain in [false, true] {
+            for streaming in [false, true] {
+                let encoded = serde_json::to_string(translated).unwrap();
+                let wire = encoded[1..encoded.len() - 1].to_owned();
+                let replies = (0..2)
+                    .map(|_| {
+                        if streaming {
+                            MockResponse::Sse(vec![wire.clone()])
+                        } else {
+                            MockResponse::Json(wire.clone())
+                        }
+                    })
+                    .collect();
+                let server = start_capturing_mock_server(replies).await;
+                let config = make_stream_config(&server.endpoint_url);
+                let client = TranslationClient::new(config.clone()).unwrap();
+                let segmenter = fallback_segmenter();
+                let dir = tempfile::tempdir().unwrap();
+                let history = HistoryDB::new(dir.path().join("history.db"));
+                let ctx = TranslationCtx {
+                    config: &config,
+                    client: &client,
+                    segmenter: &segmenter,
+                    history: &history,
+                    cache_enabled: true,
+                };
+                let opts = PromptOpts {
+                    warn_only_completeness: Some(retain),
+                    ..PromptOpts::default()
+                };
+                let result = if streaming {
+                    let (tx, mut rx) = mpsc::channel(32);
+                    let result = translate_text_stream_with_mode(
+                        source,
+                        "zh",
+                        &TemplateType::Default,
+                        &opts,
+                        &ctx,
+                        StreamOutputMode::Validated,
+                        tx,
+                    )
+                    .await
+                    .unwrap();
+                    let mut published = String::new();
+                    let mut completed = 0;
+                    while let Some(event) = rx.recv().await {
+                        match event {
+                            StreamEvent::Token(text) => published.push_str(&text),
+                            StreamEvent::AllDone(_) => completed += 1,
+                            _ => {}
+                        }
+                    }
+                    assert_eq!(published, translated);
+                    assert_eq!(completed, 1);
+                    result
+                } else {
+                    translate_text(source, "zh", &TemplateType::Default, &opts, &ctx)
+                        .await
+                        .unwrap()
+                };
+                assert_eq!(result.text, translated);
+                assert!(!result.is_completeness_degraded());
+                assert_eq!(server.requests.lock().unwrap().len(), 1);
+                let cached = translate_text(source, "zh", &TemplateType::Default, &opts, &ctx)
+                    .await
+                    .unwrap();
+                assert_eq!(cached.text, translated);
+                assert_eq!(
+                    server.requests.lock().unwrap().len(),
+                    1,
+                    "model wording must remain cacheable"
+                );
+            }
+        }
+    }
 }

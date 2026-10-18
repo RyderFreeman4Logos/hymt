@@ -467,9 +467,6 @@ concurrency = 1
 timeout = 5
 
 [completeness]
-zh_to_en_min_ratio = 0.3
-en_to_zh_min_ratio = 0.3
-min_paragraph_ratio = 0.5
 max_retries = 1
 "#,
         )

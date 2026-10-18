@@ -74,11 +74,8 @@ secondary = "en"
 divergence_threshold = 2.0
 
 [completeness]
-zh_to_en_min_ratio = 0.3
-en_to_zh_min_ratio = 0.3
-min_paragraph_ratio = 0.5
 max_retries = 2
-# Retain marked complete original paragraphs after content validation retries fail.
+# Retain marked complete original paragraphs after mechanical validation retries fail.
 # Set false for strict failure instead. Runtime errors and atomic JSON remain strict.
 warn_only = true
 
@@ -1220,24 +1217,10 @@ impl HotConfig {
         );
         fields.insert(
             "completeness".to_owned(),
-            canonical_object([
-                (
-                    "en_to_zh_min_ratio".to_owned(),
-                    serde_json::Value::from(self.completeness_en_to_zh_min_ratio()),
-                ),
-                (
-                    "max_retries".to_owned(),
-                    serde_json::Value::from(self.completeness_max_retries()),
-                ),
-                (
-                    "min_paragraph_ratio".to_owned(),
-                    serde_json::Value::from(self.completeness_min_paragraph_ratio()),
-                ),
-                (
-                    "zh_to_en_min_ratio".to_owned(),
-                    serde_json::Value::from(self.completeness_zh_to_en_min_ratio()),
-                ),
-            ]),
+            canonical_object([(
+                "max_retries".to_owned(),
+                serde_json::Value::from(self.completeness_max_retries()),
+            )]),
         );
         fields.insert(
             "endpoint_url".to_owned(),
@@ -1332,38 +1315,11 @@ impl HotConfig {
 
     // ── completeness ────────────────────────────────────────────────────────
 
-    pub fn completeness_zh_to_en_min_ratio(&self) -> f64 {
-        let v = self.get_number_as_f64("completeness", "zh_to_en_min_ratio", 0.3);
-        if v > 0.0 {
-            v
-        } else {
-            0.3
-        }
-    }
-
-    pub fn completeness_en_to_zh_min_ratio(&self) -> f64 {
-        let v = self.get_number_as_f64("completeness", "en_to_zh_min_ratio", 0.3);
-        if v > 0.0 {
-            v
-        } else {
-            0.3
-        }
-    }
-
-    pub fn completeness_min_paragraph_ratio(&self) -> f64 {
-        let v = self.get_number_as_f64("completeness", "min_paragraph_ratio", 0.5);
-        if v > 0.0 {
-            v
-        } else {
-            0.5
-        }
-    }
-
     pub fn completeness_max_retries(&self) -> u32 {
         self.get_non_negative_u32("completeness", "max_retries", 2)
     }
 
-    /// Retain complete original paragraphs after exhausted content validation.
+    /// Retain complete original paragraphs after exhausted mechanical validation.
     /// Missing settings default to true; explicit false preserves strict failure.
     pub fn completeness_warn_only(&self) -> bool {
         self.get_bool("completeness", "warn_only", true)
@@ -1851,9 +1807,6 @@ mod tests {
         assert!(cfg.stream());
         assert!((cfg.timeout() - 600.0).abs() < f64::EPSILON);
         assert_eq!(cfg.max_source_tokens_per_segment(), 384);
-        assert!((cfg.completeness_zh_to_en_min_ratio() - 0.3).abs() < f64::EPSILON);
-        assert!((cfg.completeness_en_to_zh_min_ratio() - 0.3).abs() < f64::EPSILON);
-        assert!((cfg.completeness_min_paragraph_ratio() - 0.5).abs() < f64::EPSILON);
         assert_eq!(cfg.completeness_max_retries(), 2);
         assert!(cfg.completeness_warn_only());
         assert!(!cfg.strict_token_budget());

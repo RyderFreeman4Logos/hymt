@@ -5,7 +5,7 @@ use std::{
     ops::Range,
 };
 
-/// Identity failures independent of translation density and transport termination.
+/// Source identity failures independent of model wording and transport termination.
 /// Suitable for validating a reconstructed document with source-owned syntax.
 pub fn identity_preservation_failures(input_text: &str, output_text: &str) -> Vec<String> {
     let mut checks_failed = Vec::new();
