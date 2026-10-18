@@ -1028,8 +1028,8 @@ os._exit(99)
                 server.server_close()
 
     def test_two_credentials_share_exact_bytes(self) -> None:
-        first = self.request(headers={"Authorization": "Bearer first"})
-        second = self.request(headers={"Authorization": "Bearer second"})
+        first = self.request(headers={"Authorization": "Bearer first", "User-Agent": "ordinary-json-client/1"})
+        second = self.request(headers={"Authorization": "Bearer second", "User-Agent": "another-json-client/2"})
         self.assertEqual(1, self.state["posts"], "equal payloads across credentials must execute upstream once")
         self.assertEqual("MISS", first[1].get("X-Hymt-Cache"))
         self.assertEqual("HIT", second[1].get("X-Hymt-Cache"))
@@ -1114,9 +1114,10 @@ os._exit(99)
     @unittest.skipUnless(_MODULE, "shared service not implemented yet")
     def test_stream_miss_is_live_and_hit_replays_exact_usage(self) -> None:
         self.state["stream_release"].clear()
+        payload = {"model": "Hy-MT2-7B", "stream": True, "stream_options": {"include_usage": True}}
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=2)
         try:
-            conn.request("POST", "/v1/chat/completions", json.dumps({"model": "Hy-MT2-7B", "stream": True}))
+            conn.request("POST", "/v1/chat/completions", json.dumps(payload), {"User-Agent": "ordinary-sse-client/1"})
             response = conn.getresponse()
             self.assertEqual("MISS", response.getheader("X-Hymt-Cache"))
             first = response.read(len(_SSE_FIRST))
@@ -1127,7 +1128,7 @@ os._exit(99)
         finally:
             self.state["stream_release"].set()
             conn.close()
-        hit = self.request({"model": "Hy-MT2-7B", "stream": True})
+        hit = self.request(payload, {"User-Agent": "another-sse-client/2"})
         self.assertEqual("HIT", hit[1]["X-Hymt-Cache"])
         self.assertEqual(_SSE_FIRST + _SSE_LAST, raw)
         self.assertEqual(raw, hit[2])

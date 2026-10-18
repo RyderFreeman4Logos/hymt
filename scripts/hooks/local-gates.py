@@ -606,7 +606,7 @@ def main() -> None:
         env = os.environ.copy()
         env.update(TMPDIR=str(parent), TMP=str(parent), TEMP=str(parent))
         subprocess.run(
-            ["python3", "-B", "-m", "unittest", "discover", "-s", "scripts/tests", "-p", "test_inference_cache.py"],
+            ["python3", "-B", "-m", "unittest", "discover", "-s", "scripts/tests", "-p", "test_inference_cache*.py"],
             check=True,
             env=env,
         )

@@ -122,7 +122,8 @@ install-inference-cache:
     mv -f -- "$script_tmp" "$HOME/.local/share/hymt/inference-cache.py"
     mv -f -- "$unit_tmp" "$HOME/.config/systemd/user/hy-mt2-cache.service"
     systemctl --user daemon-reload
-    systemctl --user try-restart hy-mt2-cache.service
+    systemctl --user enable hy-mt2-cache.service
+    systemctl --user restart hy-mt2-cache.service
 
 # Install without the default `telegram` feature (drops Bot API deps).
 install-no-telegram:
