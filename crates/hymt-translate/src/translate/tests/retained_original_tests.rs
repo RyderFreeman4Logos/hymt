@@ -753,3 +753,124 @@ fn coherent_selection_keeps_budget_and_unprovable_source_guards() {
         assert_eq!(plan.reconstruct(&completed), source);
     }
 }
+
+#[tokio::test]
+async fn omitted_url_retries_stay_inside_the_admitted_request_budget() {
+    for context_window in [480, 509, 510] {
+        for streaming in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let captured = Arc::clone(&requests);
+            let handle = tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    let request = read_http_request(&mut socket).await.unwrap();
+                    let request = String::from_utf8(request).unwrap();
+                    let body: serde_json::Value =
+                        serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+                    let prompt = body["messages"].as_array().unwrap().last().unwrap()["content"]
+                        .as_str()
+                        .unwrap();
+                    let source = prompt.split_once("\n\n").unwrap().1;
+                    let reply = source
+                        .split_once(COMPLETENESS_RETRY_INSTRUCTION)
+                        .map_or_else(String::new, |(source, _)| source.to_owned());
+                    let encoded = serde_json::to_string(&reply).unwrap();
+                    let reply = encoded[1..encoded.len() - 1].to_owned();
+                    let response = if body["stream"] == true {
+                        MockResponse::Sse(vec![reply])
+                    } else {
+                        MockResponse::Json(reply)
+                    };
+                    captured.lock().unwrap().push(request);
+                    write_mock_response(socket, response).await.unwrap();
+                }
+            });
+            let server = CapturingMockServer {
+                endpoint_url: format!("http://{address}/v1"),
+                requests,
+                handle,
+            };
+            let config = make_protected_block_config(&server.endpoint_url);
+            let contents = std::fs::read_to_string(config.path())
+                .unwrap()
+                .replace(
+                    "context_window = 8192",
+                    &format!("context_window = {context_window}"),
+                )
+                .replace("max_output_tokens = 4096", "max_output_tokens = 256");
+            std::fs::write(config.path(), contents).unwrap();
+            let config = HotConfig::from_path(config.path()).unwrap();
+            let segmenter = fallback_segmenter();
+            let opts = PromptOpts::default();
+            let plan = plan_translation(
+                COHERENT_SOURCE,
+                "en",
+                &config,
+                &segmenter,
+                &TemplateType::Default,
+                &opts,
+            )
+            .unwrap();
+            let client = TranslationClient::new(config.clone()).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let history = HistoryDB::new(dir.path().join("history.db"));
+            let ctx = TranslationCtx {
+                config: &config,
+                client: &client,
+                segmenter: &segmenter,
+                history: &history,
+                cache_enabled: false,
+            };
+            let outcome = if streaming {
+                let (tx, mut rx) = mpsc::channel(16);
+                let collector = tokio::spawn(async move {
+                    let mut tokens = String::new();
+                    while let Some(event) = rx.recv().await {
+                        if let StreamEvent::Token(text) = event {
+                            tokens.push_str(&text);
+                        }
+                    }
+                    tokens
+                });
+                let outcome = translate_text_stream_with_mode(
+                    COHERENT_SOURCE,
+                    "en",
+                    &TemplateType::Default,
+                    &opts,
+                    &ctx,
+                    StreamOutputMode::Validated,
+                    tx,
+                )
+                .await
+                .unwrap();
+                assert_eq!(collector.await.unwrap(), outcome.text);
+                outcome
+            } else {
+                translate_text(COHERENT_SOURCE, "en", &TemplateType::Default, &opts, &ctx)
+                    .await
+                    .unwrap()
+            };
+            assert_eq!(outcome.text, COHERENT_SOURCE);
+            assert!(!outcome.is_completeness_degraded());
+            let requests = server.requests.lock().unwrap();
+            assert_eq!(requests.len(), plan.segment_count() * 2);
+            for request in requests.iter() {
+                let body: serde_json::Value =
+                    serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+                let prompt = body["messages"].as_array().unwrap().last().unwrap()["content"]
+                    .as_str()
+                    .unwrap();
+                let tokens =
+                    count_final_request(config.model_profile().unwrap(), &segmenter, prompt);
+                assert!(
+                    tokens.tokens <= plan.token_budget.input_capacity_tokens,
+                    "captured request exceeds admitted input budget: {}/{} (context={context_window}, streaming={streaming})",
+                    tokens.tokens,
+                    plan.token_budget.input_capacity_tokens
+                );
+            }
+            assert_eq!(!plan.coherent_paragraphs.is_empty(), context_window == 510);
+        }
+    }
+}

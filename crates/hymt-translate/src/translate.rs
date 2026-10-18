@@ -147,17 +147,15 @@ const APPROXIMATE_CHAT_FRAMING_TOKENS: usize = 64;
 const APPROXIMATE_SAFETY_FACTOR: usize = 2;
 const COMPLETENESS_RETRY_INSTRUCTION: &str = "\n\nTranslate the COMPLETE input. Do not stop early.";
 
-fn completeness_retry_instruction(segment: &str, previous: &str) -> String {
+fn completeness_retry_instruction(segment: &str) -> String {
     let mut hint = COMPLETENESS_RETRY_INSTRUCTION.to_owned();
-    let omitted: Vec<String> = hymt_core::completeness::preserved_urls(segment)
-        .difference(&hymt_core::completeness::preserved_urls(previous))
-        .cloned()
+    let mut targets: Vec<String> = hymt_core::completeness::preserved_urls(segment)
+        .into_iter()
         .collect();
-    if !omitted.is_empty() {
-        let mut omitted = omitted;
-        omitted.sort();
+    if !targets.is_empty() {
+        targets.sort();
         hint.push_str(" Preserve these targets exactly: ");
-        hint.push_str(&omitted.join(" "));
+        hint.push_str(&targets.join(" "));
     }
     hint
 }
@@ -776,10 +774,10 @@ fn prompt_for_budget(
     config: &HotConfig,
 ) -> Result<String> {
     let mut prompt = build_prompt(segment, target_lang, template, opts)?;
-    // Completeness retries append this exact instruction. Reserve it up front so
-    // a retry cannot turn an otherwise valid plan into an over-context request.
+    // Execution uses this exact retry prompt, including every source URL, so
+    // response-dependent hints cannot exceed the reservation or change tokenization.
     if config.completeness_max_retries() > 0 {
-        prompt.push_str(COMPLETENESS_RETRY_INSTRUCTION);
+        prompt.push_str(&completeness_retry_instruction(segment));
     }
     Ok(prompt)
 }
@@ -1404,13 +1402,11 @@ async fn translate_segment_with_completeness<'a>(
     let mut best: Option<ScoredAttempt> = None;
 
     for attempt in 0..=max_retries {
-        let mut prompt = build_prompt(segment, target_lang, template, opts)?;
-        if attempt > 0 {
-            prompt.push_str(&completeness_retry_instruction(
-                segment,
-                &best.as_ref().expect("prior attempt").text,
-            ));
-        }
+        let prompt = if attempt > 0 {
+            prompt_for_budget(segment, target_lang, template, opts, config)?
+        } else {
+            build_prompt(segment, target_lang, template, opts)?
+        };
 
         let completion = client
             .with_cache_bypass(attempt > 0)
@@ -1686,13 +1682,13 @@ async fn translate_segment_with_completeness_streaming(
 
     for attempt in 1..=max_retries {
         timing.log(request.index, "completeness_retry_begin");
-        prompt = build_prompt(
+        prompt = prompt_for_budget(
             request.segment,
             request.target_lang,
             request.template,
             request.opts,
+            request.config,
         )?;
-        prompt.push_str(&completeness_retry_instruction(request.segment, &best.text));
 
         let completion = request
             .client
@@ -3272,12 +3268,14 @@ mod tests {
     }
 
     #[test]
-    fn completeness_retry_names_each_omitted_url() {
-        let source = "See [report](https://example.test/missing?q=1) and keep it.";
-        let hint = completeness_retry_instruction(source, "See the report and keep it.");
-        assert!(
-            hint.contains("https://example.test/missing?q=1"),
-            "url retry must name the omitted target, got {hint:?}"
+    fn completeness_retry_names_each_source_url_once_in_stable_order() {
+        let source = "See [report](https://example.test/z?q=1), [guide](https://example.test/a), and [report again](https://example.test/z?q=1).";
+        let hint = completeness_retry_instruction(source);
+        assert_eq!(
+            hint,
+            format!(
+                "{COMPLETENESS_RETRY_INSTRUCTION} Preserve these targets exactly: https://example.test/a https://example.test/z?q=1"
+            )
         );
         assert!(
             !hint.contains("url_preservation"),
