@@ -380,7 +380,9 @@ hymt telegram --regenerate-claim-password
 
 直接访问缓存仅限受信任的 Tailscale 客户端，或将缓存置于现有的身份验证网关之后。API/VK 凭据不隔离缓存命中。
 
-`just install-inference-cache` 将脚本与用户 unit 安装到稳定路径，重载 systemd，并在缓存已运行时重启它。首次启动执行 `systemctl --user enable --now hy-mt2-cache.service`。附带的 unit 绑定特定宿主机：监听 Tailscale 的 `100.78.159.38:8402`，并转发到 `100.78.159.38:8401` 的模型服务。需要使用缓存的客户端可设置 `[endpoint].url = "http://100.78.159.38:8402/v1"`，保留 `backend = "llama_cpp"`，并将 `[endpoint].model` 设为上游 `/v1/models` 公布的实际 ID 或别名。示例配置中的空 `model` 会使请求省略该字段，无法产生缓存命中。
+`just install-inference-cache` 将脚本与用户 unit 安装到稳定路径，重载 systemd，启用缓存以便后续登录时自动运行，并立即启动它。再次执行安装器会重启已运行的缓存，以加载安装后的代码。附带的 unit 绑定特定宿主机：监听 Tailscale 的 `100.78.159.38:8402`，并转发到 `100.78.159.38:8401` 的模型服务。
+
+兼容的普通客户端使用共享路由时会自动使用缓存，无需 hymt 专用的启用请求头。hymt 可设置 `[endpoint].url = "http://100.78.159.38:8402/v1"`，保留 `backend = "llama_cpp"`，并将 `[endpoint].model` 设为上游 `/v1/models` 公布的实际 ID 或别名。示例配置中的空 `model` 会使请求省略该字段，无法产生缓存命中。直接访问端口 `8401` 会有意绕过共享缓存；浏览器客户端应使用现有的身份验证网关。通用 CLI 的默认端点保持不变。应用缓存默认关闭；共享服务端缓存安装后即运行。
 
 若在观测元数据不变的情况下替换了模型内容，执行 `python3 "$HOME/.local/share/hymt/inference-cache.py" clear --database "$HOME/.local/state/hymt/inference-cache.sqlite3"`；清理操作会使持久化条目及正在进行的写入失效。清理也会移除保留的规划证据。缓存 HTTP 服务可达而模型后端不可用时，包括缓存服务重启后，完整且完全相同的 JSON/SSE 响应仍可命中。历史 `/props` 与 `/v1/models` 带有 `X-Hymt-Planning: historical` 和 `X-Hymt-Observed-At`；CLI 使用历史规划上限，但不声称刚刚验证了后端。一个有界的精确 tokenization 结果保留 false-EOS 请求偏置。严格预检继续要求实时验证。未命中与显式绕过仍需后端；身份验证拒绝、损坏的元数据、TLS 验证错误以及本地容量或数据库故障均不会授权回放。来源或模型变化会使旧证据失效。每个数据库配有一个私有的单字节 `.guard` 文件，并仅允许一个缓存进程。身份探测中断或失效处理失败后，历史回放会被禁用，直到完整的在线恢复成功；请将守卫文件与数据库一同保留。显式绕过仍为透明转发，不参与缓存身份观测。该缓存仍独立于 hymt 的翻译历史；缓存服务本身不可达时不适用此能力。
 
