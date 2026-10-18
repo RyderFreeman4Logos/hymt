@@ -155,7 +155,12 @@ class _Upstream(BaseHTTPRequestHandler):
             for name, value in state.get("extra_headers", ()):
                 self.send_header(name, value)
             self.end_headers()
-            self.wfile.write(_SSE_FIRST)
+            first = _SSE_FIRST.replace(b' translation ', b'') if mode == "sse_empty" else _SSE_FIRST
+            if mode == "sse_terminal_empty":
+                first = b''
+            elif mode == "sse_null_empty":
+                first = b'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":null},"finish_reason":null}]}\n\n'
+            self.wfile.write(first)
             self.wfile.flush()
             state["stream_first"].set()
             state["stream_release"].wait(2)
@@ -1135,8 +1140,21 @@ os._exit(99)
         self.assertEqual(1, self.state["posts"])
 
     @unittest.skipUnless(_MODULE, "shared service not implemented yet")
+    def test_completed_empty_responses_are_exact_cache_hits(self) -> None:
+        for mode in ("empty", "sse_empty", "sse_terminal_empty", "sse_null_empty"):
+            with self.subTest(mode=mode):
+                payload = {"model": "Hy-MT2-7B", "messages": [{"role": "user", "content": "same text"}], "scenario": mode, "stream": mode.startswith("sse_")}
+                first = self.request(payload)
+                posts = self.state["posts"]
+                second = self.request(payload)
+                self.assertEqual(first[0], 200)
+                self.assertEqual(first[1]["X-Hymt-Cache"], "MISS")
+                self.assertEqual(second[1]["X-Hymt-Cache"], "HIT")
+                self.assertEqual(second[2], first[2])
+                self.assertEqual(self.state["posts"], posts)
+
     def test_bad_and_partial_responses_never_admit(self) -> None:
-        for mode in ("error", "length", "empty", "bad", "sse_length", "sse_partial", "sse_bad", "partial"):
+        for mode in ("error", "length", "bad", "sse_length", "sse_partial", "sse_bad", "partial"):
             with self.subTest(mode=mode):
                 payload = {"model": "Hy-MT2-7B", "scenario": mode, "stream": mode.startswith("sse")}
                 for _ in range(2):
@@ -1147,7 +1165,7 @@ os._exit(99)
                         self.assertNotEqual("HIT", reply[1]["X-Hymt-Cache"])
                     except http.client.IncompleteRead:
                         self.assertEqual("partial", mode)
-        self.assertEqual(16, self.state["posts"])
+        self.assertEqual(14, self.state["posts"])
         self.state["unknown"] = True
         self.assertEqual("UNKNOWN", self.request()[1]["X-Hymt-Cache"])
         self.state["unknown"] = False
@@ -1523,6 +1541,11 @@ os._exit(99)
     def test_numeric_content_and_unfinished_choices_never_admit(self) -> None:
         for content_type, raw in [
             ("application/json", b'{"choices":[{"index":0,"finish_reason":"stop","message":{"content":123}}]}'),
+            ("application/json", b'{"choices":[{"index":0,"finish_reason":"stop","message":{}}]}'),
+            ("application/json", b'{"choices":[{"index":0,"finish_reason":"stop","message":{"content":null}}]}'),
+            ("text/event-stream", b'data: {"choices":[{"index":0,"delta":{"content":""},"finish_reason":null}]}\n\ndata: [DONE]\n\n'),
+            ("text/event-stream", b'data: [DONE]\n\n'),
+            ("text/event-stream", b'data: {"choices":[]}\n\ndata: [DONE]\n\n'),
             ("text/event-stream", b'data: {"choices":[{"index":0,"delta":{"content":123},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'),
             ("text/event-stream", b'data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"},{"index":1,"delta":{"role":"assistant"},"finish_reason":null}]}\n\ndata: [DONE]\n\n'),
             ("text/event-stream", b'data: {"choices":[{"index":-1,"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'),

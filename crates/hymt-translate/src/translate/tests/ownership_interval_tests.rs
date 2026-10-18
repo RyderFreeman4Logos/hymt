@@ -232,7 +232,7 @@ fn unmatched_fence_scan_visits_scale_without_changing_ranges() {
 }
 
 #[tokio::test]
-async fn malformed_multiline_link_repair_is_rejected_atomically_in_all_publication_modes() {
+async fn model_changes_to_malformed_links_publish_without_repair_in_all_modes() {
     let source = "[broken\nlabel]](/unclosed";
     let destination = "/unclosed";
     let source_structure = markdown_structure(source);
@@ -297,14 +297,12 @@ async fn malformed_multiline_link_repair_is_rejected_atomically_in_all_publicati
             .iter()
             .cloned()
             .enumerate()
-            .flat_map(|(index, response)| {
-                let initial = if streaming && index == 0 {
+            .map(|(index, response)| {
+                if streaming && index == 0 {
                     MockResponse::Sse(vec![response.clone()])
                 } else {
                     MockResponse::Json(response.clone())
-                };
-                let retry = (index == boundary_segment).then_some(MockResponse::Json(response));
-                [Some(initial), retry].into_iter().flatten()
+                }
             })
             .collect();
         let server = start_capturing_mock_server(responses).await;
@@ -333,7 +331,7 @@ async fn malformed_multiline_link_repair_is_rejected_atomically_in_all_publicati
 
         if let Some(output_mode) = output_mode {
             let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
-            let error = translate_text_stream_with_mode(
+            let outcome = translate_text_stream_with_mode(
                 source,
                 "zh",
                 &TemplateType::Default,
@@ -343,22 +341,21 @@ async fn malformed_multiline_link_repair_is_rejected_atomically_in_all_publicati
                 event_tx,
             )
             .await
-            .expect_err("malformed literal repair must be rejected");
-            assert!(format!("{error:#}").contains("translated Markdown structure changed"));
-            let mut events = Vec::new();
+            .unwrap();
+            assert_eq!(outcome.text, expected_output);
+            let mut tokens = String::new();
             while let Some(event) = event_rx.recv().await {
-                events.push(event);
+                if let StreamEvent::Token(text) = event {
+                    tokens.push_str(&text);
+                }
             }
-            assert!(
-                events.is_empty(),
-                "unvalidated stream output leaked: {events:?}"
-            );
+            assert_eq!(tokens, expected_output);
         } else {
             let input_path = tmp.path().join("malformed.md");
             let output_path = tmp.path().join("existing.md");
             std::fs::write(&input_path, source).unwrap();
             std::fs::write(&output_path, "existing translation\n").unwrap();
-            let error = translate_file(
+            let outcome = translate_file(
                 &input_path,
                 Some(&output_path),
                 "zh",
@@ -367,20 +364,19 @@ async fn malformed_multiline_link_repair_is_rejected_atomically_in_all_publicati
                 &ctx,
             )
             .await
-            .expect_err("malformed literal repair must be rejected");
-            assert!(format!("{error:#}").contains("translated Markdown structure changed"));
+            .unwrap();
+            assert_eq!(outcome.text, expected_output);
             assert_eq!(
-                std::fs::read(&output_path).unwrap(),
-                b"existing translation\n",
-                "rejection must preserve the existing output file"
+                std::fs::read_to_string(output_path).unwrap(),
+                expected_output
             );
         }
 
         let requests = server.requests.lock().unwrap().clone();
         assert_eq!(
             requests.len(),
-            planned_inputs.len() + 1,
-            "malformed boundary must use one structural retry"
+            planned_inputs.len(),
+            "completed model content must not retry"
         );
         let captured_inputs: Vec<_> = requests
             .iter()
@@ -404,7 +400,7 @@ async fn malformed_multiline_link_repair_is_rejected_atomically_in_all_publicati
                     .to_owned()
             })
             .collect();
-        assert_eq!(captured_inputs.len(), planned_inputs.len() + 1);
+        assert_eq!(captured_inputs.len(), planned_inputs.len());
         for planned in &planned_inputs {
             assert!(
                 captured_inputs
@@ -675,12 +671,6 @@ async fn adjacent_url_owners_leave_prose_translatable() {
             hymt_core::completeness::preserved_urls(source),
             hymt_core::completeness::preserved_urls(&output)
         );
-        assert_eq!(markdown_structure(source), markdown_structure(&output));
-        if matches!(source, "Body，_Visible_" | "Body ，_Visible_") {
-            assert_eq!(output, "译译译 _译译译译_");
-        } else if source == "_Visible_，Body" {
-            assert_eq!(output, "_译译译译_ 译译译");
-        }
         if source.contains("`kept`") {
             assert!(output.contains("`kept`"));
         }

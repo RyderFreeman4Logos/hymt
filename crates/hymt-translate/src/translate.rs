@@ -22,12 +22,7 @@ use hymt_cache::history::{
     format_duration, EstimateScope, HistoryDB, SegmentCacheScope, TaskRecord,
 };
 use hymt_client::{TranslationClient, TranslationStreamEvent};
-#[cfg(test)]
-use hymt_core::completeness::validate_completeness;
-use hymt_core::completeness::{
-    validate_completeness_with_termination, CompletenessResult, CompletenessStatus,
-    CompletionTermination,
-};
+use hymt_core::completeness::{CompletenessResult, CompletenessStatus, CompletionTermination};
 use hymt_core::config::HotConfig;
 #[cfg(test)]
 use hymt_core::language::is_cjk_char;
@@ -38,7 +33,9 @@ use hymt_core::language_spec::{language_spec_or_none, LanguageFamily};
 use hymt_core::model_profile::ModelProfile;
 use hymt_core::templates::{build_prompt, PromptOpts, TemplateType, PROMPT_SCHEMA_ID};
 use hymt_segment::Segmenter;
-use pulldown_cmark::{Event, LinkType, Options, Parser, Tag, TagEnd};
+#[cfg(test)]
+use pulldown_cmark::TagEnd;
+use pulldown_cmark::{Event, LinkType, Options, Parser, Tag};
 
 // ── TranslationCtx ────────────────────────────────────────────────────────────
 
@@ -261,7 +258,7 @@ pub struct TranslationPlan {
 
 /// Result of a full translation pipeline run.
 ///
-/// Exhausted mechanical validation retains marked complete original paragraphs by
+/// Exhausted transport validation retains marked complete original paragraphs by
 /// default. Explicit strict mode rejects them before publication.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TranslationOutcome {
@@ -302,7 +299,7 @@ impl TranslationOutcome {
         eprintln!("completeness_status=degraded_original_retained");
         eprintln!("completeness_degraded_segments={list}");
         eprintln!(
-            "Warning: {} original paragraph(s) retained after mechanical validation failed",
+            "Warning: {} original paragraph(s) retained after transport validation failed",
             self.retained_regions.len()
         );
     }
@@ -962,23 +959,14 @@ fn fit_segments_to_final_request_budget(
 
 type SegmentPlanResult = (Vec<String>, Vec<usize>, Vec<Vec<usize>>);
 
-mod cache_proof;
 mod completeness_admission;
 pub(crate) mod offline_replay;
-pub(crate) use completeness_admission::cached_document_is_complete;
 use completeness_admission::{
-    approx_source_tokens, cached_segment_is_complete, ensure_document_identities_preserved,
-    validate_exhausted_attempt, validate_provider_attempt, CheckedAttempt,
+    approx_source_tokens, validate_exhausted_attempt, validate_provider_attempt, CheckedAttempt,
 };
 mod retained_original;
 pub use retained_original::RetainedRegion;
-mod markdown_boundary;
-mod markdown_context;
-use markdown_context::{segment_contexts, SegmentSource};
 mod markdown_ownership;
-mod markdown_recovery;
-use markdown_recovery::recover_generated_inline_code;
-mod table_shape;
 #[cfg(test)]
 use markdown_ownership::protected_markdown_block_ranges;
 use markdown_ownership::split_oversized_protected_blocks;
@@ -1018,7 +1006,6 @@ fn coherent_paragraph_sections(
             || reference_links
                 .iter()
                 .any(|range| range.start < offset && start < range.end)
-            || !markdown_ownership::coherent_protected_bytes_preserved(&section.text, &section.text)
         {
             continue;
         }
@@ -1094,59 +1081,6 @@ fn segment_document_plan(
         segments.extend(segs);
     }
     Ok((segments, indexes, groups))
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-struct MarkdownStructure {
-    blocks: Vec<String>,
-    headings: Vec<pulldown_cmark::HeadingLevel>,
-    links: Vec<(String, String)>,
-    images: Vec<(String, String)>,
-    inline: Vec<TagEnd>,
-    code: Vec<String>,
-    tables: Vec<(usize, Vec<usize>)>,
-}
-
-fn markdown_structure(text: &str) -> MarkdownStructure {
-    let mut structure = MarkdownStructure {
-        blocks: markdown_boundary::block_structure(text),
-        tables: table_shape::table_shapes(text),
-        ..MarkdownStructure::default()
-    };
-    for event in Parser::new(text) {
-        match event {
-            Event::Start(Tag::Heading { level, .. }) => structure.headings.push(level),
-            Event::Start(Tag::Link {
-                dest_url, title, ..
-            }) => structure
-                .links
-                .push((dest_url.to_string(), title.to_string())),
-            Event::Start(Tag::Image {
-                dest_url, title, ..
-            }) => structure
-                .images
-                .push((dest_url.to_string(), title.to_string())),
-            Event::Start(tag @ (Tag::Emphasis | Tag::Strong | Tag::Strikethrough)) => {
-                structure.inline.push(tag.to_end())
-            }
-            Event::End(end @ (TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough)) => {
-                structure.inline.push(end)
-            }
-            Event::Code(code) => structure.code.push(code.to_string()),
-            _ => {}
-        }
-    }
-    structure
-}
-
-fn ensure_markdown_structure_preserved(source: &str, translated: &str) -> Result<()> {
-    if hymt_core::completeness::parse_json_document(source).is_some() {
-        return ensure_document_identities_preserved(source, translated);
-    }
-    if markdown_structure(source) != markdown_structure(translated) {
-        anyhow::bail!("translated Markdown structure changed");
-    }
-    Ok(())
 }
 
 fn has_unparsed_link_syntax(text: &str) -> bool {
@@ -1257,96 +1191,38 @@ pub fn template_options_hash(
     hex::encode(h.finalize())
 }
 
-// ── Completeness helpers ──────────────────────────────────────────────────────
-
-fn cached_segment_preserves_source_owned_structure(
-    source: &str,
-    plan: &TranslationPlan,
-    index: usize,
-    translated: &str,
-) -> bool {
-    let mut candidate_segments = plan.segments.clone();
-    let Some(candidate) = candidate_segments.get_mut(index) else {
-        return false;
+fn validate_segment_source_positions(plan: &TranslationPlan) -> Result<()> {
+    let Some(document) = &plan.document_plan else {
+        return Ok(());
     };
-    *candidate = translated.to_owned();
-    ensure_markdown_structure_preserved(source, &plan.reconstruct(&candidate_segments)).is_ok()
-}
-
-fn evict_invalid_cached_segment(
-    history: &HistoryDB,
-    hash: &str,
-    scope: SegmentCacheScope<'_>,
-    translated: &str,
-) {
-    if let Err(error) = history.delete_segment_cached_if_matches(hash, scope, translated) {
-        eprintln!("Warning: invalid cached segment eviction failed: {error}");
+    let mut source = String::new();
+    let offsets: Vec<_> = document
+        .sections
+        .iter()
+        .map(|section| {
+            let offset = source.len();
+            source.push_str(&section.text);
+            offset
+        })
+        .collect();
+    let mut previous = None;
+    let mut consumed = 0;
+    for (segment, group) in plan.segments.iter().zip(&plan.segment_section_groups) {
+        let first = group[0];
+        if previous != Some(first) {
+            consumed = 0;
+            previous = Some(first);
+        }
+        let start = offsets[first] + consumed;
+        anyhow::ensure!(
+            source
+                .get(start..)
+                .is_some_and(|suffix| suffix.starts_with(segment)),
+            "segment source position changed"
+        );
+        consumed += segment.len();
     }
-}
-
-fn recover_structurally_invalid_cache_candidates(
-    source: &str,
-    plan: &TranslationPlan,
-    hashes: &[String],
-    scope: SegmentCacheScope<'_>,
-    history: &HistoryDB,
-    translations: &mut [Option<String>],
-    missing: &mut Vec<usize>,
-) {
-    if translations.iter().all(Option::is_none) {
-        return;
-    }
-    for _ in 0..translations.len() {
-        let candidate_segments: Vec<String> = translations
-            .iter()
-            .zip(&plan.segments)
-            .map(|(translated, source_segment)| {
-                translated.as_ref().unwrap_or(source_segment).to_owned()
-            })
-            .collect();
-        if ensure_markdown_structure_preserved(source, &plan.reconstruct(&candidate_segments))
-            .is_ok()
-        {
-            return;
-        }
-
-        let mut invalid = Vec::new();
-        for (index, translated) in translations.iter().enumerate() {
-            let Some(translated) = translated else {
-                continue;
-            };
-            if !cached_segment_preserves_source_owned_structure(source, plan, index, translated) {
-                invalid.push(index);
-            }
-        }
-        if invalid.is_empty() {
-            for (index, translated) in translations.iter().enumerate() {
-                if translated.is_none() {
-                    continue;
-                }
-                let mut repaired_segments = candidate_segments.clone();
-                repaired_segments[index] = plan.segments[index].clone();
-                // Several independent interactions may remain after replacing
-                // one owner. Retranslate owners that change the invalid syntax,
-                // not only those that repair the entire document in one step.
-                if markdown_structure(&plan.reconstruct(&repaired_segments))
-                    != markdown_structure(&plan.reconstruct(&candidate_segments))
-                {
-                    invalid.push(index);
-                }
-            }
-        }
-        if invalid.is_empty() {
-            return;
-        }
-
-        for index in invalid {
-            if let Some(translated) = translations[index].take() {
-                evict_invalid_cached_segment(history, &hashes[index], scope, &translated);
-                missing.push(index);
-            }
-        }
-    }
+    Ok(())
 }
 
 // ── Single-segment translation with completeness retry ────────────────────────
@@ -1355,7 +1231,6 @@ struct SegmentTranslateRequest<'a> {
     index: usize,
     client: &'a TranslationClient,
     segment: &'a str,
-    context: markdown_context::MarkdownContext,
     target_lang: &'a str,
     template: &'a TemplateType,
     opts: &'a PromptOpts,
@@ -1375,17 +1250,16 @@ fn map_segment_http_error(
     )
 }
 
-async fn translate_segment_with_completeness<'a>(
+async fn translate_segment_with_completeness(
     index: usize,
     client: &TranslationClient,
-    source: impl Into<SegmentSource<'a>>,
+    source: &str,
     target_lang: &str,
     template: &TemplateType,
     opts: &PromptOpts,
     config: &HotConfig,
 ) -> Result<SegmentTranslateOutcome> {
-    let source = source.into();
-    let segment = source.text;
+    let segment = source;
     let max_retries = config.completeness_max_retries() as usize;
     let mut last: Option<CheckedAttempt> = None;
 
@@ -1401,10 +1275,9 @@ async fn translate_segment_with_completeness<'a>(
             .translate_with_completion(&prompt)
             .await
             .map_err(|e| map_segment_http_error(index, segment, e))?;
-        let candidate =
-            validate_provider_attempt(source, completion.text, completion.termination, true);
+        let candidate = validate_provider_attempt(completion.text, completion.termination);
 
-        if candidate.validation.is_complete && candidate.structure_preserved {
+        if candidate.validation.is_complete {
             return Ok(SegmentTranslateOutcome {
                 text: candidate.text,
                 completeness_degraded: false,
@@ -1419,13 +1292,12 @@ async fn translate_segment_with_completeness<'a>(
             "retries exhausted"
         };
         eprintln!(
-            "Warning: segment {} failed validation (attempt {}/{}, {}, checks_failed={:?}, markdown_structure_preserved={})",
+            "Warning: segment {} failed validation (attempt {}/{}, {}, checks_failed={:?})",
             index + 1,
             attempt + 1,
             max_retries + 1,
             action,
-            candidate.validation.checks_failed,
-            candidate.structure_preserved
+            candidate.validation.checks_failed
         );
         last = Some(candidate);
     }
@@ -1440,7 +1312,7 @@ async fn translate_segment_with_completeness<'a>(
         last.validation.checks_failed,
     );
     Ok(SegmentTranslateOutcome {
-        text: source.text.to_owned(),
+        text: source.to_owned(),
         completeness_degraded: true,
         initial_request: false,
         cold_generation: false,
@@ -1580,13 +1452,8 @@ async fn translate_segment_with_completeness_streaming(
         }
     }
 
-    let mut last = validate_provider_attempt(
-        SegmentSource::new(request.segment, request.context),
-        translated,
-        termination,
-        !emitted_optimistically,
-    );
-    if last.validation.is_complete && last.structure_preserved {
+    let mut last = validate_provider_attempt(translated, termination);
+    if last.validation.is_complete {
         if output_mode == StreamOutputMode::Validated {
             send_stream_event(event_tx, StreamEvent::Token(last.text.clone())).await?;
         }
@@ -1606,13 +1473,13 @@ async fn translate_segment_with_completeness_streaming(
     if emitted_optimistically {
         validate_exhausted_attempt(
             request.index,
-            SegmentSource::new(request.segment, request.context),
+            request.segment,
             &last,
             request.opts,
             request.config,
         )?;
         eprintln!(
-            "Warning: segment {} failed mechanical validation, using streamed attempt (retry skipped \
+            "Warning: segment {} failed transport validation, using streamed attempt (retry skipped \
              — tokens already emitted): {:?}",
             request.index + 1,
             last.validation.checks_failed
@@ -1633,12 +1500,11 @@ async fn translate_segment_with_completeness_streaming(
         "retries exhausted"
     };
     eprintln!(
-        "Warning: segment {} failed validation (attempt 1/{}, {}, checks_failed={:?}, markdown_structure_preserved={})",
+        "Warning: segment {} failed validation (attempt 1/{}, {}, checks_failed={:?})",
         request.index + 1,
         max_retries + 1,
         action,
-        last.validation.checks_failed,
-        last.structure_preserved
+        last.validation.checks_failed
     );
 
     for attempt in 1..=max_retries {
@@ -1658,15 +1524,10 @@ async fn translate_segment_with_completeness_streaming(
             .await
             .map_err(|e| map_segment_http_error(request.index, request.segment, e))?;
 
-        let candidate = validate_provider_attempt(
-            SegmentSource::new(request.segment, request.context),
-            completion.text,
-            completion.termination,
-            true,
-        );
+        let candidate = validate_provider_attempt(completion.text, completion.termination);
         timing.log(request.index, "completeness_retry_end");
 
-        if candidate.validation.is_complete && candidate.structure_preserved {
+        if candidate.validation.is_complete {
             if !candidate.text.is_empty()
                 && (output_mode == StreamOutputMode::Validated || !emitted_optimistically)
             {
@@ -1692,20 +1553,19 @@ async fn translate_segment_with_completeness_streaming(
             "retries exhausted"
         };
         eprintln!(
-            "Warning: segment {} failed validation (attempt {}/{}, {}, checks_failed={:?}, markdown_structure_preserved={})",
+            "Warning: segment {} failed validation (attempt {}/{}, {}, checks_failed={:?})",
             request.index + 1,
             attempt + 1,
             max_retries + 1,
             action,
-            candidate.validation.checks_failed,
-            candidate.structure_preserved
+            candidate.validation.checks_failed
         );
         last = candidate;
     }
 
     validate_exhausted_attempt(
         request.index,
-        SegmentSource::new(request.segment, request.context),
+        request.segment,
         &last,
         request.opts,
         request.config,
@@ -1834,7 +1694,7 @@ pub async fn translate_text(
         profile_id,
         inference_fingerprint: inference_fingerprint.hash(),
     };
-    let contexts = segment_contexts(&plan)?;
+    validate_segment_source_positions(&plan)?;
     let seg_hashes: Vec<String> = plan
         .segments
         .iter()
@@ -1857,23 +1717,7 @@ pub async fn translate_text(
     if cache_enabled && ctx.cache_reads_enabled() {
         for (i, hash) in seg_hashes.iter().enumerate() {
             match ctx.history.find_segment_cached(hash, cache_scope) {
-                Ok(Some(cached)) => {
-                    if cached_segment_is_complete(
-                        i,
-                        SegmentSource::new(&plan.segments[i], contexts[i]),
-                        &cached,
-                    ) {
-                        translations[i] = Some(cached);
-                    } else {
-                        if SegmentSource::new(&plan.segments[i], contexts[i])
-                            .structure_preserved(&cached)
-                            .is_err()
-                        {
-                            evict_invalid_cached_segment(ctx.history, hash, cache_scope, &cached);
-                        }
-                        missing.push(i);
-                    }
-                }
+                Ok(Some(cached)) => translations[i] = Some(cached),
                 Ok(None) => missing.push(i),
                 Err(e) => {
                     eprintln!("Warning: cache lookup error: {e}");
@@ -1884,15 +1728,6 @@ pub async fn translate_text(
     } else {
         missing.extend(0..plan.segment_count());
     }
-    recover_structurally_invalid_cache_candidates(
-        text,
-        &plan,
-        &seg_hashes,
-        cache_scope,
-        ctx.history,
-        &mut translations,
-        &mut missing,
-    );
     let cache_hits = (plan.segment_count() - missing.len()) as i64;
     let source_tokens: i64 = missing
         .iter()
@@ -1941,7 +1776,6 @@ pub async fn translate_text(
         for &idx in &missing {
             let client = ctx.client.clone();
             let segment = plan.segments[idx].clone();
-            let context = contexts[idx];
             let target = target_lang.to_owned();
             let tmpl = template.clone();
             let cloned_opts = opts.clone();
@@ -1951,7 +1785,7 @@ pub async fn translate_text(
                 let outcome = translate_segment_with_completeness(
                     idx,
                     &client,
-                    SegmentSource::new(&segment, context),
+                    &segment,
                     &target,
                     &tmpl,
                     &cloned_opts,
@@ -1990,14 +1824,8 @@ pub async fn translate_text(
         .map(|(i, t)| t.ok_or_else(|| anyhow!("missing translated segment {i}")))
         .collect::<Result<_>>()?;
 
-    let (translated, retained_regions) = retained_original::finalize(
-        text,
-        &plan,
-        &mut completed,
-        &mut degraded_segments,
-        opts.warn_only_completeness
-            .unwrap_or_else(|| ctx.config.completeness_warn_only()),
-    )?;
+    let (translated, retained_regions) =
+        retained_original::finalize(text, &plan, &mut completed, &mut degraded_segments)?;
     let degraded = !retained_regions.is_empty();
     cold_generation &= !degraded;
     proof_eligible &= !degraded;
@@ -2256,13 +2084,11 @@ async fn translate_text_stream_inner(
     let ctx = &invocation;
     let template_name = template.as_str();
     let plan = plan_translation(text, target_lang, ctx.config, ctx.segmenter, template, opts)?;
-    // A source-owned delimiter can change its parse when adjacent translated
-    // punctuation arrives. Wait for the complete rendered document before emit.
+    // Original retention after a transport failure needs buffered publication.
     let output_mode = if output_mode == StreamOutputMode::Optimistic
-        && (markdown_boundary::requires_validated_rendering(&plan)
-            || opts
-                .warn_only_completeness
-                .unwrap_or_else(|| ctx.config.completeness_warn_only()))
+        && opts
+            .warn_only_completeness
+            .unwrap_or_else(|| ctx.config.completeness_warn_only())
     {
         StreamOutputMode::Validated
     } else {
@@ -2296,7 +2122,7 @@ async fn translate_text_stream_inner(
         profile_id,
         inference_fingerprint: inference_fingerprint.hash(),
     };
-    let contexts = segment_contexts(&plan)?;
+    validate_segment_source_positions(&plan)?;
     let seg_hashes: Vec<String> = plan
         .segments
         .iter()
@@ -2317,23 +2143,7 @@ async fn translate_text_stream_inner(
     if cache_enabled && ctx.cache_reads_enabled() {
         for (i, hash) in seg_hashes.iter().enumerate() {
             match ctx.history.find_segment_cached(hash, cache_scope) {
-                Ok(Some(cached)) => {
-                    if cached_segment_is_complete(
-                        i,
-                        SegmentSource::new(&plan.segments[i], contexts[i]),
-                        &cached,
-                    ) {
-                        translations[i] = Some(cached);
-                    } else {
-                        if SegmentSource::new(&plan.segments[i], contexts[i])
-                            .structure_preserved(&cached)
-                            .is_err()
-                        {
-                            evict_invalid_cached_segment(ctx.history, hash, cache_scope, &cached);
-                        }
-                        missing.push(i);
-                    }
-                }
+                Ok(Some(cached)) => translations[i] = Some(cached),
                 Ok(None) => missing.push(i),
                 Err(e) => {
                     eprintln!("Warning: cache lookup error: {e}");
@@ -2344,15 +2154,6 @@ async fn translate_text_stream_inner(
     } else {
         missing.extend(0..plan.segment_count());
     }
-    recover_structurally_invalid_cache_candidates(
-        text,
-        &plan,
-        &seg_hashes,
-        cache_scope,
-        ctx.history,
-        &mut translations,
-        &mut missing,
-    );
     let cache_hits = (plan.segment_count() - missing.len()) as i64;
     let source_tokens: i64 = missing
         .iter()
@@ -2427,7 +2228,6 @@ async fn translate_text_stream_inner(
         if let Some(chunk_idx) = priority_chunk {
             let client = ctx.client.clone();
             let segment = plan.segments[chunk_idx].clone();
-            let context = contexts[chunk_idx];
             let target = target_lang.to_owned();
             let tmpl = template.clone();
             let cloned_opts = opts.clone();
@@ -2447,7 +2247,7 @@ async fn translate_text_stream_inner(
                         index: chunk_idx,
                         client: &client,
                         segment: &segment,
-                        context,
+
                         target_lang: &target,
                         template: &tmpl,
                         opts: &cloned_opts,
@@ -2476,7 +2276,6 @@ async fn translate_text_stream_inner(
                 for &idx in &missing {
                     let client = ctx.client.clone();
                     let segment = plan.segments[idx].clone();
-                    let context = contexts[idx];
                     let target = target_lang.to_owned();
                     let tmpl = template.clone();
                     let cloned_opts = opts.clone();
@@ -2488,7 +2287,7 @@ async fn translate_text_stream_inner(
                         let outcome = translate_segment_with_completeness(
                             idx,
                             &client,
-                            SegmentSource::new(&segment, context),
+                            &segment,
                             &target,
                             &tmpl,
                             &cloned_opts,
@@ -2610,7 +2409,6 @@ async fn translate_text_stream_inner(
             for &idx in &missing {
                 let client = ctx.client.clone();
                 let segment = plan.segments[idx].clone();
-                let context = contexts[idx];
                 let target = target_lang.to_owned();
                 let tmpl = template.clone();
                 let cloned_opts = opts.clone();
@@ -2622,7 +2420,7 @@ async fn translate_text_stream_inner(
                     let outcome = translate_segment_with_completeness(
                         idx,
                         &client,
-                        SegmentSource::new(&segment, context),
+                        &segment,
                         &target,
                         &tmpl,
                         &cloned_opts,
@@ -2674,14 +2472,8 @@ async fn translate_text_stream_inner(
         .map(|(i, t)| t.ok_or_else(|| anyhow!("missing translated segment {i}")))
         .collect::<Result<_>>()?;
 
-    let (translated, retained_regions) = retained_original::finalize(
-        text,
-        &plan,
-        &mut completed,
-        &mut degraded_segments,
-        opts.warn_only_completeness
-            .unwrap_or_else(|| ctx.config.completeness_warn_only()),
-    )?;
+    let (translated, retained_regions) =
+        retained_original::finalize(text, &plan, &mut completed, &mut degraded_segments)?;
     let degraded = !retained_regions.is_empty();
     cold_generation &= !degraded;
     proof_eligible &= !degraded;
@@ -3020,13 +2812,13 @@ mod tests {
     mod context_json_tests;
     mod exec_cache_tests;
     mod identity_tests;
+    mod input_only_tests;
+    mod source_structure;
+    use source_structure::{markdown_structure, MarkdownStructure};
     mod retained_original_tests;
     pub(super) use identity_tests::record_placeholder_scan;
-    mod markdown_boundary_tests;
     mod output_tests;
-    pub(super) use markdown_boundary_tests::record_semantic_bytes;
     pub(super) mod ownership_interval_tests;
-    mod table_shape_tests;
     mod timing_tests;
 
     use super::*;
@@ -3233,6 +3025,7 @@ mod tests {
             finish_reason: String,
         },
         Sse(Vec<String>),
+        RawSse(String),
         SseWithoutTerminal(Vec<String>),
         SseWithFinishReason {
             tokens: Vec<String>,
@@ -3425,11 +3218,14 @@ mod tests {
                         .windows(failed_segment_marker.len())
                         .any(|window| window == failed_segment_marker.as_bytes())
                     {
-                        String::new()
+                        MockResponse::JsonWithFinishReason {
+                            content: String::new(),
+                            finish_reason: "length".to_owned(),
+                        }
                     } else {
-                        successful_reply
+                        MockResponse::Json(successful_reply)
                     };
-                    let _ = write_mock_response(socket, MockResponse::Json(response)).await;
+                    let _ = write_mock_response(socket, response).await;
                 });
             }
         });
@@ -3562,7 +3358,14 @@ mod tests {
                 )
             })?;
         if segment == &retry_segment && retry_responses.fetch_add(1, Ordering::SeqCst) == 0 {
-            return write_mock_response(socket, MockResponse::Json("**invalid**".to_owned())).await;
+            return write_mock_response(
+                socket,
+                MockResponse::JsonWithFinishReason {
+                    content: "**invalid**".to_owned(),
+                    finish_reason: "length".to_owned(),
+                },
+            )
+            .await;
         }
         write_mock_response(socket, MockResponse::Json(reply.clone())).await
     }
@@ -3633,6 +3436,7 @@ mod tests {
     async fn start_gated_first_token_server(
         segment0_tokens: Vec<String>,
         parallel_responses: Vec<String>,
+        truncated: bool,
     ) -> GatedMockServer {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3665,6 +3469,7 @@ mod tests {
                                 segment0_tokens,
                                 release_stream,
                                 stream_completed,
+                                truncated,
                             )
                             .await;
                         } else {
@@ -3779,6 +3584,7 @@ mod tests {
         tokens: Arc<Vec<String>>,
         release_stream: Arc<Notify>,
         stream_completed: Arc<AtomicBool>,
+        truncated: bool,
     ) -> std::io::Result<()> {
         read_http_headers(&mut socket).await?;
         let first = tokens.first().cloned().unwrap_or_default();
@@ -3787,6 +3593,11 @@ mod tests {
         let mut rest_body = String::new();
         for token in rest {
             rest_body.push_str(&sse_token_body(&token));
+        }
+        if truncated {
+            rest_body.push_str(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+            );
         }
         rest_body.push_str("data: [DONE]\n\n");
         let content_len = first_body.len() + rest_body.len();
@@ -3808,8 +3619,9 @@ mod tests {
     }
 
     fn sse_token_body(token: &str) -> String {
-        format!(r#"data: {{"choices":[{{"finish_reason":null,"delta":{{"content":"{token}"}}}}]}}"#)
-            + "\n\n"
+        format!(
+            r#"data: {{"choices":[{{"index":0,"finish_reason":null,"delta":{{"content":"{token}"}}}}]}}"#
+        ) + "\n\n"
     }
 
     fn mock_response_body(response: MockResponse) -> (&'static str, String) {
@@ -3833,13 +3645,14 @@ mod tests {
                 let mut body = String::new();
                 for token in tokens {
                     body.push_str(&format!(
-                        r#"data: {{"choices":[{{"finish_reason":null,"delta":{{"content":"{token}"}}}}]}}"#
+                        r#"data: {{"choices":[{{"index":0,"finish_reason":null,"delta":{{"content":"{token}"}}}}]}}"#
                     ));
                     body.push_str("\n\n");
                 }
                 body.push_str("data: [DONE]\n\n");
                 ("text/event-stream", body)
             }
+            MockResponse::RawSse(body) => ("text/event-stream", body),
             MockResponse::SseWithoutTerminal(tokens) => {
                 let body = tokens.iter().map(|token| sse_token_body(token)).collect();
                 ("text/event-stream", body)
@@ -3851,12 +3664,12 @@ mod tests {
                 let mut body = String::new();
                 for token in tokens {
                     body.push_str(&format!(
-                        r#"data: {{"choices":[{{"finish_reason":null,"delta":{{"content":"{token}"}}}}]}}"#
+                        r#"data: {{"choices":[{{"index":0,"finish_reason":null,"delta":{{"content":"{token}"}}}}]}}"#
                     ));
                     body.push_str("\n\n");
                 }
                 body.push_str(&format!(
-                    r#"data: {{"choices":[{{"finish_reason":"{finish_reason}","delta":{{"content":""}}}}]}}"#
+                    r#"data: {{"choices":[{{"index":0,"finish_reason":"{finish_reason}","delta":{{"content":""}}}}]}}"#
                 ));
                 body.push_str("\n\ndata: [DONE]\n\n");
                 ("text/event-stream", body)
@@ -4667,98 +4480,13 @@ After ordinary prose must also be translated in document order.\n"
         assert!(written.contains("译"));
         assert!(
             !written.contains("**invalid**"),
-            "the structurally invalid first attempt must be retried before reconstruction"
+            "the truncated first attempt must be retried before reconstruction"
         );
         assert_eq!(
             std::fs::read_to_string(&previous_output).expect("previous output through hard link"),
             previous_output_contents,
             "atomic rename must not mutate the old output inode; direct fs::write would corrupt it"
         );
-    }
-
-    #[test]
-    fn generated_inline_code_recovery_preserves_raw_bytes() {
-        let cases = [
-            (
-                "Plain source text.",
-                "译文 `name` 尾部。",
-                "译文 name 尾部。",
-            ),
-            (
-                "Plain source text.",
-                "译文 ``a`b`` 尾部。",
-                "译文 a`b 尾部。",
-            ),
-            (
-                "Plain source text.",
-                "前缀 `中文 café` 后缀",
-                "前缀 中文 café 后缀",
-            ),
-            (
-                "Plain source text.",
-                "前缀 `x`，保留  空格\t。",
-                "前缀 x，保留  空格\t。",
-            ),
-        ];
-        for (source, reply, expected) in cases {
-            assert_eq!(
-                recover_generated_inline_code(source, reply).as_deref(),
-                Some(expected)
-            );
-        }
-    }
-
-    #[test]
-    fn generated_inline_code_recovery_declines_ambiguous_markup() {
-        let cases = [
-            ("A `source` marker.", "一个 `source` 标记。"),
-            ("Plain source text.", "译文 `*word*` 尾部。"),
-            (
-                "Plain source text.",
-                "译文 `[label](https://example.test)` 尾部。",
-            ),
-            ("Plain source text.", "译文 `<b>word</b>` 尾部。"),
-            ("Plain source text.", "译文 `&amp;` 尾部。"),
-            ("Plain source text.", "译文 `\\*word` 尾部。"),
-            ("Plain source text.", "译文 `a\n- item` 尾部。"),
-            ("Plain source text.", "译文 `a\n# heading` 尾部。"),
-            ("Plain source text.", "译文 `a\n```fence` 尾部。"),
-            ("Plain source text.", "译文 ` name ` 尾部。"),
-            ("Plain source text.", "译文 `a\nb` 尾部。"),
-            ("Plain source text.", "译文 `name` 和孤立的 `。"),
-        ];
-        for (source, reply) in cases {
-            assert!(
-                recover_generated_inline_code(source, reply).is_none(),
-                "{reply:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn markdown_structure_contract_tracks_levels_occurrences_and_plain_urls() {
-        let source =
-            "##### Title\n\nRead [one](https://example.test/repeat) and [two](https://example.test/repeat).";
-        let translated =
-            "##### 标题\n\n阅读 [一](https://example.test/repeat) 和 [二](https://example.test/repeat)。";
-        assert!(ensure_markdown_structure_preserved(source, translated).is_ok());
-        assert!(ensure_markdown_structure_preserved("# Title", "## 标题").is_err());
-        assert!(ensure_markdown_structure_preserved(
-            source,
-            "##### 标题\n\n阅读 [一](https://example.test/repeat)。"
-        )
-        .is_err());
-        assert!(ensure_markdown_structure_preserved(
-            "See https://example.test/plain for details.",
-            "详情请看 https://example.test/plain 了解更多信息。"
-        )
-        .is_ok());
-
-        assert!(!cached_segment_is_complete(
-            0,
-            "ordinary source words without a Markdown link",
-            "普通翻译并添加[虚构链接](https://example.test/fabricated)"
-        ));
     }
 
     #[tokio::test]
@@ -4892,7 +4620,7 @@ After ordinary prose must also be translated in document order.\n"
     }
 
     #[tokio::test]
-    async fn document_translation_rejects_added_link_without_overwriting_previous_output() {
+    async fn document_translation_rejects_truncation_without_overwriting_previous_output() {
         let source = "This source paragraph has enough words to produce a complete translation without links.";
         let mock_translation = "这是完整的翻译内容，并附加一个[虚构链接](https://example.test/fabricated)，不应覆盖已有结果。";
         let segmenter = fallback_segmenter();
@@ -4911,7 +4639,10 @@ After ordinary prose must also be translated in document order.\n"
             plan.segment_count() * (planning_config.completeness_max_retries() as usize + 1);
         let server = start_capturing_mock_server(
             (0..response_count)
-                .map(|_| MockResponse::Json(mock_translation.to_owned()))
+                .map(|_| MockResponse::JsonWithFinishReason {
+                    content: mock_translation.to_owned(),
+                    finish_reason: "length".to_owned(),
+                })
                 .collect(),
         )
         .await;
@@ -4950,12 +4681,12 @@ After ordinary prose must also be translated in document order.\n"
                 published_hash, previous_hash,
                 "baseline returned Ok without overwriting the previous output"
             );
-            panic!("structurally invalid translation was accepted and overwrote the prior output");
+            panic!("truncated translation was accepted and overwrote the prior output");
         }
-        let error = result.expect_err("structurally invalid translation must not be published");
+        let error = result.expect_err("truncated translation must not be published");
         let error_chain = format!("{error:#}");
         assert!(
-            error_chain.contains("Markdown structure"),
+            error_chain.contains("finish_reason_length"),
             "unexpected error chain: {error_chain}"
         );
         let output_hash = format!(
@@ -4975,8 +4706,14 @@ After ordinary prose must also be translated in document order.\n"
             .all(|request| !request.contains("https://example.test/fabricated")));
 
         let stream_server = start_capturing_mock_server(vec![
-            MockResponse::Sse(vec![mock_translation.to_owned()]),
-            MockResponse::Json(mock_translation.to_owned()),
+            MockResponse::SseWithFinishReason {
+                tokens: vec![mock_translation.to_owned()],
+                finish_reason: "length".to_owned(),
+            },
+            MockResponse::JsonWithFinishReason {
+                content: mock_translation.to_owned(),
+                finish_reason: "length".to_owned(),
+            },
         ])
         .await;
         let stream_config = make_protected_block_config(&stream_server.endpoint_url);
@@ -5001,17 +4738,17 @@ After ordinary prose must also be translated in document order.\n"
         .await;
         let stream_error = match stream_result {
             Err(error) => error,
-            Ok(_) => panic!("structurally invalid streamed translation was accepted"),
+            Ok(_) => panic!("truncated streamed translation was accepted"),
         };
         let stream_error_chain = format!("{stream_error:#}");
         assert!(
-            stream_error_chain.contains("translated Markdown structure changed"),
-            "stream did not reach structural validation: {stream_error_chain}"
+            stream_error_chain.contains("finish_reason_length"),
+            "stream did not reach transport validation: {stream_error_chain}"
         );
         assert_eq!(
             stream_server.requests.lock().unwrap().len(),
             2,
-            "stream must retry the structurally invalid SSE response"
+            "stream must retry the truncated SSE response"
         );
         let mut streamed_tokens = String::new();
         let mut saw_all_done = false;
@@ -5030,7 +4767,7 @@ After ordinary prose must also be translated in document order.\n"
     }
 
     #[tokio::test]
-    async fn document_pipeline_refuses_empty_attempts() {
+    async fn document_pipeline_publishes_completed_empty_attempts() {
         let source = "This source paragraph exercises empty provider responses and verifies that \
                       rejected output cannot replace an existing document.";
         let segmenter = fallback_segmenter();
@@ -5080,18 +4817,14 @@ After ordinary prose must also be translated in document order.\n"
                 cache_enabled: true,
             };
 
-            let error = crate::doc_translate::run_doc_translation(&input, &doc_opts)
+            crate::doc_translate::run_doc_translation(&input, &doc_opts)
                 .await
-                .expect_err("{name} output must fail instead of overwriting the document");
-            let error_message = format!("{error:#}");
-            assert!(
-                error_message.contains("empty_output"),
-                "unexpected error for {name} output: {error_message}"
-            );
+                .expect("completed empty content must be published");
+            let expected = plan.reconstruct(&vec![reply.to_owned(); plan.segment_count()]);
             assert_eq!(
-                std::fs::read_to_string(&output).expect("prior output must remain readable"),
-                previous_output_contents,
-                "{name} best attempt must not overwrite the prior output"
+                std::fs::read_to_string(&output).unwrap(),
+                expected,
+                "{name}"
             );
         }
     }
@@ -6419,7 +6152,8 @@ Bravo one text carries enough source material for cache validation and ordering 
             .expect("test translation must start with first token")
             .to_owned();
         let server =
-            start_gated_first_token_server(vec![first, rest], translations[1..].to_vec()).await;
+            start_gated_first_token_server(vec![first, rest], translations[1..].to_vec(), false)
+                .await;
         let cfg = make_stream_config_with_concurrency(&server.endpoint_url, 4);
         let history = HistoryDB::new(temp_path("first-token-gate-history.db"));
 
@@ -6467,7 +6201,8 @@ Bravo one text carries enough source material for cache validation and ordering 
             .expect("test translation must start with first token")
             .to_owned();
         let server =
-            start_gated_first_token_server(vec![first, rest], translations[1..].to_vec()).await;
+            start_gated_first_token_server(vec![first, rest], translations[1..].to_vec(), false)
+                .await;
         let cfg = make_stream_config_with_concurrency_and_fcp(&server.endpoint_url, 4, false);
         let history = HistoryDB::new(temp_path("first-token-fcp-false-history.db"));
 
@@ -6703,6 +6438,7 @@ Bravo one text carries enough source material for cache validation and ordering 
         let server = start_gated_first_token_server(
             vec!["**invalid**".to_owned()],
             vec![translations[1].clone(), translations[0].clone()],
+            true,
         )
         .await;
         let cfg = make_stream_config_with_concurrency(&server.endpoint_url, 2);
@@ -6776,75 +6512,6 @@ Bravo one text carries enough source material for cache validation and ordering 
             }
         );
         assert!(!stdout.contains("PARTIAL"));
-    }
-
-    #[tokio::test]
-    async fn added_code_spans_retry_then_publish_only_valid_markdown() {
-        let source = "The property name is ordinary prose and should remain ordinary prose after translation.";
-        let invalid = "属性 `[name](https://example.test)` 是普通文字，翻译之后 `property` 仍应保持普通文字。";
-        let valid = "属性名称是普通文字，翻译之后仍应保持普通文字。";
-        let segmenter = fallback_segmenter();
-        for (streamed, first_chunk_priority) in [(false, false), (true, true), (true, false)] {
-            for recover in [false, true] {
-                let server = start_capturing_mock_server(vec![
-                    if first_chunk_priority {
-                        MockResponse::Sse(vec![invalid.to_owned()])
-                    } else {
-                        MockResponse::Json(invalid.to_owned())
-                    },
-                    MockResponse::Json(if recover { valid } else { invalid }.to_owned()),
-                ])
-                .await;
-                let config =
-                    make_stream_config_with_fcp(&server.endpoint_url, first_chunk_priority);
-                let client = TranslationClient::new(config.clone()).unwrap();
-                let history = HistoryDB::new(temp_path("markdown-code-retry.db"));
-                let ctx = TranslationCtx {
-                    config: &config,
-                    client: &client,
-                    segmenter: &segmenter,
-                    history: &history,
-                    cache_enabled: true,
-                };
-                let opts = PromptOpts::default();
-                let mut emitted = String::new();
-                let result = if streamed {
-                    let (tx, mut rx) = mpsc::channel(32);
-                    let result = translate_text_stream_with_mode(
-                        source,
-                        "zh",
-                        &TemplateType::Default,
-                        &opts,
-                        &ctx,
-                        StreamOutputMode::Validated,
-                        tx,
-                    )
-                    .await;
-                    while let Some(event) = rx.recv().await {
-                        if let StreamEvent::Token(text) = event {
-                            emitted.push_str(&text);
-                        }
-                    }
-                    result
-                } else {
-                    translate_text(source, "zh", &TemplateType::Default, &opts, &ctx).await
-                };
-                let requests = server.requests.lock().unwrap();
-                assert_eq!(requests.len(), 2);
-                assert!(requests[1].contains("Translate the COMPLETE input"));
-                drop(requests);
-                if recover {
-                    assert_eq!(result.unwrap().text, valid);
-                    if streamed {
-                        assert_eq!(emitted, valid);
-                    }
-                } else {
-                    assert!(result.is_err());
-                    assert!(emitted.is_empty());
-                    assert!(history.fetch_recent(None).unwrap().is_empty());
-                }
-            }
-        }
     }
 
     #[tokio::test]

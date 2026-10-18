@@ -42,7 +42,7 @@ async fn run(source: &str, ctx: &TranslationCtx<'_>, stream: bool) -> Translatio
 }
 
 #[tokio::test]
-async fn identical_rejected_retries_bypass_cached_bad_output() {
+async fn identical_transport_retries_bypass_cached_incomplete_response() {
     for route in 0..3 {
         for cache_enabled in [false, true] {
             tokio::time::timeout(Duration::from_secs(10), async {
@@ -103,9 +103,17 @@ async fn identical_rejected_retries_bypass_cached_bad_output() {
                             .unwrap()
                             .push((body.to_owned(), bypass, generations));
                         let response = if route == 1 && attempt == 0 {
-                            MockResponse::Sse(vec![text])
+                            MockResponse::SseWithFinishReason {
+                                tokens: vec![text],
+                                finish_reason: if generations == 3 { "stop" } else { "length" }
+                                    .into(),
+                            }
                         } else {
-                            MockResponse::Json(text)
+                            MockResponse::JsonWithFinishReason {
+                                content: text,
+                                finish_reason: if generations == 3 { "stop" } else { "length" }
+                                    .into(),
+                            }
                         };
                         reply(socket, response).await;
                     }

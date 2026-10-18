@@ -92,11 +92,7 @@ pub(super) fn population_proof(
     let inference = ctx
         .config
         .inference_fingerprint(template.as_str(), &options)?;
-    if !inference.is_cache_verified()
-        || output.is_empty()
-        || output.len() > 16_777_216
-        || !complete(source, output, plan)
-    {
+    if !inference.is_cache_verified() || output.len() > 16_777_216 {
         return Ok(None);
     }
     let configured = configured_digest(source, target, template, opts, ctx, streaming)?;
@@ -122,15 +118,6 @@ fn valid_runtime(runtime: &BackendRuntimeInfo) -> bool {
             }
             _ => false,
         }
-}
-
-fn complete(source: &str, output: &str, plan: &TranslationPlan) -> bool {
-    ensure_document_identities_preserved(source, output).is_ok()
-        && ensure_markdown_structure_preserved(source, output).is_ok()
-        && validate_completeness_with_termination(source, output, CompletionTermination::Unknown)
-            .is_complete
-        && (hymt_core::completeness::parse_json_document(source).is_some()
-            || cache_proof::cached_owned_payloads_match(plan, output))
 }
 
 pub(crate) struct Replay {
@@ -217,7 +204,6 @@ pub(crate) fn find_replay(
             if proof["output"] != digest(output)
                 || proof["requests"]
                     != request_plan_digest(&plan, target, template, opts, &client, streaming)?
-                || !complete(source, output, &plan)
             {
                 return Ok(None);
             }

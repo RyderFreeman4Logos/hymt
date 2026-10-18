@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-pub(super) fn urls(text: &str) -> HashSet<String> {
+pub fn urls(text: &str) -> HashSet<String> {
     preserved_url_ranges(text)
         .into_iter()
         .map(|range| text[range].to_owned())

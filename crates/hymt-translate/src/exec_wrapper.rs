@@ -17,10 +17,7 @@ use hymt_core::language::{resolve_target_language, DocumentTranslationPolicy};
 use hymt_core::templates::{PromptOpts, TemplateType};
 use hymt_segment::Segmenter;
 
-use crate::translate::{
-    cached_document_is_complete, effective_document_translation_policy, translate_text,
-    TranslationCtx,
-};
+use crate::translate::{effective_document_translation_policy, translate_text, TranslationCtx};
 
 const ANSI_CYAN: &str = "\x1b[36m";
 const ANSI_YELLOW: &str = "\x1b[33m";
@@ -181,17 +178,7 @@ pub(crate) async fn translate_cached(
         if let Ok(Some(cached)) =
             cache.find(command, subcommand, text, target_lang, document_policy)
         {
-            if cached_document_is_complete(
-                text,
-                &cached,
-                target_lang,
-                ctx.config,
-                prompt_opts,
-                ctx.segmenter,
-            ) {
-                return Ok(cached);
-            }
-            eprintln!("Warning: invalid whole-output cache entry, retranslating");
+            return Ok(cached);
         }
     }
 

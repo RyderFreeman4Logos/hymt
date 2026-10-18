@@ -312,10 +312,14 @@ struct OfflineFixture {
 
 impl OfflineFixture {
     async fn warm(streaming: bool) -> Self {
+        Self::warm_with_reply(streaming, REPLY).await
+    }
+
+    async fn warm_with_reply(streaming: bool, reply: &str) -> Self {
         let server = start_capturing_mock_server(vec![if streaming {
-            MockResponse::Sse(vec![REPLY.to_owned()])
+            MockResponse::Sse(vec![reply.to_owned()])
         } else {
-            MockResponse::Json(REPLY.to_owned())
+            MockResponse::Json(reply.to_owned())
         }])
         .await;
         let config = make_stream_config(&server.endpoint_url);
@@ -356,12 +360,18 @@ impl OfflineFixture {
             )
             .await
             .unwrap();
-            assert!(matches!(rx.recv().await, Some(StreamEvent::Token(_))));
+            let mut content = String::new();
+            while let Some(event) = rx.recv().await {
+                if let StreamEvent::Token(token) = event {
+                    content.push_str(&token);
+                }
+            }
+            assert_eq!(content, reply);
         } else {
             let warm = translate_text(SOURCE, "zh", &TemplateType::Default, &opts, &ctx)
                 .await
                 .unwrap();
-            assert_eq!(warm.text, REPLY);
+            assert_eq!(warm.text, reply);
         }
         assert_eq!(server.requests.lock().unwrap().len(), 1);
         let plan = plan_translation(
@@ -374,7 +384,7 @@ impl OfflineFixture {
         )
         .unwrap();
         let (key, proof) = offline_replay::population_proof(
-            (SOURCE, REPLY),
+            (SOURCE, reply),
             "zh",
             &TemplateType::Default,
             &opts,
@@ -986,10 +996,13 @@ async fn request_binding_uses_actual_rendered_content_adapter_bytes_and_order() 
 }
 
 #[tokio::test]
-async fn completeness_retry_cannot_populate_offline_proof() {
+async fn transport_retry_cannot_populate_offline_proof() {
     let fixture = OfflineFixture::warm(false).await;
     let server = start_capturing_mock_server(vec![
-        MockResponse::Json(String::new()),
+        MockResponse::JsonWithFinishReason {
+            content: String::new(),
+            finish_reason: "length".into(),
+        },
         MockResponse::Json(REPLY.into()),
     ])
     .await;
@@ -1141,4 +1154,13 @@ async fn changed_loaded_tokenizer_bytes_deny_replay() {
     .unwrap()
     .is_none());
     assert!(fixture.candidate(&config, false));
+}
+
+#[tokio::test]
+async fn completed_empty_output_populates_and_replays_offline_proof() {
+    for streaming in [false, true] {
+        let fixture = OfflineFixture::warm_with_reply(streaming, "").await;
+        assert_eq!(fixture.record.output_text.as_deref(), Some(""));
+        assert!(fixture.candidate(&fixture.fresh(), streaming));
+    }
 }

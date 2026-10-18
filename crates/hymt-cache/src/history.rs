@@ -260,7 +260,7 @@ impl HistoryDB {
         let mut statement = conn.prepare(
             "SELECT * FROM tasks WHERE input_hash=?1 AND configured_request_digest=?2
              AND length(CAST(replay_proof AS BLOB)) BETWEEN 1 AND 16384
-             AND length(CAST(output_text AS BLOB)) BETWEEN 1 AND 16777216
+             AND length(CAST(output_text AS BLOB)) BETWEEN 0 AND 16777216
              ORDER BY id DESC LIMIT 8",
         )?;
         let rows = statement

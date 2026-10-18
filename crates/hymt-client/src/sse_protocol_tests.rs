@@ -27,22 +27,56 @@ fn client_for(
 }
 
 #[tokio::test]
+async fn completion_stream_requires_a_response_slot_and_accepts_zero_text_choices() {
+    for (body, valid) in [
+        ("data: [DONE]\n\n", false),
+        ("data: {\"error\":{\"message\":\"fixture error\"}}\n\ndata: [DONE]\n\n", false),
+        ("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", false),
+        ("data: {\"choices\":[{\"index\":0,\"delta\":null,\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", false),
+        ("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":{}},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", false),
+        ("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":[]},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", false),
+        ("data: {\"choices\":[]}\n\ndata: [DONE]\n\n", false),
+        ("data: {\"choices\":[{\"index\":1,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", false),
+        ("data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", false),
+        ("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":123},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", false),
+        ("data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", true),
+        ("data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"choices\":[]}\n\ndata: [DONE]\n\n", true),
+        ("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", true),
+        ("data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n", true),
+        ("data: {\"choices\":[{\"index\":0,\"text\":\"\",\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", true),
+    ] {
+        let server = start_one_shot_server(MockReply::sse(vec![body.as_bytes().to_vec()])).await;
+        let (_fixture, client) = client_for(&server.endpoint);
+        let events = client.translate_stream_with_completion("slot fixture").await.unwrap()
+            .collect::<Vec<_>>().await;
+        assert_eq!(events.iter().all(Result::is_ok), valid, "{body}: {events:?}");
+        if valid {
+            assert!(events.iter().any(|event| matches!(event, Ok(TranslationStreamEvent::Finished(CompletionTermination::Stop)))));
+            assert!(!events.iter().any(|event| matches!(event, Ok(TranslationStreamEvent::Token(_)))));
+        } else {
+            assert!(!events.iter().any(|event| matches!(event, Ok(TranslationStreamEvent::Finished(CompletionTermination::Stop)))));
+        }
+        server.received_request().await;
+    }
+}
+
+#[tokio::test]
 async fn completion_stream_distinguishes_eof_only_done_and_explicit_finish() {
     let token =
-        "data: {\"choices\":[{\"finish_reason\":null,\"delta\":{\"content\":\"prefix\"}}]}\n\n";
+        "data: {\"choices\":[{\"index\":0,\"finish_reason\":null,\"delta\":{\"content\":\"prefix\"}}]}\n\n";
     for (suffix, expected) in [
         ("", CompletionTermination::MissingTerminal),
         ("data: [DONE]\n\n", CompletionTermination::Stop),
         (
-            "data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{\"content\":\"\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"delta\":{\"content\":\"\"}}]}\n\n",
             CompletionTermination::Stop,
         ),
         (
-            "data: {\"choices\":[{\"finish_reason\":\"length\",\"delta\":{\"content\":\"\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"length\",\"delta\":{\"content\":\"\"}}]}\n\n",
             CompletionTermination::Length,
         ),
         (
-            "data: {\"choices\":[{\"finish_reason\":\"custom\",\"delta\":{\"content\":\"\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"custom\",\"delta\":{\"content\":\"\"}}]}\n\n",
             CompletionTermination::Unknown,
         ),
     ] {
@@ -79,7 +113,7 @@ async fn sse_accepts_crlf_lf_comments_multiline_data_and_utf8_chunk_boundaries()
         "data: {\"choices\":[\r\n",
         "data: {\"finish_reason\":null,\"delta\":{\"content\":\"你\"}}]}\r\n",
         "\r\n",
-        "data: {\"choices\":[{\"finish_reason\":null,\"delta\":{\"content\":\"好\"}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"finish_reason\":null,\"delta\":{\"content\":\"好\"}}]}\n\n",
         "data: [DONE]\n\n",
     );
     let bytes = record.as_bytes();
@@ -116,7 +150,7 @@ async fn sse_accepts_crlf_lf_comments_multiline_data_and_utf8_chunk_boundaries()
 
 #[tokio::test]
 async fn sse_flushes_final_buffered_event_without_a_blank_terminator() {
-    let body = b"data: {\"choices\":[{\"finish_reason\":null,\"delta\":{\"content\":\"tail\"}}]}";
+    let body = b"data: {\"choices\":[{\"index\":0,\"finish_reason\":null,\"delta\":{\"content\":\"tail\"}}]}";
     let server = start_one_shot_server(MockReply::sse(vec![body.to_vec()])).await;
     let (_fixture, client) = client_for(&server.endpoint);
 
@@ -140,8 +174,8 @@ async fn sse_flushes_final_buffered_event_without_a_blank_terminator() {
 #[tokio::test]
 async fn sse_length_finish_reason_is_a_truncation_error() {
     let body = concat!(
-        "data: {\"choices\":[{\"finish_reason\":null,\"delta\":{\"content\":\"prefix\"}}]}\n\n",
-        "data: {\"choices\":[{\"finish_reason\":\"length\",\"delta\":{\"content\":\"\"}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"finish_reason\":null,\"delta\":{\"content\":\"prefix\"}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"length\",\"delta\":{\"content\":\"\"}}]}\n\n",
         "data: [DONE]\n\n",
     );
     let server = start_one_shot_server(MockReply::sse(vec![body.as_bytes().to_vec()])).await;
@@ -188,7 +222,7 @@ async fn sse_malformed_event_and_dropped_connection_surface_errors() {
     malformed.received_request().await;
 
     let partial =
-        b"data: {\"choices\":[{\"finish_reason\":null,\"delta\":{\"content\":\"partial\"}}]}\n\n";
+        b"data: {\"choices\":[{\"index\":0,\"finish_reason\":null,\"delta\":{\"content\":\"partial\"}}]}\n\n";
     let mut dropped_reply = MockReply::sse(vec![partial.to_vec()]);
     dropped_reply.advertised_length = Some(partial.len() + 32);
     let dropped = start_one_shot_server(dropped_reply).await;
