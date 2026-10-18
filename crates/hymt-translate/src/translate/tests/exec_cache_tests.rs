@@ -3,6 +3,56 @@ use crate::exec_wrapper::translate_cached;
 use hymt_cache::ExecCache;
 
 #[tokio::test]
+async fn refresh_skips_whole_output_hits_and_replaces_the_user_entry() {
+    let source = "Read this complete synthetic instruction.";
+    let old = "Previous synthetic translation.";
+    let updated = "Updated synthetic translation.";
+    let server = start_capturing_mock_server(vec![MockResponse::Json(updated.to_owned())]).await;
+    let config = make_stream_config(&server.endpoint_url);
+    let client = TranslationClient::new(config.clone()).unwrap();
+    let refreshed_client = client.clone().with_app_cache_refresh(true);
+    let segmenter = fallback_segmenter();
+    let dir = tempfile::tempdir().unwrap();
+    let history = HistoryDB::new(dir.path().join("history.db"));
+    let cache = ExecCache::with_user_path(dir.path().join("shared.db"), dir.path().join("user.db"));
+    let opts = PromptOpts::default();
+    let policy = effective_document_translation_policy(&opts, &config);
+    cache
+        .store_user("man", "fixture", source, "zh", policy, old)
+        .unwrap();
+    let refreshed = TranslationCtx {
+        config: &config,
+        client: &refreshed_client,
+        segmenter: &segmenter,
+        history: &history,
+        cache_enabled: true,
+    };
+    assert_eq!(
+        translate_cached("man", "fixture", source, "zh", &cache, &opts, &refreshed)
+            .await
+            .unwrap(),
+        updated
+    );
+    assert_eq!(server.requests.lock().unwrap().len(), 1);
+    assert_eq!(
+        cache.find("man", "fixture", source, "zh", policy).unwrap(),
+        Some(updated.to_owned())
+    );
+
+    let normal = TranslationCtx {
+        client: &client,
+        ..refreshed
+    };
+    assert_eq!(
+        translate_cached("man", "fixture", source, "zh", &cache, &opts, &normal)
+            .await
+            .unwrap(),
+        updated
+    );
+    assert_eq!(server.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn whole_cache_slots_cannot_omit_source_owners() {
     let instruction = "Keep the account available throughout the complete migration process and check every related service.";
     let complete = "迁移期间必须确保账户始终保持可用，并持续检查所有相关服务的运行情况。";

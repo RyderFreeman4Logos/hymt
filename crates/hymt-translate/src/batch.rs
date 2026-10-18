@@ -150,7 +150,8 @@ pub async fn build_batch_plan(
     eprintln!("Scanned {} files in {}", source_paths.len(), root.display());
 
     let template_name = template.as_str();
-    let application_cache_enabled = snapshot.application_cache_enabled() && !opts.no_cache;
+    let application_cache_enabled =
+        (snapshot.application_cache_enabled() || client.app_cache_refresh()) && !opts.no_cache;
     let mut files = Vec::new();
     let mut skipped = Vec::new();
 
@@ -209,7 +210,7 @@ pub async fn build_batch_plan(
 
         let output_path = build_output_path(&path, &root, None, output_dir, suffix);
 
-        if application_cache_enabled {
+        if application_cache_enabled && !client.app_cache_refresh() {
             let replay_ctx = TranslationCtx {
                 config: &snapshot,
                 client,
@@ -278,7 +279,7 @@ pub async fn build_batch_plan(
             .map(|s| segment_cache_hash(s))
             .collect();
         let hash_refs: Vec<&str> = seg_hashes.iter().map(|s| s.as_str()).collect();
-        let cached_set = if cache_enabled {
+        let cached_set = if cache_enabled && !client.app_cache_refresh() {
             history
                 .find_cached_segment_hashes(&hash_refs, cache_scope)
                 .unwrap_or_default()

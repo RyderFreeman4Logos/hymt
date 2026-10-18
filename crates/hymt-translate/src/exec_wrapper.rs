@@ -85,7 +85,8 @@ pub async fn run_exec_command(command: &[&str], opts: &ExecCommandOpts<'_>) -> R
         client,
         segmenter,
         history,
-        cache_enabled: config.application_cache_enabled() && !opts.no_cache,
+        cache_enabled: (config.application_cache_enabled() || client.app_cache_refresh())
+            && !opts.no_cache,
     };
 
     // Translate stderr if configured
@@ -169,7 +170,7 @@ pub(crate) async fn translate_cached(
     let document_policy = document_policy_for_exec_cache(prompt_opts, ctx.config);
     // Deferred CLI preflight can only be bypassed by a complete proof in the
     // core translator. Legacy whole-output rows carry no runtime authority.
-    if ctx.cache_enabled
+    if ctx.cache_reads_enabled()
         && !ctx.client.has_deferred_preflight()
         && (!ctx.config.strict_backend_preflight()
             || ctx

@@ -152,8 +152,17 @@ struct Cli {
     ctx: Option<String>,
 
     /// Bypass application and shared inference cache reads and writes
-    #[arg(long = "no-cache", alias = "disable-cache", global = true)]
+    #[arg(
+        long = "no-cache",
+        alias = "disable-cache",
+        global = true,
+        conflicts_with = "refresh_app_cache"
+    )]
     no_cache: bool,
+
+    /// Rebuild application caches from live requests without bypassing inference caching
+    #[arg(long, global = true)]
+    refresh_app_cache: bool,
 
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -548,7 +557,7 @@ async fn run() -> Result<()> {
         anyhow::bail!("--plan supports only text, stdin, file input, and batch");
     }
 
-    if cli.no_cache
+    if (cli.no_cache || cli.refresh_app_cache)
         && matches!(
             cli.cmd.as_ref(),
             Some(Cmd::Exec(ExecArgs {
@@ -557,7 +566,7 @@ async fn run() -> Result<()> {
             }))
         )
     {
-        anyhow::bail!("--no-cache conflicts with exec precache");
+        anyhow::bail!("cache override flags conflict with exec precache");
     }
 
     let config = HotConfig::new()?;
@@ -582,6 +591,7 @@ async fn run() -> Result<()> {
         )
         && config.application_cache_enabled()
         && !cli.no_cache
+        && !cli.refresh_app_cache
         && matches!(
             cli.cmd.as_ref(),
             None | Some(Cmd::Text(_))
@@ -631,13 +641,17 @@ async fn run() -> Result<()> {
     let target_lang = cli.lang.as_deref().unwrap_or(&default_lang);
     let explicit_target = cli.lang.is_some();
     let template = TemplateType::from(&cli.template);
+    let cache_flags = CacheFlags {
+        no_cache: cli.no_cache,
+        refresh_app_cache: cli.refresh_app_cache,
+    };
     let translate_flags = TranslateFlags {
         show_plan: cli.plan,
         stream_output: should_stream_translation(cli.stream, cli.no_stream, cli.output.as_ref()),
         output_path: cli.output.as_deref(),
         warn_only_completeness: cli.warn_only_completeness,
         concurrency_override,
-        no_cache: cli.no_cache,
+        cache: cache_flags,
     };
     let terms = parse_terms(&cli.term);
     let prompt_opts = PromptOpts {
@@ -696,7 +710,7 @@ async fn run() -> Result<()> {
                 &config,
                 &prompt_opts,
                 concurrency_override,
-                cli.no_cache,
+                cache_flags,
             )
             .await
         }
@@ -708,7 +722,7 @@ async fn run() -> Result<()> {
                 &config,
                 &prompt_opts,
                 concurrency_override,
-                cli.no_cache,
+                cache_flags,
             )
             .await
         }
@@ -720,7 +734,7 @@ async fn run() -> Result<()> {
                 &config,
                 &prompt_opts,
                 concurrency_override,
-                cli.no_cache,
+                cache_flags,
             )
             .await
         }
@@ -746,7 +760,7 @@ async fn run() -> Result<()> {
                 cli.plan,
                 &config,
                 concurrency_override,
-                cli.no_cache,
+                cache_flags,
             )
             .await
         }
@@ -766,12 +780,12 @@ async fn run() -> Result<()> {
                     output_path: None,
                     warn_only_completeness: cli.warn_only_completeness,
                     concurrency_override,
-                    no_cache: cli.no_cache,
+                    cache: cache_flags,
                 },
             )
             .await
         }
-        Some(Cmd::Telegram(args)) => run_telegram(args, &config, cli.no_cache).await,
+        Some(Cmd::Telegram(args)) => run_telegram(args, &config, cache_flags).await,
     }
 }
 
@@ -860,7 +874,7 @@ fn should_run_backend_preflight(command: Option<&Cmd>) -> bool {
 fn make_client_with_concurrency(
     config: &HotConfig,
     concurrency_override: Option<u32>,
-    no_cache: bool,
+    cache: CacheFlags,
 ) -> Result<TranslationClient> {
     let concurrency = concurrency_override
         .unwrap_or_else(|| config.concurrency())
@@ -868,8 +882,9 @@ fn make_client_with_concurrency(
     TranslationClient::with_concurrency(config.clone(), concurrency)
         .map(|client| {
             client
-                .with_cache_bypass(no_cache)
-                .with_deferred_preflight(config.application_cache_enabled() && !no_cache)
+                .with_cache_bypass(cache.no_cache)
+                .with_app_cache_refresh(cache.refresh_app_cache)
+                .with_deferred_preflight(cache.app_reads(config))
         })
         .map_err(|e| anyhow::anyhow!("{e}"))
 }
@@ -970,6 +985,22 @@ fn piped_stdin_placeholder(words: &[String], stdin_is_terminal: bool) -> bool {
 
 // ── Translate text / stdin ────────────────────────────────────────────────────
 
+#[derive(Clone, Copy, Default)]
+struct CacheFlags {
+    no_cache: bool,
+    refresh_app_cache: bool,
+}
+
+impl CacheFlags {
+    fn app_reads(self, config: &HotConfig) -> bool {
+        config.application_cache_enabled() && !self.no_cache && !self.refresh_app_cache
+    }
+
+    fn app_writes(self, config: &HotConfig) -> bool {
+        (config.application_cache_enabled() || self.refresh_app_cache) && !self.no_cache
+    }
+}
+
 #[derive(Clone, Copy)]
 struct TranslateFlags<'a> {
     show_plan: bool,
@@ -977,7 +1008,7 @@ struct TranslateFlags<'a> {
     output_path: Option<&'a Path>,
     warn_only_completeness: bool,
     concurrency_override: Option<u32>,
-    no_cache: bool,
+    cache: CacheFlags,
 }
 
 fn should_stream_translation(
@@ -1128,13 +1159,13 @@ async fn run_translate_text(
         return Ok(());
     }
 
-    let client = make_client_with_concurrency(config, flags.concurrency_override, flags.no_cache)?;
+    let client = make_client_with_concurrency(config, flags.concurrency_override, flags.cache)?;
     let tctx = TranslationCtx {
         config,
         client: &client,
         segmenter: &segmenter,
         history: &history,
-        cache_enabled: config.application_cache_enabled() && !flags.no_cache,
+        cache_enabled: flags.cache.app_writes(config),
     };
     let warn_only = completeness_warn_only(config, flags.warn_only_completeness);
     if flags.stream_output {
@@ -1200,13 +1231,13 @@ async fn run_translate_stdin(
         return Ok(());
     }
 
-    let client = make_client_with_concurrency(config, flags.concurrency_override, flags.no_cache)?;
+    let client = make_client_with_concurrency(config, flags.concurrency_override, flags.cache)?;
     let tctx = TranslationCtx {
         config,
         client: &client,
         segmenter: &segmenter,
         history: &history,
-        cache_enabled: config.application_cache_enabled() && !flags.no_cache,
+        cache_enabled: flags.cache.app_writes(config),
     };
     let warn_only = completeness_warn_only(config, flags.warn_only_completeness);
     if flags.stream_output {
@@ -1263,13 +1294,13 @@ async fn run_translate_path(
         return Ok(());
     }
 
-    let client = make_client_with_concurrency(config, flags.concurrency_override, flags.no_cache)?;
+    let client = make_client_with_concurrency(config, flags.concurrency_override, flags.cache)?;
     let tctx = TranslationCtx {
         config,
         client: &client,
         segmenter: &segmenter,
         history: &history,
-        cache_enabled: config.application_cache_enabled() && !flags.no_cache,
+        cache_enabled: flags.cache.app_writes(config),
     };
     let warn_only = completeness_warn_only(config, flags.warn_only_completeness);
     if flags.stream_output {
@@ -1400,7 +1431,7 @@ fn run_config(args: ConfigArgs, config: &HotConfig) -> Result<()> {
 
 // ── telegram ──────────────────────────────────────────────────────────────────
 
-async fn run_telegram(args: TelegramArgs, config: &HotConfig, no_cache: bool) -> Result<()> {
+async fn run_telegram(args: TelegramArgs, config: &HotConfig, cache: CacheFlags) -> Result<()> {
     if args.regenerate_claim_password {
         let password = config.regenerate_telegram_claim_password()?;
         // Print once to stdout so the user can store it; not re-printed later.
@@ -1414,11 +1445,11 @@ async fn run_telegram(args: TelegramArgs, config: &HotConfig, no_cache: bool) ->
 
     #[cfg(feature = "telegram")]
     {
-        telegram::run_telegram_bot(config, no_cache).await
+        telegram::run_telegram_bot(config, cache.no_cache, cache.refresh_app_cache).await
     }
     #[cfg(not(feature = "telegram"))]
     {
-        let _ = (config, no_cache);
+        let _ = (config, cache);
         anyhow::bail!(
             "hymt was built without the `telegram` cargo feature. \
              Rebuild with default features, or `cargo install --path crates/hymt-cli --features telegram`."
@@ -1435,14 +1466,14 @@ async fn run_man(
     config: &HotConfig,
     opts: &PromptOpts,
     concurrency_override: Option<u32>,
-    no_cache: bool,
+    cache: CacheFlags,
 ) -> Result<()> {
     if args.args.is_empty() {
         anyhow::bail!("man page name is required");
     }
     let segmenter = make_segmenter(config)?;
     let history = HistoryDB::default();
-    let client = make_client_with_concurrency(config, concurrency_override, no_cache)?;
+    let client = make_client_with_concurrency(config, concurrency_override, cache)?;
     let str_args: Vec<&str> = args.args.iter().map(String::as_str).collect();
     let opts = ManInfoOpts {
         target_lang,
@@ -1453,7 +1484,7 @@ async fn run_man(
         prompt_opts: opts,
         original: args.original,
         explicit_target,
-        no_cache,
+        no_cache: cache.no_cache,
     };
     let code = run_man_command(&str_args, &opts).await?;
     std::process::exit(code);
@@ -1468,14 +1499,14 @@ async fn run_info(
     config: &HotConfig,
     opts: &PromptOpts,
     concurrency_override: Option<u32>,
-    no_cache: bool,
+    cache: CacheFlags,
 ) -> Result<()> {
     if args.args.is_empty() {
         anyhow::bail!("info topic is required");
     }
     let segmenter = make_segmenter(config)?;
     let history = HistoryDB::default();
-    let client = make_client_with_concurrency(config, concurrency_override, no_cache)?;
+    let client = make_client_with_concurrency(config, concurrency_override, cache)?;
     let str_args: Vec<&str> = args.args.iter().map(String::as_str).collect();
     let opts = ManInfoOpts {
         target_lang,
@@ -1486,7 +1517,7 @@ async fn run_info(
         prompt_opts: opts,
         original: args.original,
         explicit_target,
-        no_cache,
+        no_cache: cache.no_cache,
     };
     let code = run_info_command(&str_args, &opts).await?;
     std::process::exit(code);
@@ -1501,7 +1532,7 @@ async fn run_exec(
     config: &HotConfig,
     opts: &PromptOpts,
     concurrency_override: Option<u32>,
-    no_cache: bool,
+    cache: CacheFlags,
 ) -> Result<()> {
     match args.action {
         Some(ExecAction::Install(install_args)) => {
@@ -1517,7 +1548,8 @@ async fn run_exec(
         Some(ExecAction::Precache) => {
             let segmenter = make_segmenter(config)?;
             let history = HistoryDB::default();
-            let client = make_client_with_concurrency(config, concurrency_override, false)?;
+            let client =
+                make_client_with_concurrency(config, concurrency_override, CacheFlags::default())?;
             let summary = run_precache(
                 target_lang,
                 config,
@@ -1551,7 +1583,7 @@ async fn run_exec(
             }
             let segmenter = make_segmenter(config)?;
             let history = HistoryDB::default();
-            let client = make_client_with_concurrency(config, concurrency_override, no_cache)?;
+            let client = make_client_with_concurrency(config, concurrency_override, cache)?;
             let exec_opts = ExecCommandOpts {
                 target_lang,
                 config,
@@ -1560,7 +1592,7 @@ async fn run_exec(
                 history: &history,
                 explicit_target,
                 prompt_opts: opts,
-                no_cache,
+                no_cache: cache.no_cache,
             };
             let code = run_exec_command(&command, &exec_opts).await?;
             std::process::exit(code);
@@ -1597,7 +1629,7 @@ async fn run_estimate(
     config.maybe_reload()?;
     let snapshot = config.detached_snapshot();
     let config = &snapshot;
-    let client = make_client_with_concurrency(config, concurrency_override, false)?;
+    let client = make_client_with_concurrency(config, concurrency_override, CacheFlags::default())?;
     client.refresh_backend_preflight().await?;
     let segmenter = make_segmenter(config)?;
     let plan = plan_translation("sample", target_lang, config, &segmenter, template, opts)?;
@@ -1740,7 +1772,7 @@ async fn run_batch(
     show_plan: bool,
     config: &HotConfig,
     concurrency_override: Option<u32>,
-    no_cache: bool,
+    cache: CacheFlags,
 ) -> Result<()> {
     let segmenter = make_segmenter(config)?;
     let history = HistoryDB::default();
@@ -1752,9 +1784,9 @@ async fn run_batch(
         recursive: args.recursive,
         explicit_target,
         concurrency_override,
-        no_cache,
+        no_cache: cache.no_cache,
     };
-    let client = make_client_with_concurrency(config, concurrency_override, no_cache)?;
+    let client = make_client_with_concurrency(config, concurrency_override, cache)?;
     let plan = build_batch_plan(
         &args.directory,
         config,
@@ -1854,7 +1886,7 @@ async fn run_translate_doc(
 ) -> Result<()> {
     let segmenter = make_segmenter(config)?;
     let history = HistoryDB::default();
-    let client = make_client_with_concurrency(config, flags.concurrency_override, flags.no_cache)?;
+    let client = make_client_with_concurrency(config, flags.concurrency_override, flags.cache)?;
     let doc_opts = DocTranslationOpts {
         target_lang,
         config,
@@ -1867,7 +1899,7 @@ async fn run_translate_doc(
         template,
         prompt_opts: opts,
         explicit_target,
-        cache_enabled: config.application_cache_enabled() && !flags.no_cache,
+        cache_enabled: flags.cache.app_writes(config),
     };
     run_doc_translation(&args.source, &doc_opts).await
 }
@@ -2226,6 +2258,28 @@ Options:\n  --source-id <SOURCE_ID>\n  --context-only\n";
     }
 
     #[test]
+    fn refresh_app_cache_is_global_and_conflicts_with_no_cache() {
+        for args in [
+            vec!["hymt", "--refresh-app-cache", "hello"],
+            vec!["hymt", "--refresh-app-cache", "batch", "docs"],
+            vec!["hymt", "--refresh-app-cache", "translate-doc", "doc.md"],
+            vec![
+                "hymt",
+                "--refresh-app-cache",
+                "exec",
+                "--",
+                "printf",
+                "hello",
+            ],
+            vec!["hymt", "--refresh-app-cache", "telegram"],
+        ] {
+            assert!(Cli::try_parse_from(args).unwrap().refresh_app_cache);
+        }
+        assert!(Cli::try_parse_from(["hymt", "--refresh-app-cache", "--no-cache"]).is_err());
+        assert!(Cli::try_parse_from(["hymt", "--disable-cache", "--refresh-app-cache"]).is_err());
+    }
+
+    #[test]
     fn force_translate_all_flag_selects_translate_all_policy() {
         let path = PathBuf::from("target").join(unique_test_name("hymt-cli-force-policy", "toml"));
         let _cleanup = CleanupPath::File(path.clone());
@@ -2340,9 +2394,10 @@ timeout = 5
         .unwrap();
         let cfg = HotConfig::from_path(&path).unwrap();
         assert_eq!(cfg.concurrency(), 8);
-        let client = make_client_with_concurrency(&cfg, Some(2), false).unwrap();
+        let client = make_client_with_concurrency(&cfg, Some(2), CacheFlags::default()).unwrap();
         assert_eq!(client.concurrency(), 2);
-        let default_client = make_client_with_concurrency(&cfg, None, false).unwrap();
+        let default_client =
+            make_client_with_concurrency(&cfg, None, CacheFlags::default()).unwrap();
         assert_eq!(default_client.concurrency(), 8);
     }
 

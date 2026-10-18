@@ -378,6 +378,7 @@ struct Inner {
 pub struct TranslationClient {
     inner: Arc<Inner>,
     cache_bypass: bool,
+    app_cache_refresh: bool,
     deferred_preflight: bool,
 }
 
@@ -408,6 +409,7 @@ impl TranslationClient {
         let http = reqwest::Client::builder().timeout(timeout).build()?;
         Ok(Self {
             cache_bypass: false,
+            app_cache_refresh: false,
             deferred_preflight: false,
             inner: Arc::new(Inner {
                 config,
@@ -430,8 +432,20 @@ impl TranslationClient {
         Self {
             inner: Arc::clone(&self.inner),
             cache_bypass: self.cache_bypass || bypass,
+            app_cache_refresh: self.app_cache_refresh,
             deferred_preflight: self.deferred_preflight,
         }
+    }
+
+    /// Skip application-cache reads for this invocation while retaining writes.
+    /// This does not set the inference-service cache bypass header.
+    pub fn with_app_cache_refresh(mut self, refresh: bool) -> Self {
+        self.app_cache_refresh = refresh;
+        self
+    }
+
+    pub fn app_cache_refresh(&self) -> bool {
+        self.app_cache_refresh
     }
 
     /// Defer CLI live preflight until the local complete-output replay misses.
@@ -456,6 +470,7 @@ impl TranslationClient {
             .and_then(|entry| entry.clone());
         Ok(Self {
             cache_bypass: self.cache_bypass,
+            app_cache_refresh: self.app_cache_refresh,
             deferred_preflight: self.deferred_preflight,
             inner: Arc::new(Inner {
                 config,
