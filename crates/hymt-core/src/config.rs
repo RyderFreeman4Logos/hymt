@@ -1582,7 +1582,7 @@ impl HotConfig {
         self.section_value(section, key)
             .and_then(|v| v.as_integer())
             .filter(|&n| n > 0)
-            .map(|n| n as u32)
+            .and_then(|n| u32::try_from(n).ok())
             .unwrap_or(default)
     }
 
@@ -1810,6 +1810,70 @@ mod tests {
         assert!(cfg.completeness_warn_only());
         assert!(!cfg.strict_token_budget());
         assert!(!cfg.application_cache_enabled());
+    }
+
+    #[test]
+    fn positive_u32_config_boundaries() {
+        let path = temp_config_path("positive-u32-boundaries");
+        for (value, expected) in [
+            ("0", None),
+            ("1", Some(1)),
+            ("4294967295", Some(u32::MAX)),
+            ("4294967296", None),
+            ("4294967297", None),
+            ("9223372036854775807", None),
+            ("-1", None),
+            ("'invalid'", None),
+        ] {
+            fs::write(
+                &path,
+                format!(
+                    "[translation]\ncontext_window = {value}\nmax_output_tokens = {value}\n\
+                     concurrency = {value}\nconfig_version = {value}\n"
+                ),
+            )
+            .unwrap();
+            let cfg = HotConfig::from_path(&path).unwrap();
+            for (key, actual, default) in [
+                ("context_window", cfg.context_window(), 16_384),
+                ("total_context", cfg.total_context(), 16_384),
+                ("max_output_tokens", cfg.max_output_tokens(), 4_096),
+                ("concurrency", cfg.concurrency(), 1),
+                ("config_version", cfg.config_version(), 1),
+            ] {
+                assert_eq!(actual, expected.unwrap_or(default), "{key} = {value}");
+            }
+            assert_eq!(cfg.parallel_slots(), 1);
+
+            for key in BACKEND_CONTEXT_KEYS {
+                let backend = if *key == "total_context" {
+                    format!("[backend]\ntotal_context = {value}\n")
+                } else {
+                    format!("[backend]\ntotal_context = 4294967295\n{key} = {value}\n")
+                };
+                fs::write(&path, backend).unwrap();
+                match expected {
+                    Some(expected) => {
+                        let cfg = HotConfig::from_path(&path).unwrap();
+                        let actual = match *key {
+                            "total_context" => cfg.total_context(),
+                            "parallel_slots" => cfg.parallel_slots(),
+                            "per_request_context" => cfg.per_request_context(),
+                            _ => unreachable!(),
+                        };
+                        assert_eq!(actual, expected, "backend.{key} = {value}");
+                    }
+                    None => {
+                        let error = HotConfig::from_path(&path).unwrap_err();
+                        assert!(
+                            error.to_string().contains(&format!("backend.{key}")),
+                            "backend.{key} = {value}: {error}"
+                        );
+                    }
+                }
+            }
+        }
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
