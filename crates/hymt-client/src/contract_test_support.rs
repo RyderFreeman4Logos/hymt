@@ -110,7 +110,7 @@ pub(crate) async fn start_one_shot_server(reply: MockReply) -> MockServer {
     }
 }
 
-async fn read_http_request(socket: &mut TcpStream) -> io::Result<String> {
+pub(crate) async fn read_http_request(socket: &mut TcpStream) -> io::Result<String> {
     let mut request = Vec::new();
     let mut chunk = [0_u8; 1024];
     let header_end = loop {
@@ -134,6 +134,7 @@ async fn read_http_request(socket: &mut TcpStream) -> io::Result<String> {
                 .or_else(|| line.strip_prefix("Content-Length:"))
         })
         .map(str::trim)
+        .or_else(|| headers.starts_with("GET ").then_some("0"))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "request has no content length"))?
         .parse::<usize>()
         .map_err(io::Error::other)?;

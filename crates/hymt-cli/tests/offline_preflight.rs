@@ -91,7 +91,7 @@ impl Fixture {
         std::fs::write(self.root.join(".config/hymt/config.toml"), format!(
             "[endpoint]\nurl = \"{}\"\nbackend = \"llama_cpp\"\nmodel = \"test-model\"\n\
              [backend]\ntotal_context = 4096\nparallel_slots = 1\n\
-             [translation]\nmax_output_tokens = {max_output}\nstrict_backend_preflight = {strict}\ntimeout = 2\n\
+             [translation]\nmax_retries = 0\nmax_output_tokens = {max_output}\nstrict_backend_preflight = {strict}\ntimeout = 2\n\
              [cache]\nenabled = true\n", self.endpoint)).unwrap();
     }
 

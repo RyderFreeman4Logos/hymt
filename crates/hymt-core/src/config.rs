@@ -41,6 +41,8 @@ concurrency = 1
 stream = true
 config_version = 1
 timeout = 600
+# Additional attempts after transient network failures; 0 disables retries.
+max_retries = 100
 first_chunk_priority = false
 # Hard cap on source tokens submitted per segment. The conservative default keeps
 # 7B models from ending a long translation before the requested max-output limit.
@@ -1075,6 +1077,12 @@ impl HotConfig {
         self.get_number_as_f64("translation", "timeout", 600.0)
     }
 
+    /// Additional network attempts per request, including interrupted response bodies.
+    /// This is separate from protocol completeness retries. Zero keeps the initial attempt.
+    pub fn network_max_retries(&self) -> u32 {
+        self.get_non_negative_u32("translation", "max_retries", 100)
+    }
+
     /// When true, chunk 0 is translated alone before remaining chunks run in parallel.
     ///
     /// This gives the first output segment priority GPU access so callers can
@@ -1805,6 +1813,7 @@ mod tests {
         assert_eq!(cfg.secondary_lang(), "en");
         assert!(cfg.stream());
         assert!((cfg.timeout() - 600.0).abs() < f64::EPSILON);
+        assert_eq!(cfg.network_max_retries(), 100);
         assert_eq!(cfg.max_source_tokens_per_segment(), 384);
         assert_eq!(cfg.completeness_max_retries(), 2);
         assert!(cfg.completeness_warn_only());

@@ -1417,11 +1417,15 @@ async fn translate_segment_with_completeness_streaming(
         request.opts,
     )?;
     timing.log(request.index, "request_start");
-    let mut stream = request
-        .client
-        .translate_stream_with_completion(&prompt)
-        .await
-        .map_err(|e| map_segment_http_error(request.index, request.segment, e))?;
+    let mut stream = if output_mode == StreamOutputMode::Validated {
+        request.client.translate_stream_with_recovery(&prompt).await
+    } else {
+        request
+            .client
+            .translate_stream_with_completion(&prompt)
+            .await
+    }
+    .map_err(|e| map_segment_http_error(request.index, request.segment, e))?;
     let mut translated = String::new();
     let mut first_token_tx = first_token_tx;
     let mut emitted_optimistically = false;
@@ -1431,6 +1435,11 @@ async fn translate_segment_with_completeness_streaming(
     while let Some(item) = stream.next().await {
         match item.map_err(|e| map_segment_http_error(request.index, request.segment, e))? {
             TranslationStreamEvent::ColdGeneration(cold) => cold_generation = cold,
+            TranslationStreamEvent::Restarted => {
+                translated.clear();
+                termination = CompletionTermination::Unknown;
+                cold_generation = false;
+            }
             TranslationStreamEvent::Token(token) => {
                 if token.is_empty() {
                     continue;
@@ -2813,6 +2822,7 @@ mod tests {
     mod exec_cache_tests;
     mod identity_tests;
     mod input_only_tests;
+    mod network_retry_tests;
     mod source_structure;
     use source_structure::{markdown_structure, MarkdownStructure};
     mod retained_original_tests;
@@ -3026,6 +3036,7 @@ mod tests {
         },
         Sse(Vec<String>),
         RawSse(String),
+        InterruptedSse(String),
         SseWithoutTerminal(Vec<String>),
         SseWithFinishReason {
             tokens: Vec<String>,
@@ -3560,13 +3571,14 @@ mod tests {
         mut socket: TcpStream,
         response: MockResponse,
     ) -> std::io::Result<()> {
+        let extra_length = usize::from(matches!(response, MockResponse::InterruptedSse(_))) * 32;
         let (content_type, body) = mock_response_body(response);
         let headers = format!(
             "HTTP/1.1 200 OK\r\n\
              content-type: {content_type}\r\n\
              content-length: {}\r\n\
              connection: close\r\n\r\n",
-            body.len()
+            body.len() + extra_length
         );
         socket.write_all(headers.as_bytes()).await?;
         socket.write_all(body.as_bytes()).await?;
@@ -3652,7 +3664,9 @@ mod tests {
                 body.push_str("data: [DONE]\n\n");
                 ("text/event-stream", body)
             }
-            MockResponse::RawSse(body) => ("text/event-stream", body),
+            MockResponse::RawSse(body) | MockResponse::InterruptedSse(body) => {
+                ("text/event-stream", body)
+            }
             MockResponse::SseWithoutTerminal(tokens) => {
                 let body = tokens.iter().map(|token| sse_token_body(token)).collect();
                 ("text/event-stream", body)
@@ -3728,6 +3742,7 @@ max_source_tokens_per_segment = 384
 concurrency = 1
 first_chunk_priority = true
 timeout = 5
+max_retries = 1
 
 [completeness]
 max_retries = 1
@@ -3782,6 +3797,7 @@ max_output_tokens = 40
 concurrency = {concurrency}
 first_chunk_priority = {first_chunk_priority}
 timeout = 5
+max_retries = 1
 
 [completeness]
 max_retries = 1
@@ -3854,6 +3870,7 @@ max_output_tokens = 40
 concurrency = 1
 first_chunk_priority = true
 timeout = 5
+max_retries = 1
 
 [completeness]
 max_retries = 1
@@ -6895,6 +6912,7 @@ context_window = 4096
 max_output_tokens = 512
 concurrency = 1
 timeout = 0.2
+max_retries = 0
 max_source_tokens_per_segment = 1024
 
 [completeness]
@@ -7035,6 +7053,7 @@ concurrency = 2
 first_chunk_priority = true
 debug_chunk_timing = true
 timeout = 5
+max_retries = 1
 
 [completeness]
 max_retries = 1

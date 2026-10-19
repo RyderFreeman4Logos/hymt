@@ -7,6 +7,9 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod retry;
+use retry::RetryBudget;
+
 use futures_core::Stream;
 use hymt_core::completeness::CompletionTermination;
 use hymt_core::config::{GenerationBackend, GenerationSettings, HotConfig, Setting};
@@ -92,6 +95,8 @@ pub struct TranslationCompletion {
 pub enum TranslationStreamEvent {
     /// Response provenance, emitted before content; unmarked responses are unknown.
     ColdGeneration(bool),
+    /// Discard the unpublished content and terminal state of the interrupted attempt.
+    Restarted,
     Token(String),
     Finished(CompletionTermination),
 }
@@ -510,7 +515,7 @@ impl TranslationClient {
     }
 
     /// Return a fresh resolved-state report even when strict translation policy
-    /// would refuse work. This keeps `hymt backend inspect` actionable.
+    /// would refuse work. Diagnostic inspection does not retry outages.
     pub async fn inspect_backend(&self) -> Result<BackendPreflight, ClientError> {
         self.preflight_backend_inner(true, false).await
     }
@@ -550,7 +555,14 @@ impl TranslationClient {
             return Err(ClientError::ConfigChangedDuringPreflight);
         }
         let observed_at = unix_timestamp_secs();
-        let runtime = self.fetch_backend_runtime(key.backend, observed_at).await;
+        let max_retries = if enforce_strict {
+            self.inner.config.network_max_retries()
+        } else {
+            0
+        };
+        let runtime = self
+            .fetch_backend_runtime(key.backend, observed_at, max_retries)
+            .await;
         if !self
             .inner
             .config
@@ -593,6 +605,7 @@ impl TranslationClient {
         &self,
         backend: GenerationBackend,
         observed_at_unix_secs: u64,
+        max_retries: u32,
     ) -> BackendRuntimeInfo {
         let url = match backend {
             GenerationBackend::LlamaCpp => {
@@ -603,84 +616,83 @@ impl TranslationClient {
             }
         };
 
-        match self
-            .inner
-            .http
-            .get(&url)
-            .headers(self.build_headers())
-            .timeout(Duration::from_secs(3))
-            .send()
-            .await
-        {
-            Ok(response) if response.status().is_success() => {
-                let historical =
-                    match historical_observation(response.headers(), observed_at_unix_secs) {
-                        Ok(value) => value,
-                        Err(message) => {
-                            return BackendRuntimeInfo::unverified(
-                                backend,
-                                observed_at_unix_secs,
-                                message,
-                            )
-                        }
-                    };
-                match response.json().await {
-                    Ok(body) => {
-                        let parsed = match backend {
-                            GenerationBackend::LlamaCpp => {
-                                BackendRuntimeInfo::from_llama_cpp_props(
-                                    &body,
-                                    observed_at_unix_secs,
-                                )
-                            }
-                            GenerationBackend::Vllm | GenerationBackend::OpenAiCompatible => {
-                                BackendRuntimeInfo::from_openai_models(
-                                    backend,
-                                    &body,
-                                    observed_at_unix_secs,
-                                )
-                            }
-                        };
-                        match parsed {
-                            Ok(mut runtime) => {
-                                if let Some(observed) = historical {
-                                    runtime.verification_status =
-                                        BackendVerificationStatus::Historical;
-                                    runtime.observed_at_unix_secs = observed;
-                                    runtime.verification_message = Some("historical inference-cache planning; live backend unavailable".to_owned());
-                                }
-                                if let Some(false_eos_token) = runtime.false_eos_token.clone() {
-                                    runtime.false_eos_token_id =
-                                        self.llama_cpp_false_eos_token_id(&false_eos_token).await;
-                                    if historical.is_some() && runtime.false_eos_token_id.is_none()
-                                    {
-                                        return BackendRuntimeInfo::unverified(
-                                            backend,
-                                            runtime.observed_at_unix_secs,
-                                            "historical false-EOS tokenization evidence is unavailable",
-                                        );
-                                    }
-                                }
-                                runtime
-                            }
-                            Err(error) => BackendRuntimeInfo::unverified(
-                                backend,
-                                observed_at_unix_secs,
-                                format!("malformed backend response: {error}"),
-                            ),
-                        }
+        let headers = self.build_headers();
+        let mut budget = RetryBudget::new(max_retries);
+        let result = retry::json::<serde_json::Value>(
+            || {
+                self.inner
+                    .http
+                    .get(&url)
+                    .headers(headers.clone())
+                    .timeout(Duration::from_secs(3))
+            },
+            &mut budget,
+        )
+        .await;
+        match result {
+            Ok((body, headers, _)) => {
+                let historical = match historical_observation(&headers, observed_at_unix_secs) {
+                    Ok(value) => value,
+                    Err(message) => {
+                        return BackendRuntimeInfo::unverified(
+                            backend,
+                            observed_at_unix_secs,
+                            message,
+                        )
                     }
-                    Err(_) => BackendRuntimeInfo::unverified(
+                };
+                let parsed = match backend {
+                    GenerationBackend::LlamaCpp => {
+                        BackendRuntimeInfo::from_llama_cpp_props(&body, observed_at_unix_secs)
+                    }
+                    GenerationBackend::Vllm | GenerationBackend::OpenAiCompatible => {
+                        BackendRuntimeInfo::from_openai_models(
+                            backend,
+                            &body,
+                            observed_at_unix_secs,
+                        )
+                    }
+                };
+                match parsed {
+                    Ok(mut runtime) => {
+                        if let Some(observed) = historical {
+                            runtime.verification_status = BackendVerificationStatus::Historical;
+                            runtime.observed_at_unix_secs = observed;
+                            runtime.verification_message = Some(
+                                "historical inference-cache planning; live backend unavailable"
+                                    .to_owned(),
+                            );
+                        }
+                        if let Some(false_eos_token) = runtime.false_eos_token.clone() {
+                            runtime.false_eos_token_id = self
+                                .llama_cpp_false_eos_token_id(&false_eos_token, max_retries)
+                                .await;
+                            if historical.is_some() && runtime.false_eos_token_id.is_none() {
+                                return BackendRuntimeInfo::unverified(
+                                    backend,
+                                    runtime.observed_at_unix_secs,
+                                    "historical false-EOS tokenization evidence is unavailable",
+                                );
+                            }
+                        }
+                        runtime
+                    }
+                    Err(error) => BackendRuntimeInfo::unverified(
                         backend,
                         observed_at_unix_secs,
-                        "backend returned invalid JSON",
+                        format!("malformed backend response: {error}"),
                     ),
                 }
             }
-            Ok(response) => BackendRuntimeInfo::unverified(
+            Err(ClientError::Http { status, .. }) => BackendRuntimeInfo::unverified(
                 backend,
                 observed_at_unix_secs,
-                format!("backend endpoint returned HTTP {}", response.status()),
+                format!("backend endpoint returned HTTP {status}"),
+            ),
+            Err(ClientError::Json(_)) => BackendRuntimeInfo::unverified(
+                backend,
+                observed_at_unix_secs,
+                "backend returned invalid JSON",
             ),
             Err(_) => BackendRuntimeInfo::unverified(
                 backend,
@@ -690,23 +702,24 @@ impl TranslationClient {
         }
     }
 
-    async fn llama_cpp_false_eos_token_id(&self, eos_token: &str) -> Option<u32> {
-        let response = self
-            .inner
-            .http
-            .post(Self::llama_cpp_tokenize_url(
-                &self.inner.config.endpoint_url(),
-            ))
-            .headers(self.build_headers())
-            .json(&serde_json::json!({"content": eos_token}))
-            .timeout(Duration::from_secs(3))
-            .send()
-            .await
-            .ok()?;
-        if !response.status().is_success() {
-            return None;
-        }
-        let response: LlamaCppTokenizeResponse = response.json().await.ok()?;
+    async fn llama_cpp_false_eos_token_id(&self, eos_token: &str, max_retries: u32) -> Option<u32> {
+        let url = Self::llama_cpp_tokenize_url(&self.inner.config.endpoint_url());
+        let headers = self.build_headers();
+        let payload = serde_json::json!({"content": eos_token});
+        let mut budget = RetryBudget::new(max_retries);
+        let (response, _, _) = retry::json::<LlamaCppTokenizeResponse>(
+            || {
+                self.inner
+                    .http
+                    .post(&url)
+                    .headers(headers.clone())
+                    .json(&payload)
+                    .timeout(Duration::from_secs(3))
+            },
+            &mut budget,
+        )
+        .await
+        .ok()?;
         match response.tokens.as_slice() {
             [token_id] => Some(*token_id),
             _ => None,
@@ -960,8 +973,9 @@ impl TranslationClient {
         let headers = self.build_headers();
         let url = self.chat_url();
 
+        let mut budget = RetryBudget::new(self.inner.config.network_max_retries());
         let (response, _) = self
-            .connect_stream_with_retry(&url, &payload, &headers)
+            .connect_stream_with_retry(&url, &payload, &headers, &mut budget)
             .await?;
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, ClientError>>(64);
 
@@ -999,72 +1013,71 @@ impl TranslationClient {
     pub async fn translate_stream_with_completion(
         &self,
         prompt: &str,
-    ) -> Result<impl Stream<Item = Result<TranslationStreamEvent, ClientError>>, ClientError> {
-        let _ = self.inner.config.maybe_reload();
+    ) -> Result<ReceiverStream<Result<TranslationStreamEvent, ClientError>>, ClientError> {
+        self.completion_stream(prompt, false).await
+    }
 
+    /// Like [`Self::translate_stream_with_completion`], but retries interrupted
+    /// bodies. Callers MUST buffer output and discard it on `Restarted`; content
+    /// already published to an end user cannot safely be replayed.
+    pub async fn translate_stream_with_recovery(
+        &self,
+        prompt: &str,
+    ) -> Result<ReceiverStream<Result<TranslationStreamEvent, ClientError>>, ClientError> {
+        self.completion_stream(prompt, true).await
+    }
+
+    async fn completion_stream(
+        &self,
+        prompt: &str,
+        recover_body: bool,
+    ) -> Result<ReceiverStream<Result<TranslationStreamEvent, ClientError>>, ClientError> {
+        let _ = self.inner.config.maybe_reload();
         let permit = Arc::clone(&self.inner.semaphore)
             .acquire_owned()
             .await
             .map_err(|_| ClientError::SemaphoreClosed)?;
-
         let payload = self.build_payload(prompt, true)?;
         let headers = self.build_headers();
         let url = self.chat_url();
-
-        let (response, cold_generation) = self
-            .connect_stream_with_retry(&url, &payload, &headers)
+        let mut budget = RetryBudget::new(self.inner.config.network_max_retries());
+        let (response, cold) = self
+            .connect_stream_with_retry(&url, &payload, &headers, &mut budget)
             .await?;
-        let (tx, rx) =
-            tokio::sync::mpsc::channel::<Result<TranslationStreamEvent, ClientError>>(64);
-
-        let is_sse = is_event_stream(&response);
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let client = self.clone();
         tokio::spawn(async move {
-            let _permit = permit; // held for the entire stream duration
-            if tx
-                .send(Ok(TranslationStreamEvent::ColdGeneration(cold_generation)))
-                .await
-                .is_err()
-            {
-                return;
-            }
+            let _permit = permit;
             let closed = tx.clone();
             tokio::select! {
                 biased;
                 _ = closed.closed() => {},
-                _ = async {
-            if is_sse {
-                parse_sse_with_completion(response, tx).await;
-            } else {
-                // Non-SSE fallback: emit its text before the terminal signal.
-                let result = async {
-                    let body = response.bytes().await?;
-                    let resp: ChatResponse = serde_json::from_slice(&body)?;
-                    extract_completion_from_response(resp)
-                }
-                .await;
-                match result {
-                    Ok(completion) => {
-                        if !completion.text.is_empty()
-                            && tx
-                                .send(Ok(TranslationStreamEvent::Token(completion.text)))
-                                .await
-                                .is_err()
-                        {
-                            return;
+                result = async {
+                    let mut response = response;
+                    let mut cold = cold;
+                    loop {
+                        if tx.send(Ok(TranslationStreamEvent::ColdGeneration(cold))).await.is_err() {
+                            return Ok(());
                         }
-                        let _ = tx
-                            .send(Ok(TranslationStreamEvent::Finished(completion.termination)))
-                            .await;
+                        match read_completion_stream(response, tx.clone()).await {
+                            Ok(()) => return Ok(()),
+                            Err(ClientError::Request(error)) if recover_body => {
+                                budget.wait(error.into()).await?;
+                                if tx.send(Ok(TranslationStreamEvent::Restarted)).await.is_err() {
+                                    return Ok(());
+                                }
+                                (response, cold) = client.connect_stream_with_retry(&url, &payload, &headers, &mut budget).await?;
+                            }
+                            Err(error) => return Err(error),
+                        }
                     }
-                    Err(error) => {
+                } => {
+                    if let Err(error) = result {
                         let _ = tx.send(Err(error)).await;
                     }
-                }
-            }
-                } => {},
+                },
             }
         });
-
         Ok(ReceiverStream::new(rx))
     }
 
@@ -1141,47 +1154,21 @@ impl TranslationClient {
         payload: &ChatPayload,
         headers: &reqwest::header::HeaderMap,
     ) -> Result<TranslationCompletion, ClientError> {
-        let mut last: Option<ClientError> = None;
-        for attempt in 0..=MAX_RETRIES {
-            match self
-                .inner
-                .http
-                .post(url)
-                .headers(headers.clone())
-                .json(payload)
-                .send()
-                .await
-            {
-                Ok(resp) => {
-                    let status = resp.status().as_u16();
-                    if status < 400 {
-                        let cold_generation = attempt == 0 && cold_generation(resp.headers());
-                        let body = resp.bytes().await?;
-                        let chat: ChatResponse = serde_json::from_slice(&body)?;
-                        let mut completion = extract_completion_from_response(chat)?;
-                        completion.cold_generation = cold_generation;
-                        return Ok(completion);
-                    }
-                    let body = resp.bytes().await.unwrap_or_default();
-                    let err = http_error(status, &body);
-                    if !is_retryable_status(status, &body) || attempt == MAX_RETRIES {
-                        return Err(err);
-                    }
-                    last = Some(err);
-                }
-                Err(e) => {
-                    if attempt == MAX_RETRIES {
-                        return Err(ClientError::Request(e));
-                    }
-                    last = Some(ClientError::Request(e));
-                }
-            }
-            tokio::time::sleep(backoff_duration(attempt)).await;
-        }
-        Err(last.unwrap_or(ClientError::Http {
-            status: 0,
-            body: "max retries exceeded".into(),
-        }))
+        let mut budget = RetryBudget::new(self.inner.config.network_max_retries());
+        let (chat, _, cold_generation) = retry::json(
+            || {
+                self.inner
+                    .http
+                    .post(url)
+                    .headers(headers.clone())
+                    .json(payload)
+            },
+            &mut budget,
+        )
+        .await?;
+        let mut completion = extract_completion_from_response(chat)?;
+        completion.cold_generation = cold_generation;
+        Ok(completion)
     }
 
     async fn connect_stream_with_retry(
@@ -1189,44 +1176,21 @@ impl TranslationClient {
         url: &str,
         payload: &ChatPayload,
         headers: &reqwest::header::HeaderMap,
+        budget: &mut RetryBudget,
     ) -> Result<(reqwest::Response, bool), ClientError> {
-        let mut last: Option<ClientError> = None;
-        for attempt in 0..=MAX_RETRIES {
-            match self
-                .inner
-                .http
-                .post(url)
-                .headers(headers.clone())
-                .json(payload)
-                .send()
-                .await
-            {
-                Ok(resp) => {
-                    let status = resp.status().as_u16();
-                    if status < 400 {
-                        let cold = attempt == 0 && cold_generation(resp.headers());
-                        return Ok((resp, cold));
-                    }
-                    let body = resp.bytes().await.unwrap_or_default();
-                    let err = http_error(status, &body);
-                    if !is_retryable_status(status, &body) || attempt == MAX_RETRIES {
-                        return Err(err);
-                    }
-                    last = Some(err);
-                }
-                Err(e) => {
-                    if attempt == MAX_RETRIES {
-                        return Err(ClientError::Request(e));
-                    }
-                    last = Some(ClientError::Request(e));
-                }
-            }
-            tokio::time::sleep(backoff_duration(attempt)).await;
-        }
-        Err(last.unwrap_or(ClientError::Http {
-            status: 0,
-            body: "max retries exceeded".into(),
-        }))
+        let response = retry::connect(
+            || {
+                self.inner
+                    .http
+                    .post(url)
+                    .headers(headers.clone())
+                    .json(payload)
+            },
+            budget,
+        )
+        .await?;
+        let cold = !budget.retried() && cold_generation(response.headers());
+        Ok((response, cold))
     }
 }
 
@@ -1308,10 +1272,35 @@ async fn parse_sse(
     }
 }
 
+async fn read_completion_stream(
+    response: reqwest::Response,
+    tx: tokio::sync::mpsc::Sender<Result<TranslationStreamEvent, ClientError>>,
+) -> Result<(), ClientError> {
+    if is_event_stream(&response) {
+        return parse_sse_with_completion(response, tx)
+            .await
+            .map_err(Into::into);
+    }
+    let body = response.bytes().await?;
+    let completion = extract_completion_from_response(serde_json::from_slice(&body)?)?;
+    if !completion.text.is_empty()
+        && tx
+            .send(Ok(TranslationStreamEvent::Token(completion.text)))
+            .await
+            .is_err()
+    {
+        return Ok(());
+    }
+    let _ = tx
+        .send(Ok(TranslationStreamEvent::Finished(completion.termination)))
+        .await;
+    Ok(())
+}
+
 async fn parse_sse_with_completion(
     response: reqwest::Response,
     tx: tokio::sync::mpsc::Sender<Result<TranslationStreamEvent, ClientError>>,
-) {
+) -> Result<(), reqwest::Error> {
     use tokio_stream::StreamExt as _;
 
     let mut byte_stream = response.bytes_stream();
@@ -1338,7 +1327,7 @@ async fn parse_sse_with_completion(
                         )
                         .await
                         {
-                            return;
+                            return Ok(());
                         }
                     } else if !line.starts_with(':') {
                         if let Some(data) = line.strip_prefix("data:") {
@@ -1348,8 +1337,7 @@ async fn parse_sse_with_completion(
                 }
             }
             Some(Err(error)) => {
-                let _ = tx.send(Err(ClientError::Request(error))).await;
-                return;
+                return Err(error);
             }
             None => break,
         }
@@ -1364,7 +1352,7 @@ async fn parse_sse_with_completion(
         }
     }
     if !flush_completion_sse_data(&mut data_lines, &tx, &mut saw_terminal, &mut saw_choice).await {
-        return;
+        return Ok(());
     }
     if !saw_terminal {
         let _ = tx
@@ -1373,6 +1361,7 @@ async fn parse_sse_with_completion(
             )))
             .await;
     }
+    Ok(())
 }
 
 async fn flush_completion_sse_data(
@@ -1575,24 +1564,14 @@ fn extract_stream_completion_events(
 
 // ── Retry helpers ─────────────────────────────────────────────────────────────
 
-const MAX_RETRIES: u32 = 5;
+const RETRYABLE_STATUSES: &[u16] = &[408, 429, 500, 502, 503, 504];
 
-const RETRYABLE_STATUSES: &[u16] = &[429, 500, 502, 503, 504];
-
-pub fn is_retryable_status(status: u16, body: &[u8]) -> bool {
-    if RETRYABLE_STATUSES.contains(&status) {
-        return true;
-    }
-    if status != 400 {
-        return false;
-    }
-    // A 400 caused by a JSON parse issue on the server side is transient
-    let text = String::from_utf8_lossy(body).to_lowercase();
-    text.contains("json") || text.contains("parse")
+pub fn is_retryable_status(status: u16, _body: &[u8]) -> bool {
+    RETRYABLE_STATUSES.contains(&status)
 }
 
 pub fn backoff_duration(attempt: u32) -> Duration {
-    Duration::from_secs_f64((0.5 * 2f64.powi(attempt as i32)).min(8.0))
+    Duration::from_millis(500 * (1_u64 << attempt.min(4)))
 }
 
 fn http_error(status: u16, body: &[u8]) -> ClientError {
@@ -1635,6 +1614,9 @@ mod payload_snapshot_tests;
 #[cfg(test)]
 #[path = "sse_protocol_tests.rs"]
 mod sse_protocol_tests;
+
+#[cfg(test)]
+mod network_retry_tests;
 
 #[cfg(test)]
 #[path = "llama_cpp_integration_tests.rs"]
@@ -1891,7 +1873,7 @@ mod tests {
 
     #[test]
     fn retryable_statuses() {
-        for &code in &[429u16, 500, 502, 503, 504] {
+        for &code in &[408u16, 429, 500, 502, 503, 504] {
             assert!(
                 is_retryable_status(code, b""),
                 "status {code} should be retryable"
@@ -1908,13 +1890,13 @@ mod tests {
     }
 
     #[test]
-    fn status_400_json_parse_body_is_retryable() {
-        assert!(is_retryable_status(
+    fn status_400_json_parse_body_is_permanent() {
+        assert!(!is_retryable_status(
             400,
             b"json parse error in request body"
         ));
-        assert!(is_retryable_status(400, b"failed to parse JSON"));
-        assert!(is_retryable_status(400, b"JSON_PARSE_FAILURE"));
+        assert!(!is_retryable_status(400, b"failed to parse JSON"));
+        assert!(!is_retryable_status(400, b"JSON_PARSE_FAILURE"));
     }
 
     #[test]
@@ -1927,6 +1909,7 @@ mod tests {
         // Capped at 8 seconds for high attempt numbers
         assert!((backoff_duration(10).as_secs_f64() - 8.0).abs() < 1e-9);
         assert!((backoff_duration(100).as_secs_f64() - 8.0).abs() < 1e-9);
+        assert_eq!(backoff_duration(u32::MAX), Duration::from_secs(8));
     }
 
     // ── Payload serialization ────────────────────────────────────────────────

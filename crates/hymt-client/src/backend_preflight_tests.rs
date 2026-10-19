@@ -16,7 +16,7 @@ fn config_for(endpoint: &str, strict: bool) -> HotConfig {
     std::fs::write(
         &path,
         format!(
-            "[endpoint]\nurl = \"{endpoint}\"\nmodel = \"served-model\"\nbackend = \"llama_cpp\"\n\n[backend]\ntotal_context = 16384\nparallel_slots = 1\n\n[translation]\nstrict_backend_preflight = {strict}\n"
+            "[endpoint]\nurl = \"{endpoint}\"\nmodel = \"served-model\"\nbackend = \"llama_cpp\"\n\n[backend]\ntotal_context = 16384\nparallel_slots = 1\n\n[translation]\nmax_retries = 0\nstrict_backend_preflight = {strict}\n"
         ),
     )
     .expect("write config fixture");
