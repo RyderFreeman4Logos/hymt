@@ -442,6 +442,29 @@ pub async fn run_telegram_bot(
             }
         }
     }
+    // getUpdates only drops confirmed ids. A restart starts at offset 0, so
+    // acknowledge the last finished update before exit or it is translated again.
+    if offset > 0 {
+        let token = config.telegram_bot_token_resolved();
+        if !token.is_empty() {
+            let url = format!("{API_BASE}/bot{token}/getUpdates");
+            if let Err(error) = http
+                .get(&url)
+                .query(&[
+                    ("offset", offset.to_string()),
+                    ("timeout", "0".to_owned()),
+                    ("limit", "1".to_owned()),
+                ])
+                .send()
+                .await
+            {
+                eprintln!(
+                    "hymt telegram: could not confirm updates before exit: {}",
+                    safe_reqwest_error("getUpdates confirm", &token, &error)
+                );
+            }
+        }
+    }
     Ok(())
 }
 
