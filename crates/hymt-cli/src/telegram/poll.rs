@@ -2,6 +2,8 @@
 
 use std::collections::BTreeSet;
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -335,7 +337,11 @@ async fn deliver_stream_events<A: TelegramMessageApi>(
     Ok(())
 }
 
-/// Run the Telegram long-poll loop until SIGINT / process exit.
+/// Run the Telegram long-poll loop until SIGINT, SIGTERM, or process exit.
+///
+/// SIGTERM finishes the update already in progress, then returns so systemd can
+/// start the replaced executable. The loop also exits between polls when
+/// `/proc/self/exe` no longer names the invoked path.
 pub async fn run_telegram_bot(
     config: &HotConfig,
     no_cache: bool,
@@ -367,7 +373,7 @@ pub async fn run_telegram_bot(
         );
     }
     eprintln!(
-        "hymt telegram: long-polling (Ctrl+C to stop). Config: {}",
+        "hymt telegram: long-polling (SIGINT or SIGTERM to stop). Config: {}",
         config.path().display()
     );
 
@@ -382,8 +388,26 @@ pub async fn run_telegram_bot(
         .with_cache_bypass(no_cache)
         .with_app_cache_refresh(refresh_app_cache);
     let mut offset: i64 = 0;
+    let shutdown = Arc::new(AtomicBool::new(false));
+    for signal in [
+        tokio::signal::unix::SignalKind::terminate(),
+        tokio::signal::unix::SignalKind::interrupt(),
+    ] {
+        let mut listener =
+            tokio::signal::unix::signal(signal).context("install shutdown signal")?;
+        let shutdown = Arc::clone(&shutdown);
+        tokio::spawn(async move {
+            listener.recv().await;
+            shutdown.store(true, Ordering::Relaxed);
+        });
+    }
 
+    let mut poll_token = String::new();
     loop {
+        if shutdown.load(Ordering::Relaxed) || executable_was_replaced() {
+            eprintln!("hymt telegram: shutting down");
+            break;
+        }
         // Hot-reload token/owners/mode between polls.
         let _ = config.maybe_reload();
         if !config.telegram_enabled() {
@@ -406,7 +430,11 @@ pub async fn run_telegram_bot(
 
         let api = TelegramHttpApi::new(&http, &token);
         for update in updates {
+            if shutdown.load(Ordering::Relaxed) {
+                break;
+            }
             offset = update.update_id + 1;
+            poll_token = token.clone();
             if let Err(e) = handle_update(
                 config, &api, &client, &segmenter, &history, no_cache, update,
             )
@@ -416,11 +444,55 @@ pub async fn run_telegram_bot(
             }
         }
     }
+    // getUpdates only drops confirmed ids. A restart starts at offset 0, so
+    // acknowledge the last finished update before exit or it is translated again.
+    if offset > 0 && !poll_token.is_empty() {
+        let url = format!("{API_BASE}/bot{poll_token}/getUpdates");
+        let mut confirmed = false;
+        for _ in 0..2 {
+            match http
+                .get(&url)
+                .query(&[
+                    ("offset", offset.to_string()),
+                    ("timeout", "0".to_owned()),
+                    ("limit", "1".to_owned()),
+                ])
+                .send()
+                .await
+            {
+                Ok(response) if response.status().is_success() => {
+                    confirmed = true;
+                    break;
+                }
+                Ok(response) => {
+                    eprintln!("hymt telegram: update confirm HTTP {}", response.status())
+                }
+                Err(error) => eprintln!(
+                    "hymt telegram: could not confirm updates before exit: {}",
+                    safe_reqwest_error("getUpdates confirm", &poll_token, &error)
+                ),
+            }
+        }
+        if !confirmed {
+            eprintln!("hymt telegram: shutdown continued without confirming offset");
+        }
+    }
     Ok(())
 }
 
 fn telegram_cache_enabled(config: &HotConfig, no_cache: bool, client: &TranslationClient) -> bool {
     (config.application_cache_enabled() || client.app_cache_refresh()) && !no_cache
+}
+
+/// True when this process no longer maps the path it was started as.
+///
+/// `cargo install` and `mv` replace a binary by a new inode. systemd keeps the
+/// old mapping until restart; `(deleted)` in the kernel link is that condition.
+/// A missing `/proc` (non-Linux tests) does not shut the loop down.
+fn executable_was_replaced() -> bool {
+    std::fs::read_link("/proc/self/exe")
+        .ok()
+        .is_some_and(|path| path.to_string_lossy().ends_with(" (deleted)"))
 }
 
 async fn handle_update(

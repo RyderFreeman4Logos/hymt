@@ -1,0 +1,16 @@
+[Unit]
+Description=hymt Telegram translation bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hymt telegram
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=infinity
+# Environment=HYMT_TELEGRAM_BOT_TOKEN=...
+# Config at ~/.config/hymt/config.toml
+
+[Install]
+WantedBy=default.target

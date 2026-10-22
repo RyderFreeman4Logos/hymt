@@ -81,14 +81,15 @@ Template-specific options:
 - `hymt config edit`
 - `hymt backend inspect` — query the selected service without printing credentials; compare configured and resolved backend state
 - `hymt tokenizer download [--force]`
-- `hymt telegram` — long-poll CN↔EN Telegram bot until Ctrl+C (default cargo feature; requires `[telegram].enabled = true` and a bot token)
+- `hymt telegram` — long-poll CN↔EN Telegram bot until SIGINT or SIGTERM (default cargo feature; requires `[telegram].enabled = true` and a bot token). Text and documents use the same default-template translation path as the CLI; replies may be split or truncated at Telegram's message limit.
 - `hymt telegram --regenerate-claim-password` — rotate claim password, print once, exit
 
 ### Telegram bot
 
 - Config section `[telegram]`: `enabled` (default `false`), `bot_token` or env `HYMT_TELEGRAM_BOT_TOKEN`, `claim_password` (auto-generated once), `owners[]`, `groups[]`, `mode` (`owners`|`groups`).
 - Private chat: send the claim password (or `/claim <password>`) to become an owner; multi-owner is supported.
-- Authorized chats auto-translate Chinese↔English text; unauthorized chats get a short denial.
+- Authorized chats auto-translate Chinese↔English text with the CLI's default language routing; unauthorized chats get a short denial.
+- `services/hymt-telegram.service` runs `hymt telegram`. `services/hymt-telegram-reload.path` restarts that service once when `/usr/local/bin/hymt` is replaced. SIGTERM finishes the current update before exit.
 - Build without Telegram deps: `just install-no-telegram` / `cargo install --path crates/hymt-cli --no-default-features`.
 
 Related skills cover command/documentation translation:
