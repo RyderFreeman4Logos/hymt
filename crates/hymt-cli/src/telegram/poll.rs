@@ -448,20 +448,33 @@ pub async fn run_telegram_bot(
         let token = config.telegram_bot_token_resolved();
         if !token.is_empty() {
             let url = format!("{API_BASE}/bot{token}/getUpdates");
-            if let Err(error) = http
-                .get(&url)
-                .query(&[
-                    ("offset", offset.to_string()),
-                    ("timeout", "0".to_owned()),
-                    ("limit", "1".to_owned()),
-                ])
-                .send()
-                .await
-            {
-                eprintln!(
-                    "hymt telegram: could not confirm updates before exit: {}",
-                    safe_reqwest_error("getUpdates confirm", &token, &error)
-                );
+            let mut confirmed = false;
+            for _ in 0..2 {
+                match http
+                    .get(&url)
+                    .query(&[
+                        ("offset", offset.to_string()),
+                        ("timeout", "0".to_owned()),
+                        ("limit", "1".to_owned()),
+                    ])
+                    .send()
+                    .await
+                {
+                    Ok(response) if response.status().is_success() => {
+                        confirmed = true;
+                        break;
+                    }
+                    Ok(response) => {
+                        eprintln!("hymt telegram: update confirm HTTP {}", response.status())
+                    }
+                    Err(error) => eprintln!(
+                        "hymt telegram: could not confirm updates before exit: {}",
+                        safe_reqwest_error("getUpdates confirm", &token, &error)
+                    ),
+                }
+            }
+            if !confirmed {
+                eprintln!("hymt telegram: shutdown continued without confirming offset");
             }
         }
     }
