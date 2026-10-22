@@ -418,7 +418,6 @@ pub async fn run_telegram_bot(
         if token.is_empty() {
             bail!("telegram bot_token became empty");
         }
-        poll_token = token.clone();
 
         let updates = match get_updates(&http, &token, offset).await {
             Ok(u) => u,
@@ -435,6 +434,7 @@ pub async fn run_telegram_bot(
                 break;
             }
             offset = update.update_id + 1;
+            poll_token = token.clone();
             if let Err(e) = handle_update(
                 config, &api, &client, &segmenter, &history, no_cache, update,
             )
