@@ -402,6 +402,7 @@ pub async fn run_telegram_bot(
         });
     }
 
+    let mut poll_token = String::new();
     loop {
         if shutdown.load(Ordering::Relaxed) || executable_was_replaced() {
             eprintln!("hymt telegram: shutting down");
@@ -417,6 +418,7 @@ pub async fn run_telegram_bot(
         if token.is_empty() {
             bail!("telegram bot_token became empty");
         }
+        poll_token = token.clone();
 
         let updates = match get_updates(&http, &token, offset).await {
             Ok(u) => u,
@@ -444,38 +446,35 @@ pub async fn run_telegram_bot(
     }
     // getUpdates only drops confirmed ids. A restart starts at offset 0, so
     // acknowledge the last finished update before exit or it is translated again.
-    if offset > 0 {
-        let token = config.telegram_bot_token_resolved();
-        if !token.is_empty() {
-            let url = format!("{API_BASE}/bot{token}/getUpdates");
-            let mut confirmed = false;
-            for _ in 0..2 {
-                match http
-                    .get(&url)
-                    .query(&[
-                        ("offset", offset.to_string()),
-                        ("timeout", "0".to_owned()),
-                        ("limit", "1".to_owned()),
-                    ])
-                    .send()
-                    .await
-                {
-                    Ok(response) if response.status().is_success() => {
-                        confirmed = true;
-                        break;
-                    }
-                    Ok(response) => {
-                        eprintln!("hymt telegram: update confirm HTTP {}", response.status())
-                    }
-                    Err(error) => eprintln!(
-                        "hymt telegram: could not confirm updates before exit: {}",
-                        safe_reqwest_error("getUpdates confirm", &token, &error)
-                    ),
+    if offset > 0 && !poll_token.is_empty() {
+        let url = format!("{API_BASE}/bot{poll_token}/getUpdates");
+        let mut confirmed = false;
+        for _ in 0..2 {
+            match http
+                .get(&url)
+                .query(&[
+                    ("offset", offset.to_string()),
+                    ("timeout", "0".to_owned()),
+                    ("limit", "1".to_owned()),
+                ])
+                .send()
+                .await
+            {
+                Ok(response) if response.status().is_success() => {
+                    confirmed = true;
+                    break;
                 }
+                Ok(response) => {
+                    eprintln!("hymt telegram: update confirm HTTP {}", response.status())
+                }
+                Err(error) => eprintln!(
+                    "hymt telegram: could not confirm updates before exit: {}",
+                    safe_reqwest_error("getUpdates confirm", &poll_token, &error)
+                ),
             }
-            if !confirmed {
-                eprintln!("hymt telegram: shutdown continued without confirming offset");
-            }
+        }
+        if !confirmed {
+            eprintln!("hymt telegram: shutdown continued without confirming offset");
         }
     }
     Ok(())
