@@ -1,8 +1,7 @@
 //! Pure claim, authorization, and CN↔EN routing for the Telegram bot.
 
 use hymt_core::config::TelegramMode;
-use hymt_core::language::detect_target_language;
-use hymt_core::language_spec::normalize_language_code;
+use hymt_core::language::resolve_target_language;
 
 /// Kind of Telegram chat we care about for v1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,55 +61,12 @@ pub fn claim_password_matches(provided: &str, expected: &str) -> bool {
     diff == 0
 }
 
-const TELEGRAM_SHORT_MESSAGE_CHAR_LIMIT: usize = 500;
-
-/// Choose CN↔EN target using the document-level CJK confidence ratio.
+/// Choose the same CN↔EN target the CLI uses when `-l` is omitted.
 ///
-/// When the source looks predominantly like `primary` (default zh), target
-/// `secondary` (default en); otherwise target `primary`.
+/// A source that looks predominantly like `primary` (default zh) targets
+/// `secondary` (default en); otherwise the target is `primary`.
 pub fn cn_en_target_lang(text: &str, primary: &str, secondary: &str) -> String {
-    select_cn_en_target_lang(text, primary, secondary, false)
-}
-
-/// Choose CN↔EN target for a single Telegram text message.
-///
-/// A short message containing any CJK character is user-authored CJK text even
-/// when English names, URLs, or numbers make its ratio fall below the document
-/// confidence threshold. Document routing keeps the stricter ratio above.
-fn telegram_text_target_lang(text: &str, primary: &str, secondary: &str) -> String {
-    select_cn_en_target_lang(text, primary, secondary, true)
-}
-
-fn select_cn_en_target_lang(
-    text: &str,
-    primary: &str,
-    secondary: &str,
-    short_message_cjk_is_enough: bool,
-) -> String {
-    let primary = canonical_or_default(primary, "zh");
-    let secondary = canonical_or_default(secondary, "en");
-    if let Some(det) = detect_target_language(text, &primary) {
-        let short_message_contains_cjk = short_message_cjk_is_enough
-            && text.chars().count() < TELEGRAM_SHORT_MESSAGE_CHAR_LIMIT
-            && det.detected_lang.is_some();
-        if det.target_ratio > hymt_core::language::TARGET_PARAGRAPH_RATIO
-            || short_message_contains_cjk
-        {
-            return secondary;
-        }
-    }
-    primary
-}
-
-fn canonical_or_default(language: &str, default: &str) -> String {
-    let requested = if language.trim().is_empty() {
-        default
-    } else {
-        language
-    };
-    normalize_language_code(requested)
-        .map(str::to_owned)
-        .unwrap_or_else(|_| requested.trim().to_owned())
+    resolve_target_language(text, "", primary, secondary, false)
 }
 
 /// Authorize a chat under the configured mode.
@@ -188,7 +144,7 @@ pub fn evaluate_text_message(
             if msg.chat_kind == ChatKind::Other {
                 return BotAction::Ignore;
             }
-            let target = telegram_text_target_lang(text, primary_lang, secondary_lang);
+            let target = cn_en_target_lang(text, primary_lang, secondary_lang);
             BotAction::Translate {
                 text: text.to_owned(),
                 target_lang: target,
@@ -225,8 +181,10 @@ mod tests {
 
     #[test]
     fn cn_en_routes_cjk_to_english() {
-        let target = cn_en_target_lang("这是一段中文测试文本用于检测", "zh", "en");
-        assert_eq!(target, "en");
+        assert_eq!(
+            cn_en_target_lang("这是一段中文测试文本用于检测", "zh", "en"),
+            "en"
+        );
     }
 
     #[test]
@@ -240,11 +198,12 @@ mod tests {
     }
 
     #[test]
-    fn telegram_short_mixed_cjk_and_english_routes_to_english() {
+    fn telegram_short_mixed_text_matches_cli_routing() {
+        let text = "GitHub是好用的";
         let message = IncomingTextMessage {
             chat_id: 1,
             chat_kind: ChatKind::Private,
-            text: "GitHub是好用的".into(),
+            text: text.into(),
         };
 
         assert_eq!(
@@ -258,22 +217,30 @@ mod tests {
                 "en",
             ),
             BotAction::Translate {
-                text: "GitHub是好用的".into(),
-                target_lang: "en".into(),
+                text: text.into(),
+                target_lang: "zh".into(),
             }
+        );
+        assert_eq!(
+            cn_en_target_lang(text, "zh", "en"),
+            resolve_target_language(text, "", "zh", "en", false)
         );
     }
 
     #[test]
-    fn telegram_short_text_keeps_pure_language_direction() {
-        assert_eq!(
-            telegram_text_target_lang("This remains an English Telegram message.", "zh", "en"),
-            "zh"
-        );
-        assert_eq!(
-            telegram_text_target_lang("这仍然是一条中文 Telegram 消息。", "zh", "en"),
-            "en"
-        );
+    fn telegram_text_uses_cli_language_routing() {
+        let cases = [
+            ("This remains an English Telegram message.", "zh"),
+            ("这仍然是一条中文 Telegram 消息。", "zh"),
+            ("GitHub是好用的", "zh"),
+        ];
+        for (text, target) in cases {
+            assert_eq!(cn_en_target_lang(text, "zh", "en"), target);
+            assert_eq!(
+                cn_en_target_lang(text, "zh", "en"),
+                resolve_target_language(text, "", "zh", "en", false)
+            );
+        }
     }
 
     #[test]

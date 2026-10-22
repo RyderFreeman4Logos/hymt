@@ -1,0 +1,7 @@
+[Unit]
+Description=Restart hymt Telegram bot after an executable replacement
+After=hymt-telegram.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl --user try-restart hymt-telegram.service

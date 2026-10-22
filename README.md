@@ -166,7 +166,7 @@ mode = "owners"         # "owners" | "groups"
 
 1. Create a bot with [@BotFather](https://t.me/BotFather), set `bot_token` (or `HYMT_TELEGRAM_BOT_TOKEN`).
 2. Set `enabled = true`.
-3. Run `hymt telegram` (long-poll until Ctrl+C). On first run, hymt generates a claim password, stores it in config, and prints it once.
+3. Run `hymt telegram` (long-poll until SIGINT or SIGTERM). On first run, hymt generates a claim password, stores it in config, and prints it once. A systemd user service is `services/hymt-telegram.service`; `services/hymt-telegram-reload.path` restarts it when `/usr/local/bin/hymt` is replaced. SIGTERM finishes the current update before the process exits.
 4. In a private chat with the bot, send the claim password (or `/claim <password>`) to become an owner. Multiple owners are supported.
 5. Authorized owners (and configured groups when `mode = "groups"`) get automatic Chinese↔English translation for text messages and UTF-8 `.txt`/`.md` documents. Documents over `max_document_size` or non-text documents are rejected; short translations are replied inline and longer translations are returned as a document with the original extension.
 6. Set `accept_documents = false` to opt out of document handling.
