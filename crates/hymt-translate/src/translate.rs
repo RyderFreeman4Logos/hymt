@@ -112,6 +112,9 @@ enum StreamEventSink {
 pub enum StreamOutputMode {
     /// Withhold all output until the complete reconstructed document is validated.
     Validated,
+    /// Publish complete source paragraphs in order, retaining retryable attempts
+    /// until their whole paragraph is ready. Original-retention notices follow the body.
+    Paragraph,
     /// Emit segment 0 tokens as soon as the streaming backend returns them,
     /// except when source text contains an unparsed inline-link delimiter or
     /// unresolved reference candidate that could be repaired into a link, or
@@ -425,28 +428,49 @@ fn reconstruction_newline_after_segment<T: AsRef<str>>(
         .get(segment_index)
         .filter(|group| !group.is_empty())
     {
-        if plan
+        let has_next_piece = plan
             .segment_section_groups
             .get(segment_index + 1)
-            .is_some_and(|next| next == group)
-        {
-            let source_segment = plan.segments.get(segment_index)?;
-            let translated = translations.get(segment_index)?.as_ref()?.as_ref();
-            let missing = trailing_newline_deficit(translated, source_segment);
-            return (missing > 0).then(|| "\n".repeat(missing));
+            .is_some_and(|next| next == group);
+        let source_text = if has_next_piece {
+            plan.segments.get(segment_index)?.clone()
+        } else {
+            group
+                .iter()
+                .map(|&i| doc_plan.sections[i].text.as_str())
+                .collect()
+        };
+        let required = trailing_newline_deficit("", &source_text);
+        if required == 0 {
+            return None;
         }
-
-        let source_text: String = group
+        let mut trailing = 0;
+        let mut restored = 0;
+        for (idx, candidate) in plan
+            .segment_section_groups
             .iter()
-            .map(|&i| doc_plan.sections[i].text.as_str())
-            .collect();
-        let mut output = String::new();
-        for (idx, candidate) in plan.segment_section_groups.iter().enumerate() {
+            .enumerate()
+            .take(segment_index + 1)
+            .rev()
+        {
             if candidate == group {
-                output.push_str(translations.get(idx)?.as_ref()?.as_ref());
+                // Only the newline suffix matters, including separators before empty replies.
+                if idx < segment_index {
+                    restored = restored
+                        .max(trailing + trailing_newline_deficit("", plan.segments.get(idx)?));
+                }
+                if restored >= required {
+                    return None;
+                }
+                let text = translations.get(idx)?.as_ref()?.as_ref();
+                let newlines = text.bytes().rev().take_while(|&byte| byte == b'\n').count();
+                trailing += newlines;
+                if trailing >= required || newlines < text.len() {
+                    break;
+                }
             }
         }
-        let missing = trailing_newline_deficit(&output, &source_text);
+        let missing = required.saturating_sub(trailing.max(restored));
         return (missing > 0).then(|| "\n".repeat(missing));
     }
 
@@ -964,6 +988,7 @@ pub(crate) mod offline_replay;
 use completeness_admission::{
     approx_source_tokens, validate_exhausted_attempt, validate_provider_attempt, CheckedAttempt,
 };
+mod paragraph_stream;
 mod retained_original;
 pub use retained_original::RetainedRegion;
 mod markdown_ownership;
@@ -1354,26 +1379,30 @@ async fn flush_ready_stream_prefix<T: AsRef<str>>(
     next_section_index: &mut usize,
     next_emit: &mut usize,
     event_tx: &StreamEventSink,
-) -> Result<()> {
+) -> Result<usize> {
+    let mut bytes = 0;
     while *next_emit < translations.len() && translations[*next_emit].is_some() {
         let idx = *next_emit;
         let prefix = untranslated_text_before_segment(plan, idx, next_section_index);
         if !prefix.is_empty() {
+            bytes += prefix.len();
             send_stream_event(event_tx, StreamEvent::Token(prefix)).await?;
         }
         if let Some(text) = translations[idx].as_ref() {
             let text = text.as_ref();
             if !text.is_empty() {
+                bytes += text.len();
                 send_stream_event(event_tx, StreamEvent::Token(text.to_owned())).await?;
             }
         }
         send_stream_event(event_tx, StreamEvent::SegmentDone(idx)).await?;
         if let Some(newline) = reconstruction_newline_after_segment(plan, translations, idx) {
+            bytes += newline.len();
             send_stream_event(event_tx, StreamEvent::Token(newline)).await?;
         }
         *next_emit += 1;
     }
-    Ok(())
+    Ok(bytes)
 }
 
 /// Advance reconstruction cursor past a segment whose tokens were already streamed.
@@ -1417,7 +1446,7 @@ async fn translate_segment_with_completeness_streaming(
         request.opts,
     )?;
     timing.log(request.index, "request_start");
-    let mut stream = if output_mode == StreamOutputMode::Validated {
+    let mut stream = if output_mode != StreamOutputMode::Optimistic {
         request.client.translate_stream_with_recovery(&prompt).await
     } else {
         request
@@ -1450,7 +1479,7 @@ async fn translate_segment_with_completeness_streaming(
                 }
                 translated.push_str(&token);
                 match output_mode {
-                    StreamOutputMode::Validated => {}
+                    StreamOutputMode::Validated | StreamOutputMode::Paragraph => {}
                     StreamOutputMode::Optimistic => {
                         emitted_optimistically = true;
                         send_stream_event(event_tx, StreamEvent::Token(token)).await?;
@@ -1463,7 +1492,7 @@ async fn translate_segment_with_completeness_streaming(
 
     let mut last = validate_provider_attempt(translated, termination);
     if last.validation.is_complete {
-        if output_mode == StreamOutputMode::Validated {
+        if output_mode != StreamOutputMode::Optimistic {
             send_stream_event(event_tx, StreamEvent::Token(last.text.clone())).await?;
         }
         send_stream_event(event_tx, StreamEvent::SegmentDone(request.index)).await?;
@@ -1538,7 +1567,7 @@ async fn translate_segment_with_completeness_streaming(
 
         if candidate.validation.is_complete {
             if !candidate.text.is_empty()
-                && (output_mode == StreamOutputMode::Validated || !emitted_optimistically)
+                && (output_mode != StreamOutputMode::Optimistic || !emitted_optimistically)
             {
                 send_stream_event(event_tx, StreamEvent::Token(candidate.text.clone())).await?;
                 if let Some(tx) = first_token_tx.take() {
@@ -2010,12 +2039,15 @@ pub async fn translate_text_stream_with_mode(
     if event_tx.is_closed() {
         anyhow::bail!("stream event receiver dropped");
     }
-    // Keep a provider repair of literal link syntax behind the document guard.
-    let output_mode = if output_mode == StreamOutputMode::Optimistic
-        && (has_unparsed_link_syntax(text)
-            || opts
-                .warn_only_completeness
-                .unwrap_or_else(|| ctx.config.completeness_warn_only()))
+    // Atomic JSON has no paragraph boundary to publish. Keep a provider repair
+    // of literal link syntax behind the existing document guard as well.
+    let output_mode = if (output_mode == StreamOutputMode::Paragraph
+        && hymt_core::completeness::parse_json_document(text).is_some())
+        || (output_mode == StreamOutputMode::Optimistic
+            && (has_unparsed_link_syntax(text)
+                || opts
+                    .warn_only_completeness
+                    .unwrap_or_else(|| ctx.config.completeness_warn_only())))
     {
         StreamOutputMode::Validated
     } else {
@@ -2104,7 +2136,9 @@ async fn translate_text_stream_inner(
         output_mode
     };
     let event_tx = match output_mode {
-        StreamOutputMode::Validated => StreamEventSink::Validated(event_tx),
+        StreamOutputMode::Validated | StreamOutputMode::Paragraph => {
+            StreamEventSink::Validated(event_tx)
+        }
         StreamOutputMode::Optimistic => StreamEventSink::Immediate(event_tx),
     };
 
@@ -2200,6 +2234,8 @@ async fn translate_text_stream_inner(
     let mut proof_eligible = cache_enabled && cache_hits == 0 && !missing.is_empty();
 
     let mut degraded_segments: Vec<usize> = Vec::new();
+    let mut paragraph_stream = (output_mode == StreamOutputMode::Paragraph)
+        .then(|| paragraph_stream::ParagraphStream::new(text, &plan, output_event_tx.clone()));
     #[cfg(test)]
     wait_at_dispatch_barrier().await;
     let mut next_section_index = 0;
@@ -2222,6 +2258,10 @@ async fn translate_text_stream_inner(
             send_stream_event(&event_tx, StreamEvent::Token(newline)).await?;
         }
         cached_prefix_len += 1;
+    }
+
+    if let Some(stream) = &mut paragraph_stream {
+        stream.flush(&translations, None).await?;
     }
 
     if cached_prefix_len == plan.segment_count() {
@@ -2333,6 +2373,9 @@ async fn translate_text_stream_inner(
                 proof_eligible &= initial_request;
                 cache_candidates[idx] = !degraded;
                 translations[idx] = Some(translated);
+                if let Some(stream) = &mut paragraph_stream {
+                    stream.flush(&translations, Some((idx, degraded))).await?;
+                }
                 // Priority segment already streamed its tokens (validated or
                 // optimistic). Advance the ordered cursor past it, then flush
                 // any contiguous completed remaining segments.
@@ -2371,6 +2414,9 @@ async fn translate_text_stream_inner(
                     proof_eligible &= initial_request;
                     cache_candidates[idx] = !degraded;
                     translations[idx] = Some(translated);
+                    if let Some(stream) = &mut paragraph_stream {
+                        stream.flush(&translations, Some((idx, degraded))).await?;
+                    }
                     flush_ready_stream_prefix(
                         &plan,
                         &translations,
@@ -2402,6 +2448,9 @@ async fn translate_text_stream_inner(
                 proof_eligible &= initial_request;
                 cache_candidates[idx] = !degraded;
                 translations[idx] = Some(translated);
+                if let Some(stream) = &mut paragraph_stream {
+                    stream.flush(&translations, Some((idx, degraded))).await?;
+                }
                 advance_stream_cursor_past_segment(
                     &plan,
                     &translations,
@@ -2458,6 +2507,9 @@ async fn translate_text_stream_inner(
                 proof_eligible &= initial_request;
                 cache_candidates[idx] = !degraded;
                 translations[idx] = Some(translated);
+                if let Some(stream) = &mut paragraph_stream {
+                    stream.flush(&translations, Some((idx, degraded))).await?;
+                }
                 flush_ready_stream_prefix(
                     &plan,
                     &translations,
@@ -2481,8 +2533,16 @@ async fn translate_text_stream_inner(
         .map(|(i, t)| t.ok_or_else(|| anyhow!("missing translated segment {i}")))
         .collect::<Result<_>>()?;
 
-    let (translated, retained_regions) =
-        retained_original::finalize(text, &plan, &mut completed, &mut degraded_segments)?;
+    let (translated, retained_regions) = retained_original::finalize_with_notice(
+        text,
+        &plan,
+        &mut completed,
+        &mut degraded_segments,
+        output_mode == StreamOutputMode::Paragraph,
+    )?;
+    if let Some(stream) = paragraph_stream {
+        stream.finish(&translated).await?;
+    }
     let degraded = !retained_regions.is_empty();
     cold_generation &= !degraded;
     proof_eligible &= !degraded;
@@ -2823,6 +2883,7 @@ mod tests {
     mod identity_tests;
     mod input_only_tests;
     mod network_retry_tests;
+    mod paragraph_stream_tests;
     mod source_structure;
     use source_structure::{markdown_structure, MarkdownStructure};
     mod retained_original_tests;
