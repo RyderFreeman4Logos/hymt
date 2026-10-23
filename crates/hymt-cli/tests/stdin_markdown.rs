@@ -437,3 +437,251 @@ async fn redirected_stdin_publishes_model_content_and_handles_transport_failures
         }
     }
 }
+
+#[tokio::test]
+async fn default_stream_reaches_tee_before_later_paragraph_completes() {
+    for from_file in [false, true] {
+        let home = TestHome::new();
+        let source = "First source paragraph.\n\nSecond source paragraph.";
+        let input = home.0.join("input.md");
+        std::fs::write(&input, source).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        std::fs::create_dir_all(home.0.join(".config/hymt")).unwrap();
+        std::fs::write(home.0.join(".config/hymt/config.toml"), format!(
+            "[endpoint]\nurl=\"http://{address}/v1\"\nbackend=\"openai_compatible\"\nmodel=\"test-model\"\n[translation]\ncontext_window=8192\nmax_output_tokens=1024\nconcurrency=2\ntimeout=20\nmax_retries=0\n[cache]\nenabled=false\n"
+        )).unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let provider = tokio::spawn({
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            async move {
+                let mut attempt = 0;
+                while attempt < 2 {
+                    let (mut socket, _) = listener.accept().await?;
+                    let request = read_fixture_request(&mut socket, &Mutex::default()).await?;
+                    let (kind, body) = if request.starts_with(b"GET /v1/models ") {
+                        (
+                            "application/json",
+                            serde_json::json!({"data":[{"id":"test-model"}]}).to_string(),
+                        )
+                    } else {
+                        attempt += 1;
+                        if attempt == 1 {
+                            (
+                                "text/event-stream",
+                                format!(
+                                    "data: {}\n\ndata: [DONE]\n\n",
+                                    serde_json::json!({"choices":[{"index":0,"delta":{"content":"FIRST_REPLY"},"finish_reason":"stop"}]})
+                                ),
+                            )
+                        } else {
+                            assert_eq!(attempt, 2);
+                            entered.notify_one();
+                            release.notified().await;
+                            ("application/json", serde_json::json!({"choices":[{"message":{"content":"SECOND_REPLY"},"finish_reason":"stop"}]}).to_string())
+                        }
+                    };
+                    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await?;
+                }
+                Ok::<(), std::io::Error>(())
+            }
+        });
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hymt"));
+        command.args([
+            "--lang",
+            "zh",
+            "--force-translate-all",
+            "--no-progress",
+            "-y",
+        ]);
+        if from_file {
+            command.arg(&input);
+        }
+        let stderr_path = home.0.join("stderr.txt");
+        let mut child = command
+            .env("HOME", &home.0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(std::fs::File::create(&stderr_path).unwrap())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pipe: Stdio = child.stdout.take().unwrap().try_into().unwrap();
+        let output = home.0.join("tee.md");
+        let mut tee = Command::new("/usr/bin/tee")
+            .arg(&output)
+            .stdin(pipe)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        if !from_file {
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(source.as_bytes())
+                .await
+                .unwrap();
+        } else {
+            drop(child.stdin.take());
+        }
+        let mut stdout = tee.stdout.take().unwrap();
+        let observed = tokio::time::timeout(Duration::from_secs(5), async {
+            entered.notified().await;
+            let mut prefix = vec![0; "FIRST_REPLY".len()];
+            stdout.read_exact(&mut prefix).await?;
+            Ok::<_, std::io::Error>(prefix)
+        })
+        .await;
+        release.notify_one();
+        let mut rest = Vec::new();
+        // Completion includes durable history; use the existing child-wait budget.
+        let finished = tokio::time::timeout(Duration::from_secs(20), async {
+            stdout.read_to_end(&mut rest).await?;
+            let child_status = child.wait().await?;
+            let tee_status = tee.wait().await?;
+            Ok::<_, std::io::Error>((child_status, tee_status))
+        })
+        .await;
+        if !matches!(&finished, Ok(Ok(_))) {
+            eprintln!("stream fixture completion={finished:?}, child={:?}, tee={:?}, provider_finished={}, rest={:?}, stderr={}", child.try_wait(), tee.try_wait(), provider.is_finished(), String::from_utf8_lossy(&rest), std::fs::read_to_string(&stderr_path).unwrap());
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            let _ = tee.kill().await;
+            let _ = tee.wait().await;
+        }
+        provider.abort();
+        let _ = provider.await;
+        assert_eq!(
+            observed
+                .expect("completed paragraph must reach tee while the next response is held open")
+                .unwrap(),
+            b"FIRST_REPLY"
+        );
+        let (child_status, tee_status) = finished.unwrap().unwrap();
+        assert!(child_status.success() && tee_status.success());
+        let mut all = b"FIRST_REPLY".to_vec();
+        all.extend(rest);
+        assert_eq!(all, b"FIRST_REPLY\n\nSECOND_REPLY\n");
+        assert_eq!(std::fs::read(output).unwrap(), all);
+    }
+}
+
+#[tokio::test]
+async fn leading_blank_json_preserves_complete_request_and_output() {
+    let source = "\n \n{\"message\":\"hello\"}\n";
+    let reply = "{\"message\":\"translated\"}";
+    for buffered in [true, false] {
+        let home = TestHome::new();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        std::fs::create_dir_all(home.0.join(".config/hymt")).unwrap();
+        std::fs::write(home.0.join(".config/hymt/config.toml"), format!(
+            "[endpoint]\nurl=\"http://{address}/v1\"\nbackend=\"openai_compatible\"\nmodel=\"test-model\"\n[translation]\ncontext_window=8192\nmax_output_tokens=1024\ntimeout=5\nmax_retries=0\n[cache]\nenabled=false\n"
+        )).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&requests);
+        let provider = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await?;
+                let request = read_fixture_request(&mut socket, &Mutex::default()).await?;
+                let (kind, body) = if request.starts_with(b"GET /v1/models ") {
+                    (
+                        "application/json",
+                        serde_json::json!({"data":[{"id":"test-model"}]}).to_string(),
+                    )
+                } else {
+                    let offset = request
+                        .windows(4)
+                        .position(|bytes| bytes == b"\r\n\r\n")
+                        .unwrap()
+                        + 4;
+                    let payload: serde_json::Value =
+                        serde_json::from_slice(&request[offset..]).unwrap();
+                    let streaming = payload["stream"].as_bool().unwrap_or(false);
+                    captured.lock().unwrap().push(payload);
+                    if streaming {
+                        (
+                            "text/event-stream",
+                            format!(
+                                "data: {}\n\ndata: [DONE]\n\n",
+                                serde_json::json!({"choices":[{"index":0,"delta":{"content":reply},"finish_reason":"stop"}]})
+                            ),
+                        )
+                    } else {
+                        ("application/json", serde_json::json!({"choices":[{"index":0,"message":{"content":reply},"finish_reason":"stop"}]}).to_string())
+                    }
+                };
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await?;
+                if request.starts_with(b"POST /v1/chat/completions ") {
+                    return Ok::<(), std::io::Error>(());
+                }
+            }
+        });
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hymt"));
+        command.args([
+            "--lang",
+            "zh",
+            "--force-translate-all",
+            "--no-progress",
+            "-y",
+        ]);
+        if buffered {
+            command.arg("--no-stream");
+        }
+        let mut child = command
+            .env("HOME", &home.0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(source.as_bytes())
+            .await
+            .unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
+        let finished = tokio::time::timeout(Duration::from_secs(20), async {
+            tokio::try_join!(
+                stdout.read_to_end(&mut output),
+                stderr.read_to_end(&mut errors),
+                child.wait()
+            )
+        })
+        .await;
+        if !matches!(&finished, Ok(Ok(_))) {
+            child.kill().await.unwrap();
+            child.wait().await.unwrap();
+        }
+        provider.abort();
+        let _ = provider.await;
+        let (_, _, status) = finished.unwrap().unwrap();
+        assert!(status.success(), "{}", String::from_utf8_lossy(&errors));
+        assert_eq!(output, format!("{reply}\n").as_bytes());
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0]["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .ends_with(source));
+        let history =
+            hymt_cache::history::HistoryDB::new(home.0.join(".local/share/hymt/history.db"));
+        assert_eq!(
+            history.fetch_recent(None).unwrap()[0]
+                .output_text
+                .as_deref(),
+            Some(format!("{reply}\n").as_str())
+        );
+    }
+}

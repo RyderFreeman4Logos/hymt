@@ -1338,6 +1338,11 @@ async fn translate_text_to_stdout_streaming(
 ) -> Result<()> {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
     let output_mode = current_stream_output_mode(text, input_is_interactive);
+    let output_mode = if output_mode == StreamOutputMode::Optimistic && warn_only {
+        StreamOutputMode::Paragraph
+    } else {
+        output_mode
+    };
     let translate =
         translate_text_stream_with_mode(text, target_lang, template, opts, tctx, output_mode, tx);
     let print = print_stream_events(rx);

@@ -5,8 +5,8 @@ use std::ops::Range;
 
 #[derive(Clone, Debug)]
 pub(super) struct SourceParagraph {
-    index: usize,
-    bytes: Range<usize>,
+    pub(super) index: usize,
+    pub(super) bytes: Range<usize>,
 }
 
 /// An untranslated original paragraph, indexed by its occurrence in the source.
@@ -33,7 +33,7 @@ pub(super) fn source_paragraphs(document: &DocumentLanguagePlan) -> Vec<SourcePa
         .collect()
 }
 
-fn owner(plan: &TranslationPlan, segment: usize) -> Option<usize> {
+pub(super) fn owner(plan: &TranslationPlan, segment: usize) -> Option<usize> {
     let section = *plan.segment_section_groups.get(segment)?.first()?;
     plan.document_plan.as_ref()?.sections[section].paragraph_index
 }
@@ -101,6 +101,16 @@ pub(super) fn finalize(
     completed: &mut [String],
     degraded_segments: &mut Vec<usize>,
 ) -> Result<(String, Vec<RetainedRegion>)> {
+    finalize_with_notice(source, plan, completed, degraded_segments, false)
+}
+
+pub(super) fn finalize_with_notice(
+    source: &str,
+    plan: &TranslationPlan,
+    completed: &mut [String],
+    degraded_segments: &mut Vec<usize>,
+    append_notice: bool,
+) -> Result<(String, Vec<RetainedRegion>)> {
     let retained: BTreeSet<_> = degraded_segments
         .iter()
         .map(|index| {
@@ -136,6 +146,13 @@ pub(super) fn finalize(
             "Untranslated original: paragraph {} (source bytes {}..{}; body lines {}..{}).\n\n",
             region.paragraph_index, region.source_bytes.start, region.source_bytes.end, first, last
         ));
+    }
+    if append_notice {
+        if !body.ends_with("\n\n") {
+            body.push_str("\n\n");
+        }
+        body.push_str(&notice);
+        return Ok((body, regions));
     }
     // Keep existing YAML frontmatter at byte zero. All other notices precede the
     // complete body, including lists, tables, block quotes, and open fences.
