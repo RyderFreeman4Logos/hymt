@@ -63,7 +63,7 @@ const KNOWN_SUBCOMMANDS: &[&str] = &[
     about = "Hy-MT2 translation CLI",
     long_about = "Translate text, files, man pages, and command output via Hy-MT2.\n\
                   Run without a subcommand to translate positional text or a file.",
-    version
+    version = env!("HYMT_VERSION")
 )]
 struct Cli {
     /// Target language (default: from config / auto-detected)
