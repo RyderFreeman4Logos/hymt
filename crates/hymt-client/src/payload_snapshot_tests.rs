@@ -41,6 +41,7 @@ async fn payload_snapshot_server_defaults_omit_sampler_fields_and_empty_model() 
         serde_json::json!({
             "messages": [{"role": "user", "content": "translate this"}],
             "max_tokens": 37,
+            "stream": true,
         }),
         "server-default mode is a complete request snapshot, not a partial-field assertion"
     );
@@ -53,7 +54,6 @@ async fn payload_snapshot_server_defaults_omit_sampler_fields_and_empty_model() 
         "min_p",
         "repeat_last_n",
         "model",
-        "stream",
     ] {
         assert!(
             actual.get(forbidden).is_none(),
@@ -86,6 +86,7 @@ async fn payload_snapshot_llama_cpp_uses_only_llama_wire_keys() {
             "messages": [{"role": "user", "content": "llama request"}],
             "max_tokens": 37,
             "model": "pinned-llama-model",
+            "stream": true,
             "temperature": 0.8,
             "top_p": 0.6,
             "top_k": 0,

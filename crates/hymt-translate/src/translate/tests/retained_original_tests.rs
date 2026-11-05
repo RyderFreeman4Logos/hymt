@@ -326,7 +326,7 @@ fn oversized_copy_only_owner_does_not_trigger_fallback_notice() {
 }
 
 #[tokio::test]
-async fn default_stream_tokens_equal_marked_final_and_failed_text_never_leaks() {
+async fn validated_stream_tokens_equal_marked_final_and_failed_text_never_leaks() {
     let source = "The complete synthetic source must be retained after retries fail.";
     let server = start_mock_server(vec![
         MockResponse::SseWithFinishReason {
@@ -358,7 +358,7 @@ async fn default_stream_tokens_equal_marked_final_and_failed_text_never_leaks() 
         &TemplateType::Default,
         &PromptOpts::default(),
         &ctx,
-        StreamOutputMode::Optimistic,
+        StreamOutputMode::Validated,
         tx,
     )
     .await

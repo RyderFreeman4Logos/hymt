@@ -45,7 +45,6 @@ pub(super) fn request_plan_digest(
     template: &TemplateType,
     opts: &PromptOpts,
     client: &TranslationClient,
-    streaming: bool,
 ) -> Result<String> {
     let mut hash = Sha256::new();
     let mut bind = |bytes: &[u8]| {
@@ -62,12 +61,12 @@ pub(super) fn request_plan_digest(
         "original_paragraphs": format!("{:?}", plan.original_paragraphs),
         "coherent_paragraphs": plan.coherent_paragraphs,
     }))?);
-    for (index, segment) in plan.segments.iter().enumerate() {
+    for segment in &plan.segments {
         let prompt = build_prompt(segment, target, template, opts)?;
         bind(segment.as_bytes());
         bind(prompt.as_bytes());
-        // Eligible plans have no cached segments: segment 0 is the stream route.
-        bind(&client.request_bytes(&prompt, streaming && index == 0)?);
+        // Output buffering never changes the inference request.
+        bind(&client.request_bytes(&prompt, true)?);
     }
     Ok(format!("{:x}", hash.finalize()))
 }
@@ -99,7 +98,7 @@ pub(super) fn population_proof(
     let proof = serde_json::to_string(&json!({
         "version": VERSION, "configured": configured, "runtime": runtime,
         "inference": inference.hash(),
-        "requests": request_plan_digest(plan, target, template, opts, ctx.client, streaming)?,
+        "requests": request_plan_digest(plan, target, template, opts, ctx.client)?,
         "output": digest(output),
     }))?;
     Ok((proof.len() <= 16_384).then_some((configured, proof)))
@@ -202,8 +201,7 @@ pub(crate) fn find_replay(
                 return Ok(None);
             };
             if proof["output"] != digest(output)
-                || proof["requests"]
-                    != request_plan_digest(&plan, target, template, opts, &client, streaming)?
+                || proof["requests"] != request_plan_digest(&plan, target, template, opts, &client)?
             {
                 return Ok(None);
             }

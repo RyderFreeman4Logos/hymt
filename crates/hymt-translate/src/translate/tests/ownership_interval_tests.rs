@@ -291,19 +291,11 @@ async fn model_changes_to_malformed_links_publish_without_repair_in_all_modes() 
         Some(StreamOutputMode::Validated),
         Some(StreamOutputMode::Optimistic),
     ] {
-        let streaming = output_mode.is_some();
-        // Match the existing validated-stream fixture: only the prioritized first request streams.
+        // All output modes send SSE; completed model text remains unchanged.
         let responses = mock_replies
             .iter()
             .cloned()
-            .enumerate()
-            .map(|(index, response)| {
-                if streaming && index == 0 {
-                    MockResponse::Sse(vec![response.clone()])
-                } else {
-                    MockResponse::Json(response.clone())
-                }
-            })
+            .map(|response| MockResponse::Sse(vec![response]))
             .collect();
         let server = start_capturing_mock_server(responses).await;
         let config = make_stream_config(&server.endpoint_url);
@@ -380,14 +372,10 @@ async fn model_changes_to_malformed_links_publish_without_repair_in_all_modes() 
         );
         let captured_inputs: Vec<_> = requests
             .iter()
-            .enumerate()
-            .map(|(index, request)| {
+            .map(|request| {
                 let (_, body) = request.split_once("\r\n\r\n").expect("captured HTTP body");
                 let payload: serde_json::Value = serde_json::from_str(body).unwrap();
-                assert_eq!(
-                    payload["stream"].as_bool() == Some(true),
-                    streaming && index == 0
-                );
+                assert_eq!(payload["stream"], true);
                 let prompt = payload["messages"]
                     .as_array()
                     .and_then(|messages| messages.last())

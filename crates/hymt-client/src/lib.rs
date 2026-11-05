@@ -81,7 +81,7 @@ pub enum ClientError {
     ConfigChangedDuringPreflight,
 }
 
-/// A completed non-streaming translation with its provider termination signal.
+/// A buffered translation with its provider termination signal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranslationCompletion {
     pub text: String,
@@ -931,25 +931,35 @@ impl TranslationClient {
         Ok(completion.text)
     }
 
-    /// Translates `prompt`, preserving partial output and the provider termination signal.
+    /// Buffer the same recoverable SSE request used by incremental clients.
+    /// Preserves partial output and the provider termination signal.
     pub async fn translate_with_completion(
         &self,
         prompt: &str,
     ) -> Result<TranslationCompletion, ClientError> {
-        // Continue with cached config on reload failure (e.g. transient I/O)
-        let _ = self.inner.config.maybe_reload();
+        use tokio_stream::StreamExt as _;
 
-        let _permit = self
-            .inner
-            .semaphore
-            .acquire()
-            .await
-            .map_err(|_| ClientError::SemaphoreClosed)?;
-
-        let payload = self.build_payload(prompt, false)?;
-        let headers = self.build_headers();
-        let url = self.chat_url();
-        self.post_with_retry(&url, &payload, &headers).await
+        let mut stream = self.translate_stream_with_recovery(prompt).await?;
+        let mut completion = TranslationCompletion {
+            text: String::new(),
+            termination: CompletionTermination::Unknown,
+            cold_generation: false,
+        };
+        while let Some(event) = stream.next().await {
+            match event? {
+                TranslationStreamEvent::ColdGeneration(cold) => completion.cold_generation = cold,
+                TranslationStreamEvent::Restarted => {
+                    completion.text.clear();
+                    completion.termination = CompletionTermination::Unknown;
+                    completion.cold_generation = false;
+                }
+                TranslationStreamEvent::Token(token) => completion.text.push_str(&token),
+                TranslationStreamEvent::Finished(termination) => {
+                    completion.termination = termination
+                }
+            }
+        }
+        Ok(completion)
     }
 
     /// Translates `prompt` with SSE streaming.
@@ -1010,6 +1020,8 @@ impl TranslationClient {
     ///
     /// A `finish_reason == "length"` response emits [`TranslationStreamEvent::Finished`]
     /// with [`CompletionTermination::Length`] after all available partial tokens.
+    /// Body interruptions retry only before any content token; a partial draft
+    /// is never replayed because its caller may already have published it.
     pub async fn translate_stream_with_completion(
         &self,
         prompt: &str,
@@ -1059,9 +1071,10 @@ impl TranslationClient {
                         if tx.send(Ok(TranslationStreamEvent::ColdGeneration(cold))).await.is_err() {
                             return Ok(());
                         }
-                        match read_completion_stream(response, tx.clone()).await {
+                        let mut saw_content = false;
+                        match read_completion_stream(response, tx.clone(), &mut saw_content).await {
                             Ok(()) => return Ok(()),
-                            Err(ClientError::Request(error)) if recover_body => {
+                            Err(ClientError::Request(error)) if recover_body || !saw_content => {
                                 budget.wait(error.into()).await?;
                                 if tx.send(Ok(TranslationStreamEvent::Restarted)).await.is_err() {
                                     return Ok(());
@@ -1146,29 +1159,6 @@ impl TranslationClient {
 
     fn models_url(endpoint_url: &str) -> String {
         format!("{}/models", endpoint_url.trim_end_matches('/'))
-    }
-
-    async fn post_with_retry(
-        &self,
-        url: &str,
-        payload: &ChatPayload,
-        headers: &reqwest::header::HeaderMap,
-    ) -> Result<TranslationCompletion, ClientError> {
-        let mut budget = RetryBudget::new(self.inner.config.network_max_retries());
-        let (chat, _, cold_generation) = retry::json(
-            || {
-                self.inner
-                    .http
-                    .post(url)
-                    .headers(headers.clone())
-                    .json(payload)
-            },
-            &mut budget,
-        )
-        .await?;
-        let mut completion = extract_completion_from_response(chat)?;
-        completion.cold_generation = cold_generation;
-        Ok(completion)
     }
 
     async fn connect_stream_with_retry(
@@ -1275,9 +1265,10 @@ async fn parse_sse(
 async fn read_completion_stream(
     response: reqwest::Response,
     tx: tokio::sync::mpsc::Sender<Result<TranslationStreamEvent, ClientError>>,
+    saw_content: &mut bool,
 ) -> Result<(), ClientError> {
     if is_event_stream(&response) {
-        return parse_sse_with_completion(response, tx)
+        return parse_sse_with_completion(response, tx, saw_content)
             .await
             .map_err(Into::into);
     }
@@ -1300,6 +1291,7 @@ async fn read_completion_stream(
 async fn parse_sse_with_completion(
     response: reqwest::Response,
     tx: tokio::sync::mpsc::Sender<Result<TranslationStreamEvent, ClientError>>,
+    saw_content: &mut bool,
 ) -> Result<(), reqwest::Error> {
     use tokio_stream::StreamExt as _;
 
@@ -1324,6 +1316,7 @@ async fn parse_sse_with_completion(
                             &tx,
                             &mut saw_terminal,
                             &mut saw_choice,
+                            saw_content,
                         )
                         .await
                         {
@@ -1351,7 +1344,15 @@ async fn parse_sse_with_completion(
             data_lines.push(data.trim_start().to_owned());
         }
     }
-    if !flush_completion_sse_data(&mut data_lines, &tx, &mut saw_terminal, &mut saw_choice).await {
+    if !flush_completion_sse_data(
+        &mut data_lines,
+        &tx,
+        &mut saw_terminal,
+        &mut saw_choice,
+        saw_content,
+    )
+    .await
+    {
         return Ok(());
     }
     if !saw_terminal {
@@ -1369,6 +1370,7 @@ async fn flush_completion_sse_data(
     tx: &tokio::sync::mpsc::Sender<Result<TranslationStreamEvent, ClientError>>,
     saw_terminal: &mut bool,
     saw_choice: &mut bool,
+    saw_content: &mut bool,
 ) -> bool {
     if data_lines.is_empty() {
         return true;
@@ -1407,6 +1409,9 @@ async fn flush_completion_sse_data(
     };
     *saw_choice |= observed_choice;
     for event in events {
+        if matches!(&event, TranslationStreamEvent::Token(token) if !token.is_empty()) {
+            *saw_content = true;
+        }
         if matches!(event, TranslationStreamEvent::Finished(_)) {
             *saw_terminal = true;
         }
