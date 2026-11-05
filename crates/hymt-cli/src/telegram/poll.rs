@@ -40,7 +40,7 @@ struct ApiResponse<T> {
 }
 
 #[derive(Debug, Deserialize)]
-struct Update {
+pub(crate) struct Update {
     update_id: i64,
     message: Option<Message>,
 }
@@ -122,8 +122,12 @@ enum StreamPublishMode {
 
 /// Minimal Bot API surface used by progressive delivery. Keeping it narrow makes
 /// the ordered send/edit sequence directly testable without network traffic.
-trait TelegramMessageApi {
-    async fn send_chat_action(&self, chat_id: i64, action: &str) -> Result<()>;
+pub(crate) trait TelegramMessageApi {
+    fn send_chat_action(
+        &self,
+        chat_id: i64,
+        action: &str,
+    ) -> impl Future<Output = Result<()>> + Send;
     async fn send_message(&self, chat_id: i64, text: &str) -> Result<i64>;
     async fn edit_message(&self, chat_id: i64, message_id: i64, text: &str) -> Result<()>;
 }
@@ -132,7 +136,7 @@ trait TelegramMessageApi {
 ///
 /// Keeping the Bot API calls behind this small trait makes the full
 /// download → translate → reply sequence testable without network traffic.
-trait TelegramDocumentApi: TelegramMessageApi {
+pub(crate) trait TelegramDocumentApi: TelegramMessageApi {
     async fn download_document(&self, file_id: &str, max_size: u64) -> Result<Vec<u8>>;
     async fn send_document(&self, chat_id: i64, file_name: &str, text: &str) -> Result<()>;
 }
@@ -495,17 +499,18 @@ fn executable_was_replaced() -> bool {
         .is_some_and(|path| path.to_string_lossy().ends_with(" (deleted)"))
 }
 
-async fn handle_update(
+pub(crate) async fn handle_update<A>(
     config: &HotConfig,
-    api: &TelegramHttpApi,
+    api: &A,
     client: &TranslationClient,
     segmenter: &Segmenter,
     history: &HistoryDB,
     no_cache: bool,
     update: Update,
-) -> Result<()> {
-    let http = &api.http;
-    let token = api.token.as_str();
+) -> Result<()>
+where
+    A: TelegramDocumentApi + Clone + Send + Sync + 'static,
+{
     let Some(message) = update.message else {
         return Ok(());
     };
@@ -534,20 +539,26 @@ async fn handle_update(
 
         return match action {
             BotAction::Ignore => Ok(()),
-            BotAction::Help => send_message(http, token, incoming.chat_id, help_text()).await,
-            BotAction::Denied => send_message(http, token, incoming.chat_id, denial_text()).await,
-            BotAction::AlreadyOwner => {
-                send_message(http, token, incoming.chat_id, "You are already an owner.").await
-            }
+            BotAction::Help => api
+                .send_message(incoming.chat_id, help_text())
+                .await
+                .map(|_| ()),
+            BotAction::Denied => api
+                .send_message(incoming.chat_id, denial_text())
+                .await
+                .map(|_| ()),
+            BotAction::AlreadyOwner => api
+                .send_message(incoming.chat_id, "You are already an owner.")
+                .await
+                .map(|_| ()),
             BotAction::Claimed { chat_id } => {
                 config.add_telegram_owner(chat_id)?;
-                send_message(
-                    http,
-                    token,
+                api.send_message(
                     chat_id,
                     "Ownership claimed. You can now send text for Chinese↔English translation.",
                 )
                 .await
+                .map(|_| ())
             }
             BotAction::Translate { text, target_lang } => {
                 let opts = PromptOpts::default();
@@ -626,16 +637,15 @@ async fn handle_update(
         return Ok(());
     };
     handle_document_update(
-        config, http, token, client, segmenter, history, no_cache, chat_id, chat_kind, document,
+        config, api, client, segmenter, history, no_cache, chat_id, chat_kind, document,
     )
     .await
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn handle_document_update(
+async fn handle_document_update<A>(
     config: &HotConfig,
-    http: &Client,
-    token: &str,
+    api: &A,
     client: &TranslationClient,
     segmenter: &Segmenter,
     history: &HistoryDB,
@@ -643,7 +653,10 @@ async fn handle_document_update(
     chat_id: i64,
     chat_kind: ChatKind,
     document: Document,
-) -> Result<()> {
+) -> Result<()>
+where
+    A: TelegramDocumentApi + Clone + Send + Sync + 'static,
+{
     let auth = authorize_chat(
         chat_kind,
         chat_id,
@@ -651,7 +664,6 @@ async fn handle_document_update(
         &config.telegram_owners(),
         &config.telegram_groups(),
     );
-    let api = TelegramHttpApi::new(http, token);
     if !config.telegram_accept_documents() {
         return Ok(());
     }
@@ -677,7 +689,7 @@ async fn handle_document_update(
             let chat_action_repeater =
                 spawn_chat_action_repeater(api.clone(), chat_id, CHAT_ACTION_UPLOAD_DOCUMENT);
             let result = process_document_message(
-                &api,
+                api,
                 chat_id,
                 auth,
                 true,
@@ -731,15 +743,18 @@ where
     translate().await
 }
 
-fn spawn_chat_action_repeater(
-    api: TelegramHttpApi,
+fn spawn_chat_action_repeater<A>(
+    api: A,
     chat_id: i64,
     action: &'static str,
-) -> tokio::task::JoinHandle<()> {
+) -> tokio::task::JoinHandle<()>
+where
+    A: TelegramMessageApi + Send + 'static,
+{
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(TELEGRAM_CHAT_ACTION_INTERVAL).await;
-            if let Err(error) = send_chat_action(&api.http, &api.token, chat_id, action).await {
+            if let Err(error) = api.send_chat_action(chat_id, action).await {
                 eprintln!("hymt telegram: sendChatAction refresh failed: {error:#}");
             }
         }
@@ -1035,12 +1050,6 @@ fn telegram_message_text(text: &str) -> String {
     } else {
         text.to_owned()
     }
-}
-
-async fn send_message(http: &Client, token: &str, chat_id: i64, text: &str) -> Result<()> {
-    send_message_id(http, token, chat_id, text)
-        .await
-        .map(|_| ())
 }
 
 async fn send_chat_action(http: &Client, token: &str, chat_id: i64, action: &str) -> Result<()> {

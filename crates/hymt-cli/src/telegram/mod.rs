@@ -5,6 +5,6 @@
 //! the Bot API via `reqwest`.
 
 mod logic;
-mod poll;
+pub(crate) mod poll;
 
 pub use poll::run_telegram_bot;
