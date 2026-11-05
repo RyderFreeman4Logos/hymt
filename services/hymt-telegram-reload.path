@@ -2,7 +2,7 @@
 Description=Restart hymt Telegram bot when its executable is replaced
 
 [Path]
-PathChanged=/usr/local/bin/hymt
+PathChanged=%h/.local/bin/hymt
 Unit=hymt-telegram-reload.service
 
 [Install]

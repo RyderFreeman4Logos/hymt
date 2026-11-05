@@ -8,8 +8,7 @@ async fn interrupted_validated_stream_replays_only_complete_chunk() {
     ])
     .await;
     let config = make_stream_config(&server.endpoint_url);
-    // Exercise the CLI's ordinary-text Optimistic selection with the default
-    // retention policy, which must buffer unpublished attempts before replay.
+    // Explicit buffering keeps interrupted attempts private before replay.
     let contents = std::fs::read_to_string(config.path())
         .unwrap()
         .replace("warn_only = false\n", "");
@@ -22,7 +21,7 @@ async fn interrupted_validated_stream_replays_only_complete_chunk() {
         &config,
         &fallback_segmenter(),
         &history,
-        StreamOutputMode::Optimistic,
+        StreamOutputMode::Validated,
     )
     .await
     .unwrap();

@@ -105,9 +105,15 @@ fn acknowledge_terminal_consumer_exit() {
 enum StreamEventSink {
     Immediate(mpsc::Sender<StreamEvent>),
     Validated(mpsc::Sender<StreamEvent>),
+    Indexed(usize, mpsc::Sender<ChunkProgress>),
 }
 
-/// Controls when segment 0 output is emitted while first-chunk priority is active.
+enum ChunkProgress {
+    Token(usize, String),
+    Completed(usize, Result<SegmentTranslateOutcome>),
+}
+
+/// Controls when ordered translation output is published.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StreamOutputMode {
     /// Withhold all output until the complete reconstructed document is validated.
@@ -115,7 +121,7 @@ pub enum StreamOutputMode {
     /// Publish complete source paragraphs in order, retaining retryable attempts
     /// until their whole paragraph is ready. Original-retention notices follow the body.
     Paragraph,
-    /// Emit segment 0 tokens as soon as the streaming backend returns them,
+    /// Emit each segment's tokens in source order as the backend returns them,
     /// except when source text contains an unparsed inline-link delimiter or
     /// unresolved reference candidate that could be repaired into a link, or
     /// fixed inline delimiters that need validated rendering before output.
@@ -334,30 +340,6 @@ impl TranslationPlan {
             ),
             Some(plan) => reconstruct_sections(plan, &self.segment_section_indexes, translations),
         }
-    }
-
-    /// Return untranslated source text that reconstructs before priority segment 0.
-    fn reconstruct_prefix_before_segment(&self, segment_index: usize) -> String {
-        debug_assert_eq!(
-            segment_index, 0,
-            "reconstruct_prefix_before_segment is only valid for segment 0"
-        );
-        let Some(plan) = &self.document_plan else {
-            return String::new();
-        };
-        let first_section = self
-            .segment_section_groups
-            .get(segment_index)
-            .and_then(|group| group.first().copied())
-            .or_else(|| self.segment_section_indexes.get(segment_index).copied());
-        let Some(first_section) = first_section else {
-            return String::new();
-        };
-        plan.sections
-            .iter()
-            .take(first_section)
-            .map(|section| section.text.as_str())
-            .collect()
     }
 }
 
@@ -1356,6 +1338,14 @@ async fn send_stream_event(tx: &StreamEventSink, event: StreamEvent) -> Result<(
             }
             Ok(())
         }
+        StreamEventSink::Indexed(index, sender) => match event {
+            StreamEvent::Token(token) => sender
+                .send(ChunkProgress::Token(*index, token))
+                .await
+                .map_err(|_| anyhow!("stream event receiver dropped")),
+            StreamEvent::SegmentDone(_) => Ok(()),
+            StreamEvent::AllDone(_) => anyhow::bail!("unexpected chunk terminal event"),
+        },
     }
 }
 
@@ -1433,7 +1423,6 @@ async fn advance_stream_cursor_past_segment(
 async fn translate_segment_with_completeness_streaming(
     request: SegmentTranslateRequest<'_>,
     event_tx: &StreamEventSink,
-    first_token_tx: Option<mpsc::Sender<()>>,
     output_mode: StreamOutputMode,
     timing: ChunkTiming,
 ) -> Result<SegmentTranslateOutcome> {
@@ -1446,18 +1435,17 @@ async fn translate_segment_with_completeness_streaming(
         request.opts,
     )?;
     timing.log(request.index, "request_start");
-    let mut stream = if output_mode != StreamOutputMode::Optimistic {
-        request.client.translate_stream_with_recovery(&prompt).await
-    } else {
+    let mut stream = if output_mode == StreamOutputMode::Optimistic {
         request
             .client
             .translate_stream_with_completion(&prompt)
             .await
+    } else {
+        request.client.translate_stream_with_recovery(&prompt).await
     }
     .map_err(|e| map_segment_http_error(request.index, request.segment, e))?;
     let mut translated = String::new();
-    let mut first_token_tx = first_token_tx;
-    let mut emitted_optimistically = false;
+    let mut first_token = true;
     let mut termination = CompletionTermination::Unknown;
     let mut cold_generation = false;
 
@@ -1473,18 +1461,12 @@ async fn translate_segment_with_completeness_streaming(
                 if token.is_empty() {
                     continue;
                 }
-                if let Some(tx) = first_token_tx.take() {
+                if first_token {
                     timing.log(request.index, "first_token");
-                    let _ = tx.try_send(());
+                    first_token = false;
                 }
                 translated.push_str(&token);
-                match output_mode {
-                    StreamOutputMode::Validated | StreamOutputMode::Paragraph => {}
-                    StreamOutputMode::Optimistic => {
-                        emitted_optimistically = true;
-                        send_stream_event(event_tx, StreamEvent::Token(token)).await?;
-                    }
-                }
+                send_stream_event(event_tx, StreamEvent::Token(token)).await?;
             }
             TranslationStreamEvent::Finished(next_termination) => termination = next_termination,
         }
@@ -1492,9 +1474,6 @@ async fn translate_segment_with_completeness_streaming(
 
     let mut last = validate_provider_attempt(translated, termination);
     if last.validation.is_complete {
-        if output_mode != StreamOutputMode::Optimistic {
-            send_stream_event(event_tx, StreamEvent::Token(last.text.clone())).await?;
-        }
         send_stream_event(event_tx, StreamEvent::SegmentDone(request.index)).await?;
         timing.log(request.index, "complete");
         return Ok(SegmentTranslateOutcome {
@@ -1505,33 +1484,15 @@ async fn translate_segment_with_completeness_streaming(
         });
     }
 
-    // Optimistic mode: tokens are already on stdout and cannot be retracted.
-    // Retrying would produce text that diverges from the emitted prefix,
-    // corrupting stdout. Fail the task unless last effort was explicitly enabled.
-    if emitted_optimistically {
-        validate_exhausted_attempt(
-            request.index,
-            request.segment,
-            &last,
-            request.opts,
-            request.config,
-        )?;
-        eprintln!(
-            "Warning: segment {} failed transport validation, using streamed attempt (retry skipped \
-             — tokens already emitted): {:?}",
+    // Optimistic drafts may already be stdout: never replay a partial attempt.
+    // This also conservatively rejects an out-of-order draft not published yet.
+    if output_mode == StreamOutputMode::Optimistic && !last.text.is_empty() {
+        anyhow::bail!(
+            "segment {} failed transport validation after content: {:?}",
             request.index + 1,
             last.validation.checks_failed
         );
-        send_stream_event(event_tx, StreamEvent::SegmentDone(request.index)).await?;
-        timing.log(request.index, "complete");
-        return Ok(SegmentTranslateOutcome {
-            text: last.text,
-            completeness_degraded: true,
-            initial_request: false,
-            cold_generation: false,
-        });
     }
-
     let action = if max_retries > 0 {
         "retrying"
     } else {
@@ -1566,14 +1527,8 @@ async fn translate_segment_with_completeness_streaming(
         timing.log(request.index, "completeness_retry_end");
 
         if candidate.validation.is_complete {
-            if !candidate.text.is_empty()
-                && (output_mode != StreamOutputMode::Optimistic || !emitted_optimistically)
-            {
+            if !candidate.text.is_empty() {
                 send_stream_event(event_tx, StreamEvent::Token(candidate.text.clone())).await?;
-                if let Some(tx) = first_token_tx.take() {
-                    timing.log(request.index, "first_token");
-                    let _ = tx.try_send(());
-                }
             }
             send_stream_event(event_tx, StreamEvent::SegmentDone(request.index)).await?;
             timing.log(request.index, "complete");
@@ -1601,6 +1556,13 @@ async fn translate_segment_with_completeness_streaming(
         last = candidate;
     }
 
+    if output_mode == StreamOutputMode::Optimistic {
+        anyhow::bail!(
+            "segment {} failed transport validation: {:?}",
+            request.index + 1,
+            last.validation.checks_failed
+        );
+    }
     validate_exhausted_attempt(
         request.index,
         request.segment,
@@ -1624,6 +1586,43 @@ async fn translate_segment_with_completeness_streaming(
         initial_request: false,
         cold_generation: false,
     })
+}
+
+fn spawn_streaming_segment(
+    tasks: &mut JoinSet<()>,
+    progress: &mpsc::Sender<ChunkProgress>,
+    request: SegmentTranslateRequest<'_>,
+    output_mode: StreamOutputMode,
+    timing: ChunkTiming,
+) {
+    let index = request.index;
+    let client = request.client.clone();
+    let segment = request.segment.to_owned();
+    let target = request.target_lang.to_owned();
+    let template = request.template.clone();
+    let opts = request.opts.clone();
+    let config = request.config.clone();
+    let progress = progress.clone();
+    tasks.spawn(async move {
+        let outcome = translate_segment_with_completeness_streaming(
+            SegmentTranslateRequest {
+                index,
+                client: &client,
+                segment: &segment,
+                target_lang: &target,
+                template: &template,
+                opts: &opts,
+                config: &config,
+            },
+            &StreamEventSink::Indexed(index, progress.clone()),
+            output_mode,
+            timing,
+        )
+        .await;
+        let _ = progress
+            .send(ChunkProgress::Completed(index, outcome))
+            .await;
+    });
 }
 
 // ── Pipeline partition helper ─────────────────────────────────────────────────
@@ -2041,13 +2040,9 @@ pub async fn translate_text_stream_with_mode(
     }
     // Atomic JSON has no paragraph boundary to publish. Keep a provider repair
     // of literal link syntax behind the existing document guard as well.
-    let output_mode = if (output_mode == StreamOutputMode::Paragraph
+    let output_mode = if (output_mode != StreamOutputMode::Validated
         && hymt_core::completeness::parse_json_document(text).is_some())
-        || (output_mode == StreamOutputMode::Optimistic
-            && (has_unparsed_link_syntax(text)
-                || opts
-                    .warn_only_completeness
-                    .unwrap_or_else(|| ctx.config.completeness_warn_only())))
+        || (output_mode == StreamOutputMode::Optimistic && has_unparsed_link_syntax(text))
     {
         StreamOutputMode::Validated
     } else {
@@ -2125,16 +2120,6 @@ async fn translate_text_stream_inner(
     let ctx = &invocation;
     let template_name = template.as_str();
     let plan = plan_translation(text, target_lang, ctx.config, ctx.segmenter, template, opts)?;
-    // Original retention after a transport failure needs buffered publication.
-    let output_mode = if output_mode == StreamOutputMode::Optimistic
-        && opts
-            .warn_only_completeness
-            .unwrap_or_else(|| ctx.config.completeness_warn_only())
-    {
-        StreamOutputMode::Validated
-    } else {
-        output_mode
-    };
     let event_tx = match output_mode {
         StreamOutputMode::Validated | StreamOutputMode::Paragraph => {
             StreamEventSink::Validated(event_tx)
@@ -2271,254 +2256,134 @@ async fn translate_text_stream_inner(
         }
     } else if !missing.is_empty() {
         let timing = ChunkTiming::new(ctx.config.debug_chunk_timing());
-        let (priority_chunk, remaining) = partition_pipeline(&missing, true);
-        missing = remaining;
-
-        if let Some(chunk_idx) = priority_chunk {
-            let client = ctx.client.clone();
-            let segment = plan.segments[chunk_idx].clone();
-            let target = target_lang.to_owned();
-            let tmpl = template.clone();
-            let cloned_opts = opts.clone();
-            let cfg = ctx.config.clone();
-            let event_tx_clone = event_tx.clone();
-            let (first_token_tx, mut first_token_rx) = mpsc::channel(1);
-
-            let leading_prefix = plan.reconstruct_prefix_before_segment(chunk_idx);
-            if !leading_prefix.is_empty() {
-                send_stream_event(&event_tx, StreamEvent::Token(leading_prefix)).await?;
-            }
-
-            let mut priority_tasks = JoinSet::new();
-            priority_tasks.spawn(async move {
-                let outcome = translate_segment_with_completeness_streaming(
-                    SegmentTranslateRequest {
-                        index: chunk_idx,
-                        client: &client,
-                        segment: &segment,
-
-                        target_lang: &target,
-                        template: &tmpl,
-                        opts: &cloned_opts,
-                        config: &cfg,
-                    },
-                    &event_tx_clone,
-                    Some(first_token_tx),
-                    output_mode,
-                    timing,
-                )
-                .await?;
-                Ok((chunk_idx, outcome))
-            });
-
-            let mut priority_done: Option<(usize, SegmentTranslateOutcome)> = None;
-            if !missing.is_empty() {
-                tokio::select! {
-                    _ = first_token_rx.recv() => {}
-                    res = priority_tasks.join_next() => {
-                        priority_done = Some(joined_segment(res.expect("priority task exists"))?);
-                    }
+        let (priority_chunk, mut remaining) = partition_pipeline(&missing, true);
+        let (progress_tx, mut progress_rx) = mpsc::channel(64);
+        let mut tasks = JoinSet::new();
+        let initial =
+            priority_chunk.map_or_else(|| std::mem::take(&mut remaining), |index| vec![index]);
+        for index in initial {
+            spawn_streaming_segment(
+                &mut tasks,
+                &progress_tx,
+                SegmentTranslateRequest {
+                    index,
+                    client: ctx.client,
+                    segment: &plan.segments[index],
+                    target_lang,
+                    template,
+                    opts,
+                    config: ctx.config,
+                },
+                output_mode,
+                timing,
+            );
+        }
+        let mut pending = vec![String::new(); plan.segment_count()];
+        let mut published = vec![false; plan.segment_count()];
+        let mut completed_count = 0;
+        while completed_count < missing.len() {
+            let event = tokio::select! {
+                event = progress_rx.recv() => event.context("chunk progress channel closed")?,
+                result = tasks.join_next(), if !tasks.is_empty() => {
+                    result.context("missing chunk task")?
+                        .map_err(|error| anyhow!("segment task panicked: {error}"))?;
+                    continue;
                 }
-
-                let mut join_set: JoinSet<Result<(usize, SegmentTranslateOutcome)>> =
-                    JoinSet::new();
-                for &idx in &missing {
-                    let client = ctx.client.clone();
-                    let segment = plan.segments[idx].clone();
-                    let target = target_lang.to_owned();
-                    let tmpl = template.clone();
-                    let cloned_opts = opts.clone();
-                    let cfg = ctx.config.clone();
-
-                    join_set.spawn(async move {
-                        timing.log(idx, "queue_enter");
-                        timing.log(idx, "request_start");
-                        let outcome = translate_segment_with_completeness(
-                            idx,
-                            &client,
-                            &segment,
-                            &target,
-                            &tmpl,
-                            &cloned_opts,
-                            &cfg,
-                        )
-                        .await?;
-                        timing.log(idx, "complete");
-                        Ok((idx, outcome))
-                    });
-                }
-
-                let (
-                    idx,
-                    SegmentTranslateOutcome {
-                        text: translated,
-                        completeness_degraded: degraded,
-                        cold_generation: cold,
-                        initial_request,
-                    },
-                ) = if let Some(done) = priority_done {
-                    done
-                } else {
-                    joined_segment(
-                        priority_tasks
-                            .join_next()
-                            .await
-                            .expect("priority task exists"),
-                    )?
-                };
-                if degraded {
-                    degraded_segments.push(idx + 1);
-                }
-                cold_generation &= cold;
-                proof_eligible &= initial_request;
-                cache_candidates[idx] = !degraded;
-                translations[idx] = Some(translated);
-                if let Some(stream) = &mut paragraph_stream {
-                    stream.flush(&translations, Some((idx, degraded))).await?;
-                }
-                // Priority segment already streamed its tokens (validated or
-                // optimistic). Advance the ordered cursor past it, then flush
-                // any contiguous completed remaining segments.
-                advance_stream_cursor_past_segment(
-                    &plan,
-                    &translations,
-                    idx,
-                    &mut next_section_index,
-                    &mut cached_prefix_len,
-                    &event_tx,
-                )
-                .await?;
-                flush_ready_stream_prefix(
-                    &plan,
-                    &translations,
-                    &mut next_section_index,
-                    &mut cached_prefix_len,
-                    &event_tx,
-                )
-                .await?;
-
-                while let Some(res) = join_set.join_next().await {
-                    let (
-                        idx,
-                        SegmentTranslateOutcome {
-                            text: translated,
-                            completeness_degraded: degraded,
-                            cold_generation: cold,
-                            initial_request,
+            };
+            // Keep the existing first-token head start, including empty completions.
+            let release_remaining = matches!(
+                &event,
+                ChunkProgress::Token(0, _) | ChunkProgress::Completed(0, _)
+            );
+            if release_remaining {
+                for index in remaining.drain(..) {
+                    spawn_streaming_segment(
+                        &mut tasks,
+                        &progress_tx,
+                        SegmentTranslateRequest {
+                            index,
+                            client: ctx.client,
+                            segment: &plan.segments[index],
+                            target_lang,
+                            template,
+                            opts,
+                            config: ctx.config,
                         },
-                    ) = joined_segment(res)?;
-                    if degraded {
-                        degraded_segments.push(idx + 1);
+                        output_mode,
+                        timing,
+                    );
+                }
+            }
+            match event {
+                ChunkProgress::Token(index, token) => {
+                    if output_mode == StreamOutputMode::Optimistic {
+                        pending[index].push_str(&token);
                     }
-                    cold_generation &= cold;
-                    proof_eligible &= initial_request;
-                    cache_candidates[idx] = !degraded;
-                    translations[idx] = Some(translated);
+                }
+                ChunkProgress::Completed(index, outcome) => {
+                    let outcome = outcome.context("segment translation failed")?;
+                    if outcome.completeness_degraded {
+                        degraded_segments.push(index + 1);
+                    }
+                    cold_generation &= outcome.cold_generation;
+                    proof_eligible &= outcome.initial_request;
+                    cache_candidates[index] = !outcome.completeness_degraded;
+                    translations[index] = Some(outcome.text);
+                    pending[index].clear();
+                    completed_count += 1;
                     if let Some(stream) = &mut paragraph_stream {
-                        stream.flush(&translations, Some((idx, degraded))).await?;
+                        stream
+                            .flush(&translations, Some((index, outcome.completeness_degraded)))
+                            .await?;
                     }
-                    flush_ready_stream_prefix(
-                        &plan,
-                        &translations,
-                        &mut next_section_index,
-                        &mut cached_prefix_len,
-                        &event_tx,
-                    )
-                    .await?;
                 }
-            } else {
-                let (
-                    idx,
-                    SegmentTranslateOutcome {
-                        text: translated,
-                        completeness_degraded: degraded,
-                        cold_generation: cold,
-                        initial_request,
-                    },
-                ) = joined_segment(
-                    priority_tasks
-                        .join_next()
-                        .await
-                        .expect("priority task exists"),
-                )?;
-                if degraded {
-                    degraded_segments.push(idx + 1);
-                }
-                cold_generation &= cold;
-                proof_eligible &= initial_request;
-                cache_candidates[idx] = !degraded;
-                translations[idx] = Some(translated);
-                if let Some(stream) = &mut paragraph_stream {
-                    stream.flush(&translations, Some((idx, degraded))).await?;
-                }
+            }
+            if output_mode == StreamOutputMode::Optimistic
+                && published.get(cached_prefix_len) == Some(&true)
+                && translations[cached_prefix_len].is_some()
+            {
+                send_stream_event(&event_tx, StreamEvent::SegmentDone(cached_prefix_len)).await?;
+                let index = cached_prefix_len;
                 advance_stream_cursor_past_segment(
                     &plan,
                     &translations,
-                    idx,
+                    index,
                     &mut next_section_index,
                     &mut cached_prefix_len,
                     &event_tx,
                 )
                 .await?;
             }
-        } else {
-            let mut join_set: JoinSet<Result<(usize, SegmentTranslateOutcome)>> = JoinSet::new();
-
-            for &idx in &missing {
-                let client = ctx.client.clone();
-                let segment = plan.segments[idx].clone();
-                let target = target_lang.to_owned();
-                let tmpl = template.clone();
-                let cloned_opts = opts.clone();
-                let cfg = ctx.config.clone();
-
-                join_set.spawn(async move {
-                    timing.log(idx, "queue_enter");
-                    timing.log(idx, "request_start");
-                    let outcome = translate_segment_with_completeness(
-                        idx,
-                        &client,
-                        &segment,
-                        &target,
-                        &tmpl,
-                        &cloned_opts,
-                        &cfg,
-                    )
-                    .await?;
-                    timing.log(idx, "complete");
-                    Ok((idx, outcome))
-                });
-            }
-
-            while let Some(res) = join_set.join_next().await {
-                let (
-                    idx,
-                    SegmentTranslateOutcome {
-                        text: translated,
-                        completeness_degraded: degraded,
-                        cold_generation: cold,
-                        initial_request,
-                    },
-                ) = joined_segment(res)?;
-                if degraded {
-                    degraded_segments.push(idx + 1);
-                }
-                cold_generation &= cold;
-                proof_eligible &= initial_request;
-                cache_candidates[idx] = !degraded;
-                translations[idx] = Some(translated);
-                if let Some(stream) = &mut paragraph_stream {
-                    stream.flush(&translations, Some((idx, degraded))).await?;
-                }
-                flush_ready_stream_prefix(
+            flush_ready_stream_prefix(
+                &plan,
+                &translations,
+                &mut next_section_index,
+                &mut cached_prefix_len,
+                &event_tx,
+            )
+            .await?;
+            if output_mode == StreamOutputMode::Optimistic
+                && cached_prefix_len < plan.segment_count()
+                && !pending[cached_prefix_len].is_empty()
+            {
+                let prefix = untranslated_text_before_segment(
                     &plan,
-                    &translations,
+                    cached_prefix_len,
                     &mut next_section_index,
-                    &mut cached_prefix_len,
+                );
+                if !prefix.is_empty() {
+                    send_stream_event(&event_tx, StreamEvent::Token(prefix)).await?;
+                }
+                published[cached_prefix_len] = true;
+                send_stream_event(
                     &event_tx,
+                    StreamEvent::Token(std::mem::take(&mut pending[cached_prefix_len])),
                 )
                 .await?;
             }
+        }
+        while let Some(result) = tasks.join_next().await {
+            result.map_err(|error| anyhow!("segment task panicked: {error}"))?;
         }
 
         let suffix = untranslated_text_after_segments(&plan, next_section_index);
@@ -2881,6 +2746,7 @@ mod tests {
     mod context_json_tests;
     mod exec_cache_tests;
     mod identity_tests;
+    mod incremental_stream_tests;
     mod input_only_tests;
     mod network_retry_tests;
     mod paragraph_stream_tests;

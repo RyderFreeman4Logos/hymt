@@ -272,6 +272,26 @@ async fn model_discovery_and_false_eos_tokenization_recover() {
 }
 
 #[tokio::test]
+async fn optimistic_stream_recovers_a_body_interruption_before_any_content() {
+    let interrupted = response(200, "", 32).replace("application/json", "text/event-stream");
+    let server = server(vec![interrupted, success()]).await;
+    let (_fixture, client) = configured_client(&server.endpoint, Some(1));
+    let events = client
+        .translate_stream_with_completion("untouched source bytes")
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(events.contains(&TranslationStreamEvent::Token("complete".into())));
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0], requests[1]);
+}
+
+#[tokio::test]
 async fn optimistic_stream_does_not_replay_published_tokens() {
     let server = server(vec![interrupted_stream(), success()]).await;
     let (_fixture, client) = configured_client(&server.endpoint, Some(1));
@@ -338,4 +358,34 @@ async fn interrupted_headers_recover_and_optional_diagnostics_do_not_retry() {
         .runtime
         .is_verified());
     assert_eq!(inspection.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn buffered_and_incremental_translations_share_the_same_sse_request() {
+    let server = server(vec![success(), success()]).await;
+    let (_fixture, client) = configured_client(&server.endpoint, Some(0));
+    let buffered = client
+        .translate_with_completion("complete source bytes")
+        .await
+        .unwrap();
+    let events = client
+        .translate_stream_with_recovery("complete source bytes")
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+    assert_eq!(buffered.text, "complete");
+    assert!(events.iter().all(Result::is_ok));
+    let requests = server.requests.lock().unwrap();
+    let bodies: Vec<serde_json::Value> = requests
+        .iter()
+        .map(|request| serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap())
+        .collect();
+    assert_eq!(bodies.len(), 2);
+    assert_eq!(
+        bodies[0], bodies[1],
+        "output delivery must not partition inference caching"
+    );
+    assert_eq!(bodies[0]["stream"], true);
+    assert_eq!(bodies[0]["messages"][0]["content"], "complete source bytes");
 }

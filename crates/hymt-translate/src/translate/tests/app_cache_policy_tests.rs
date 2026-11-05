@@ -281,13 +281,13 @@ async fn populated_stream_proof_binds_captured_requests_for_both_priority_settin
             }))
             .unwrap(),
         );
-        for (index, segment) in plan.segments.iter().enumerate() {
+        for segment in &plan.segments {
             let prompt = build_prompt(segment, "zh", &TemplateType::Default, &opts).unwrap();
             let (body, payload) = bodies
                 .iter()
                 .find(|(_, payload)| payload["messages"][0]["content"] == prompt)
                 .unwrap();
-            assert_eq!(payload["stream"].as_bool(), (index == 0).then_some(true));
+            assert_eq!(payload["stream"].as_bool(), Some(true));
             bind(segment.as_bytes());
             bind(prompt.as_bytes());
             bind(body.as_bytes());
@@ -931,7 +931,6 @@ async fn request_binding_uses_actual_rendered_content_adapter_bytes_and_order() 
         &TemplateType::Personalization,
         &opts,
         &client,
-        false,
     )
     .unwrap();
     let changed = PromptOpts {
@@ -947,7 +946,6 @@ async fn request_binding_uses_actual_rendered_content_adapter_bytes_and_order() 
             &TemplateType::Personalization,
             &changed,
             &client,
-            false
         )
         .unwrap()
     );
@@ -963,7 +961,6 @@ async fn request_binding_uses_actual_rendered_content_adapter_bytes_and_order() 
             &TemplateType::Personalization,
             &opts,
             &client,
-            false
         )
         .unwrap()
     );
@@ -976,7 +973,6 @@ async fn request_binding_uses_actual_rendered_content_adapter_bytes_and_order() 
             &TemplateType::Personalization,
             &opts,
             &client,
-            false
         )
         .unwrap()
     );
@@ -989,7 +985,6 @@ async fn request_binding_uses_actual_rendered_content_adapter_bytes_and_order() 
             &TemplateType::Personalization,
             &opts,
             &client,
-            false
         )
         .unwrap()
     );

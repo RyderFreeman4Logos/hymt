@@ -685,3 +685,136 @@ async fn leading_blank_json_preserves_complete_request_and_output() {
         );
     }
 }
+
+#[tokio::test]
+async fn every_chunk_reaches_tee_before_its_terminal_event() {
+    let home = TestHome::new();
+    let source = "First source paragraph.\n\nSecond source paragraph.\n\nThird source paragraph.";
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    std::fs::create_dir_all(home.0.join(".config/hymt")).unwrap();
+    std::fs::write(home.0.join(".config/hymt/config.toml"), format!(
+        "[endpoint]\nurl=\"http://{address}/v1\"\nbackend=\"openai_compatible\"\nmodel=\"test-model\"\n[translation]\ncontext_window=8192\nmax_output_tokens=1024\nconcurrency=2\ntimeout=20\nmax_retries=0\n[cache]\nenabled=false\n"
+    )).unwrap();
+    let releases: Arc<Vec<_>> = Arc::new((0..3).map(|_| tokio::sync::Notify::new()).collect());
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider = tokio::spawn({
+        let releases = Arc::clone(&releases);
+        let requests = Arc::clone(&requests);
+        async move {
+            let mut handlers = tokio::task::JoinSet::new();
+            loop {
+                let (mut socket, _) = listener.accept().await?;
+                let request = read_fixture_request(&mut socket, &Mutex::default()).await?;
+                if request.starts_with(b"GET /v1/models ") {
+                    let body = r#"{"data":[{"id":"test-model"}]}"#;
+                    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await?;
+                    continue;
+                }
+                let raw = std::str::from_utf8(&request).unwrap();
+                let payload: serde_json::Value =
+                    serde_json::from_str(raw.split_once("\r\n\r\n").unwrap().1).unwrap();
+                let prompt = payload["messages"][0]["content"].as_str().unwrap();
+                let index = ["First", "Second", "Third"]
+                    .iter()
+                    .position(|name| prompt.contains(&format!("{name} source paragraph.")))
+                    .unwrap();
+                requests.lock().unwrap().push((index, payload));
+                let releases = Arc::clone(&releases);
+                handlers.spawn(async move {
+                    let first = format!("data: {}\n\n", serde_json::json!({"choices":[{"index":0,"delta":{"content":format!("TOKEN_{index}")},"finish_reason":null}]}));
+                    let last = format!("data: {}\n\ndata: [DONE]\n\n", serde_json::json!({"choices":[{"index":0,"delta":{"content":"_END"},"finish_reason":"stop"}]}));
+                    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{first}", first.len()+last.len()).as_bytes()).await?;
+                    socket.flush().await?;
+                    releases[index].notified().await;
+                    socket.write_all(last.as_bytes()).await?;
+                    socket.shutdown().await
+                });
+                if requests.lock().unwrap().len() == 3 {
+                    break;
+                }
+            }
+            while let Some(result) = handlers.join_next().await {
+                result.unwrap()?;
+            }
+            Ok::<_, std::io::Error>(())
+        }
+    });
+    let stderr_path = home.0.join("stderr.txt");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hymt"))
+        .args(["-l", "zh", "--force-translate-all", "--no-progress", "-y"])
+        .env("HOME", &home.0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(std::fs::File::create(&stderr_path).unwrap())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let pipe: Stdio = child.stdout.take().unwrap().try_into().unwrap();
+    let output = home.0.join("tee.md");
+    let mut tee = Command::new("/usr/bin/tee")
+        .arg(&output)
+        .stdin(pipe)
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(source.as_bytes())
+        .await
+        .unwrap();
+    let mut stdout = tee.stdout.take().unwrap();
+    let mut captured = Vec::new();
+    let mut observations = Vec::new();
+    for index in 0..3 {
+        let expected = if index == 0 {
+            "TOKEN_0".to_owned()
+        } else {
+            format!("_END\n\nTOKEN_{index}")
+        };
+        let mut bytes = vec![0; expected.len()];
+        let observed =
+            tokio::time::timeout(Duration::from_secs(5), stdout.read_exact(&mut bytes)).await;
+        releases[index].notify_one();
+        observations
+            .push(observed.is_ok_and(|result| result.is_ok()) && bytes == expected.as_bytes());
+        captured.extend(bytes);
+        if !observations[index] {
+            break;
+        }
+    }
+    for release in releases.iter() {
+        release.notify_one();
+    }
+    let finished = tokio::time::timeout(Duration::from_secs(20), async {
+        stdout.read_to_end(&mut captured).await?;
+        Ok::<_, std::io::Error>((child.wait().await?, tee.wait().await?))
+    })
+    .await;
+    if !matches!(finished, Ok(Ok(_))) {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        let _ = tee.kill().await;
+        let _ = tee.wait().await;
+    }
+    provider.abort();
+    let _ = provider.await;
+    assert_eq!(
+        observations,
+        [true, true, true],
+        "each chunk must emit before terminal; stderr={}",
+        std::fs::read_to_string(stderr_path).unwrap()
+    );
+    let (status, tee_status) = finished.unwrap().unwrap();
+    assert!(status.success() && tee_status.success());
+    assert_eq!(captured, b"TOKEN_0_END\n\nTOKEN_1_END\n\nTOKEN_2_END\n");
+    assert_eq!(std::fs::read(output).unwrap(), captured);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    for (index, payload) in requests.iter() {
+        assert_eq!(payload["stream"], true, "chunk {index} must request SSE");
+    }
+}
