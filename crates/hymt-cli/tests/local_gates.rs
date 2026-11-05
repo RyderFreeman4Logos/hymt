@@ -1362,7 +1362,7 @@ async fn local_gates_service_executable_and_library_paths_are_coherent() {
         let source = source_root().join("services").join(name);
         let text = std::fs::read_to_string(&source).unwrap();
         assert!(
-            text.contains("/usr/local/bin/hymt") || text.contains("hymt-telegram.service"),
+            text.contains("%h/.local/bin/hymt") || text.contains("hymt-telegram.service"),
             "{name} must watch or run the installed hymt executable"
         );
         std::fs::copy(source, services.join(name)).unwrap();

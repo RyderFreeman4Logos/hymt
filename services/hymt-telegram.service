@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/hymt telegram
+ExecStart=%h/.local/bin/hymt telegram
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=infinity
