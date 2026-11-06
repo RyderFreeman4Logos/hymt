@@ -37,8 +37,8 @@ class Upstream(BaseHTTPRequestHandler):
         if self.path == "/props":
             self.reply({"build_info": "fixture-b123", "version": "llama.cpp-6000",
                         "model_alias": "Hy-MT2-7B", "model_path": "/synthetic/model.gguf",
-                        "chat_template": "chatml", "n_ctx": 24576, "n_ctx_per_seq": 8192,
-                        "n_parallel": 3, "default_generation_settings": {"n_predict": 2048,
+                        "chat_template": "<|eos|>", "eos_token": "$", "n_ctx": 24576, "n_ctx_per_seq": 8192,
+                        "n_parallel": 3, "default_generation_settings": {"n_predict": 512,
                         "temperature": 0.7, "top_p": 0.6, "top_k": 20, "min_p": 0.0,
                         "repeat_penalty": 1.05, "repeat_last_n": 64}})
         elif self.path == "/v1/models":
@@ -50,7 +50,7 @@ class Upstream(BaseHTTPRequestHandler):
     def do_POST(self):
         raw = self.rfile.read(int(self.headers["Content-Length"]))
         if self.path == "/tokenize":
-            self.reply({"tokens": [42]})
+            self.reply({"tokens": [3]})
             return
         assert self.path == "/v1/chat/completions"
         payload = json.loads(raw)
