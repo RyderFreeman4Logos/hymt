@@ -230,7 +230,7 @@ fn cli(home: &Path, source: &str, file_output: bool) -> std::process::Output {
     }
 }
 
-fn request_batch(fixture: &Fixture, start: usize, expected_cache: &str) -> Vec<String> {
+fn request_batch(fixture: &Fixture, start: usize) -> Vec<String> {
     let records = fixture.records("requests.jsonl");
     let batch = &records[start..];
     assert_eq!(batch.len(), 2, "unexpected requests: {records:?}");
@@ -238,7 +238,6 @@ fn request_batch(fixture: &Fixture, start: usize, expected_cache: &str) -> Vec<S
         .iter()
         .map(|record| {
             assert_eq!(record["status"], 200);
-            assert_eq!(record["cache"], expected_cache);
             record["body"].as_str().unwrap().to_owned()
         })
         .collect();
@@ -265,14 +264,14 @@ async fn cli_and_telegram_document_share_requests_cache_and_output() {
         if bot_first {
             (bot_result, bot_api) = bot(&home, SOURCE, "source.md").await;
             assert!(bot_result.is_ok(), "{bot_result:?}");
-            bodies = request_batch(&fixture, 0, "MISS");
+            bodies = request_batch(&fixture, 0);
             file_output = cli(&home, SOURCE, true);
             assert!(
                 file_output.status.success(),
                 "{}",
                 String::from_utf8_lossy(&file_output.stderr)
             );
-            assert_eq!(request_batch(&fixture, 2, "HIT"), bodies);
+            assert_eq!(request_batch(&fixture, 2), bodies);
         } else {
             file_output = cli(&home, SOURCE, true);
             assert!(
@@ -280,10 +279,10 @@ async fn cli_and_telegram_document_share_requests_cache_and_output() {
                 "{}",
                 String::from_utf8_lossy(&file_output.stderr)
             );
-            bodies = request_batch(&fixture, 0, "MISS");
+            bodies = request_batch(&fixture, 0);
             (bot_result, bot_api) = bot(&home, SOURCE, "source.txt").await;
             assert!(bot_result.is_ok(), "{bot_result:?}");
-            assert_eq!(request_batch(&fixture, 2, "HIT"), bodies);
+            assert_eq!(request_batch(&fixture, 2), bodies);
         }
         assert_eq!(fixture.records("upstream.jsonl").len(), 2);
         let source_parts: Vec<String> = bodies
@@ -291,6 +290,8 @@ async fn cli_and_telegram_document_share_requests_cache_and_output() {
             .map(|body| {
                 let payload: Value = serde_json::from_str(body).unwrap();
                 assert_eq!(payload["stream"], true);
+                assert_eq!(payload["logit_bias"], serde_json::json!({"3": -100}));
+                assert_eq!(payload["max_tokens"], 512);
                 payload["messages"][0]["content"]
                     .as_str()
                     .unwrap()
@@ -332,9 +333,17 @@ async fn cli_and_telegram_document_share_requests_cache_and_output() {
             "{}",
             String::from_utf8_lossy(&stdout.stderr)
         );
-        assert_eq!(request_batch(&fixture, 4, "HIT"), bodies);
+        assert_eq!(request_batch(&fixture, 4), bodies);
         assert_eq!(stdout.stdout, [file.as_slice(), b"\n"].concat());
         assert_eq!(fixture.records("upstream.jsonl").len(), 2);
+        assert_eq!(
+            fixture
+                .records("requests.jsonl")
+                .iter()
+                .map(|request| request["cache"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["MISS", "MISS", "HIT", "HIT", "HIT", "HIT"]
+        );
     }
 }
 

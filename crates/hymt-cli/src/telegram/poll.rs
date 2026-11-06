@@ -514,6 +514,7 @@ where
     let Some(message) = update.message else {
         return Ok(());
     };
+    let client = &client.clone().with_deferred_preflight(true);
     let chat_id = message.chat.id;
     let chat_kind = match message.chat.chat_type.as_str() {
         "private" => ChatKind::Private,
